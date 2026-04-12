@@ -1,1 +1,6 @@
-./venv
+venv
+AnimaLoraToolkit/Dataset/*
+!AnimaLoraToolkit/Dataset/.keep
+output/*
+**/__pycache__
+AnimaLoraToolkit/monitor_data/*

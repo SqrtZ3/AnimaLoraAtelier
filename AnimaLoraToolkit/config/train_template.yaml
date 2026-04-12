@@ -50,7 +50,7 @@ lokr_factor: 8                       # LoKr 专用参数
 epochs: 10                           # 训练轮数
 max_steps: 0                         # 最大步数 (0=不限制)
 batch_size: 1                        # 批次大小
-grad_accum: 4                        # 梯度累积步数（有效 batch = batch_size × grad_accum）
+grad_accum: 1                        # 梯度累积步数（有效 batch = batch_size × grad_accum）
 learning_rate: 1.0e-4                # 学习率
 lr_scheduler: "none"  # 学习率调度: "none", "cosine", "cosine_with_restart"
 lr_scheduler_t0: 500                 # cosine_with_restart: 首次 restart 周期 (step)

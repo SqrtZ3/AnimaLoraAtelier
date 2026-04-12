@@ -13,11 +13,11 @@ t5_tokenizer_path: "models/t5_tokenizer"  # 本地 T5 tokenizer，避免联网
 # ============================================================================
 # 数据集（训练前请修改为实际数据集路径）
 # ============================================================================
-data_dir: "./dataset"
+data_dir: "./Dataset/your-dataset"
 resolution: 1024
 repeats: 1
 shuffle_caption: true      # 分类打乱（JSON: appearance/tags/environment 内部打乱）
-keep_tokens: 6             # 保留前 N 个 tokens 不打乱（仅对 TXT 模式生效）
+keep_tokens: 0             # 保留前 N 个 tokens 不打乱（仅对 TXT 模式生效）
 flip_augment: true         # 随机水平翻转
 tag_dropout: 0.0           # Tag dropout 概率 (0-1)
 prefer_json: true          # 优先使用 JSON 文件（支持分类 shuffle）
@@ -55,8 +55,8 @@ seed: 42
 # ============================================================================
 # 采样
 # ============================================================================
-sample_every: 5           # 每 5 个 epoch 采样
-sample_prompt: "masterpiece, best quality, newest, safe, 1girl"
+sample_every: 1           # 每 5 个 epoch 采样
+sample_prompt: " @your-trigger,masterpiece, best quality, newest, safe, 1girl"
 
 # ============================================================================
 # 进度显示

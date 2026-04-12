@@ -24,15 +24,22 @@ def load_caption_json(json_path: Path) -> dict | None:
 def normalize_caption_json(raw_json: dict) -> dict:
     """
     将 batch_tag.py 生成的 JSON 转换为标准格式
-    
-    标准格式按 Anima 官方顺序:
-    quality → count → character → series → artist → appearance → tags → environment → nl
+    【修复版】：完美支持官方文档提到的“简化扁平格式”，并修复了 character 解析崩溃 Bug
     """
-    # 提取各部分
-    fixed = raw_json.get("fixed", {})
-    character_info = raw_json.get("character", {})
-    from_path = raw_json.get("from_path", {})
-    ai_output = raw_json.get("ai_output", {})
+    # 判断是否为简化格式 (如果根目录没有 ai_output 和 fixed，说明所有标签都在外层)
+    is_simplified = "ai_output" not in raw_json and "fixed" not in raw_json
+    
+    # 根据格式决定去哪里取数据
+    fixed = raw_json if is_simplified else raw_json.get("fixed", {})
+    from_path = raw_json if is_simplified else raw_json.get("from_path", {})
+    ai_output = raw_json if is_simplified else raw_json.get("ai_output", {})
+    
+    # 【Bug修复核心】兼容 character 是字符串的情况
+    character_info = raw_json.get("character", "")
+    if isinstance(character_info, str):
+        character_name = character_info
+    else:
+        character_name = character_info.get("full", character_info.get("name", ""))
     
     # 解析 quality（可能是 "newest, safe" 字符串）
     quality_str = fixed.get("quality", "newest, safe")
@@ -41,23 +48,26 @@ def normalize_caption_json(raw_json: dict) -> dict:
     else:
         quality = list(quality_str)
     
-    # 合并 appearance（AI + from_path）
+    # 合并 appearance
     appearance = []
     ai_appearance = ai_output.get("appearance", [])
     if isinstance(ai_appearance, list):
         appearance.extend(ai_appearance)
     elif isinstance(ai_appearance, str):
         appearance.extend([t.strip() for t in ai_appearance.split(",") if t.strip()])
-    appearance.extend(from_path.get("extra_appearance", []))
+    # 仅在嵌套模式下提取 extra_appearance 以免重复
+    if not is_simplified:
+        appearance.extend(from_path.get("extra_appearance", []))
     
-    # 合并 tags（AI + from_path）
+    # 合并 tags
     tags = []
     ai_tags = ai_output.get("tags", [])
     if isinstance(ai_tags, list):
         tags.extend(ai_tags)
     elif isinstance(ai_tags, str):
         tags.extend([t.strip() for t in ai_tags.split(",") if t.strip()])
-    tags.extend(from_path.get("extra_tags", []))
+    if not is_simplified:
+        tags.extend(from_path.get("extra_tags", []))
     
     # environment
     environment = []
@@ -67,22 +77,22 @@ def normalize_caption_json(raw_json: dict) -> dict:
     elif isinstance(ai_env, str):
         environment.extend([t.strip() for t in ai_env.split(",") if t.strip()])
     
-    # 构建标准格式
+    # 构建标准格式返回
     return {
         "meta": {
             "path": raw_json.get("path", ""),
             "source_path_parts": raw_json.get("path_parts", []),
         },
         "tags": {
-            "quality": quality,                           # ["newest", "safe"]
-            "count": ai_output.get("count", ""),          # "1girl"
-            "character": character_info.get("full", ""),  # "asahi sakayori"
-            "series": fixed.get("series", ""),            # "cosmic princess kaguya"
-            "artist": fixed.get("artist", ""),            # "@spacetime kaguya"
-            "appearance": appearance,                     # [...]
-            "tags": tags,                                 # [...]
-            "environment": environment,                   # [...]
-            "nl": ai_output.get("nl", ""),                # "A boy..."
+            "quality": quality,
+            "count": ai_output.get("count", ""),
+            "character": character_name,
+            "series": fixed.get("series", ""),
+            "artist": fixed.get("artist", ""),
+            "appearance": appearance,
+            "tags": tags,
+            "environment": environment,
+            "nl": ai_output.get("nl", ""),
         }
     }
 

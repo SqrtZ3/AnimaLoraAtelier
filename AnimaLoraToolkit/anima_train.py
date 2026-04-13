@@ -28,6 +28,24 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+# 尝试添加当前目录到路径，确保能找到 utils
+script_dir = Path(__file__).resolve().parent
+if str(script_dir) not in sys.path:
+    sys.path.insert(0, str(script_dir))
+
+# 强制导入优化器工具，不再提供静默回退（Fail fast）
+try:
+    from utils.optimizer_utils import create_optimizer, get_optimizer_info
+except ImportError as e:
+    logger.error(f"无法导入高级优化器逻辑: {e}")
+    logger.error(f"当前 Python 路径 (sys.path): {sys.path}")
+    logger.error(f"脚本所在目录 (script_dir): {script_dir}")
+    raise ImportError(
+        "关键模块 utils.optimizer_utils 加载失败。\n"
+        "1. 请确认 AnimaLoraToolkit/utils/optimizer_utils.py 文件存在\n"
+        "2. 请确认已安装依赖: pip install prodigy-plus-schedule-free"
+    ) from e
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -178,6 +196,10 @@ def apply_yaml_config(args, config):
         "monitor_host": "monitor_host",
         "monitor_port": "monitor_port",
         "no_browser": "no_browser",
+        # 优化器配置映射
+        "optimizer_type": "optimizer_type",
+        "prodigyplus_d0": "prodigyplus_d0",
+        "prodigyplus_use_stableadamw": "prodigyplus_use_stableadamw",
     }
 
     # 需要特殊处理的默认值（用于判断命令行是否显式设置）
@@ -241,9 +263,12 @@ def apply_yaml_config(args, config):
         "no_progress": False,
         "log_every": 10,
         "no_monitor": False,
-        "monitor_host": "127.0.0.1",
+        "monitor_host": "0.0.0.0",
         "monitor_port": 8765,
         "no_browser": False,
+        "optimizer_type": "adamw",
+        "prodigyplus_d0": 1e-6,
+        "prodigyplus_use_stableadamw": True,
     }
 
     for yaml_key, arg_attr in mapping.items():
@@ -1400,9 +1425,18 @@ class ImageDataset(Dataset):
 
     def _scan(self):
         samples = []
+        # 扫描所有子目录，寻找图像及其对应的标签文件
         for img_path in self.data_dir.rglob("*"):
             if img_path.suffix.lower() not in self.EXTS:
                 continue
+            
+            # 解析目录名中的重复次数 (例如 10_tags)
+            repeats = 1
+            parent_name = img_path.parent.name
+            if "_" in parent_name:
+                prefix = parent_name.split("_", 1)[0]
+                if prefix.isdigit():
+                    repeats = max(1, int(prefix))
             
             sample = {"image": img_path}
             
@@ -1421,7 +1455,9 @@ class ImageDataset(Dataset):
                 sample["json_path"] = None
                 sample["txt_path"] = txt_path
             
-            samples.append(sample)
+            # 按重复次数添加样本
+            for _ in range(repeats):
+                samples.append(sample.copy())
         return samples
 
     def _process_caption_txt(self, caption):
@@ -2007,10 +2043,15 @@ def parse_args():
     p.add_argument("--loss-curve-steps", type=int, default=100, help="Loss 曲线显示步数 (0=禁用)")
     p.add_argument("--no-live-curve", action="store_true", help="禁用实时 Loss 曲线刷新")
     p.add_argument("--no-monitor", action="store_true", help="禁用 Web 监控面板")
-    p.add_argument("--monitor-host", default="127.0.0.1", help="监控面板绑定地址（默认仅本机；局域网/云端访问用 0.0.0.0）")
+    p.add_argument("--monitor-host", default="0.0.0.0", help="监控面板绑定地址（默认 0.0.0.0 以支持远程访问）")
     p.add_argument("--monitor-port", type=int, default=8765, help="监控面板端口")
     p.add_argument("--no-browser", action="store_true", help="不自动打开监控面板浏览器")
     p.add_argument("--log-every", type=int, default=10, help="日志输出间隔")
+
+    # 优化器设置
+    p.add_argument("--optimizer-type", default="adamw", choices=["adamw", "adamw8bit", "prodigyplus"], help="优化器类型")
+    p.add_argument("--prodigyplus-d0", type=float, default=1e-6, help="ProdigyPlus 初始 d 估计值")
+    p.add_argument("--prodigyplus-use-stableadamw", action="store_true", default=True, help="ProdigyPlus 是否使用 StableAdamW")
 
     # 依赖和交互
     p.add_argument("--auto-install", action="store_true", help="自动安装缺失依赖")
@@ -2325,17 +2366,45 @@ def main():
 
     # 优化器
     weight_decay = float(getattr(args, "weight_decay", 0.01) or 0.0)
+    opt_type = getattr(args, "optimizer_type", "adamw")
+    
+    # 针对 ProdigyPlus 的学习率建议
+    if opt_type == "prodigyplus" and args.lr != 1.0:
+        logger.warning(f"检测到正在使用 ProdigyPlus 优化器，但学习率为 {args.lr}。建议将学习率设为 1.0 以获得最佳自适应效果。")
+
+    # 获取参数组
     param_groups = injector.get_param_groups(weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+    
+    # 创建优化器
+    optimizer = create_optimizer(
+        optimizer_type=opt_type,
+        params=param_groups,
+        learning_rate=args.lr,
+        weight_decay=weight_decay,
+        d0=getattr(args, "prodigyplus_d0", 1e-6),
+        use_schedulefree=True,  # 默认启用 schedule-free
+        use_stableadamw=getattr(args, "prodigyplus_use_stableadamw", True),
+    )
+
+    # 打印优化器详细信息（确保用户知道当前用的是哪一个）
+    opt_info = get_optimizer_info(optimizer)
+    logger.info(f"优化器创建成功: {opt_info['type']}")
+    logger.info(f"优化器配置详情: {opt_info}")
+
     if weight_decay > 0:
-        wd_info = f"AdamW weight_decay={weight_decay}"
+        wd_info = f"Optimizer: {opt_type}, weight_decay={weight_decay}"
         if injector.use_lokr:
             wd_info += "（w1 排除 weight_decay）"
         logger.info(wd_info)
+    
     grad_clip = float(getattr(args, "grad_clip_max_norm", 0) or 0)
     if grad_clip > 0:
         logger.info(f"梯度裁剪 max_norm={grad_clip}")
-    trainable_params = [p for group in optimizer.param_groups for p in group["params"]]
+    
+    # 获取可训练参数用于梯度裁剪
+    trainable_params = []
+    for group in optimizer.param_groups:
+        trainable_params.extend(group["params"])
 
     # 计算总步数
     try:
@@ -2355,6 +2424,13 @@ def main():
     # 学习率调度器
     scheduler = None
     lr_sched = getattr(args, "lr_scheduler", "none") or "none"
+    
+    # 如果是 ProdigyPlus 且启用了 schedule-free，则不使用调度器
+    if opt_type == "prodigyplus":
+        if lr_sched != "none":
+            logger.warning("ProdigyPlus (Schedule-Free) 不需要学习率调度器，已将其设为 none")
+            lr_sched = "none"
+    
     if lr_sched == "cosine":
         eta_min = float(getattr(args, "lr_scheduler_eta_min", 0.0) or 0.0)
         if total_steps is None:
@@ -2460,6 +2536,11 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     
     current_epoch = start_epoch
+    
+    # 确保优化器在训练模式
+    if hasattr(optimizer, "train"):
+        optimizer.train()
+        
     model.train()
     step_start_time = time.perf_counter()
 
@@ -2484,6 +2565,10 @@ def main():
     if global_step == 0 and sampling_enabled:
         emit("采样中 (step 0, 基线)...")
         model.eval()
+        # 如果是 Schedule-Free 优化器，采样前需 eval()
+        if hasattr(optimizer, "eval"):
+            optimizer.eval()
+            
         s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
         s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
         s_cfg = float(getattr(args, "sample_cfg_scale", 4.0) or 4.0)
@@ -2511,6 +2596,10 @@ def main():
                     update_monitor(sample_path=sample_path)
                 except Exception:
                     pass
+                    
+        # 恢复训练模式
+        if hasattr(optimizer, "train"):
+            optimizer.train()
         model.train()
     elif global_step > 0 and sampling_enabled:
         emit(f"跳过启动基线采样（从 step {global_step} 恢复，非 step 0）")

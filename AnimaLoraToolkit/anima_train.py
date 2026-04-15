@@ -2377,18 +2377,23 @@ def main():
     
     # 创建优化器
 # 创建优化器
+# 找到 anima_train.py 中这段创建优化器的代码 (约 1400 行)：
     optimizer = create_optimizer(
         optimizer_type=opt_type,
         params=param_groups,
         learning_rate=args.lr,
         weight_decay=weight_decay,
         d0=getattr(args, "prodigyplus_d0", 1e-6),
-        use_schedulefree=True,  # 默认启用 schedule-free
+        use_schedulefree=True,
         use_stableadamw=getattr(args, "prodigyplus_use_stableadamw", True),
-        # === 针对 Prodigy 的安全防爆设置 ===
-        eps=1e-6 if args.mixed_precision == "bf16" else 1e-8, 
-        factored=False, # 官方明确建议：如果遇到 NaN，请禁用 factored
-        d_coef=0.5      # 稍微降低自适应步伐，防止早期 d 暴走
+        
+        # ========== 请将此处的参数修改为以下内容 ==========
+        eps=None,                 # 【核心修改】设为 None 开启 atan2 操作，彻底消除除零风险和尺度爆炸
+        use_orthograd=True,       # 【核心新增】开启正交梯度，只允许梯度改变权重方向而不暴力增加权重大小，防止后期崩溃
+        use_bias_correction=True, # 【核心新增】启用偏差校正，平滑前期和中期的 d 值增长曲线
+        factored=False,           # 保持 False (防 NaN)
+        d_coef=1.1,                # 保持 0.5 或降为 0.3
+        # ==================================================
     )
 
     # 打印优化器详细信息（确保用户知道当前用的是哪一个）

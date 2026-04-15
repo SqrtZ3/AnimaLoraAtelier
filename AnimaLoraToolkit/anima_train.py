@@ -2522,7 +2522,7 @@ def main():
         interrupted = True
         emit("\n检测到 Ctrl+C，正在保存训练状态...")
         state_path = output_dir / f"training_state_step{global_step}.pt"
-        if hasattr(optimizer, "eval"): optimizer.eval()
+        if hasattr(optimizer, "eval") and global_step > 0: optimizer.eval()
         # 获取监控面板数据用于恢复 loss 曲线
         monitor_data = None
         if monitor_server:
@@ -2571,9 +2571,6 @@ def main():
     if global_step == 0 and sampling_enabled:
         emit("采样中 (step 0, 基线)...")
         model.eval()
-        # 如果是 Schedule-Free 优化器，采样前需 eval()
-        if hasattr(optimizer, "eval"):
-            optimizer.eval()
             
         s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
         s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
@@ -2603,9 +2600,6 @@ def main():
                 except Exception:
                     pass
                     
-        # 恢复训练模式
-        if hasattr(optimizer, "train"):
-            optimizer.train()
         model.train()
     elif global_step > 0 and sampling_enabled:
         emit(f"跳过启动基线采样（从 step {global_step} 恢复，非 step 0）")
@@ -2666,7 +2660,7 @@ def main():
             loss.backward()
 
             if (batch_idx + 1) % args.grad_accum == 0:
-                if grad_clip > 0:
+                if grad_clip > 0 and opt_type != "prodigyplus":
                     torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
                 optimizer.step()
                 if scheduler is not None:

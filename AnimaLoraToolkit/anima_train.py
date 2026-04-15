@@ -2376,6 +2376,7 @@ def main():
     param_groups = injector.get_param_groups(weight_decay)
     
     # 创建优化器
+# 创建优化器
     optimizer = create_optimizer(
         optimizer_type=opt_type,
         params=param_groups,
@@ -2384,6 +2385,10 @@ def main():
         d0=getattr(args, "prodigyplus_d0", 1e-6),
         use_schedulefree=True,  # 默认启用 schedule-free
         use_stableadamw=getattr(args, "prodigyplus_use_stableadamw", True),
+        # === 针对 Prodigy 的安全防爆设置 ===
+        eps=1e-6 if args.mixed_precision == "bf16" else 1e-8, 
+        factored=False, # 官方明确建议：如果遇到 NaN，请禁用 factored
+        d_coef=0.5      # 稍微降低自适应步伐，防止早期 d 暴走
     )
 
     # 打印优化器详细信息（确保用户知道当前用的是哪一个）
@@ -2517,6 +2522,7 @@ def main():
         interrupted = True
         emit("\n检测到 Ctrl+C，正在保存训练状态...")
         state_path = output_dir / f"training_state_step{global_step}.pt"
+        if hasattr(optimizer, "eval"): optimizer.eval()
         # 获取监控面板数据用于恢复 loss 曲线
         monitor_data = None
         if monitor_server:
@@ -2738,13 +2744,16 @@ def main():
                 # 定期保存 LoRA 权重（按 step）
                 save_every_steps = getattr(args, "save_every_steps", 0)
                 if save_every_steps > 0 and global_step % save_every_steps == 0:
+                    if hasattr(optimizer, "eval"): optimizer.eval()
                     lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
                     injector.save(lora_path)
                     emit(f"Saved LoRA: {lora_path}")
+                    if hasattr(optimizer, "train"): optimizer.train()
 
                 # 定期保存训练状态（断点续训）
                 save_state_every = getattr(args, "save_state_every", 0)
                 if save_state_every > 0 and global_step % save_state_every == 0:
+                    if hasattr(optimizer, "eval"): optimizer.eval()
                     state_path = output_dir / f"training_state_step{global_step}.pt"
                     # 获取监控面板数据用于恢复 loss 曲线
                     monitor_data = None
@@ -2758,6 +2767,7 @@ def main():
                     # 同时保存 LoRA 权重
                     lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
                     injector.save(lora_path)
+                    if hasattr(optimizer, "train"): optimizer.train()
 
                 # 检查 max_steps
                 if args.max_steps and global_step >= args.max_steps:
@@ -2768,9 +2778,11 @@ def main():
         if not args.max_steps or global_step < args.max_steps:
             # 保存 checkpoint
             if args.save_every > 0 and current_epoch % args.save_every == 0:
+                if hasattr(optimizer, "eval"): optimizer.eval()
                 save_path = output_dir / f"{args.output_name}_epoch{current_epoch}.safetensors"
                 injector.save(save_path)
                 emit(f"Saved LoRA: {save_path}")
+                if hasattr(optimizer, "train"): optimizer.train()
 
             # 采样（轮换提示词）
             if args.sample_every > 0 and current_epoch % args.sample_every == 0:
@@ -2810,6 +2822,7 @@ def main():
             break
 
     # 最终保存
+    if hasattr(optimizer, "eval"): optimizer.eval()
     final_path = output_dir / f"{args.output_name}.safetensors"
     injector.save(final_path)
 

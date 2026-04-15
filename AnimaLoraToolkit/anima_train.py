@@ -2716,6 +2716,7 @@ def main():
                     prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
                     emit(f"采样中 (step {global_step}): {prompt_short}")
                     model.eval()
+                    if hasattr(optimizer, "eval"): optimizer.eval()
                     s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
                     s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
                     s_cfg = float(getattr(args, "sample_cfg_scale", 4.0) or 4.0)
@@ -2739,6 +2740,7 @@ def main():
                             update_monitor(sample_path=sample_path)
                         except Exception:
                             pass
+                    if hasattr(optimizer, "train"): optimizer.train()
                     model.train()
 
                 # 定期保存 LoRA 权重（按 step）
@@ -2790,6 +2792,7 @@ def main():
                 prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
                 emit(f"采样中 (epoch {current_epoch}): {prompt_short}")
                 model.eval()
+                if hasattr(optimizer, "eval"): optimizer.eval()
                 s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
                 s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
                 s_cfg = float(getattr(args, "sample_cfg_scale", 4.0) or 4.0)
@@ -2808,6 +2811,7 @@ def main():
                 sample_path = sample_dir / f"epoch_{current_epoch}.png"
                 img.save(sample_path)
                 emit(f"采样保存: epoch_{current_epoch}.png")
+                if hasattr(optimizer, "train"): optimizer.train()
                 model.train()
                 
                 # 更新监控面板

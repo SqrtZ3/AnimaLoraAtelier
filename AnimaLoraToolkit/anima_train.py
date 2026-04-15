@@ -2377,23 +2377,22 @@ def main():
     
     # 创建优化器
 # 创建优化器
-# 找到 anima_train.py 中这段创建优化器的代码 (约 1400 行)：
     optimizer = create_optimizer(
         optimizer_type=opt_type,
         params=param_groups,
         learning_rate=args.lr,
         weight_decay=weight_decay,
-        d0=getattr(args, "prodigyplus_d0", 1e-6),
+        d0=getattr(args, "prodigyplus_d0", 2e-5), # 沿用你设置的 2e-5
         use_schedulefree=True,
         use_stableadamw=getattr(args, "prodigyplus_use_stableadamw", True),
-        
-        # ========== 请将此处的参数修改为以下内容 ==========
-        eps=None,                 # 【核心修改】设为 None 开启 atan2 操作，彻底消除除零风险和尺度爆炸
-        use_orthograd=True,       # 【核心新增】开启正交梯度，只允许梯度改变权重方向而不暴力增加权重大小，防止后期崩溃
-        use_bias_correction=True, # 【核心新增】启用偏差校正，平滑前期和中期的 d 值增长曲线
-        factored=False,           # 保持 False (防 NaN)
-        d_coef=1.1,                # 保持 0.5 或降为 0.3
-        # ==================================================
+        # === 终极修复：严格对齐你成功的 TOML 配置 ===
+        split_groups=True,          # 核心修复 1：LoKr 必须分组计算 d 值！
+        use_bias_correction=True,   # 稳定早期训练 (TOML中开启)
+        use_speed=True,             # 动态调整速度 (TOML中开启)
+        eps=1e-8,                   # 关闭 atan2 (恢复常规 eps)
+        factored=False,             # 保持 False 防止 NaN
+        d_coef=1.0,                 # 可以用 1.0 或 1.1，由 split_groups 动态调节
+        use_orthograd=False         # 核心修复 2：绝不能在初始化为 0 的 LoRA 上开正交梯度！
     )
 
     # 打印优化器详细信息（确保用户知道当前用的是哪一个）

@@ -172,18 +172,13 @@ def create_prodigyplus_optimizer(
     eps: float = 1e-8,
     d0: float = 1e-6,
     use_schedulefree: bool = True,
+    # === 新增防 NaN 专用参数，遵循官方建议 ===
+    factored: bool = False,
+    d_coef: float = 0.5,
     **kwargs
 ) -> Optimizer:
     """
     创建 ProdigyPlusScheduleFree 优化器
-
-    ProdigyPlus 是一个先进的自适应优化器，它结合了 Prodigy 的自适应学习率
-    和 Meta 的 Schedule-Free 训练技术。
-
-    特点：
-    - 无需手动设置学习率（通常设为 1.0）
-    - 无需学习率调度器（Schedule-Free）
-    - 训练和评估时需要切换 optimizer.train() / eval()
     """
     if not PRODIGYPLUS_AVAILABLE:
         raise ImportError(
@@ -203,6 +198,9 @@ def create_prodigyplus_optimizer(
         eps=eps,
         d0=d0,
         use_schedulefree=use_schedulefree,
+        # === 透传安全参数 ===
+        factored=factored,
+        d_coef=d_coef,
         **kwargs
     )
 

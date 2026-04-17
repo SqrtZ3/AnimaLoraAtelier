@@ -2397,10 +2397,11 @@ def main():
         use_bias_correction=True,   
         use_speed=True,             
         factored=False,             
-        d_coef=1.0,
+        d_coef=1,
         betas=(0.9, 0.9999),        # 配合 ADOPT 使用更长的二阶记忆
-        weight_decay=0.0,           # 保护低秩特征不被惩罚消失
-        d_limiter=True,                 
+        weight_decay=0.001,           # 保护低秩特征不被惩罚消失
+        d_limiter=True,
+        prodigy_steps=800,                 
         
         # --- 毒药选项（强制关闭） ---
         use_orthograd=False,

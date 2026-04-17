@@ -2376,26 +2376,35 @@ def main():
     param_groups = injector.get_param_groups(weight_decay)
     
     # 创建优化器
-# 创建优化器
     optimizer = create_optimizer(
         optimizer_type=opt_type,
         params=param_groups,
         learning_rate=args.lr,
-        d0=getattr(args, "prodigyplus_d0", 1e-6), # 沿用你设置的 2e-5
+        d0=getattr(args, "prodigyplus_d0", 2e-5), 
         use_schedulefree=True,
-        use_stableadamw=getattr(args, "prodigyplus_use_stableadamw", True),
-        # === 终极修复：严格对齐你成功的 TOML 配置 ===
-        split_groups=True,          # 核心修复 1：LoKr 必须分组计算 d 值！
-        use_bias_correction=True,   # 稳定早期训练 (TOML中开启)
-        use_speed=True,             # 动态调整速度 (TOML中开启)                  # 关闭 atan2 (恢复常规 eps)
-        factored=False,             # 保持 False 防止 NaN
-        d_coef=1,
-        weight_decay=0.001,
-        split_groups_mean=False,
-        d_limiter=True,                 # 可以用 1.0 或 1.1，由 split_groups 动态调节
-        use_orthograd=False         # 核心修复 2：绝不能在初始化为 0 的 LoRA 上开正交梯度！
+        use_stableadamw=True,
+        
+        # --- 核心修复：防止乘性爆炸 ---
+        split_groups=True,          
+        split_groups_mean=True,     
+        
+        # --- 新引入的稳压黑科技 ---
+        eps=None,                   # 开启 Adam-atan2，彻底防止除零和步长激增
+        use_cautious=True,          # 开启 C-Optim，防止震荡，提高标签精准度
+        use_adopt=True,             # 开启 ADOPT，免疫异常/脏数据的梯度污染
+        
+        # --- 常规选项 ---
+        use_bias_correction=True,   
+        use_speed=True,             
+        factored=False,             
+        d_coef=1.0,
+        betas=(0.9, 0.9999),        # 配合 ADOPT 使用更长的二阶记忆
+        weight_decay=0.0,           # 保护低秩特征不被惩罚消失
+        d_limiter=True,                 
+        
+        # --- 毒药选项（强制关闭） ---
+        use_orthograd=False,
     )
-
     # 打印优化器详细信息（确保用户知道当前用的是哪一个）
     opt_info = get_optimizer_info(optimizer)
     logger.info(f"优化器创建成功: {opt_info['type']}")

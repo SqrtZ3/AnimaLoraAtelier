@@ -2381,17 +2381,18 @@ def main():
         optimizer_type=opt_type,
         params=param_groups,
         learning_rate=args.lr,
-        weight_decay=weight_decay,
-        d0=getattr(args, "prodigyplus_d0", 2e-5), # 沿用你设置的 2e-5
+        d0=getattr(args, "prodigyplus_d0", 1e-6), # 沿用你设置的 2e-5
         use_schedulefree=True,
         use_stableadamw=getattr(args, "prodigyplus_use_stableadamw", True),
         # === 终极修复：严格对齐你成功的 TOML 配置 ===
         split_groups=True,          # 核心修复 1：LoKr 必须分组计算 d 值！
         use_bias_correction=True,   # 稳定早期训练 (TOML中开启)
-        use_speed=True,             # 动态调整速度 (TOML中开启)
-        eps=1e-8,                   # 关闭 atan2 (恢复常规 eps)
+        use_speed=True,             # 动态调整速度 (TOML中开启)                  # 关闭 atan2 (恢复常规 eps)
         factored=False,             # 保持 False 防止 NaN
-        d_coef=1.0,                 # 可以用 1.0 或 1.1，由 split_groups 动态调节
+        d_coef=1,
+        weight_decay=0.001,
+        split_groups_mean=False,
+        d_limiter=True,                 # 可以用 1.0 或 1.1，由 split_groups 动态调节
         use_orthograd=False         # 核心修复 2：绝不能在初始化为 0 的 LoRA 上开正交梯度！
     )
 

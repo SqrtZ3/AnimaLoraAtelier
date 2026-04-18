@@ -2400,7 +2400,7 @@ def main():
         weight_decay_by_lr=True,
 
         # ── 梯度缩放 ──────────────────────────────────────────
-        eps=None,                  # 默认；或可试 eps=None (Adam-atan2) 省去调 eps
+        eps=1e-8,                  # 默认；或可试 eps=None (Adam-atan2) 省去调 eps
         use_stableadamw=True,      # ✅ 保持，DiT 梯度规模变化大
 
         # ── 精度与内存 ────────────────────────────────────────
@@ -2418,7 +2418,7 @@ def main():
         use_focus=False,           # 与 factored 不兼容，保持关闭
 
         use_bias_correction=False, # 不需要；会大幅拖慢 Prodigy 起步
-        split_groups=True,         # ✅ 多参数组分别适配（DiT blocks vs LLM Adapter）
+        split_groups=False,         # ✅ 多参数组分别适配（DiT blocks vs LLM Adapter）
         split_groups_mean=False,   # v2.0 默认，完整逐组适配
     )
     # 打印优化器详细信息（确保用户知道当前用的是哪一个）

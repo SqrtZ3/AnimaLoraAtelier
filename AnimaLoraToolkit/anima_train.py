@@ -2705,7 +2705,14 @@ def main():
 
                 # 更新进度显示
                 now = time.perf_counter()
-                lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else 0.0
+                if opt_type == "prodigyplus" and optimizer.param_groups:
+                    g = optimizer.param_groups[0]
+                    # effective_lr 是 v2.0 新增的 logging 字段，d * effective_lr 近似真实 LR
+                    d_val = g.get("d", 1.0)
+                    eff_lr = g.get("effective_lr", g.get("lr", 1.0))
+                    lr = float(d_val) * float(eff_lr)
+                else:
+                    lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else 0.0
                 
                 # 更新训练监控面板
                 if monitor_server:

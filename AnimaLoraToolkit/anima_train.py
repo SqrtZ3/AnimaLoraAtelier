@@ -2387,39 +2387,39 @@ def main():
         # ── Prodigy 步长控制 ──────────────────────────────────
         d0=1e-6,                   # 默认值，Anima 梯度较"干净"无需调高
         d_coef=1,                # 略低于 1.0；Anima 官方强调"轻触"
-                                # 若 LR 收敛过慢，可改回 1.0
+        #                         # 若 LR 收敛过慢，可改回 1.0
         d_limiter=True,            # ✅ 保持开启，60 张数据集尤其需要防止早期 LR 高估
-        prodigy_steps=400,         # 约 25% 总步数处冻结
+        # prodigy_steps=400,         # 约 25% 总步数处冻结
 
-        # ── Schedule-Free ────────────────────────────────────
-        use_schedulefree=True,
-        schedulefree_c=8,          # 60 张小数据集 + 小 batch，适合 6–12 范围
+        # # ── Schedule-Free ────────────────────────────────────
+        # use_schedulefree=True,
+        # schedulefree_c=8,          # 60 张小数据集 + 小 batch，适合 6–12 范围
 
-        # ── 权重衰减 ──────────────────────────────────────────
-        weight_decay=0.01,         # 轻量衰减，配合 Anima 的"轻触"原则
-        weight_decay_by_lr=True,
+        # # ── 权重衰减 ──────────────────────────────────────────
+        # weight_decay=0.01,         # 轻量衰减，配合 Anima 的"轻触"原则
+        # weight_decay_by_lr=True,
 
-        # ── 梯度缩放 ──────────────────────────────────────────
-        eps=1e-8,                  # 默认；或可试 eps=None (Adam-atan2) 省去调 eps
-        use_stableadamw=True,      # ✅ 保持，DiT 梯度规模变化大
+        # # ── 梯度缩放 ──────────────────────────────────────────
+        eps=None,                  # 默认；或可试 eps=None (Adam-atan2) 省去调 eps
+        # use_stableadamw=True,      # ✅ 保持，DiT 梯度规模变化大
 
-        # ── 精度与内存 ────────────────────────────────────────
-        factored=True,
-        factored_fp32=True,
-        stochastic_rounding=True,
-        fused_back_pass=False,     # 如果框架支持可开启以节省显存
+        # # ── 精度与内存 ────────────────────────────────────────
+        # factored=True,
+        # factored_fp32=True,
+        # stochastic_rounding=True,
+        # fused_back_pass=False,     # 如果框架支持可开启以节省显存
 
-        # ── 实验性功能 ────────────────────────────────────────
-        use_adopt=True,            # ✅ 推荐：延迟二阶矩更新，对小数据集更稳定
-        use_cautious=False,        # 可选，效果有限但无害
-        use_orthograd=False,       # 可选，若出现过拟合可以尝试
-        use_grams=False,
-        use_speed=False,           # 默认关闭；若 LR 长期不动可尝试开启
-        use_focus=False,           # 与 factored 不兼容，保持关闭
+        # # ── 实验性功能 ────────────────────────────────────────
+        # use_adopt=True,            # ✅ 推荐：延迟二阶矩更新，对小数据集更稳定
+        # use_cautious=False,        # 可选，效果有限但无害
+        # use_orthograd=False,       # 可选，若出现过拟合可以尝试
+        # use_grams=False,
+        # use_speed=False,           # 默认关闭；若 LR 长期不动可尝试开启
+        # use_focus=False,           # 与 factored 不兼容，保持关闭
 
-        use_bias_correction=False, # 不需要；会大幅拖慢 Prodigy 起步
-        split_groups=False,         # ✅ 多参数组分别适配（DiT blocks vs LLM Adapter）
-        split_groups_mean=False,   # v2.0 默认，完整逐组适配
+        # use_bias_correction=False, # 不需要；会大幅拖慢 Prodigy 起步
+        # split_groups=False,         # ✅ 多参数组分别适配（DiT blocks vs LLM Adapter）
+        # split_groups_mean=False,   # v2.0 默认，完整逐组适配
     )
     # 打印优化器详细信息（确保用户知道当前用的是哪一个）
     opt_info = get_optimizer_info(optimizer)

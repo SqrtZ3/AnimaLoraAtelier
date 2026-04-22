@@ -2388,12 +2388,12 @@ def main():
         d0=1e-6,                   # 默认值，Anima 梯度较"干净"无需调高
         d_coef=1,                # 略低于 1.0；Anima 官方强调"轻触"
         #                         # 若 LR 收敛过慢，可改回 1.0
-        d_limiter=True,            # ✅ 保持开启，60 张数据集尤其需要防止早期 LR 高估
+        # d_limiter=True,            # ✅ 保持开启，60 张数据集尤其需要防止早期 LR 高估
         # prodigy_steps=400,         # 约 25% 总步数处冻结
 
         # # ── Schedule-Free ────────────────────────────────────
-        # use_schedulefree=True,
-        # schedulefree_c=8,          # 60 张小数据集 + 小 batch，适合 6–12 范围
+        use_schedulefree=True,
+        schedulefree_c=8,          # 60 张小数据集 + 小 batch，适合 6–12 范围
 
         # # ── 权重衰减 ──────────────────────────────────────────
         # weight_decay=0.01,         # 轻量衰减，配合 Anima 的"轻触"原则

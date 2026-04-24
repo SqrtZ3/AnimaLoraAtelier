@@ -1072,7 +1072,9 @@ class LoKrLayer(torch.nn.Module):
         self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
 
         # LyCORIS 标准初始化: w1=kaiming, w2_a=kaiming, w2_b=zeros
-        torch.nn.init.kaiming_uniform_(self.lokr_w1, a=5**0.5)
+        # ★ w1 用小标准差的正态分布，避免 kron 放大后溢出
+        torch.nn.init.normal_(self.lokr_w1, mean=0.0, std=0.1)
+        # w2_a 用标准 kaiming（它会和 zeros 的 w2_b 相乘，初始贡献为 0，安全）
         torch.nn.init.kaiming_uniform_(self.lokr_w2_a, a=5**0.5)
         torch.nn.init.zeros_(self.lokr_w2_b)
 
@@ -1084,8 +1086,12 @@ class LoKrLayer(torch.nn.Module):
         return 1
 
     def forward(self, x):
-        w2 = self.lokr_w2_a @ self.lokr_w2_b
-        weight = torch.kron(self.lokr_w1, w2)
+        # ★ 关键修复：kron 在 bf16 下极易溢出，强制 fp32 计算，最后转回输入 dtype
+        w1 = self.lokr_w1.float()
+        w2_a = self.lokr_w2_a.float()
+        w2_b = self.lokr_w2_b.float()
+        w2 = w2_a @ w2_b
+        weight = torch.kron(w1, w2).to(dtype=x.dtype)
         return F.linear(self.dropout(x), weight) * self.scaling
 
 
@@ -2393,7 +2399,7 @@ def main():
 
         # # ── Schedule-Free ────────────────────────────────────
         use_schedulefree=True,
-        schedulefree_c=8,          # 60 张小数据集 + 小 batch，适合 6–12 范围
+        # schedulefree_c=8,          # 60 张小数据集 + 小 batch，适合 6–12 范围
 
         # # ── 权重衰减 ──────────────────────────────────────────
         # weight_decay=0.01,         # 轻量衰减，配合 Anima 的"轻触"原则
@@ -2634,6 +2640,11 @@ def main():
     elif global_step > 0 and sampling_enabled:
         emit(f"跳过启动基线采样（从 step {global_step} 恢复，非 step 0）")
 
+    # ★ Schedule-Free 需要显式进入 train 模式
+    if hasattr(optimizer, "train"):
+        optimizer.train()
+    model.train()
+
     for epoch in range(start_epoch, args.epochs):
         current_epoch = epoch
         if use_cached and hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_epoch"):
@@ -2651,9 +2662,10 @@ def main():
             else:
                 pixels = batch["pixel_values"].to(device, dtype=dtype)
                 with torch.no_grad():
-                    pixels_5d = pixels.unsqueeze(2)  # [B,C,1,H,W]
-                    latents = vae.model.encode(pixels_5d, vae.scale)
-
+                    pixels_5d = pixels.unsqueeze(2)
+                    # ★ VAE encode 在 fp32 下数值更稳定，随后再转回 bf16
+                    with torch.autocast("cuda", enabled=False):
+                        latents = vae.model.encode(pixels_5d.float(), vae.scale).to(dtype)
             bs = latents.shape[0]
 
             # 文本编码
@@ -2683,20 +2695,57 @@ def main():
                     model, noisy, t.view(-1, 1), cross, pad_mask,
                     use_checkpoint=args.grad_checkpoint
                 )
+                # ★ 损失始终 fp32 计算
                 loss = F.mse_loss(pred.float(), target.float())
 
-            # 反向传播
-            loss = loss / args.grad_accum
-            loss.backward()
+            # ★ 守护 1：forward 结果 NaN/Inf 检查
+            if not torch.isfinite(loss):
+                logger.warning(
+                    f"[step {global_step}] Non-finite loss detected ({loss.item()}), "
+                    f"skipping this micro-batch. "
+                    f"pred stats: min={pred.float().min().item():.3e} "
+                    f"max={pred.float().max().item():.3e}"
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            loss_to_backward = loss / args.grad_accum
+            loss_to_backward.backward()
 
             if (batch_idx + 1) % args.grad_accum == 0:
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
+                # ★ 守护 2：梯度 NaN/Inf 检查
+                bad_grad = False
+                for p in trainable_params:
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        bad_grad = True
+                        break
+                if bad_grad:
+                    logger.warning(f"[step {global_step}] Non-finite gradient, skipping update.")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                # ★ 更严格的梯度裁剪（LoKr bf16 下推荐 0.5~1.0）
+                effective_clip = grad_clip if grad_clip > 0 else 1.0
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=effective_clip)
+
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+
+                # ★ 守护 3：优化器状态污染检测（Prodigy 内部 d 变 NaN 会连锁崩溃）
+                if opt_type == "prodigyplus" and global_step % 50 == 0:
+                    try:
+                        from utils.optimizer_utils import is_optimizer_state_healthy
+                        if not is_optimizer_state_healthy(optimizer):
+                            logger.error(
+                                f"[step {global_step}] Optimizer state contaminated by NaN/Inf. "
+                                f"Training cannot continue. Consider reloading from last checkpoint."
+                            )
+                            raise RuntimeError("Optimizer state NaN")
+                    except ImportError:
+                        pass
 
                 # 记录 loss 历史
                 loss_val = float(loss.item() * args.grad_accum)

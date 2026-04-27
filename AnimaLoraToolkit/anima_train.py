@@ -149,6 +149,7 @@ def apply_yaml_config(args, config):
         "lora_type": "lora_type",
         "lora_rank": "lora_rank",
         "lora_alpha": "lora_alpha",
+        "lora_dropout": "lora_dropout",
         "lokr_factor": "lokr_factor",
         "resume_lora": "resume_lora",
         # 训练参数
@@ -200,6 +201,19 @@ def apply_yaml_config(args, config):
         "optimizer_type": "optimizer_type",
         "prodigyplus_d0": "prodigyplus_d0",
         "prodigyplus_use_stableadamw": "prodigyplus_use_stableadamw",
+        # 优化器透明路由（任意 key 直接以 **kwargs 传入优化器，未识别的会被自动过滤并 warning）
+        "optimizer_args": "optimizer_args",
+        "use_t5_token_weights": "use_t5_token_weights",
+        # Flow Matching / 损失权重 / 噪声增强
+        "flow_shift": "flow_shift",
+        "timestep_sampling": "timestep_sampling",
+        "min_snr_gamma": "min_snr_gamma",
+        "loss_weighting_scheme": "loss_weighting_scheme",
+        "noise_offset": "noise_offset",
+        "noise_offset_random_strength": "noise_offset_random_strength",
+        "pyramid_noise_iterations": "pyramid_noise_iterations",
+        "pyramid_noise_discount": "pyramid_noise_discount",
+        "caption_dropout_rate": "caption_dropout_rate",
     }
 
     # 需要特殊处理的默认值（用于判断命令行是否显式设置）
@@ -223,6 +237,7 @@ def apply_yaml_config(args, config):
         "lora_type": "lokr",
         "lora_rank": 32,
         "lora_alpha": 32.0,
+        "lora_dropout": 0.0,
         "lokr_factor": 8,
         "resume_lora": "",
         "epochs": 10,
@@ -269,6 +284,17 @@ def apply_yaml_config(args, config):
         "optimizer_type": "adamw",
         "prodigyplus_d0": 1e-6,
         "prodigyplus_use_stableadamw": True,
+        "optimizer_args": None,
+        "use_t5_token_weights": True,
+        "flow_shift": 3.0,
+        "timestep_sampling": "logit_normal",
+        "min_snr_gamma": 0.0,
+        "loss_weighting_scheme": "none",
+        "noise_offset": 0.0,
+        "noise_offset_random_strength": False,
+        "pyramid_noise_iterations": 0,
+        "pyramid_noise_discount": 0.3,
+        "caption_dropout_rate": 0.0,
     }
 
     for yaml_key, arg_attr in mapping.items():
@@ -1047,10 +1073,25 @@ class LoRALayer(torch.nn.Module):
 
 
 class LoKrLayer(torch.nn.Module):
-    """LyCORIS LoKr 层 (ComfyUI 兼容) — w2 低秩分解版"""
+    """LyCORIS LoKr 层 (ComfyUI 兼容) — w2 低秩分解版
+
+    分解: ΔW = kron(w1, w2_a @ w2_b)
+        w1   : (factor, factor)
+        w2_a : (out_dim, rank)
+        w2_b : (rank,    in_dim)
+        其中 in_dim = in_features // factor, out_dim = out_features // factor
+
+    forward 用 kron-bypass 数学等价但完全不实例化 (out_features, in_features) 全矩阵：
+        将 x 视作 (..., factor, in_dim)，则 y = w1 @ ((x @ w2_b^T) @ w2_a^T)
+        最后 reshape 回 (..., factor * out_dim)。
+    复杂度 O(B*factor*in_dim*rank + B*factor*rank*out_dim + B*factor^2*out_dim)，
+    远小于原本的 O(B*factor^2*in_dim*out_dim)，且无需在 bf16 中保存巨型 kron 矩阵。
+    """
     def __init__(self, in_features, out_features, rank=4, alpha=1.0, factor=8, dropout=0.0):
         super().__init__()
         self.alpha = alpha
+        self.in_features = in_features
+        self.out_features = out_features
 
         # 自动调整 factor 确保能整除
         factor = self._find_factor(in_features, out_features, factor)
@@ -1063,18 +1104,14 @@ class LoKrLayer(torch.nn.Module):
         self.rank = min(rank, self.out_dim, self.in_dim)
         self.scaling = alpha / self.rank
 
-        # LoKr 分解: W = kron(w1, w2_a @ w2_b) * scaling
-        # w1: [factor, factor]
-        # w2_a: [out_dim, rank], w2_b: [rank, in_dim]
+        # LoKr 分解: ΔW = kron(w1, w2_a @ w2_b)（命名与 LyCORIS 一致，可直接被 ComfyUI 加载）
         self.lokr_w1 = torch.nn.Parameter(torch.empty(factor, factor))
         self.lokr_w2_a = torch.nn.Parameter(torch.empty(self.out_dim, self.rank))
         self.lokr_w2_b = torch.nn.Parameter(torch.empty(self.rank, self.in_dim))
         self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
 
-        # LyCORIS 标准初始化: w1=kaiming, w2_a=kaiming, w2_b=zeros
-        # ★ w1 用小标准差的正态分布，避免 kron 放大后溢出
+        # ★ w1 用小 std 正态分布，配合 w2_b=0 初始时 ΔW=0；训练后 ΔW 量级由 scaling 控制
         torch.nn.init.normal_(self.lokr_w1, mean=0.0, std=0.1)
-        # w2_a 用标准 kaiming（它会和 zeros 的 w2_b 相乘，初始贡献为 0，安全）
         torch.nn.init.kaiming_uniform_(self.lokr_w2_a, a=5**0.5)
         torch.nn.init.zeros_(self.lokr_w2_b)
 
@@ -1086,13 +1123,27 @@ class LoKrLayer(torch.nn.Module):
         return 1
 
     def forward(self, x):
-        # ★ 关键修复：kron 在 bf16 下极易溢出，强制 fp32 计算，最后转回输入 dtype
+        # bf16 下 kron 容易数值放大，统一转 fp32 中间运算
         w1 = self.lokr_w1.float()
         w2_a = self.lokr_w2_a.float()
         w2_b = self.lokr_w2_b.float()
-        w2 = w2_a @ w2_b
-        weight = torch.kron(w1, w2).to(dtype=x.dtype)
-        return F.linear(self.dropout(x), weight) * self.scaling
+
+        x_drop = self.dropout(x)
+        orig_shape = x_drop.shape
+        # (..., in_features) → (B*, factor, in_dim)；保留前置维度
+        x_flat = x_drop.reshape(-1, self.factor, self.in_dim).float()
+
+        # 两段低秩矩阵乘代替 kron 全矩阵：
+        #   tmp = x_flat @ w2_b^T  → (B*, factor, rank)
+        #   tmp = tmp     @ w2_a^T → (B*, factor, out_dim)
+        tmp = torch.matmul(x_flat, w2_b.transpose(0, 1))
+        tmp = torch.matmul(tmp, w2_a.transpose(0, 1))
+        # 用 (factor, factor) 在前广播：w1 @ (B*, factor, out_dim) → (B*, factor, out_dim)
+        y = torch.matmul(w1, tmp)
+
+        # reshape 回 (..., out_features)
+        y = y.reshape(*orig_shape[:-1], self.factor * self.out_dim)
+        return y.to(dtype=x.dtype) * self.scaling
 
 
 class LoRALinear(torch.nn.Module):
@@ -1132,20 +1183,24 @@ class LoRALinear(torch.nn.Module):
 class LoRAInjector:
     """LoRA 注入器"""
     DEFAULT_TARGETS = ["q_proj", "k_proj", "v_proj", "output_proj", "mlp.layer1", "mlp.layer2"]
+    DEFAULT_EXCLUDE_PREFIXES = ("llm_adapter.",)
 
-    def __init__(self, rank=32, alpha=16.0, dropout=0.0, use_lokr=False, factor=8, targets=None):
+    def __init__(self, rank=32, alpha=16.0, dropout=0.0, use_lokr=False, factor=8, targets=None, exclude_prefixes=None):
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
         self.use_lokr = use_lokr
         self.factor = factor
         self.targets = targets or self.DEFAULT_TARGETS
+        self.exclude_prefixes = tuple(exclude_prefixes or self.DEFAULT_EXCLUDE_PREFIXES)
         self.injected = {}
 
     def inject(self, model):
         """注入 LoRA 到模型"""
         for name, module in list(model.named_modules()):
             if not isinstance(module, torch.nn.Linear):
+                continue
+            if any(name.startswith(prefix) for prefix in self.exclude_prefixes):
                 continue
             if not any(t in name for t in self.targets):
                 continue
@@ -1163,7 +1218,10 @@ class LoRAInjector:
             setattr(parent, parts[-1], lora_linear)
             self.injected[name] = lora_linear
 
-        logger.info(f"注入 {'LoKr' if self.use_lokr else 'LoRA'} 到 {len(self.injected)} 层")
+        logger.info(
+            f"注入 {'LoKr' if self.use_lokr else 'LoRA'} 到 {len(self.injected)} 层"
+            f"（排除前缀: {', '.join(self.exclude_prefixes) or '无'}）"
+        )
         return self.injected
 
     def get_params(self):
@@ -1796,6 +1854,9 @@ class CachedLatentDataset(Dataset):
         base = self.base_dataset
         while hasattr(base, "dataset"):
             base = base.dataset
+
+        if getattr(base, "flip_augment", False) and random.random() > 0.5:
+            latent = torch.flip(latent, dims=[-1])
         
         # 处理 caption（正则集 caption_override 优先）
         caption = None
@@ -1863,7 +1924,13 @@ def sample_image(
         t5_ids = t5_ids.to(device)
         t5_attn = t5_attn.to(device)
         t5_w = t5_w.to(device, dtype=torch.float32)
-        cross_cond = model.preprocess_text_embeds(qwen_embeds, t5_ids)
+        cross_cond = model.preprocess_text_embeds(qwen_embeds, t5_ids, t5_attn, qwen_attn)
+        if (
+            getattr(args, "use_t5_token_weights", True)
+            and getattr(model, "llm_adapter", None) is not None
+            and cross_cond.shape[1] == t5_w.shape[1]
+        ):
+            cross_cond = cross_cond * t5_w.to(cross_cond.dtype).unsqueeze(-1)
         if cross_cond.shape[1] < 512:
             cross_cond = F.pad(cross_cond, (0, 0, 0, 512 - cross_cond.shape[1]))
 
@@ -1874,7 +1941,13 @@ def sample_image(
         t5_ids_uncond = t5_ids_uncond.to(device)
         t5_attn_uncond = t5_attn_uncond.to(device)
         t5_w_uncond = t5_w_uncond.to(device, dtype=torch.float32)
-        cross_uncond = model.preprocess_text_embeds(qwen_embeds_uncond, t5_ids_uncond)
+        cross_uncond = model.preprocess_text_embeds(qwen_embeds_uncond, t5_ids_uncond, t5_attn_uncond, qwen_attn_uncond)
+        if (
+            getattr(args, "use_t5_token_weights", True)
+            and getattr(model, "llm_adapter", None) is not None
+            and cross_uncond.shape[1] == t5_w_uncond.shape[1]
+        ):
+            cross_uncond = cross_uncond * t5_w_uncond.to(cross_uncond.dtype).unsqueeze(-1)
         if cross_uncond.shape[1] < 512:
             cross_uncond = F.pad(cross_uncond, (0, 0, 0, 512 - cross_uncond.shape[1]))
             
@@ -1949,12 +2022,130 @@ def sample_image(
 # 训练辅助
 # ============================================================================
 
-def sample_t(bs, device):
-    """采样时间步 (logit-normal)"""
-    t = torch.sigmoid(torch.randn(bs, device=device))
-    shift = 3.0
-    t = (t * shift) / (1 + (shift - 1) * t)
-    return t
+def sample_t(bs, device, mode: str = "logit_normal", shift: float = 3.0):
+    """采样 Flow Matching 时间步 t ∈ (0, 1)。
+
+    mode:
+      - "logit_normal": 经典 SD3/Anima 偏向中间 t 的分布，shift>1 进一步偏向高噪声端（默认）。
+      - "uniform":      均匀采样 t，对低噪声端（细节）和高噪声端（结构）覆盖更均衡。
+      - "logit_normal_low": logit-normal 但 shift 反向（推 t 偏向低噪声/细节端），适合刻画细节差的训练集。
+      - "mode":         SD3 式 mode-distribution（用 sigma 形式，需要 shift）。
+    """
+    mode = (mode or "logit_normal").lower()
+    if mode == "uniform":
+        return torch.rand(bs, device=device).clamp(1e-4, 1.0 - 1e-4)
+
+    # 基础 logit-normal
+    u = torch.sigmoid(torch.randn(bs, device=device))
+
+    if mode == "logit_normal_low":
+        # shift 倒数，效果是把 t 推向 0 端（更多“低噪声/细节”样本）
+        s = max(float(shift), 1e-4)
+        u = (u * (1.0 / s)) / (1 + (1.0 / s - 1) * u)
+        return u.clamp(1e-4, 1.0 - 1e-4)
+
+    if mode == "mode":
+        # SD3 mode sampling: 集中在某个 sigma 附近
+        s = float(shift)
+        u = 1 - u - s * (torch.cos(torch.pi * 0.5 * u) ** 2 - 1 + u)
+        return u.clamp(1e-4, 1.0 - 1e-4)
+
+    # 默认 logit_normal + shift
+    s = float(shift)
+    u = (u * s) / (1 + (s - 1) * u)
+    return u.clamp(1e-4, 1.0 - 1e-4)
+
+
+def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
+               pyramid_discount: float = 0.3, random_offset_strength: bool = False):
+    """生成训练用噪声。
+
+    base: standard normal
+    noise_offset: 给每个样本/通道加一个低频偏移，缓解“总是中等亮度”的偏差，对学习明暗对比尤其有效（来自 SDXL 的 noise_offset 思路）。
+    pyramid_iters: 叠加多尺度低频噪声，帮助模型快速学习全局光照/构图（参考 multires noise / pyramid noise）。
+    """
+    noise = torch.randn_like(latents)
+
+    if noise_offset and noise_offset > 0:
+        # 形状: (B, C, T, 1, 1) 或 (B, C, 1, 1) — 与 latents 兼容的"低频"扰动
+        leading_shape = list(latents.shape)
+        for ax in range(2, latents.ndim):
+            leading_shape[ax] = 1
+        offset = torch.randn(*leading_shape, device=latents.device, dtype=latents.dtype)
+        scale = float(noise_offset)
+        if random_offset_strength:
+            scale = scale * float(torch.rand(1, device=latents.device).item())
+        noise = noise + scale * offset
+
+    if pyramid_iters and int(pyramid_iters) > 0:
+        # 简化的 pyramid noise：在多个降采样尺度上叠加噪声，再 upsample 加回原噪声
+        try:
+            import torch.nn.functional as _F
+            spatial_dims = list(latents.shape[-2:])
+            cur = noise.clone()
+            for i in range(int(pyramid_iters)):
+                r = 2 ** (i + 1)
+                small_h = max(spatial_dims[0] // r, 1)
+                small_w = max(spatial_dims[1] // r, 1)
+                # 5D latent: (B, C, T, H, W)；4D 也支持
+                if latents.ndim == 5:
+                    extra = torch.randn(latents.shape[0], latents.shape[1], latents.shape[2], small_h, small_w,
+                                        device=latents.device, dtype=latents.dtype)
+                    extra = _F.interpolate(extra.flatten(0, 1), size=spatial_dims, mode="nearest").view(
+                        latents.shape[0], latents.shape[1], latents.shape[2], spatial_dims[0], spatial_dims[1])
+                else:
+                    extra = torch.randn(latents.shape[0], latents.shape[1], small_h, small_w,
+                                        device=latents.device, dtype=latents.dtype)
+                    extra = _F.interpolate(extra, size=spatial_dims, mode="nearest")
+                cur = cur + extra * (float(pyramid_discount) ** (i + 1))
+                if min(small_h, small_w) <= 1:
+                    break
+            # 归一到与原噪声相同的方差，保持训练稳定
+            cur = cur / cur.std().clamp(min=1e-6)
+            noise = cur
+        except Exception as _e:
+            logger.warning(f"pyramid_noise 计算失败，回退到标准噪声: {_e}")
+
+    return noise
+
+
+def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: float = 0.0):
+    """根据 scheme 返回每样本的 loss 权重 (B,)。
+
+    Flow Matching CONST 调度下：alpha_t = 1 - t，sigma_t = t；SNR(t) = ((1-t)/t)^2
+
+    scheme:
+      - "none":          全 1 权重
+      - "min_snr":       w = min(gamma / SNR, 1)，下调“几乎无噪声/高 SNR”的简单步
+      - "max_snr_inv":   w = min(SNR / gamma, 1)，下调极高噪声/低 SNR 步（少用）
+      - "logit_normal":  按 logit-normal 概率密度的倒数加权（debias 采样偏置）
+      - "sigma_sqrt":    w = sqrt(sigma) = sqrt(t)，缓解 t→0 处梯度爆炸
+    """
+    scheme = (scheme or "none").lower()
+    if scheme == "none":
+        return torch.ones_like(t)
+
+    eps = 1e-4
+    t_c = t.clamp(eps, 1 - eps)
+
+    if scheme == "min_snr":
+        if min_snr_gamma <= 0:
+            return torch.ones_like(t)
+        snr = ((1 - t_c) / t_c) ** 2
+        return torch.minimum(float(min_snr_gamma) / snr, torch.ones_like(t_c))
+    if scheme == "max_snr_inv":
+        if min_snr_gamma <= 0:
+            return torch.ones_like(t)
+        snr = ((1 - t_c) / t_c) ** 2
+        return torch.minimum(snr / float(min_snr_gamma), torch.ones_like(t_c))
+    if scheme == "logit_normal":
+        # debias logit-normal sampling: 权重 ∝ 1 / pdf(t)
+        # logit-normal pdf 的关键项: 1 / (t*(1-t))  → 取反 t*(1-t) 作为权重
+        return (t_c * (1 - t_c)).clamp(min=eps)
+    if scheme == "sigma_sqrt":
+        return t_c.sqrt()
+
+    return torch.ones_like(t)
 
 
 def collate_fn(batch):
@@ -2022,6 +2213,7 @@ def parse_args():
     p.add_argument("--lora-type", choices=["lora", "lokr"], default="lokr")
     p.add_argument("--lora-rank", type=int, default=32)
     p.add_argument("--lora-alpha", type=float, default=32.0)
+    p.add_argument("--lora-dropout", type=float, default=0.0)
     p.add_argument("--lokr-factor", type=int, default=8)
     p.add_argument("--resume-lora", default="", help="从已有 LoRA 继续训练（safetensors 路径）")
 
@@ -2062,6 +2254,8 @@ def parse_args():
     # 依赖和交互
     p.add_argument("--auto-install", action="store_true", help="自动安装缺失依赖")
     p.add_argument("--interactive", action="store_true", help="交互模式，提示输入缺失参数")
+    p.add_argument("--use-t5-token-weights", action="store_true", default=True)
+    p.add_argument("--no-t5-token-weights", dest="use_t5_token_weights", action="store_false")
 
     return p.parse_args()
 
@@ -2271,6 +2465,7 @@ def main():
     injector = LoRAInjector(
         rank=args.lora_rank,
         alpha=args.lora_alpha,
+        dropout=float(getattr(args, "lora_dropout", 0.0) or 0.0),
         use_lokr=(args.lora_type == "lokr"),
         factor=args.lokr_factor,
     )
@@ -2380,52 +2575,41 @@ def main():
 
     # 获取参数组
     param_groups = injector.get_param_groups(weight_decay)
-    
-    # 创建优化器
+
+    # ── 透明路由 ──────────────────────────────────────────────────────────
+    # YAML 中 `optimizer_args:` 下的所有 key 直接以 **kwargs 注入优化器。
+    # 未被优化器签名识别的 key 会被 optimizer_utils 自动过滤并 warning（不会报错）。
+    raw_opt_args = getattr(args, "optimizer_args", None) or {}
+    if not isinstance(raw_opt_args, dict):
+        logger.warning(f"optimizer_args 不是字典，已忽略: {type(raw_opt_args).__name__}")
+        raw_opt_args = {}
+    opt_args = dict(raw_opt_args)  # 拷贝，避免污染 args
+
+    # YAML 中 list/tuple 互转：betas 这类参数惯例为 tuple
+    for k in ("betas",):
+        if k in opt_args and isinstance(opt_args[k], list):
+            opt_args[k] = tuple(opt_args[k])
+
+    # 顶层 weight_decay 作为兜底（若 optimizer_args 中没显式给）
+    opt_args.setdefault("weight_decay", weight_decay)
+
+    # 兼容旧字段（让旧 yaml 仍可工作）：prodigyplus_d0 / prodigyplus_use_stableadamw
+    legacy_d0 = getattr(args, "prodigyplus_d0", None)
+    if opt_type == "prodigyplus" and "d0" not in opt_args and legacy_d0 not in (None, 1e-6):
+        opt_args["d0"] = legacy_d0
+    legacy_sa = getattr(args, "prodigyplus_use_stableadamw", None)
+    if opt_type == "prodigyplus" and "use_stableadamw" not in opt_args and legacy_sa is not None and legacy_sa is not True:
+        # 默认 True，仅当显式改成 False 才透传（避免覆盖默认值）
+        opt_args["use_stableadamw"] = legacy_sa
+
+    if opt_args:
+        logger.info(f"[optimizer_args] passthrough keys: {sorted(opt_args.keys())}")
+
     optimizer = create_optimizer(
         optimizer_type=opt_type,
         params=param_groups,
         learning_rate=args.lr,
-        # ── 核心 LR 控制 ──────────────────────────────────────
-        betas=(0.95, 0.99),        # 新版研究推荐 0.95，SF 下平均窗口更合理
-        beta3=None,                # 使用 sqrt(beta2) ≈ 0.995
-
-        # ── Prodigy 步长控制 ──────────────────────────────────
-        d0=1e-6,                   # 默认值，Anima 梯度较"干净"无需调高
-        d_coef=1,                # 略低于 1.0；Anima 官方强调"轻触"
-        #                         # 若 LR 收敛过慢，可改回 1.0
-        # d_limiter=True,            # ✅ 保持开启，60 张数据集尤其需要防止早期 LR 高估
-        # prodigy_steps=400,         # 约 25% 总步数处冻结
-
-        # # ── Schedule-Free ────────────────────────────────────
-        use_schedulefree=True,
-        # schedulefree_c=8,          # 60 张小数据集 + 小 batch，适合 6–12 范围
-
-        # # ── 权重衰减 ──────────────────────────────────────────
-        # weight_decay=0.01,         # 轻量衰减，配合 Anima 的"轻触"原则
-        # weight_decay_by_lr=True,
-
-        # # ── 梯度缩放 ──────────────────────────────────────────
-        eps=None,                  # 默认；或可试 eps=None (Adam-atan2) 省去调 eps
-        # use_stableadamw=True,      # ✅ 保持，DiT 梯度规模变化大
-
-        # # ── 精度与内存 ────────────────────────────────────────
-        # factored=True,
-        # factored_fp32=True,
-        # stochastic_rounding=True,
-        # fused_back_pass=False,     # 如果框架支持可开启以节省显存
-
-        # # ── 实验性功能 ────────────────────────────────────────
-        # use_adopt=True,            # ✅ 推荐：延迟二阶矩更新，对小数据集更稳定
-        # use_cautious=False,        # 可选，效果有限但无害
-        # use_orthograd=False,       # 可选，若出现过拟合可以尝试
-        # use_grams=False,
-        # use_speed=False,           # 默认关闭；若 LR 长期不动可尝试开启
-        # use_focus=False,           # 与 factored 不兼容，保持关闭
-
-        # use_bias_correction=False, # 不需要；会大幅拖慢 Prodigy 起步
-        # split_groups=False,         # ✅ 多参数组分别适配（DiT blocks vs LLM Adapter）
-        # split_groups_mean=False,   # v2.0 默认，完整逐组适配
+        **opt_args,
     )
     # 打印优化器详细信息（确保用户知道当前用的是哪一个）
     opt_info = get_optimizer_info(optimizer)
@@ -2656,6 +2840,11 @@ def main():
 
             captions = batch["captions"]
 
+            # caption dropout：随机把 caption 替换为空字符串，提升 CFG 服从度（Anima 主要靠 CFG 出图）
+            cap_drop_p = float(getattr(args, "caption_dropout_rate", 0.0) or 0.0)
+            if cap_drop_p > 0:
+                captions = ["" if random.random() < cap_drop_p else c for c in captions]
+
             # 获取 latents（缓存模式或实时编码）
             if use_cached:
                 latents = batch["latents"].to(device, dtype=dtype)
@@ -2677,14 +2866,29 @@ def main():
                 t5_ids = t5_ids.to(device)
                 t5_attn = t5_attn.to(device)
                 t5_w = t5_w.to(device, dtype=torch.float32)
-                cross = model.preprocess_text_embeds(qwen_emb, t5_ids)
+                cross = model.preprocess_text_embeds(qwen_emb, t5_ids, t5_attn, qwen_attn)
+                if (
+                    getattr(args, "use_t5_token_weights", True)
+                    and getattr(model, "llm_adapter", None) is not None
+                    and cross.shape[1] == t5_w.shape[1]
+                ):
+                    cross = cross * t5_w.to(cross.dtype).unsqueeze(-1)
                 if cross.shape[1] < 512:
                     cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
 
-            # Flow Matching
-            t = sample_t(bs, device)
+            # Flow Matching：t 采样、噪声生成、目标计算
+            ts_mode = str(getattr(args, "timestep_sampling", "logit_normal") or "logit_normal")
+            f_shift = float(getattr(args, "flow_shift", 3.0) or 3.0)
+            t = sample_t(bs, device, mode=ts_mode, shift=f_shift)
             t_exp = t.view(-1, 1, 1, 1, 1)
-            noise = torch.randn_like(latents)
+
+            noise = make_noise(
+                latents,
+                noise_offset=float(getattr(args, "noise_offset", 0.0) or 0.0),
+                pyramid_iters=int(getattr(args, "pyramid_noise_iterations", 0) or 0),
+                pyramid_discount=float(getattr(args, "pyramid_noise_discount", 0.3) or 0.3),
+                random_offset_strength=bool(getattr(args, "noise_offset_random_strength", False)),
+            )
             noisy = (1 - t_exp) * latents + t_exp * noise
             target = noise - latents
 
@@ -2695,8 +2899,25 @@ def main():
                     model, noisy, t.view(-1, 1), cross, pad_mask,
                     use_checkpoint=args.grad_checkpoint
                 )
-                # ★ 损失始终 fp32 计算
-                loss = F.mse_loss(pred.float(), target.float())
+                # ★ 损失始终 fp32 计算（per-sample MSE，便于按 t 加权）
+                pred_f = pred.float()
+                target_f = target.float()
+                # 形状: (B, C, T, H, W) → 展平为 (B, *) 再求均值
+                per_sample = F.mse_loss(pred_f, target_f, reduction="none")
+                per_sample = per_sample.view(per_sample.shape[0], -1).mean(dim=1)
+
+                w_scheme = str(getattr(args, "loss_weighting_scheme", "none") or "none")
+                if w_scheme != "none":
+                    w = compute_loss_weight(
+                        t.float(),
+                        scheme=w_scheme,
+                        min_snr_gamma=float(getattr(args, "min_snr_gamma", 0.0) or 0.0),
+                    )
+                    # 归一到均值 1，避免间接改变 LR
+                    w = w / w.mean().clamp(min=1e-6)
+                    loss = (per_sample * w).mean()
+                else:
+                    loss = per_sample.mean()
 
             # ★ 守护 1：forward 结果 NaN/Inf 检查
             if not torch.isfinite(loss):
@@ -2724,9 +2945,9 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                # ★ 更严格的梯度裁剪（LoKr bf16 下推荐 0.5~1.0）
-                effective_clip = grad_clip if grad_clip > 0 else 1.0
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=effective_clip)
+                # 梯度裁剪：grad_clip > 0 才启用；==0 表示用户显式关闭
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
 
                 optimizer.step()
                 if scheduler is not None:
@@ -2747,10 +2968,12 @@ def main():
                     except ImportError:
                         pass
 
-                # 记录 loss 历史
+                # 记录 loss 历史（环形缓冲：始终保留最近 N 步）
                 loss_val = float(loss.item() * args.grad_accum)
-                if args.loss_curve_steps and len(loss_history) < args.loss_curve_steps:
+                if args.loss_curve_steps and args.loss_curve_steps > 0:
                     loss_history.append(loss_val)
+                    if len(loss_history) > args.loss_curve_steps:
+                        del loss_history[: len(loss_history) - args.loss_curve_steps]
 
                 # 更新进度显示
                 now = time.perf_counter()

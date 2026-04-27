@@ -6,7 +6,7 @@ Optimizer Utils Module - 优化器创建（修复版）
    避免因版本差异 raise TypeError 或静默吞参数。
 2. 当 params 已是分组格式（list of dict）时，不再用顶层 weight_decay 覆盖。
 3. 强制 ProdigyPlus 的 lr=1.0（Prodigy 数学要求），并用显式警告而非静默修改。
-4. d_coef 默认 0.5（Prodigy 作者推荐），而不是 1.0，避免 d 增长过快导致 bf16 溢出。
+4. d_coef 默认 1.0：LoRA/LoKr 实战里低于 1 容易出现长期不学习；不再默认压制自适应步长。
 5. eps 默认 None —— 启用 Adam-atan2 模式（新版 prodigy-plus-schedule-free 支持）。
    atan2(m, sqrt(v)) 数学上天然避免除零，比传统 m/(sqrt(v)+eps) 更稳定，
    对 bf16 尤其友好。仅当用户显式传入非正数 eps 时会降级提示。
@@ -122,6 +122,16 @@ def create_optimizer(
             weight_decay=weight_decay, eps=eps, **kwargs,
         )
     if optimizer_type == "prodigyplus":
+        # `optimizer_args` may contain constructor-level keys. Pop them here so
+        # YAML passthrough works without sending duplicate lr/betas/wd/eps.
+        if "lr" in kwargs:
+            learning_rate = kwargs.pop("lr")
+        if "betas" in kwargs:
+            betas = tuple(kwargs.pop("betas"))
+        if "weight_decay" in kwargs:
+            weight_decay = kwargs.pop("weight_decay")
+        if "eps" in kwargs:
+            eps = kwargs.pop("eps")
         return create_prodigyplus_optimizer(
             params=params, lr=learning_rate, betas=betas,
             weight_decay=weight_decay, eps=eps, **kwargs,
@@ -200,7 +210,7 @@ def create_prodigyplus_optimizer(
     weight_decay: float = 0.01,
     eps: Optional[float] = None,         # ★ 默认 None → 启用 Adam-atan2（新版推荐）
     d0: float = 1e-6,
-    d_coef: float = 0.5,                 # ★ 官方推荐 0.5，避免 d 爆炸
+    d_coef: float = 1.0,                 # LoRA 实战默认：低于 1 容易完全不学
     use_schedulefree: bool = True,
     use_stableadamw: bool = True,        # ★ 抗 bf16 梯度尖峰
     use_bias_correction: bool = False,

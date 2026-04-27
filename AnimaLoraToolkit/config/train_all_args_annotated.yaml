@@ -1,0 +1,395 @@
+# AnimaLoraToolkit 全参数说明版配置
+# 目的：
+#   1. 列出 anima_train.py 当前可从 YAML 传入的全部顶层参数。
+#   2. 列出 ProdigyPlusScheduleFree 2.0.x 公开文档中的全部主要 optimizer 参数。
+#   3. 每个参数旁边写出调大会怎样、调小会怎样、什么时候建议启用。
+#
+# 使用建议：
+#   - 第一次跑不要一次改太多。先复制本文件，改路径、data_dir、output_dir。
+#   - ProdigyPlus + Schedule-Free 请保持 lr_scheduler: "none"，并保持 learning_rate: 1.0。
+#   - 本补丁代码会在保存/采样前调用 optimizer.eval()，回到训练时 optimizer.train()。
+
+# ============================================================================
+# 模型路径
+# ============================================================================
+
+# Anima transformer 权重。preview3-base 通常用 anima-preview3-base.safetensors。
+transformer_path: "models/transformers/anima-preview3-base.safetensors"
+
+# Qwen-Image / Anima VAE。VAE 不训练，只用于 latent 编码和预览解码。
+vae_path: "models/vae/qwen_image_vae.safetensors"
+
+# Qwen3 文本编码器目录。文本编码器冻结；路径错会直接无法编码 prompt。
+text_encoder_path: "models/text_encoders"
+
+# T5 tokenizer 目录。Anima 的 LLM adapter 使用 Qwen embedding + T5 token ids。
+t5_tokenizer_path: "models/t5_tokenizer"
+
+# ============================================================================
+# 数据集与 Caption
+# ============================================================================
+
+# 训练集目录。支持图片旁边 .txt/.caption/.json；子目录名前缀如 10_xxx 可做额外 repeats。
+data_dir: "./Dataset/your-dataset"
+
+# 正则集目录。空字符串表示不用。小角色集过拟合、背景/姿势被记死时可启用。
+reg_data_dir: ""
+
+# 正则集每张图重复次数。调大：更强防过拟合，但会冲淡角色/风格；调小：主体拟合更快。
+reg_repeats: 1
+
+# 正则集统一 caption。留空则读取正则图自己的 caption。
+reg_caption: ""
+
+# 训练分辨率。Anima 原生 1024；调高吃显存且慢，调低可能损失细节/光照层次。
+resolution: 1024
+
+# 全局重复次数。调大等价增加每 epoch 步数；小数据集可用，但太大会让 epoch 统计失真。
+repeats: 1
+
+# 打乱 caption tag。开启能减少固定 tag 顺序记忆；角色触发词需要配合 keep_tokens 保护。
+shuffle_caption: true
+
+# 保留前 N 个 tag 不打乱。1-2 常用于角色名/触发词；太大则削弱 shuffle 泛化收益。
+keep_tokens: 1
+
+# 水平翻转增强。开启增加数据多样性；左右不对称角色、文字、单边装饰明显时建议关闭。
+flip_augment: true
+
+# 每个 tag 随机丢弃概率。0.03-0.08 常用于防止提示词死记；过高会降低 prompt 服从。
+tag_dropout: 0.04
+
+# 优先读取 JSON caption。JSON 可分组 shuffle appearance/tags/environment；TXT 更简单。
+prefer_json: true
+
+# 缓存 VAE latent。开启后训练更快；首次编码耗时。开启 flip_augment 时本补丁会翻转 latent。
+cache_latents: true
+
+# ============================================================================
+# LoRA / LoKr
+# ============================================================================
+
+# "lora" 更稳、参数少；"lokr" 表达力更强，适合复杂风格/多角色，但更容易过拟合。
+lora_type: "lokr"
+
+# rank 容量。调大：更能记复杂特征，也更易记死；调小：泛化好但可能欠拟合。
+# Anima 官方 LoRA tips 提到 rank 32 可作为轻量起点。
+lora_rank: 32
+
+# alpha 控制实际缩放 alpha/rank。通常等于 rank；低于 rank 更保守，高于 rank 更激进。
+lora_alpha: 32.0
+
+# LoRA/LoKr 输出 dropout。本补丁恢复该参数。小数据集 0.03-0.08 常有用；太高会欠拟合。
+lora_dropout: 0.05
+
+# LoKr Kronecker factor。8 是折中值；更大表达力/参数更多，整除失败时代码会自动降级。
+lokr_factor: 8
+
+# 从已有 LoRA/LoKr 权重继续训练。空字符串表示不用。
+resume_lora: ""
+
+# 是否应用 T5 token 权重，例如 (tag:1.2)。关闭会更接近普通 tag，但损失权重提示能力。
+use_t5_token_weights: true
+
+# ============================================================================
+# 基础训练计划
+# ============================================================================
+
+# epoch 上限。使用 ProdigyPlus 时更建议靠 max_steps/save_every_steps 观察，而不是只看 epoch。
+epochs: 200
+
+# 最大 optimizer step；0 表示不限制。小数据集建议明确设置，如 800/1200/1600 做对比。
+max_steps: 0
+
+# 单步 batch。调大梯度更稳、Prodigy 估计更稳，但吃显存；batch 1 时建议 grad_accum 补足。
+batch_size: 4
+
+# 梯度累积。有效 batch=batch_size*grad_accum；调大会变稳但响应变慢。
+grad_accum: 1
+
+# 对 ProdigyPlus 必须保持 1.0；实际步长由 d/d0/d_coef 自适应。
+# AdamW/AdamW8bit 时才是常规学习率，例如 1e-4 或更低。
+learning_rate: 1.0
+
+# ProdigyPlus + Schedule-Free 用 none。AdamW 可用 cosine/cosine_with_restart。
+lr_scheduler: "none"
+
+# cosine_with_restart 首次周期 step。太短会频繁重启，可能干扰 Prodigy。
+lr_scheduler_t0: 500
+
+# 每次 restart 周期倍数。只在 lr_scheduler: cosine_with_restart 时有效。
+lr_scheduler_t_mult: 2.0
+
+# scheduler 最低学习率。只在 AdamW 调度时有意义。
+lr_scheduler_eta_min: 0.0
+
+# 顶层 weight_decay。optimizer_args.weight_decay 若存在会覆盖它。
+# LoKr w1 会被参数组排除 weight decay；过大 WD 会削弱拟合。
+weight_decay: 0.0
+
+# 外部梯度裁剪。ProdigyPlus 文档提示外部裁剪可能阻碍步长估计；用 ProdigyPlus 建议 0。
+grad_clip_max_norm: 0
+
+# bf16 通常优先；fp16 更容易溢出；"no" 最稳但慢且吃显存。
+mixed_precision: "bf16"
+
+# 梯度检查点。开启省显存但变慢；显存足够时关闭更快。
+grad_checkpoint: false
+
+# xformers attention。Windows/新卡上不一定稳定；不确定先 false。
+xformers: false
+
+# DataLoader workers。Windows 建议 0；Linux 可试 2-4。
+num_workers: 0
+
+# ============================================================================
+# Optimizer 选择与 ProdigyPlusScheduleFree 全参数
+# ============================================================================
+
+# "prodigyplus" / "adamw" / "adamw8bit"。
+optimizer_type: "prodigyplus"
+
+# 旧字段兼容：仅当 optimizer_args 未给 d0/use_stableadamw 时作为兜底。
+prodigyplus_d0: 1.0e-6
+prodigyplus_use_stableadamw: true
+
+# optimizer_args 会直接传入 create_optimizer，再由 optimizer_utils 按当前安装版本签名过滤。
+# 未被当前 ProdigyPlus 版本支持的 key 会 warning 后丢弃，不会中断训练。
+optimizer_args:
+  # lr 是 Prodigy 的倍率入口，官方建议 1.0。小于 1 会让整体有效 LR 被压低，常见表现是不学。
+  lr: 1.0
+
+  # betas=(beta1,beta2)。beta1 越大，Schedule-Free 平均更强，样本更稳但响应慢。
+  # PyPI tips 提到 Schedule-Free 常可试 [0.95,0.99]；LoRA 基线先用 [0.9,0.99]。
+  betas: [0.9, 0.99]
+
+  # beta3 是 Prodigy 的第三动量/估计平滑项。null 通常由库取 sqrt(beta2)。
+  # 调低：d 响应更快但更抖；调高：更稳但可能起步慢。
+  beta3: null
+
+  # eps。正数时是传统 AdamW 分母稳定项；null 启用 Adam-atan2，尺度不敏感，bf16 友好。
+  # 如果 use_focus=true，官方说明与 Adam-atan2 不兼容，需设正数 eps。
+  eps: null
+
+  # weight_decay。调大可抗过拟合，但会削弱角色/风格拟合；LoRA/LoKr 常从 0 或 0.01 试。
+  weight_decay: 0.0
+
+  # weight_decay_by_lr 是旧/兼容字段：让 WD 随有效 LR 缩放。开启后 WD 在自适应 LR 下更自然。
+  # 新版文档/代码可能使用 decouple_lr 替代；不确定版本时二者不要同时乱开。
+  weight_decay_by_lr: false
+
+  # decouple_lr 是新版替代字段，若当前安装版本支持会生效；不支持会被过滤。
+  # 开启可能让 WD 与 Prodigy 内部 LR 解耦/行为更接近新版设计；基线保持 false。
+  decouple_lr: true
+
+  # d0 是初始有效 LR 估计。太小：前几百步几乎不动；太大：早期过冲、颜色/构图崩。
+  # 若 200-300 step 不学习，优先试 2e-6、5e-6、1e-5。
+  d0: 1.0e-6
+
+  # d_coef 控制 d 增长力度。你的 SDXL LoRA 经验表明 <1 会不学；这里基线用 1。
+  # 调大到 1.5/2：更快起步，也更容易过冲；复杂集可小幅试，简单集谨慎。
+  d_coef: 1.0
+
+  # d_limiter 限制 d 单步增长。开启更稳、防早期高估；若完全不学习，可关掉。
+  d_limiter: true
+
+  # safeguard_warmup 是旧版/兼容 warmup 安全项；开启更稳但会拖慢起步。
+  # 当前 optimizer 版本不支持时会被过滤。
+  safeguard_warmup: false
+
+  # prodigy_steps：第 N 步后冻结 Prodigy 的 LR 估计并释放部分状态。
+  # 0/null=不冻结。可设总步数 20-30%，如 400/500，减少后期 d 继续涨。
+  prodigy_steps: 0
+
+  # use_schedulefree：true = Prodigy + Schedule-Free，不需要外部 scheduler。
+  # false = 近似纯 Prodigy，最好配合 cosine/linear 衰减；本训练器默认建议 true。
+  use_schedulefree: true
+
+  # schedulefree_c 控制 Schedule-Free 平均强度。0/null 通常用库默认。
+  # 调大：平均更强、泛化可能更稳，但拟合/响应更慢。
+  schedulefree_c: 0
+
+  # use_stableadamw：内部更新缩放，减少外部 grad_clip 需求。
+  # true 更稳；false 更自由，可能需要外部 grad_clip，且 d 估计更敏感。
+  use_stableadamw: true
+
+  # use_bias_correction：Adam bias correction。true 更传统但 Prodigy 起步常变慢。
+  use_bias_correction: false
+
+  # factored：二阶矩低秩/分解近似，省显存。LoRA 参数少时收益有限；复杂参数组可试 true。
+  factored: false
+
+  # factored_fp32：factored=true 时用 fp32 保存统计量。更稳但稍占显存；bf16 下建议 true。
+  factored_fp32: true
+
+  # stochastic_rounding：随机舍入，低精度下可减少累积偏差；也可能引入不可复现噪声。
+  stochastic_rounding: false
+
+  # fused_back_pass：融合反传以省显存。需要训练框架显式支持；不支持时打开可能不生效或出错。
+  fused_back_pass: false
+
+  # split_groups：每个参数组单独自适应 LR。本训练器 LoKr 有 decay/no_decay 分组；true 更精细。
+  # false 更接近原始 Prodigy，全组共用估计，可能更稳但不够灵活。
+  split_groups: true
+
+  # split_groups_mean：true 复制旧版行为，按组均值同步；false 是 v2 默认的逐组完整适配。
+  split_groups_mean: false
+
+  # use_adopt：延迟二阶矩更新。小/噪声数据集可能更稳；也可能使起步更慢。
+  use_adopt: false
+
+  # use_cautious：只强化与梯度方向一致的更新。可能提高稳定/收敛，收益不固定。
+  use_cautious: false
+
+  # use_orthograd：使用相对权重方向的正交梯度分量。可抗过拟合/提升泛化，也可能削弱角色记忆。
+  use_orthograd: false
+
+  # use_grams：按动量/梯度幅度调整更新方向。实验项，收益不稳定。
+  use_grams: false
+
+  # use_speed：替换 Prodigy d 估计为 SPEED。官方说多网络训练可能更好；长训/WD 下可能不稳。
+  # 若 d 长期不涨、又不想提高 d0/d_coef，可单独试 true。
+  use_speed: false
+
+  # use_focus：大步长噪声处理实验项。与 factored、Adam-atan2(eps:null) 不兼容。
+  # 若要试：factored=false 且 eps=1e-8。
+  use_focus: false
+
+# ============================================================================
+# Flow Matching / timestep / 噪声增强 / loss 权重
+# ============================================================================
+
+# flow_shift 影响 t 采样向高噪声端偏移。3.0 与 Anima/ComfyUI 常用设置对齐。
+# 调大：更重结构/全局；调小：更重低噪声细节。
+flow_shift: 3.0
+
+# timestep_sampling:
+#   logit_normal      默认，中段为主，适合基线。
+#   uniform           均匀覆盖，细节端更多但收敛可能慢。
+#   logit_normal_low  更偏低噪声/细节，适合细节欠拟合实验。
+#   mode              SD3 风格 mode distribution，实验项。
+timestep_sampling: "logit_normal"
+
+# loss_weighting_scheme:
+#   none         基线，不加权。
+#   min_snr      下调高 SNR/低噪声简单步，可能改善泛化。
+#   max_snr_inv  下调低 SNR/高噪声步，少用。
+#   logit_normal 抵消采样分布偏置，实验项。
+#   sigma_sqrt   缓解低 t 梯度爆点。
+loss_weighting_scheme: "none"
+
+# min_snr_gamma。仅 loss_weighting_scheme 需要 gamma 时生效；常见试 5。
+min_snr_gamma: 0.0
+
+# noise_offset：低频亮度噪声偏移。对“明暗对比训练出来变平”很有针对性。
+# 0.03-0.08 常用；>0.15 可能导致偏色/脏。
+noise_offset: 0.0625
+
+# 随机缩放 noise_offset。开启可减少固定偏色，但会给训练增加一点随机性。
+noise_offset_random_strength: false
+
+# pyramid_noise_iterations：多尺度低频噪声层数。可强化全局光照/构图。
+# 0=关闭；若光照仍平，可试 4-8；太高会让训练目标偏低频。
+pyramid_noise_iterations: 0
+
+# pyramid_noise_discount：每层衰减。0.2-0.4 较稳；越高低频影响越强。
+pyramid_noise_discount: 0.3
+
+# caption_dropout_rate：整条 caption 置空概率，训练无条件分支，提升 CFG 表现。
+# 0.03-0.08 常用；>0.2 容易学不到具体内容。
+caption_dropout_rate: 0.05
+
+# ============================================================================
+# 输出 / 保存 / 断点
+# ============================================================================
+
+output_dir: "./output/all_args_test"
+output_name: "anima_lokr_all_args"
+
+# 每 N epoch 保存；0=关闭。更建议用 save_every_steps。
+save_every: 0
+
+# 每 N optimizer step 保存 LoRA。建议与 sample_steps 对齐，方便选 checkpoint。
+save_every_steps: 100
+
+# 每 N step 保存完整训练状态。可断点续训，但文件更大。
+save_state_every: 500
+
+# 从完整训练状态恢复。空字符串表示不用。
+resume_state: ""
+
+# 随机种子。固定可复现预览；不同 seed 可检查泛化稳定性。
+seed: 42
+
+# ============================================================================
+# 训练中采样
+# ============================================================================
+
+# 每 N epoch 采样；0=关闭。建议用 sample_steps。
+sample_every: 0
+
+# 每 N step 采样。过小会拖慢训练；40-200 适合观察小数据集过拟合点。
+sample_steps: 100
+
+# 单 prompt 采样。若 sample_prompts 非空，通常会轮换多 prompt。
+sample_prompt: "newest, safe, 1girl, masterpiece, best quality"
+
+# 多 prompt 轮换，用于检查训练集内/外、明暗、复杂构图泛化。
+sample_prompts:
+  - "newest, safe, 1girl, masterpiece, best quality"
+  - "newest, safe, 1girl, cinematic lighting, backlit, detailed background"
+  - "newest, safe, 1girl, bright sunlight, outdoor, dynamic pose"
+
+# CFG。Anima 常用 3.5-5。过高会硬、糊或过饱和；过低 prompt 服从弱。
+sample_cfg_scale: 4.0
+
+# 负面 prompt。空字符串表示代码默认/无负面，视 sample_image 实现而定。
+sample_negative_prompt: ""
+
+# 采样宽高。0=跟随 resolution；建议用与正式推理相同尺寸比较。
+sample_width: 0
+sample_height: 0
+
+# 采样 seed。0=每次随机；固定值便于横向比较 checkpoint。
+sample_seed: 42
+
+# 采样步数。与 ComfyUI 正式工作流对齐；25 是常用起点。
+sample_infer_steps: 25
+
+# 采样器/调度器。用于和 ComfyUI Anima 流程对齐。
+sample_sampler_name: "er_sde"
+sample_scheduler: "simple"
+
+# ============================================================================
+# 进度 / 日志 / Web 监控
+# ============================================================================
+
+# loss 曲线保留最近 N 点。太大无害但 UI 更重。
+loss_curve_steps: 200
+
+# 关闭进度条。云端日志很乱时可 true。
+no_progress: false
+
+# 每 N step 打印日志。调小更详细，略影响速度。
+log_every: 10
+
+# 关闭 Web 监控。无浏览器/纯终端训练可 true。
+no_monitor: false
+
+# 监控地址。127.0.0.1 更安全；云端需要外部访问可 0.0.0.0，但注意无鉴权。
+monitor_host: "127.0.0.1"
+
+# 监控端口。
+monitor_port: 8765
+
+# 不自动打开浏览器。服务器/云端建议 true。
+no_browser: true
+
+# ============================================================================
+# 命令行专用参数提示
+# ============================================================================
+# 以下参数由 argparse 支持，但不是 YAML mapping 的训练超参：
+#   --config              指定 YAML 路径。
+#   --auto-install        自动安装缺失依赖。
+#   --interactive         交互式补齐缺失参数。
+#   --no-t5-token-weights 等价于把 use_t5_token_weights 设为 false。

@@ -213,7 +213,7 @@ class Anima(MiniTrainDIT):
             layer_norm=False,
         )
 
-    def preprocess_text_embeds(self, text_embeds, text_ids):
+    def preprocess_text_embeds(self, text_embeds, text_ids, target_attention_mask=None, source_attention_mask=None):
         """
         Process text embeddings through the LLM adapter.
 
@@ -224,7 +224,11 @@ class Anima(MiniTrainDIT):
         Returns:
             Processed embeddings for cross-attention
         """
-        if text_ids is not None:
-            return self.llm_adapter(text_embeds, text_ids)
-        else:
-            return text_embeds
+        if text_ids is not None and self.llm_adapter is not None:
+            return self.llm_adapter(
+                text_embeds,
+                text_ids,
+                target_attention_mask=target_attention_mask,
+                source_attention_mask=source_attention_mask,
+            )
+        return text_embeds

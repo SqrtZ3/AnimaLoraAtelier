@@ -197,6 +197,7 @@ def apply_yaml_config(args, config):
         "monitor_host": "monitor_host",
         "monitor_port": "monitor_port",
         "no_browser": "no_browser",
+        "debug_first_batches": "debug_first_batches",
         # 优化器配置映射
         "optimizer_type": "optimizer_type",
         "prodigyplus_d0": "prodigyplus_d0",
@@ -281,6 +282,7 @@ def apply_yaml_config(args, config):
         "monitor_host": "0.0.0.0",
         "monitor_port": 8765,
         "no_browser": False,
+        "debug_first_batches": 0,
         "optimizer_type": "adamw",
         "prodigyplus_d0": 1e-6,
         "prodigyplus_use_stableadamw": True,
@@ -1618,7 +1620,7 @@ class ImageDataset(Dataset):
         arr = np.array(img).astype(np.float32) / 127.5 - 1.0
         tensor = torch.from_numpy(arr).permute(2, 0, 1)
 
-        return {"pixel_values": tensor, "caption": caption}
+        return {"pixel_values": tensor, "caption": caption, "image": str(sample["image"])}
 
 
 class RepeatDataset(Dataset):
@@ -1782,6 +1784,19 @@ class CachedLatentDataset(Dataset):
                 npz_path.unlink()
                 logger.debug(f"已删除不兼容缓存: {npz_path.name}")
                 return False
+            latent = data["latent"]
+            if latent.ndim != 4:
+                logger.warning(f"删除异常 latent 缓存（维度应为 C,T,H,W）: {npz_path}")
+                npz_path.unlink()
+                return False
+            if latent.shape[0] != 16:
+                logger.warning(f"删除疑似非 Anima/Qwen VAE 缓存（C={latent.shape[0]}，应为 16）: {npz_path}")
+                npz_path.unlink()
+                return False
+            if not self.np.isfinite(latent).all():
+                logger.warning(f"删除非有限 latent 缓存: {npz_path}")
+                npz_path.unlink()
+                return False
         except Exception:
             try:
                 npz_path.unlink()
@@ -1835,6 +1850,9 @@ class CachedLatentDataset(Dataset):
             with torch.no_grad():
                 pixels_5d = pixels.unsqueeze(2)
                 latent = vae.model.encode(pixels_5d, vae.scale)
+            if not torch.isfinite(latent).all():
+                logger.warning(f"VAE 编码产生非有限 latent，跳过缓存: {self.samples[i]['image']}")
+                continue
             latent_np = latent.squeeze(0).cpu().float().numpy()
             npz_path = self._get_npz_path(self.samples[i]["image"])
             self.np.savez(npz_path, latent=latent_np, bucket_w=bucket_w, bucket_h=bucket_h)
@@ -1849,6 +1867,8 @@ class CachedLatentDataset(Dataset):
         npz_path = self._get_npz_path(sample["image"])
         data = self.np.load(npz_path)
         latent = torch.from_numpy(data["latent"])
+        if not torch.isfinite(latent).all():
+            raise RuntimeError(f"读取到非有限 latent 缓存: {npz_path}")
         
         # 获取 base_dataset 的引用（处理可能的嵌套）
         base = self.base_dataset
@@ -1873,7 +1893,7 @@ class CachedLatentDataset(Dataset):
         if caption is None:
             caption = ""
         
-        return {"latent": latent, "caption": caption}
+        return {"latent": latent, "caption": caption, "image": str(sample["image"])}
 
 
 # ============================================================================
@@ -2153,14 +2173,16 @@ def collate_fn(batch):
     """DataLoader collate"""
     pixels = torch.stack([b["pixel_values"] for b in batch])
     captions = [b["caption"] for b in batch]
-    return {"pixel_values": pixels, "captions": captions}
+    images = [b.get("image", "") for b in batch]
+    return {"pixel_values": pixels, "captions": captions, "images": images}
 
 
 def collate_fn_cached(batch):
     """DataLoader collate for cached latents"""
     latents = torch.stack([b["latent"] for b in batch])
     captions = [b["caption"] for b in batch]
-    return {"latents": latents, "captions": captions}
+    images = [b.get("image", "") for b in batch]
+    return {"latents": latents, "captions": captions, "images": images}
 
 
 # ============================================================================
@@ -2246,6 +2268,7 @@ def parse_args():
     p.add_argument("--monitor-port", type=int, default=8765, help="监控面板端口")
     p.add_argument("--no-browser", action="store_true", help="不自动打开监控面板浏览器")
     p.add_argument("--log-every", type=int, default=10, help="日志输出间隔")
+    p.add_argument("--debug-first-batches", type=int, default=0, help="记录前 N 个优化步的张量统计，用于对齐 loss 标尺")
 
     # 优化器设置
     p.add_argument("--optimizer-type", default="adamw", choices=["adamw", "adamw8bit", "prodigyplus"], help="优化器类型")
@@ -2922,6 +2945,44 @@ def main():
                     loss = per_sample.mean()
 
             # ★ 守护 1：forward 结果 NaN/Inf 检查
+            debug_n = int(getattr(args, "debug_first_batches", 0) or 0)
+            if debug_n > 0 and global_step < debug_n:
+                try:
+                    batch_images = batch.get("images", [])
+                    preview = ", ".join(str(p) for p in batch_images[:4] if p)
+                    logger.info(
+                        "[debug step %s] loss=%.6f t(mean/min/max)=%.4f/%.4f/%.4f "
+                        "latent(mean/std)=%.4f/%.4f noise(mean/std)=%.4f/%.4f "
+                        "target(mean/std)=%.4f/%.4f pred(mean/std)=%.4f/%.4f "
+                        "ts=%s shift=%.3f noise_offset=%.4f pyramid=%s loss_weight=%s "
+                        "cap_drop=%.4f tag_drop=%.4f lora_drop=%.4f t5_weight=%s images=[%s]",
+                        global_step,
+                        float(loss.detach().cpu()),
+                        float(t.float().mean().detach().cpu()),
+                        float(t.float().min().detach().cpu()),
+                        float(t.float().max().detach().cpu()),
+                        float(latents.float().mean().detach().cpu()),
+                        float(latents.float().std().detach().cpu()),
+                        float(noise.float().mean().detach().cpu()),
+                        float(noise.float().std().detach().cpu()),
+                        float(target.float().mean().detach().cpu()),
+                        float(target.float().std().detach().cpu()),
+                        float(pred.float().mean().detach().cpu()),
+                        float(pred.float().std().detach().cpu()),
+                        ts_mode,
+                        f_shift,
+                        float(getattr(args, "noise_offset", 0.0) or 0.0),
+                        int(getattr(args, "pyramid_noise_iterations", 0) or 0),
+                        str(getattr(args, "loss_weighting_scheme", "none") or "none"),
+                        float(getattr(args, "caption_dropout_rate", 0.0) or 0.0),
+                        float(getattr(args, "tag_dropout", 0.0) or 0.0),
+                        float(getattr(args, "lora_dropout", 0.0) or 0.0),
+                        bool(getattr(args, "use_t5_token_weights", True)),
+                        preview,
+                    )
+                except Exception as _debug_e:
+                    logger.warning(f"debug_first_batches logging failed: {_debug_e}")
+
             if not torch.isfinite(loss):
                 logger.warning(
                     f"[step {global_step}] Non-finite loss detected ({loss.item()}), "
@@ -2943,7 +3004,10 @@ def main():
                         bad_grad = True
                         break
                 if bad_grad:
-                    logger.warning(f"[step {global_step}] Non-finite gradient, skipping update.")
+                    batch_images = batch.get("images", [])
+                    preview = ", ".join(str(p) for p in batch_images[:4] if p)
+                    suffix = f" batch_images=[{preview}]" if preview else ""
+                    logger.warning(f"[step {global_step}] Non-finite gradient, skipping update.{suffix}")
                     optimizer.zero_grad(set_to_none=True)
                     continue
 

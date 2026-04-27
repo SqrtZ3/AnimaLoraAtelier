@@ -1889,6 +1889,7 @@ def sample_image(
     scheduler: str = "simple",
     device="cuda",
     dtype=torch.bfloat16,
+    use_t5_token_weights: bool = True,
 ):
     """训练时采样预览（尽量对齐 ComfyUI KSampler）
     
@@ -1926,7 +1927,7 @@ def sample_image(
         t5_w = t5_w.to(device, dtype=torch.float32)
         cross_cond = model.preprocess_text_embeds(qwen_embeds, t5_ids, t5_attn, qwen_attn)
         if (
-            getattr(args, "use_t5_token_weights", True)
+            use_t5_token_weights
             and getattr(model, "llm_adapter", None) is not None
             and cross_cond.shape[1] == t5_w.shape[1]
         ):
@@ -1943,7 +1944,7 @@ def sample_image(
         t5_w_uncond = t5_w_uncond.to(device, dtype=torch.float32)
         cross_uncond = model.preprocess_text_embeds(qwen_embeds_uncond, t5_ids_uncond, t5_attn_uncond, qwen_attn_uncond)
         if (
-            getattr(args, "use_t5_token_weights", True)
+            use_t5_token_weights
             and getattr(model, "llm_adapter", None) is not None
             and cross_uncond.shape[1] == t5_w_uncond.shape[1]
         ):
@@ -2809,7 +2810,8 @@ def main():
                 negative_prompt=(s_neg or None),
                 sampler_name=s_sampler,
                 scheduler=s_sched,
-                device=device, dtype=dtype
+                device=device, dtype=dtype,
+                use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
             )
             sample_path = sample_dir / f"step_0_baseline_{i}.png"
             img.save(sample_path)
@@ -3033,7 +3035,8 @@ def main():
                         negative_prompt=(s_neg or None),
                         sampler_name=s_sampler,
                         scheduler=s_sched,
-                        device=device, dtype=dtype
+                        device=device, dtype=dtype,
+                        use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
                     )
                     sample_path = sample_dir / f"step_{global_step}.png"
                     img.save(sample_path)
@@ -3109,7 +3112,8 @@ def main():
                     negative_prompt=(s_neg or None),
                     sampler_name=s_sampler,
                     scheduler=s_sched,
-                    device=device, dtype=dtype
+                    device=device, dtype=dtype,
+                    use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
                 )
                 sample_path = sample_dir / f"epoch_{current_epoch}.png"
                 img.save(sample_path)

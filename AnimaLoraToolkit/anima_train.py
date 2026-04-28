@@ -593,6 +593,55 @@ def resolve_path_best_effort(path_str: str, bases: list[Path]) -> str:
     return path_str
 
 
+def normalize_resume_paths(args, output_dir: Path):
+    """Validate resume paths and recover common resume_lora/resume_state mixups."""
+    resume_lora = str(getattr(args, "resume_lora", "") or "").strip()
+    resume_state = str(getattr(args, "resume_state", "") or "").strip()
+
+    if resume_lora:
+        lora_path = Path(resume_lora)
+        if lora_path.suffix.lower() == ".pt":
+            if resume_state:
+                logger.warning(
+                    "resume_lora points to a .pt training state, but resume_state is already set; "
+                    "ignoring resume_lora: %s",
+                    resume_lora,
+                )
+                args.resume_lora = ""
+            else:
+                step_match = re.search(r"step(\d+)", lora_path.stem)
+                companion = None
+                if step_match:
+                    step = step_match.group(1)
+                    search_dir = lora_path.parent if str(lora_path.parent) != "." else output_dir
+                    candidates = sorted(search_dir.glob(f"*_step{step}.safetensors"))
+                    if candidates:
+                        companion = candidates[0]
+
+                if companion and companion.exists():
+                    args.resume_lora = str(companion)
+                    logger.warning(
+                        "resume_lora was a .pt training state; using matching LoRA weights instead: %s",
+                        companion,
+                    )
+                else:
+                    args.resume_lora = ""
+                    args.resume_state = resume_lora
+                    logger.warning(
+                        "resume_lora was a .pt training state and no matching .safetensors was found; "
+                        "using resume_state instead: %s",
+                        resume_lora,
+                    )
+        elif not lora_path.exists():
+            logger.warning("resume_lora path does not exist; ignoring it: %s", resume_lora)
+            args.resume_lora = ""
+
+    resume_state = str(getattr(args, "resume_state", "") or "").strip()
+    if resume_state and not Path(resume_state).exists():
+        logger.warning("resume_state path does not exist; ignoring it: %s", resume_state)
+        args.resume_state = ""
+
+
 def _load_weights_best_effort(model: torch.nn.Module, sd: dict, label: str) -> dict:
     """
     更健壮的权重加载：
@@ -2485,6 +2534,9 @@ def main():
     reg_data_dir = getattr(args, "reg_data_dir", "") or ""
     if reg_data_dir:
         args.reg_data_dir = resolve_path_best_effort(reg_data_dir, bases)
+    args.resume_lora = resolve_path_best_effort(getattr(args, "resume_lora", ""), bases)
+    args.resume_state = resolve_path_best_effort(getattr(args, "resume_state", ""), bases)
+    normalize_resume_paths(args, output_dir)
 
     # 加载模型
     logger.info("加载 Transformer...")

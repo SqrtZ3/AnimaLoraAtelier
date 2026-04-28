@@ -151,6 +151,7 @@ def apply_yaml_config(args, config):
         "lora_alpha": "lora_alpha",
         "lora_dropout": "lora_dropout",
         "lokr_factor": "lokr_factor",
+        "lora_exclude_prefixes": "lora_exclude_prefixes",
         "resume_lora": "resume_lora",
         # 训练参数
         "epochs": "epochs",
@@ -240,6 +241,7 @@ def apply_yaml_config(args, config):
         "lora_alpha": 32.0,
         "lora_dropout": 0.0,
         "lokr_factor": 8,
+        "lora_exclude_prefixes": None,
         "resume_lora": "",
         "epochs": 10,
         "max_steps": 0,
@@ -1041,7 +1043,8 @@ def tokenize_t5_weighted(tokenizer, texts, max_length=512):
     # pad 到 batch 内最长
     max_len = max(x.numel() for x in all_ids) if all_ids else 1
     input_ids = torch.full((len(all_ids), max_len), pad_id, dtype=torch.long)
-    token_w = torch.zeros((len(all_w), max_len), dtype=torch.float32)
+    # padding 位的权重置 1（恒等），避免下游 cross *= t5_w 把 pad 位置的条件信号抹零
+    token_w = torch.ones((len(all_w), max_len), dtype=torch.float32)
     attention_mask = torch.zeros((len(all_ids), max_len), dtype=torch.long)
 
     for i, (ids, ws) in enumerate(zip(all_ids, all_w)):
@@ -1185,6 +1188,10 @@ class LoRALinear(torch.nn.Module):
 class LoRAInjector:
     """LoRA 注入器"""
     DEFAULT_TARGETS = ["q_proj", "k_proj", "v_proj", "output_proj", "mlp.layer1", "mlp.layer2"]
+    # Anima 官方模型卡明确建议："Don't train the LLM adapter ... it is easy to degrade
+    # by training it." 该层处理文本 embedding 进入扩散模型前的桥接，影响过大且本身已含
+    # 大量知识。所以 codex-merge 默认就把 llm_adapter.* 排除掉 —— 这是与 base 主要区别。
+    # 想强制把它也训进去（一般不建议），yaml 里写：lora_exclude_prefixes: []
     DEFAULT_EXCLUDE_PREFIXES = ("llm_adapter.",)
 
     def __init__(self, rank=32, alpha=16.0, dropout=0.0, use_lokr=False, factor=8, targets=None, exclude_prefixes=None):
@@ -1194,7 +1201,11 @@ class LoRAInjector:
         self.use_lokr = use_lokr
         self.factor = factor
         self.targets = targets or self.DEFAULT_TARGETS
-        self.exclude_prefixes = tuple(exclude_prefixes or self.DEFAULT_EXCLUDE_PREFIXES)
+        # 区分"未指定"和"显式空列表"：未指定 → 用默认；显式 [] → 一个都不排除
+        if exclude_prefixes is None:
+            self.exclude_prefixes = tuple(self.DEFAULT_EXCLUDE_PREFIXES)
+        else:
+            self.exclude_prefixes = tuple(exclude_prefixes)
         self.injected = {}
 
     def inject(self, model):
@@ -1875,9 +1886,14 @@ class CachedLatentDataset(Dataset):
         while hasattr(base, "dataset"):
             base = base.dataset
 
-        if getattr(base, "flip_augment", False) and random.random() > 0.5:
-            latent = torch.flip(latent, dims=[-1])
-        
+        # NOTE: 不要在缓存 latent 上做空间 flip！
+        # Anima/Qwen VAE 的 conv encoder 不是 flip-equivariant，
+        # 即 flip(encode(img)) ≠ encode(flip(img))；
+        # 在 latent 空间翻转会喂给训练"非自然"的潜变量，模型学到的是
+        # 偏离真实分布的 latent，推理时表现为马赛克 / 边缘溶解。
+        # flip 增强在缓存阶段（base ImageDataset 的 __getitem__ 里做图像 flip
+        # 后再 encode）已经生效一次；想要每个 epoch 重新 flip，请关闭 cache_latents。
+
         # 处理 caption（正则集 caption_override 优先）
         caption = None
         if getattr(base, "caption_override", None) is not None:
@@ -2212,7 +2228,7 @@ def parse_args():
     p.add_argument("--lr-scheduler-t-mult", type=float, default=2.0, help="cosine_with_restart: 每次 restart 周期倍数")
     p.add_argument("--lr-scheduler-eta-min", type=float, default=0.0, help="cosine/cosine_with_restart: 最小学习率")
     p.add_argument("--weight-decay", type=float, default=0.01, help="AdamW 权重衰减 (L2 正则, 0=禁用)")
-    p.add_argument("--grad-clip-max-norm", type=float, default=1.0, help="梯度裁剪最大范数 (0=禁用)")
+    p.add_argument("--grad-clip-max-norm", type=float, default=1.0, help="梯度裁剪最大范数 (0=禁用；ProdigyPlus 推荐设 0)")
     p.add_argument("--resolution", type=int, default=1024)
     p.add_argument("--mixed-precision", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--grad-checkpoint", action="store_true", help="启用梯度检查点减少显存")
@@ -2238,6 +2254,8 @@ def parse_args():
     p.add_argument("--lora-alpha", type=float, default=32.0)
     p.add_argument("--lora-dropout", type=float, default=0.0)
     p.add_argument("--lokr-factor", type=int, default=8)
+    p.add_argument("--lora-exclude-prefixes", default=None,
+                   help="逗号分隔，命中前缀的 Linear 不被注入 LoRA/LoKr，例如 'llm_adapter.'。默认空（与 base 一致）")
     p.add_argument("--resume-lora", default="", help="从已有 LoRA 继续训练（safetensors 路径）")
 
     # 采样参数
@@ -2486,12 +2504,23 @@ def main():
 
     # 注入 LoRA
     logger.info(f"注入 {args.lora_type.upper()}...")
+    # exclude_prefixes 语义：
+    #   - None / 未设置  → 用 DEFAULT_EXCLUDE_PREFIXES（默认排除 llm_adapter.*，与 Anima 官方建议一致）
+    #   - 字符串/列表    → 完全替换默认值（例如 [] 表示一个不排除）
+    raw_exclude = getattr(args, "lora_exclude_prefixes", None)
+    if raw_exclude is None:
+        injector_kwargs = {}
+    else:
+        if isinstance(raw_exclude, str):
+            raw_exclude = [s.strip() for s in raw_exclude.split(",") if s.strip()]
+        injector_kwargs = {"exclude_prefixes": tuple(raw_exclude)}
     injector = LoRAInjector(
         rank=args.lora_rank,
         alpha=args.lora_alpha,
         dropout=float(getattr(args, "lora_dropout", 0.0) or 0.0),
         use_lokr=(args.lora_type == "lokr"),
         factor=args.lokr_factor,
+        **injector_kwargs,
     )
     injector.inject(model)
     
@@ -3011,7 +3040,9 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                # 梯度裁剪：grad_clip > 0 才启用；==0 表示用户显式关闭
+                # 梯度裁剪：grad_clip > 0 时启用，==0 表示用户显式关闭（推荐对 ProdigyPlus）。
+                # ProdigyPlus 官方建议：use_stableadamw=True 时其内部已处理梯度归一化，
+                # 外部裁剪会干扰 d 估计。AdamW 系优化器若想用裁剪，再把这个值设为 1.0。
                 if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
 

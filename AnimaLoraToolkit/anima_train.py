@@ -16,6 +16,7 @@ Anima LoRA Trainer v2 - 支持 LyCORIS + 训练时推理
 
 import argparse
 import logging
+import math
 import os
 import random
 import subprocess
@@ -209,13 +210,19 @@ def apply_yaml_config(args, config):
         # Flow Matching / 损失权重 / 噪声增强
         "flow_shift": "flow_shift",
         "timestep_sampling": "timestep_sampling",
+        "timestep_mix_low_prob": "timestep_mix_low_prob",
         "min_snr_gamma": "min_snr_gamma",
         "loss_weighting_scheme": "loss_weighting_scheme",
+        "loss_type": "loss_type",
+        "huber_c": "huber_c",
+        "huber_schedule": "huber_schedule",
         "noise_offset": "noise_offset",
+        "noise_offset_min": "noise_offset_min",
         "noise_offset_random_strength": "noise_offset_random_strength",
         "pyramid_noise_iterations": "pyramid_noise_iterations",
         "pyramid_noise_discount": "pyramid_noise_discount",
         "caption_dropout_rate": "caption_dropout_rate",
+        "grad_norm_log_every": "grad_norm_log_every",
     }
 
     # 需要特殊处理的默认值（用于判断命令行是否显式设置）
@@ -292,13 +299,19 @@ def apply_yaml_config(args, config):
         "use_t5_token_weights": True,
         "flow_shift": 3.0,
         "timestep_sampling": "logit_normal",
+        "timestep_mix_low_prob": 0.25,
         "min_snr_gamma": 0.0,
         "loss_weighting_scheme": "none",
+        "loss_type": "mse",
+        "huber_c": 0.1,
+        "huber_schedule": "constant",
         "noise_offset": 0.0,
+        "noise_offset_min": 0.0,
         "noise_offset_random_strength": False,
         "pyramid_noise_iterations": 0,
         "pyramid_noise_discount": 0.3,
         "caption_dropout_rate": 0.0,
+        "grad_norm_log_every": 0,
     }
 
     for yaml_key, arg_attr in mapping.items():
@@ -2108,7 +2121,13 @@ def sample_image(
 # 训练辅助
 # ============================================================================
 
-def sample_t(bs, device, mode: str = "logit_normal", shift: float = 3.0):
+def sample_t(
+    bs,
+    device,
+    mode: str = "logit_normal",
+    shift: float = 3.0,
+    mix_low_prob: float = 0.25,
+):
     """采样 Flow Matching 时间步 t ∈ (0, 1)。
 
     mode:
@@ -2116,10 +2135,25 @@ def sample_t(bs, device, mode: str = "logit_normal", shift: float = 3.0):
       - "uniform":      均匀采样 t，对低噪声端（细节）和高噪声端（结构）覆盖更均衡。
       - "logit_normal_low": logit-normal 但 shift 反向（推 t 偏向低噪声/细节端），适合刻画细节差的训练集。
       - "mode":         SD3 式 mode-distribution（用 sigma 形式，需要 shift）。
+      - "mixed_uniform_low": 以 uniform 为主体，按 mix_low_prob 混入 logit_normal_low，用于一次训练中补低噪声细节。
     """
     mode = (mode or "logit_normal").lower()
     if mode == "uniform":
         return torch.rand(bs, device=device).clamp(1e-4, 1.0 - 1e-4)
+
+    if mode in ("mixed_uniform_low", "uniform_low_mix"):
+        uniform_t = torch.rand(bs, device=device)
+        low_t = sample_t(bs, device, mode="logit_normal_low", shift=shift)
+        p = min(max(float(mix_low_prob), 0.0), 1.0)
+        use_low = (torch.rand(bs, device=device) < p)
+        return torch.where(use_low, low_t, uniform_t).clamp(1e-4, 1.0 - 1e-4)
+
+    if mode in ("mixed_uniform_logit", "uniform_logit_mix"):
+        uniform_t = torch.rand(bs, device=device)
+        logit_t = sample_t(bs, device, mode="logit_normal", shift=shift)
+        p = min(max(float(mix_low_prob), 0.0), 1.0)
+        use_logit = (torch.rand(bs, device=device) < p)
+        return torch.where(use_logit, logit_t, uniform_t).clamp(1e-4, 1.0 - 1e-4)
 
     # 基础 logit-normal
     u = torch.sigmoid(torch.randn(bs, device=device))
@@ -2143,11 +2177,13 @@ def sample_t(bs, device, mode: str = "logit_normal", shift: float = 3.0):
 
 
 def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
-               pyramid_discount: float = 0.3, random_offset_strength: bool = False):
+               pyramid_discount: float = 0.3, random_offset_strength: bool = False,
+               noise_offset_min: float = 0.0):
     """生成训练用噪声。
 
     base: standard normal
     noise_offset: 给每个样本/通道加一个低频偏移，缓解“总是中等亮度”的偏差，对学习明暗对比尤其有效（来自 SDXL 的 noise_offset 思路）。
+    noise_offset_min: random_offset_strength=true 时的随机下限；默认 0 兼容旧行为。
     pyramid_iters: 叠加多尺度低频噪声，帮助模型快速学习全局光照/构图（参考 multires noise / pyramid noise）。
     """
     noise = torch.randn_like(latents)
@@ -2160,7 +2196,11 @@ def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
         offset = torch.randn(*leading_shape, device=latents.device, dtype=latents.dtype)
         scale = float(noise_offset)
         if random_offset_strength:
-            scale = scale * float(torch.rand(1, device=latents.device).item())
+            lo = max(float(noise_offset_min or 0.0), 0.0)
+            hi = max(scale, 0.0)
+            if lo > hi:
+                lo, hi = hi, lo
+            scale = lo + (hi - lo) * float(torch.rand(1, device=latents.device).item())
         noise = noise + scale * offset
 
     if pyramid_iters and int(pyramid_iters) > 0:
@@ -2193,6 +2233,77 @@ def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
             logger.warning(f"pyramid_noise 计算失败，回退到标准噪声: {_e}")
 
     return noise
+
+
+def _huber_delta_for_t(t: torch.Tensor | None, huber_c: float, schedule: str):
+    delta = max(float(huber_c), 1e-8)
+    if t is None:
+        return delta
+
+    schedule = (schedule or "constant").lower()
+    if schedule == "constant":
+        return delta
+
+    t_c = t.float().clamp(1e-4, 1.0 - 1e-4)
+    if schedule == "snr":
+        # High SNR / low-noise steps get a larger quadratic basin; high-noise steps become more L1-like.
+        snr_sqrt = ((1.0 - t_c) / t_c).clamp(0.1, 10.0)
+        return (delta * snr_sqrt).view(-1, *([1] * 4))
+    if schedule == "sigma":
+        return (delta * t_c.clamp(0.1, 1.0)).view(-1, *([1] * 4))
+
+    return delta
+
+
+def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "mse",
+                    huber_c: float = 0.1, huber_schedule: str = "constant",
+                    t: torch.Tensor | None = None) -> torch.Tensor:
+    """Return per-sample loss for tensors shaped (B, C, T, H, W)."""
+    pred_f = pred.float()
+    target_f = target.float()
+    loss_type = (loss_type or "mse").lower()
+
+    if loss_type in ("mse", "l2"):
+        loss_map = F.mse_loss(pred_f, target_f, reduction="none")
+    elif loss_type in ("l1", "mae"):
+        loss_map = F.l1_loss(pred_f, target_f, reduction="none")
+    elif loss_type in ("huber", "smooth_l1"):
+        delta = _huber_delta_for_t(t, huber_c, huber_schedule)
+        err = (pred_f - target_f).abs()
+        if not torch.is_tensor(delta):
+            delta_t = torch.tensor(float(delta), device=err.device, dtype=err.dtype)
+        else:
+            delta_t = delta.to(device=err.device, dtype=err.dtype)
+        if loss_type == "huber":
+            loss_map = torch.where(
+                err < delta_t,
+                0.5 * err.square(),
+                delta_t * (err - 0.5 * delta_t),
+            )
+        else:
+            loss_map = torch.where(
+                err < delta_t,
+                0.5 * err.square() / delta_t,
+                err - 0.5 * delta_t,
+            )
+    else:
+        logger.warning(f"Unknown loss_type={loss_type!r}; falling back to mse")
+        loss_map = F.mse_loss(pred_f, target_f, reduction="none")
+
+    return loss_map.view(loss_map.shape[0], -1).mean(dim=1)
+
+
+def compute_grad_norm(parameters) -> float:
+    total_sq = 0.0
+    for p in parameters:
+        if p.grad is None:
+            continue
+        grad = p.grad.detach()
+        if not torch.isfinite(grad).all():
+            return float("inf")
+        param_norm = grad.float().norm(2).item()
+        total_sq += param_norm * param_norm
+    return total_sq ** 0.5
 
 
 def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: float = 0.0):
@@ -2336,6 +2447,7 @@ def parse_args():
     p.add_argument("--no-browser", action="store_true", help="不自动打开监控面板浏览器")
     p.add_argument("--log-every", type=int, default=10, help="日志输出间隔")
     p.add_argument("--debug-first-batches", type=int, default=0, help="记录前 N 个优化步的张量统计，用于对齐 loss 标尺")
+    p.add_argument("--grad-norm-log-every", type=int, default=0, help="每 N 个优化步记录梯度范数和裁切状态 (0=禁用)")
 
     # 优化器设置
     p.add_argument("--optimizer-type", default="adamw", choices=["adamw", "adamw8bit", "prodigyplus"], help="优化器类型")
@@ -2347,6 +2459,11 @@ def parse_args():
     p.add_argument("--interactive", action="store_true", help="交互模式，提示输入缺失参数")
     p.add_argument("--use-t5-token-weights", action="store_true", default=True)
     p.add_argument("--no-t5-token-weights", dest="use_t5_token_weights", action="store_false")
+    p.add_argument("--timestep-mix-low-prob", type=float, default=0.25, help="mixed_uniform_low 中低噪声样本比例")
+    p.add_argument("--loss-type", default="mse", choices=["mse", "l2", "l1", "huber", "smooth_l1"], help="训练损失类型")
+    p.add_argument("--huber-c", type=float, default=0.1, help="Huber/SmoothL1 切换阈值")
+    p.add_argument("--huber-schedule", default="constant", choices=["constant", "snr", "sigma"], help="Huber 阈值随 timestep 的调度")
+    p.add_argument("--noise-offset-min", type=float, default=0.0, help="随机 noise_offset 的下限；仅 random_strength=true 时生效")
 
     return p.parse_args()
 
@@ -2985,7 +3102,8 @@ def main():
             # Flow Matching：t 采样、噪声生成、目标计算
             ts_mode = str(getattr(args, "timestep_sampling", "logit_normal") or "logit_normal")
             f_shift = float(getattr(args, "flow_shift", 3.0) or 3.0)
-            t = sample_t(bs, device, mode=ts_mode, shift=f_shift)
+            mix_low_prob = float(getattr(args, "timestep_mix_low_prob", 0.25) or 0.0)
+            t = sample_t(bs, device, mode=ts_mode, shift=f_shift, mix_low_prob=mix_low_prob)
             t_exp = t.view(-1, 1, 1, 1, 1)
 
             noise = make_noise(
@@ -2994,6 +3112,7 @@ def main():
                 pyramid_iters=int(getattr(args, "pyramid_noise_iterations", 0) or 0),
                 pyramid_discount=float(getattr(args, "pyramid_noise_discount", 0.3) or 0.3),
                 random_offset_strength=bool(getattr(args, "noise_offset_random_strength", False)),
+                noise_offset_min=float(getattr(args, "noise_offset_min", 0.0) or 0.0),
             )
             noisy = (1 - t_exp) * latents + t_exp * noise
             target = noise - latents
@@ -3005,12 +3124,15 @@ def main():
                     model, noisy, t.view(-1, 1), cross, pad_mask,
                     use_checkpoint=args.grad_checkpoint
                 )
-                # ★ 损失始终 fp32 计算（per-sample MSE，便于按 t 加权）
-                pred_f = pred.float()
-                target_f = target.float()
-                # 形状: (B, C, T, H, W) → 展平为 (B, *) 再求均值
-                per_sample = F.mse_loss(pred_f, target_f, reduction="none")
-                per_sample = per_sample.view(per_sample.shape[0], -1).mean(dim=1)
+                # ★ 损失始终 fp32 计算（per-sample，便于按 t 加权）
+                per_sample = per_sample_loss(
+                    pred,
+                    target,
+                    loss_type=str(getattr(args, "loss_type", "mse") or "mse"),
+                    huber_c=float(getattr(args, "huber_c", 0.1) or 0.1),
+                    huber_schedule=str(getattr(args, "huber_schedule", "constant") or "constant"),
+                    t=t.float(),
+                )
 
                 w_scheme = str(getattr(args, "loss_weighting_scheme", "none") or "none")
                 if w_scheme != "none":
@@ -3035,7 +3157,8 @@ def main():
                         "[debug step %s] loss=%.6f t(mean/min/max)=%.4f/%.4f/%.4f "
                         "latent(mean/std)=%.4f/%.4f noise(mean/std)=%.4f/%.4f "
                         "target(mean/std)=%.4f/%.4f pred(mean/std)=%.4f/%.4f "
-                        "ts=%s shift=%.3f noise_offset=%.4f pyramid=%s loss_weight=%s "
+                        "ts=%s shift=%.3f mix_low=%.3f noise_offset=%.4f offset_min=%.4f "
+                        "pyramid=%s loss_type=%s huber_c=%.4f loss_weight=%s "
                         "cap_drop=%.4f tag_drop=%.4f lora_drop=%.4f t5_weight=%s images=[%s]",
                         global_step,
                         float(loss.detach().cpu()),
@@ -3052,8 +3175,12 @@ def main():
                         float(pred.float().std().detach().cpu()),
                         ts_mode,
                         f_shift,
+                        mix_low_prob,
                         float(getattr(args, "noise_offset", 0.0) or 0.0),
+                        float(getattr(args, "noise_offset_min", 0.0) or 0.0),
                         int(getattr(args, "pyramid_noise_iterations", 0) or 0),
+                        str(getattr(args, "loss_type", "mse") or "mse"),
+                        float(getattr(args, "huber_c", 0.1) or 0.1),
                         str(getattr(args, "loss_weighting_scheme", "none") or "none"),
                         float(getattr(args, "caption_dropout_rate", 0.0) or 0.0),
                         float(getattr(args, "tag_dropout", 0.0) or 0.0),
@@ -3095,8 +3222,30 @@ def main():
                 # 梯度裁剪：grad_clip > 0 时启用，==0 表示用户显式关闭（推荐对 ProdigyPlus）。
                 # ProdigyPlus 官方建议：use_stableadamw=True 时其内部已处理梯度归一化，
                 # 外部裁剪会干扰 d 估计。AdamW 系优化器若想用裁剪，再把这个值设为 1.0。
+                grad_norm_before = None
+                grad_norm_log_every = int(getattr(args, "grad_norm_log_every", 0) or 0)
+                should_log_grad_norm = grad_norm_log_every > 0 and (global_step + 1) % grad_norm_log_every == 0
+                if should_log_grad_norm:
+                    grad_norm_before = compute_grad_norm(trainable_params)
                 if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
+                    clipped_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
+                    if should_log_grad_norm:
+                        clipped_norm_f = float(clipped_norm)
+                        grad_norm_after = min(clipped_norm_f, grad_clip) if math.isfinite(clipped_norm_f) else float("inf")
+                        logger.info(
+                            "[step %s] grad_norm before=%.6f after<=%.6f clip=%.3f clipped=%s",
+                            global_step + 1,
+                            float(grad_norm_before),
+                            float(grad_norm_after),
+                            grad_clip,
+                            bool(clipped_norm_f > grad_clip),
+                        )
+                elif should_log_grad_norm:
+                    logger.info(
+                        "[step %s] grad_norm=%.6f clip=disabled",
+                        global_step + 1,
+                        float(grad_norm_before),
+                    )
 
                 optimizer.step()
                 if scheduler is not None:

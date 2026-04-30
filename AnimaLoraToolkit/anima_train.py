@@ -209,6 +209,7 @@ def apply_yaml_config(args, config):
         "use_t5_token_weights": "use_t5_token_weights",
         # Flow Matching / 损失权重 / 噪声增强
         "flow_shift": "flow_shift",
+        "schedule_shift": "schedule_shift",
         "timestep_sampling": "timestep_sampling",
         "timestep_mix_low_prob": "timestep_mix_low_prob",
         "min_snr_gamma": "min_snr_gamma",
@@ -298,6 +299,7 @@ def apply_yaml_config(args, config):
         "optimizer_args": None,
         "use_t5_token_weights": True,
         "flow_shift": 3.0,
+        "schedule_shift": 1.0,
         "timestep_sampling": "logit_normal",
         "timestep_mix_low_prob": 0.25,
         "min_snr_gamma": 0.0,
@@ -2214,15 +2216,19 @@ def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
                 small_h = max(spatial_dims[0] // r, 1)
                 small_w = max(spatial_dims[1] // r, 1)
                 # 5D latent: (B, C, T, H, W)；4D 也支持
+                # NOTE: 用 bilinear 而非 nearest，与 Whitaker 原版 pyramid_noise_like 一致；
+                # nearest 会产生块状低频结构，模型把"预测块状偏移"也作为目标的一部分学习，
+                # 导致规则小结构（如扣子、文字、网格）训练后变形。bilinear 提供平滑的 LF 噪声。
                 if latents.ndim == 5:
                     extra = torch.randn(latents.shape[0], latents.shape[1], latents.shape[2], small_h, small_w,
                                         device=latents.device, dtype=latents.dtype)
-                    extra = _F.interpolate(extra.flatten(0, 1), size=spatial_dims, mode="nearest").view(
+                    extra = _F.interpolate(extra.flatten(0, 1), size=spatial_dims, mode="bilinear",
+                                           align_corners=False).view(
                         latents.shape[0], latents.shape[1], latents.shape[2], spatial_dims[0], spatial_dims[1])
                 else:
                     extra = torch.randn(latents.shape[0], latents.shape[1], small_h, small_w,
                                         device=latents.device, dtype=latents.dtype)
-                    extra = _F.interpolate(extra, size=spatial_dims, mode="nearest")
+                    extra = _F.interpolate(extra, size=spatial_dims, mode="bilinear", align_corners=False)
                 cur = cur + extra * (float(pyramid_discount) ** (i + 1))
                 if min(small_h, small_w) <= 1:
                     break
@@ -2340,7 +2346,17 @@ def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: fl
         # logit-normal pdf 的关键项: 1 / (t*(1-t))  → 取反 t*(1-t) 作为权重
         return (t_c * (1 - t_c)).clamp(min=eps)
     if scheme == "sigma_sqrt":
+        # 【遗留】这是 sqrt(t)，不是 SD3 论文 Eq.6 的 sigma^-2。
+        # 想要 SD3 行为请用 "sigma_sqrt_sd3"。保留旧名以免破坏既有 YAML。
         return t_c.sqrt()
+    if scheme == "sigma_sqrt_sd3":
+        # SD3 paper Eq. 6: w(sigma) = sigma^-2，强烈强调低噪声/细节端
+        # clamp 上限 1e3 防止 t→0 时数值爆炸
+        return (t_c ** -2).clamp(max=1e3)
+    if scheme == "cosmap":
+        # SD3 cosmap weighting，对中间 t 更友好
+        bot = 1 - 2 * t_c + 2 * t_c ** 2
+        return 2.0 / (math.pi * bot)
 
     return torch.ones_like(t)
 
@@ -2460,6 +2476,9 @@ def parse_args():
     p.add_argument("--use-t5-token-weights", action="store_true", default=True)
     p.add_argument("--no-t5-token-weights", dest="use_t5_token_weights", action="store_false")
     p.add_argument("--timestep-mix-low-prob", type=float, default=0.25, help="mixed_uniform_low 中低噪声样本比例")
+    p.add_argument("--schedule-shift", type=float, default=1.0,
+                   help="SD3 式 σ schedule shift（应用于所有 t 在噪声混合前）。1.0=不偏移；"
+                        "1024 高分辨率训练 SD3 论文推荐 3.0；与 timestep_sampling 模式无关，对 uniform 也生效。")
     p.add_argument("--loss-type", default="mse", choices=["mse", "l2", "l1", "huber", "smooth_l1"], help="训练损失类型")
     p.add_argument("--huber-c", type=float, default=0.1, help="Huber/SmoothL1 切换阈值")
     p.add_argument("--huber-schedule", default="constant", choices=["constant", "snr", "sigma"], help="Huber 阈值随 timestep 的调度")
@@ -3104,6 +3123,14 @@ def main():
             f_shift = float(getattr(args, "flow_shift", 3.0) or 3.0)
             mix_low_prob = float(getattr(args, "timestep_mix_low_prob", 0.25) or 0.0)
             t = sample_t(bs, device, mode=ts_mode, shift=f_shift, mix_low_prob=mix_low_prob)
+
+            # SD3 式 σ schedule shift：作用于所有模式的 t（含 uniform / mixed_*），
+            # 把噪声混合用的 sigma 整体偏向高噪声端。1.0=禁用，向后兼容。
+            sched_shift = float(getattr(args, "schedule_shift", 1.0) or 1.0)
+            if sched_shift > 0 and abs(sched_shift - 1.0) > 1e-6:
+                t = (t * sched_shift) / (1 + (sched_shift - 1) * t)
+                t = t.clamp(1e-4, 1.0 - 1e-4)
+
             t_exp = t.view(-1, 1, 1, 1, 1)
 
             noise = make_noise(
@@ -3157,7 +3184,8 @@ def main():
                         "[debug step %s] loss=%.6f t(mean/min/max)=%.4f/%.4f/%.4f "
                         "latent(mean/std)=%.4f/%.4f noise(mean/std)=%.4f/%.4f "
                         "target(mean/std)=%.4f/%.4f pred(mean/std)=%.4f/%.4f "
-                        "ts=%s shift=%.3f mix_low=%.3f noise_offset=%.4f offset_min=%.4f "
+                        "ts=%s shift=%.3f sched_shift=%.3f mix_low=%.3f "
+                        "noise_offset=%.4f offset_min=%.4f "
                         "pyramid=%s loss_type=%s huber_c=%.4f loss_weight=%s "
                         "cap_drop=%.4f tag_drop=%.4f lora_drop=%.4f t5_weight=%s images=[%s]",
                         global_step,
@@ -3175,6 +3203,7 @@ def main():
                         float(pred.float().std().detach().cpu()),
                         ts_mode,
                         f_shift,
+                        sched_shift,
                         mix_low_prob,
                         float(getattr(args, "noise_offset", 0.0) or 0.0),
                         float(getattr(args, "noise_offset_min", 0.0) or 0.0),

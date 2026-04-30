@@ -214,6 +214,7 @@ def apply_yaml_config(args, config):
         "timestep_mix_low_prob": "timestep_mix_low_prob",
         "min_snr_gamma": "min_snr_gamma",
         "loss_weighting_scheme": "loss_weighting_scheme",
+        "weight_cap_ratio": "weight_cap_ratio",
         "loss_type": "loss_type",
         "huber_c": "huber_c",
         "huber_schedule": "huber_schedule",
@@ -304,6 +305,7 @@ def apply_yaml_config(args, config):
         "timestep_mix_low_prob": 0.25,
         "min_snr_gamma": 0.0,
         "loss_weighting_scheme": "none",
+        "weight_cap_ratio": 5.0,
         "loss_type": "mse",
         "huber_c": 0.1,
         "huber_schedule": "constant",
@@ -2312,17 +2314,28 @@ def compute_grad_norm(parameters) -> float:
     return total_sq ** 0.5
 
 
-def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: float = 0.0):
+def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: float = 0.0,
+                        weight_cap_ratio: float = 0.0):
     """根据 scheme 返回每样本的 loss 权重 (B,)。
 
     Flow Matching CONST 调度下：alpha_t = 1 - t，sigma_t = t；SNR(t) = ((1-t)/t)^2
 
     scheme:
       - "none":          全 1 权重
-      - "min_snr":       w = min(gamma / SNR, 1)，下调“几乎无噪声/高 SNR”的简单步
+      - "min_snr":       w = min(gamma / SNR, 1)，下调"几乎无噪声/高 SNR"的简单步
       - "max_snr_inv":   w = min(SNR / gamma, 1)，下调极高噪声/低 SNR 步（少用）
       - "logit_normal":  按 logit-normal 概率密度的倒数加权（debias 采样偏置）
       - "sigma_sqrt":    w = sqrt(sigma) = sqrt(t)，缓解 t→0 处梯度爆炸
+      - "sigma_sqrt_sd3":SD3 论文 Eq.6 原始 σ^-2 权重；max=1000，**仅用于大 batch (>=64)**。
+                         小 batch + Prodigy 会因单样本主导导致 d 估计崩坏（不学习）。
+                         小 batch 想要细节强化请用 "detail_inv_t" 或 "cosmap"。
+      - "detail_inv_t":  w = 1/t，clamp 到 [1, 5]；这是一个温和的细节端强化，配合
+                         weight_cap_ratio (默认 5) 时单 batch 内 max/min 比 ≤ 5×。
+                         小 batch + Prodigy 兼容，是 sigma_sqrt_sd3 的实用替代。
+      - "cosmap":        SD3 cosmap weighting，对中间 t 更友好（max/min ≈ 1.81×）
+
+    weight_cap_ratio: 单个 batch 内最大权重 / 最小权重的硬上限。0=禁用。
+                       建议小 batch 训练设 5-10，避免单样本主导破坏 Prodigy 的 d 估计。
     """
     scheme = (scheme or "none").lower()
     if scheme == "none":
@@ -2335,30 +2348,37 @@ def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: fl
         if min_snr_gamma <= 0:
             return torch.ones_like(t)
         snr = ((1 - t_c) / t_c) ** 2
-        return torch.minimum(float(min_snr_gamma) / snr, torch.ones_like(t_c))
-    if scheme == "max_snr_inv":
+        w = torch.minimum(float(min_snr_gamma) / snr, torch.ones_like(t_c))
+    elif scheme == "max_snr_inv":
         if min_snr_gamma <= 0:
             return torch.ones_like(t)
         snr = ((1 - t_c) / t_c) ** 2
-        return torch.minimum(snr / float(min_snr_gamma), torch.ones_like(t_c))
-    if scheme == "logit_normal":
-        # debias logit-normal sampling: 权重 ∝ 1 / pdf(t)
-        # logit-normal pdf 的关键项: 1 / (t*(1-t))  → 取反 t*(1-t) 作为权重
-        return (t_c * (1 - t_c)).clamp(min=eps)
-    if scheme == "sigma_sqrt":
+        w = torch.minimum(snr / float(min_snr_gamma), torch.ones_like(t_c))
+    elif scheme == "logit_normal":
+        w = (t_c * (1 - t_c)).clamp(min=eps)
+    elif scheme == "sigma_sqrt":
         # 【遗留】这是 sqrt(t)，不是 SD3 论文 Eq.6 的 sigma^-2。
-        # 想要 SD3 行为请用 "sigma_sqrt_sd3"。保留旧名以免破坏既有 YAML。
-        return t_c.sqrt()
-    if scheme == "sigma_sqrt_sd3":
-        # SD3 paper Eq. 6: w(sigma) = sigma^-2，强烈强调低噪声/细节端
-        # clamp 上限 1e3 防止 t→0 时数值爆炸
-        return (t_c ** -2).clamp(max=1e3)
-    if scheme == "cosmap":
-        # SD3 cosmap weighting，对中间 t 更友好
+        w = t_c.sqrt()
+    elif scheme == "sigma_sqrt_sd3":
+        # SD3 paper Eq. 6: w(sigma) = sigma^-2
+        # ⚠️ 仅适合大 batch (>=64)。小 batch + Prodigy 会让单样本独占 loss → d 估计崩坏。
+        w = (t_c ** -2).clamp(max=1000.0)
+    elif scheme == "detail_inv_t":
+        # 温和细节端强化：w = 1/t 但 clamp 到 [1, 5]；与小 batch + Prodigy 兼容。
+        w = (1.0 / t_c).clamp(min=1.0, max=5.0)
+    elif scheme == "cosmap":
         bot = 1 - 2 * t_c + 2 * t_c ** 2
-        return 2.0 / (math.pi * bot)
+        w = 2.0 / (math.pi * bot)
+    else:
+        return torch.ones_like(t)
 
-    return torch.ones_like(t)
+    # batch 内 max/min 比上限：防止单样本主导（破坏 Prodigy d 估计）。
+    if weight_cap_ratio and weight_cap_ratio > 1.0:
+        w_min = w.min().clamp(min=eps)
+        w_max_allowed = w_min * float(weight_cap_ratio)
+        w = w.clamp(max=w_max_allowed)
+
+    return w
 
 
 def collate_fn(batch):
@@ -2482,6 +2502,9 @@ def parse_args():
     p.add_argument("--loss-type", default="mse", choices=["mse", "l2", "l1", "huber", "smooth_l1"], help="训练损失类型")
     p.add_argument("--huber-c", type=float, default=0.1, help="Huber/SmoothL1 切换阈值")
     p.add_argument("--huber-schedule", default="constant", choices=["constant", "snr", "sigma"], help="Huber 阈值随 timestep 的调度")
+    p.add_argument("--weight-cap-ratio", type=float, default=5.0,
+                   help="loss 加权时单 batch 内 max/min 比上限。0=禁用；推荐 5-10（小 batch + Prodigy）。"
+                        "防止 detail_inv_t / sigma_sqrt_sd3 等激进权重让单样本主导 batch loss → 破坏 Prodigy 的 d 估计。")
     p.add_argument("--noise-offset-min", type=float, default=0.0, help="随机 noise_offset 的下限；仅 random_strength=true 时生效")
 
     return p.parse_args()
@@ -3167,6 +3190,7 @@ def main():
                         t.float(),
                         scheme=w_scheme,
                         min_snr_gamma=float(getattr(args, "min_snr_gamma", 0.0) or 0.0),
+                        weight_cap_ratio=float(getattr(args, "weight_cap_ratio", 0.0) or 0.0),
                     )
                     # 归一到均值 1，避免间接改变 LR
                     w = w / w.mean().clamp(min=1e-6)

@@ -2914,11 +2914,15 @@ def main():
     scheduler = None
     lr_sched = getattr(args, "lr_scheduler", "none") or "none"
     
-    # 如果是 ProdigyPlus 且启用了 schedule-free，则不使用调度器
+    # 如果是 ProdigyPlus 且启用了 schedule-free，则不使用调度器；
+    # 关掉 schedule-free 时允许并推荐使用 cosine 等调度器，让后期 LR 衰减带来精修。
     if opt_type == "prodigyplus":
-        if lr_sched != "none":
+        sf_enabled = bool(opt_args.get("use_schedulefree", True))
+        if sf_enabled and lr_sched != "none":
             logger.warning("ProdigyPlus (Schedule-Free) 不需要学习率调度器，已将其设为 none")
             lr_sched = "none"
+        elif not sf_enabled and lr_sched == "none":
+            logger.warning("ProdigyPlus 关闭 Schedule-Free 时建议配 cosine 调度器，否则后期没有 LR 衰减")
     
     if lr_sched == "cosine":
         eta_min = float(getattr(args, "lr_scheduler_eta_min", 0.0) or 0.0)
@@ -3334,6 +3338,12 @@ def main():
                     d_val = g.get("d", 1.0)
                     eff_lr = g.get("effective_lr", g.get("lr", 1.0))
                     lr = float(d_val) * float(eff_lr)
+                    # 每 50 步把 d / eff_lr / 实际 LR 分开打印一次，便于诊断 Prodigy 是否找到合理 LR
+                    if global_step % 50 == 0:
+                        logger.info(
+                            "[step %d] prodigy d=%.3e effective_lr=%.3e real_lr=%.3e",
+                            global_step, float(d_val), float(eff_lr), lr
+                        )
                 else:
                     lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else 0.0
                 

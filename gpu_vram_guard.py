@@ -3,8 +3,8 @@
 Keep a CUDA GPU looking busy by reserving otherwise-free VRAM.
 
 This is meant for personally owned/shared machines where the scheduler decides
-availability mostly from memory usage. It dynamically grows and shrinks its
-allocation so existing workloads still have a configurable safety margin.
+availability mostly from memory usage. By default it keeps its reservation sticky
+and only releases memory when free VRAM drops below a hard safety margin.
 """
 
 from __future__ import annotations
@@ -52,7 +52,24 @@ def parse_args() -> argparse.Namespace:
         "--block",
         type=int,
         default=256,
-        help="Allocation/release block size, in MiB.",
+        help="Steady-state allocation/release block size, in MiB.",
+    )
+    parser.add_argument(
+        "--startup-block",
+        type=int,
+        default=2048,
+        help="Fast startup allocation block size, in MiB.",
+    )
+    parser.add_argument(
+        "--release-policy",
+        choices=("hard-only", "target"),
+        default="hard-only",
+        help="hard-only releases only below hard-min-free; target also releases below keep-free.",
+    )
+    parser.add_argument(
+        "--no-touch",
+        action="store_true",
+        help="Skip writing to allocated tensors. Faster startup, but some setups may report usage less reliably.",
     )
     parser.add_argument(
         "--interval",
@@ -74,8 +91,8 @@ def main() -> int:
     if hard_min_free is None:
         hard_min_free = max(256, args.keep_free // 2)
 
-    if args.block <= 0 or args.keep_free <= 0 or hard_min_free <= 0:
-        print("block, keep-free, and hard-min-free must be positive.", file=sys.stderr)
+    if args.block <= 0 or args.startup_block <= 0 or args.keep_free <= 0 or hard_min_free <= 0:
+        print("block, startup-block, keep-free, and hard-min-free must be positive.", file=sys.stderr)
         return 2
 
     try:
@@ -114,13 +131,54 @@ def main() -> int:
         torch.cuda.empty_cache()
         return True
 
+    def allocate(alloc_mb: int) -> bool:
+        try:
+            # uint8 makes requested bytes easy to reason about.
+            tensor = torch.empty(alloc_mb * MB, dtype=torch.uint8, device=device)
+            if not args.no_touch:
+                tensor.fill_(1)
+            blocks.append(Block(tensor=tensor, size_mb=alloc_mb))
+            return True
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return False
+
     free_mb, total_mb = free_total_mb()
     print(
         f"Guarding cuda:{args.gpu}: total={total_mb} MiB, initial_free={free_mb} MiB, "
-        f"keep_free={args.keep_free} MiB, hard_min_free={hard_min_free} MiB"
+        f"keep_free={args.keep_free} MiB, hard_min_free={hard_min_free} MiB, "
+        f"release_policy={args.release_policy}"
     )
 
     try:
+        while not stopping:
+            free_mb, _total_mb = free_total_mb()
+            current_reserved = reserved_mb()
+            can_reserve_more = args.max_reserve <= 0 or current_reserved < args.max_reserve
+            if free_mb <= args.keep_free or not can_reserve_more:
+                break
+
+            alloc_mb = min(args.startup_block, free_mb - args.keep_free)
+            if args.max_reserve > 0:
+                alloc_mb = min(alloc_mb, args.max_reserve - current_reserved)
+            if alloc_mb <= 0:
+                break
+
+            if allocate(alloc_mb):
+                if not args.quiet:
+                    print(
+                        f"startup_allocated={alloc_mb} MiB, free_before={free_mb} MiB, "
+                        f"reserved={reserved_mb()} MiB",
+                        flush=True,
+                    )
+                continue
+
+            if alloc_mb <= args.block:
+                if not args.quiet:
+                    print("startup allocation hit OOM; entering steady state", flush=True)
+                break
+            args.startup_block = max(args.block, alloc_mb // 2)
+
         while not stopping:
             free_mb, _total_mb = free_total_mb()
             current_reserved = reserved_mb()
@@ -138,23 +196,21 @@ def main() -> int:
 
             can_reserve_more = args.max_reserve <= 0 or current_reserved + args.block <= args.max_reserve
             should_allocate = free_mb > args.keep_free + args.block and can_reserve_more
-            should_release = free_mb < args.keep_free - args.block
+            should_release = (
+                args.release_policy == "target"
+                and free_mb < args.keep_free - args.block
+            )
 
             if should_allocate:
                 alloc_mb = min(args.block, free_mb - args.keep_free)
-                try:
-                    # uint8 makes requested bytes easy to reason about.
-                    tensor = torch.empty(alloc_mb * MB, dtype=torch.uint8, device=device)
-                    tensor.fill_(1)
-                    blocks.append(Block(tensor=tensor, size_mb=alloc_mb))
+                if allocate(alloc_mb):
                     if not args.quiet:
                         print(
                             f"allocated={alloc_mb} MiB, free_before={free_mb} MiB, "
                             f"reserved={reserved_mb()} MiB",
                             flush=True,
                         )
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
+                else:
                     if not args.quiet:
                         print("allocation hit OOM; backing off", flush=True)
                     time.sleep(args.interval * 2)

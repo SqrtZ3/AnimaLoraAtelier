@@ -47,6 +47,13 @@ except ImportError as e:
         "2. 请确认已安装依赖: pip install prodigy-plus-schedule-free"
     ) from e
 
+# 选择性 / 延迟 OrthoGrad（在 ProdigyPlus 内置版本之外，自己控制何时、对哪些参数应用）
+from utils.orthograd import (
+    apply_partial_orthograd_,
+    assert_no_double_orthograd,
+    build_orthograd_config,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -225,6 +232,14 @@ def apply_yaml_config(args, config):
         "pyramid_noise_discount": "pyramid_noise_discount",
         "caption_dropout_rate": "caption_dropout_rate",
         "grad_norm_log_every": "grad_norm_log_every",
+        # 手动 OrthoGrad（参考 utils/orthograd.py 的注释）
+        "orthograd_mode": "orthograd_mode",
+        "orthograd_enable_after": "orthograd_enable_after",
+        "orthograd_ramp_steps": "orthograd_ramp_steps",
+        "orthograd_strength": "orthograd_strength",
+        "orthograd_rescale": "orthograd_rescale",
+        "orthograd_exclude_param_keywords": "orthograd_exclude_param_keywords",
+        "orthograd_exclude_module_keywords": "orthograd_exclude_module_keywords",
     }
 
     # 需要特殊处理的默认值（用于判断命令行是否显式设置）
@@ -316,6 +331,13 @@ def apply_yaml_config(args, config):
         "pyramid_noise_discount": 0.3,
         "caption_dropout_rate": 0.0,
         "grad_norm_log_every": 0,
+        "orthograd_mode": "off",
+        "orthograd_enable_after": 0,
+        "orthograd_ramp_steps": 0,
+        "orthograd_strength": 1.0,
+        "orthograd_rescale": True,
+        "orthograd_exclude_param_keywords": None,
+        "orthograd_exclude_module_keywords": None,
     }
 
     for yaml_key, arg_attr in mapping.items():
@@ -1604,24 +1626,37 @@ class ImageDataset(Dataset):
         return samples
 
     def _process_caption_txt(self, caption):
-        """处理 TXT caption: 传统 tag 打乱 + keep_tokens"""
+        """处理 TXT caption: 传统 tag 打乱 + keep_tokens + tag_dropout
+
+        tag_dropout 与 caption_utils.build_caption_from_json 中的语义一致：
+          - 仅丢弃 keep_tokens 之后的可变标签；keep_tokens（角色名/触发词）始终保留
+          - 若 dropout 后可变部分全空，强制保留其中随机一个，避免 caption 退化为只有触发词
+        """
         if not caption:
             return ""
         if "," in caption:
-            tags = [t.strip() for t in caption.split(",")]
+            tags = [t.strip() for t in caption.split(",") if t.strip()]
         else:
-            tags = caption.split()
+            tags = [t for t in caption.split() if t]
 
-        if self.keep_tokens > 0:
-            kept = tags[:self.keep_tokens]
-            rest = tags[self.keep_tokens:]
-            if self.shuffle_caption:
-                random.shuffle(rest)
-            tags = kept + rest
-        elif self.shuffle_caption:
-            random.shuffle(tags)
+        if not tags:
+            return ""
 
-        return ", ".join(tags)
+        keep_n = max(int(self.keep_tokens or 0), 0)
+        kept = tags[:keep_n]
+        rest = tags[keep_n:]
+
+        if self.shuffle_caption and rest:
+            random.shuffle(rest)
+
+        dropout = float(self.tag_dropout or 0.0)
+        if dropout > 0.0 and rest:
+            survivors = [t for t in rest if random.random() > dropout]
+            if not survivors:
+                survivors = [random.choice(rest)]
+            rest = survivors
+
+        return ", ".join(kept + rest)
 
     def _process_caption_json(self, json_path):
         """处理 JSON caption: 分类 shuffle"""
@@ -2778,6 +2813,18 @@ def main():
 
     # 缓存 VAE latents（在 repeat 之前）
     use_cached = getattr(args, "cache_latents", False)
+    if use_cached and bool(getattr(args, "flip_augment", False)):
+        # flip_augment 在 ImageDataset.__getitem__ 中作用于像素图像；启用 cache_latents 后，
+        # 每张图只在首次缓存时调用一次 __getitem__，是否 flip 在那一刻被随机决定并冻结。
+        # 后续每个 epoch 永远拿到同一份 latent，flip 不再随机 → 增强等同于"50% 数据集预 flip"，
+        # 失去逐 epoch 增广的本意。VAE encoder 非 flip-equivariant，也不能在 latent 上后补 flip。
+        # 此处只警告，不强行覆盖用户配置。
+        logger.warning(
+            "[dataset] cache_latents=True 与 flip_augment=True 同时开启："
+            "flip 仅在首次 latent 缓存时一次性生效，后续 epoch 不再随机翻转。"
+            "若想让 flip 在每个 epoch 随机，请关闭 cache_latents；"
+            "若想保持 cache_latents 的速度，请关闭 flip_augment。"
+        )
     if use_cached:
         dataset = CachedLatentDataset(dataset, vae, device, dtype)
     if reg_dataset is not None and use_cached:
@@ -2894,6 +2941,22 @@ def main():
     trainable_params = []
     for group in optimizer.param_groups:
         trainable_params.extend(group["params"])
+
+    # ── 手动 OrthoGrad：建立 (full_name, param) 列表 ──────────────────────────
+    # 通过 id(p) 反向查名字，避免与 model.named_parameters 的迭代顺序耦合。
+    # 排除规则按完整路径名（含 transformer.blocks.X.cross_attn.q_proj.adapter.lokr_w2_b 这类）匹配。
+    _trainable_id_set = {id(p) for p in trainable_params}
+    orthograd_named_params = [
+        (n, p) for n, p in model.named_parameters() if id(p) in _trainable_id_set and p.requires_grad
+    ]
+    orthograd_cfg = build_orthograd_config(args)
+    assert_no_double_orthograd(args)
+    if orthograd_cfg.enable:
+        logger.info(
+            "[orthograd] 共捕获 %d 个可训练参数用于按名匹配；"
+            "默认排除关键字（含 lokr_w2_b/lokr_w1/lora_B 等磁场承载参数）将不被投影。",
+            len(orthograd_named_params),
+        )
 
     # 计算总步数
     try:
@@ -3303,6 +3366,13 @@ def main():
                         global_step + 1,
                         float(grad_norm_before),
                     )
+
+                # 手动 OrthoGrad：在 optimizer.step 前对未排除的参数把梯度投影到
+                # 当前权重的正交子空间（与 ProdigyPlus 内置一致：whole-tensor flat
+                # view，rescale 回原 ||g||）。enable_after_step / ramp_steps / strength
+                # 控制何时启用与启用强度。详见 utils/orthograd.py。
+                if orthograd_cfg.enable:
+                    apply_partial_orthograd_(orthograd_named_params, global_step, orthograd_cfg)
 
                 optimizer.step()
                 if scheduler is not None:

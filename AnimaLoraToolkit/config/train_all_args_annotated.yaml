@@ -73,23 +73,74 @@ cache_latents: true
 lora_type: "lokr"
 
 # rank 容量。调大：更能记复杂特征，也更易记死；调小：泛化好但可能欠拟合。
-# Anima 官方 LoRA tips 提到 rank 32 可作为轻量起点。
+# Anima 官方 LoRA tips 提到 rank 32 可作为轻量起点。SimpleTuner/Ostris 经验：
+# Qwen-Image 上 rank≥64 通常无收益甚至有害；rank 32 是上限附近的甜区。
 lora_rank: 32
 
-# alpha 控制实际缩放 alpha/rank。通常等于 rank；低于 rank 更保守，高于 rank 更激进。
+# alpha 控制实际缩放 alpha/rank。LoRA 通常等于 rank。
+# ⚠ LoKr 不同：Kronecker 已放大表达力，alpha=rank 在小数据集容易过强；
+#   LyCORIS 文档推荐 LoKr 用 alpha=1.0；alpha=rank 时建议配合更短训练步数。
 lora_alpha: 32.0
 
-# LoRA/LoKr 输出 dropout。本补丁恢复该参数。小数据集 0.03-0.08 常有用；太高会欠拟合。
+# LoRA/LoKr 输出 dropout（作用在 down 输入上）。0.03-0.08 常用；太高会欠拟合。
 lora_dropout: 0.05
 
-# LoKr Kronecker factor。8 是折中值；更大表达力/参数更多，整除失败时代码会自动降级。
+# rank 维度 dropout（kohya sd-scripts，PR #2046）。训练时随机置零 rank 通道，
+# inverted dropout 自动放缩。0.1-0.3 适合小数据集抗过拟合；与 lora_dropout 可叠加。
+# 大数据集若 loss 已平稳不必启用；小数据集失败模式（特征过强）的首选工具。
+rank_dropout: 0.0
+
+# 整模块 dropout。训练时整层 LoRA 输出置零，等效随机"关闭"该层。
+# 0.05-0.15 用于小数据集；与 rank_dropout 可叠加但不要都设很高，否则严重欠拟合。
+module_dropout: 0.0
+
+# LoKr Kronecker factor。8 是折中值；更大表达力/参数更多。
+# 当前实现：标量 factor + _find_factor 自动降级到 [target,4,2,1] 中能整除的最大值。
+# 不支持 LyCORIS 的 (a,b,c,d) 非方形分解，也未实现 use_tucker / decompose_both。
 lokr_factor: 8
 
 # 从已有 LoRA/LoKr 权重继续训练。空字符串表示不用。
 resume_lora: ""
 
 # 是否应用 T5 token 权重，例如 (tag:1.2)。关闭会更接近普通 tag，但损失权重提示能力。
+# 仅在 llm_adapter 实际存在且形状匹配时生效（代码 ~line 5213）。
 use_t5_token_weights: true
+
+# ── 模块选择（regex，re.fullmatch） ─────────────────────────────────────
+# 默认排除规则：[r".*llm_adapter.*"]。Anima 作者 tdrussell 公开建议不要训 llm_adapter，
+# 因为该层桥接 Qwen3 文本嵌入到 cross-attn，含大量预训练知识，易在小 LR 下退化。
+# 但用户实证：在 Prodigy + Schedule-Free + huber 组合下，训 llm_adapter 反而能让
+# 小数据集更快收敛（约 -25% 步数）且泛化更好。两种说法都成立，取决于训练动力学。
+#
+# include 优先级高于 exclude（在 _should_inject 中先检查 exclude，命中后再用 include 解禁）。
+# 不要写 prefix（旧字段），统一用 regex 模式。
+lora_exclude_patterns:
+  - ".*llm_adapter.*"           # 默认排除；要训 llm_adapter 时清空此列表
+
+lora_include_patterns: []       # 例：[".*llm_adapter.*"] 强制纳入即使 exclude 命中
+
+# ── 模块级 rank/lr 控制（regex → 值） ────────────────────────────────────
+# reg_dims：把特定模块覆盖为更低/更高 rank，常用于"软限制"特定子结构。
+# 例：cross_attn 用低 rank 防特征记死；llm_adapter 解禁但限制为 8。
+lora_reg_dims: {}
+# 示例：
+# lora_reg_dims:
+#   ".*self_attn.*":  16
+#   ".*cross_attn.*": 8
+#   ".*mlp.*":        16
+#   ".*llm_adapter.*": 8
+
+# reg_lrs：模块级绝对 LR。
+# ⚠ ProdigyPlus 下慎用：Prodigy 期待所有 group lr=1.0 由 d 自适应；
+#   设非 1.0 会被 Prodigy d 估计覆盖，效果不可预测。
+#   仅在 AdamW/AdamW8bit 时有意义。
+lora_reg_lrs: {}
+
+# LoRA+（PR by frothmoon, NeurIPS 2024 inspired）：B 矩阵（lora_up/lokr_w2_b）
+# 使用更高 LR，加速从零起步的收敛。原论文 SDXL 推荐 16，Flow Matching 社区收敛在 4-8。
+# ⚠ 与 ProdigyPlus 冲突：Prodigy d 是全局自适应，ratio 表现为 group["lr"] 的绝对值，
+#   会被 Prodigy 内部状态覆盖。**用 ProdigyPlus 时保持 1.0**；只在 AdamW 启用。
+loraplus_lr_ratio: 1.0
 
 # ============================================================================
 # 基础训练计划
@@ -259,37 +310,90 @@ optimizer_args:
 # Flow Matching / timestep / 噪声增强 / loss 权重
 # ============================================================================
 
-# flow_shift 影响 t 采样向高噪声端偏移。3.0 与 Anima/ComfyUI 常用设置对齐。
-# 调大：更重结构/全局；调小：更重低噪声细节。
+# flow_shift：作用在模型/scheduler 端的 sigma 调度偏移（影响真实噪声幅度）。
+# Anima 默认 1.0，社区/SD3 风格常用 3.0。调大：更重结构/全局；调小：更重低噪声细节。
 flow_shift: 3.0
 
+# schedule_shift：作用在 t 采样分布端的 SD3-style shift（影响采样分布形状）。
+# ⚠ 与 flow_shift 是两个独立旋钮，不要混淆。
+# - logit_normal:     shift>1 把 t 推向 1（高噪声/结构）
+# - logit_normal_low: shift>1 把 t 推向 0（低噪声/细节）
+# - shift=1.0 时两个分布退化为同一对称 sigmoid(N(0,1))；此时 mixed_uniform_low
+#   实际上 = mixed_uniform_logit，"_low" 子分布 **失效**。要让 _low 真正偏低 t，
+#   必须 schedule_shift > 1（例如 1.5-2.0）。
+schedule_shift: 1.0
+
 # timestep_sampling:
-#   logit_normal      默认，中段为主，适合基线。
-#   uniform           均匀覆盖，细节端更多但收敛可能慢。
-#   logit_normal_low  更偏低噪声/细节，适合细节欠拟合实验。
-#   mode              SD3 风格 mode distribution，实验项。
+#   logit_normal           默认，中段为主，shift>1 偏高 t。
+#   uniform                均匀覆盖；细节端覆盖更多但收敛可能慢。
+#   logit_normal_low       配合 shift>1 偏低 t/细节，适合细节欠拟合实验。
+#   mode                   SD3 mode distribution，集中在某 sigma 附近，实验项。
+#   mixed_uniform_low      uniform 与 logit_normal_low 的混合（按 timestep_mix_low_prob）。
+#                          schedule_shift=1 时 = mixed_uniform_logit。
+#   mixed_uniform_logit    uniform 与 logit_normal 的混合。
 timestep_sampling: "logit_normal"
 
+# 混合采样的 _low 子分布权重（仅 mixed_* 模式）。0.10-0.20 常用。
+timestep_mix_low_prob: 0.15
+
 # loss_weighting_scheme:
-#   none         基线，不加权。
-#   min_snr      下调高 SNR/低噪声简单步，可能改善泛化。
-#   max_snr_inv  下调低 SNR/高噪声步，少用。
-#   logit_normal 抵消采样分布偏置，实验项。
-#   sigma_sqrt   缓解低 t 梯度爆点。
+#   none           基线，不加权。
+#   min_snr        下调"几乎无噪声/高 SNR"的简单步，需 min_snr_gamma>0；常用 gamma=5。
+#   max_snr_inv    下调极高噪声/低 SNR 步，少用。
+#   logit_normal   抵消采样分布偏置，实验项。
+#   sigma_sqrt     w=sqrt(t)，缓解 t→0 处梯度爆点（非 SD3 原版）。
+#   sigma_sqrt_sd3 SD3 论文 Eq.6 原版 w=sigma^-2。**仅适合 batch≥64**；
+#                  小 batch + Prodigy 会被单样本主导导致 d 估计崩坏。
+#   detail_inv_t   w=clip(1/t, 1, 5)；温和细节端强化，与小 batch + Prodigy 兼容。
+#                  ⚠ 与 huber_schedule="snr" 叠加会双重加强低 t/高 SNR 信号，
+#                    在小数据集（≤60）易导致"线条锁死、面部/背景崩坏"。
+#   cosmap         SD3 cosmap weighting，对中间 t 友好，max/min ≈ 1.81。
 loss_weighting_scheme: "none"
 
-# min_snr_gamma。仅 loss_weighting_scheme 需要 gamma 时生效；常见试 5。
+# min_snr_gamma。仅 loss_weighting_scheme=min_snr/max_snr_inv 时使用；常用 5。
 min_snr_gamma: 0.0
 
-# noise_offset：低频亮度噪声偏移。对“明暗对比训练出来变平”很有针对性。
+# weight_cap_ratio：单 batch 内 max(w)/min(w) 硬上限。0=禁用，>1.0=启用。
+# 用途：保护 ProdigyPlus d 估计不被极端样本权重主导。
+# detail_inv_t / sigma_sqrt_sd3 / cosmap 等放大方差的方案配合 5-10 较稳。
+# 注意 detail_inv_t 自身已 clamp 到 [1,5]，weight_cap_ratio 是叠加保险。
+weight_cap_ratio: 0.0
+
+# loss_type:
+#   mse / l2     默认；标准做法。
+#   l1 / mae     更鲁棒于离群梯度，但收敛更慢。
+#   huber        小残差走 L2 / 大残差走 L1；huber_c 是切换阈值。
+#   smooth_l1    与 huber 类似但归一化方式不同（PyTorch 标准 SmoothL1）。
+loss_type: "mse"
+
+# huber/smooth_l1 的 delta 阈值。0.10-0.25 常用；越小越接近 L1（越鲁棒越糊）。
+# Flux 社区经验：0.15-0.25 + huber_schedule="snr" 是稳定组合。
+huber_c: 0.1
+
+# huber_schedule:
+#   constant     delta 固定为 huber_c，最简单。
+#   snr          delta = huber_c * sqrt(SNR(t))；高 SNR/低 t 更 L2 化（保细节），
+#                高噪声/低 SNR 更 L1 化（抗离群）。kohya scheduled-Huber PR#1228。
+#   sigma        delta = huber_c * t（线性按 sigma 缩放）。
+#
+# ⚠ huber_schedule="snr" + loss_weighting_scheme="detail_inv_t" 叠加风险：
+#   两者都加重低 t/高 SNR 端的影响，小数据集可见"细节过拟合"。择一即可。
+huber_schedule: "constant"
+
+# noise_offset：低频亮度噪声偏移。对"明暗对比训练出来变平"针对性强。
 # 0.03-0.08 常用；>0.15 可能导致偏色/脏。
 noise_offset: 0.0625
 
-# 随机缩放 noise_offset。开启可减少固定偏色，但会给训练增加一点随机性。
+# 随机缩放 noise_offset。开启时实际幅度从 [noise_offset_min, noise_offset] 均匀采样。
 noise_offset_random_strength: false
+
+# noise_offset_random_strength=true 时的随机下限。默认 0 兼容旧行为；
+# 设 0.02-0.03 可避免随机抽到过弱的 offset（信号"偶尔失效"）。
+noise_offset_min: 0.0
 
 # pyramid_noise_iterations：多尺度低频噪声层数。可强化全局光照/构图。
 # 0=关闭；若光照仍平，可试 4-8；太高会让训练目标偏低频。
+# 当前实现使用 bilinear 插值（非 nearest），避免规则结构（扣子/文字/网格）变形。
 pyramid_noise_iterations: 0
 
 # pyramid_noise_discount：每层衰减。0.2-0.4 较稳；越高低频影响越强。
@@ -393,3 +497,38 @@ no_browser: true
 #   --auto-install        自动安装缺失依赖。
 #   --interactive         交互式补齐缺失参数。
 #   --no-t5-token-weights 等价于把 use_t5_token_weights 设为 false。
+
+# ============================================================================
+# 已知交互/坑位汇总（写在最后便于对照）
+# ============================================================================
+# 1. flow_shift（模型/scheduler 端） vs schedule_shift（采样分布端）是两个独立旋钮。
+#    schedule_shift=1.0 时 logit_normal_low 退化为 logit_normal，"_low" 失效。
+#
+# 2. detail_inv_t × huber_schedule="snr" 叠加 → 低 t/高 SNR 端被双重加强；
+#    小数据集（≤60）的"线条锁死、面部/背景崩"很多来自这种叠加。择一使用。
+#
+# 3. ProdigyPlus + Schedule-Free 下：
+#    - learning_rate 必须 1.0
+#    - lr_scheduler 必须 "none"（启用 use_schedulefree 时代码会自动禁用 cosine）
+#    - loraplus_lr_ratio 与 lora_reg_lrs 几乎无效（被 Prodigy d 全局覆盖）
+#    - grad_clip_max_norm 建议 0（外部裁剪会扰乱 d 估计）
+#
+# 4. cache_latents=true + flip_augment=true：翻转只在缓存构建时生效一次，
+#    不是每 epoch 随机翻转；想要随机翻转请关 cache_latents。
+#
+# 5. lora_alpha：LoRA 推荐 = rank；LoKr 因 Kronecker 已放大表达力，
+#    LyCORIS 文档推荐 alpha=1.0。alpha=rank 时小数据集易过强。
+#
+# 6. llm_adapter：默认排除（Anima 作者建议）。要训：
+#    lora_exclude_patterns: []  # 或保留并用 include 覆盖
+#    lora_include_patterns: [".*llm_adapter.*"]
+#    lora_reg_dims: { ".*llm_adapter.*": 8 }   # 软限制容量
+#
+# 7. mixed_uniform_low 在小 batch + 强 detail 权重下波动很大，
+#    若用 batch_size=2，建议 weight_cap_ratio=5-10 或换 batch_size=4。
+#
+# 8. 当前 LoKr 实现是自研（非 LyCORIS 原生）：
+#    - 无 use_tucker / decompose_both / 非方形 (a,b,c,d) 分解
+#    - 自动 _find_factor 降级
+#    - ComfyUI 键名兼容（lokr_w1/w2_a/w2_b）
+#    小数据集若失败模式难解，可考虑后续接入 lycoris-lora 拿 Tucker 收益。

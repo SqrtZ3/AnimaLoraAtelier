@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -38,21 +39,15 @@ if str(script_dir) not in sys.path:
 try:
     from utils.optimizer_utils import create_optimizer, get_optimizer_info
 except ImportError as e:
-    logger.error(f"无法导入高级优化器逻辑: {e}")
-    logger.error(f"当前 Python 路径 (sys.path): {sys.path}")
-    logger.error(f"脚本所在目录 (script_dir): {script_dir}")
+    # NOTE: logger 此时尚未定义，用 print 输出
+    print(f"[FATAL] 无法导入高级优化器逻辑: {e}")
+    print(f"[FATAL] 当前 Python 路径 (sys.path): {sys.path}")
+    print(f"[FATAL] 脚本所在目录 (script_dir): {script_dir}")
     raise ImportError(
         "关键模块 utils.optimizer_utils 加载失败。\n"
         "1. 请确认 AnimaLoraToolkit/utils/optimizer_utils.py 文件存在\n"
         "2. 请确认已安装依赖: pip install prodigy-plus-schedule-free"
     ) from e
-
-# 选择性 / 延迟 OrthoGrad（在 ProdigyPlus 内置版本之外，自己控制何时、对哪些参数应用）
-from utils.orthograd import (
-    apply_partial_orthograd_,
-    assert_no_double_orthograd,
-    build_orthograd_config,
-)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -232,14 +227,17 @@ def apply_yaml_config(args, config):
         "pyramid_noise_discount": "pyramid_noise_discount",
         "caption_dropout_rate": "caption_dropout_rate",
         "grad_norm_log_every": "grad_norm_log_every",
-        # 手动 OrthoGrad（参考 utils/orthograd.py 的注释）
-        "orthograd_mode": "orthograd_mode",
-        "orthograd_enable_after": "orthograd_enable_after",
-        "orthograd_ramp_steps": "orthograd_ramp_steps",
-        "orthograd_strength": "orthograd_strength",
-        "orthograd_rescale": "orthograd_rescale",
-        "orthograd_exclude_param_keywords": "orthograd_exclude_param_keywords",
-        "orthograd_exclude_module_keywords": "orthograd_exclude_module_keywords",
+        # Regex 模块选择（kohya 风格）
+        "lora_exclude_patterns": "lora_exclude_patterns",
+        "lora_include_patterns": "lora_include_patterns",
+        # 模块级 rank/lr 控制（kohya 风格）
+        "lora_reg_dims": "lora_reg_dims",
+        "lora_reg_lrs": "lora_reg_lrs",
+        # 精细正则化
+        "rank_dropout": "rank_dropout",
+        "module_dropout": "module_dropout",
+        # LoRA+ for LoKr
+        "loraplus_lr_ratio": "loraplus_lr_ratio",
     }
 
     # 需要特殊处理的默认值（用于判断命令行是否显式设置）
@@ -331,13 +329,13 @@ def apply_yaml_config(args, config):
         "pyramid_noise_discount": 0.3,
         "caption_dropout_rate": 0.0,
         "grad_norm_log_every": 0,
-        "orthograd_mode": "off",
-        "orthograd_enable_after": 0,
-        "orthograd_ramp_steps": 0,
-        "orthograd_strength": 1.0,
-        "orthograd_rescale": True,
-        "orthograd_exclude_param_keywords": None,
-        "orthograd_exclude_module_keywords": None,
+        "lora_exclude_patterns": None,
+        "lora_include_patterns": None,
+        "lora_reg_dims": None,
+        "lora_reg_lrs": None,
+        "rank_dropout": 0.0,
+        "module_dropout": 0.0,
+        "loraplus_lr_ratio": 1.0,
     }
 
     for yaml_key, arg_attr in mapping.items():
@@ -1149,8 +1147,9 @@ def tokenize_t5_weighted(tokenizer, texts, max_length=512):
 # ============================================================================
 
 class LoRALayer(torch.nn.Module):
-    """标准 LoRA 层"""
-    def __init__(self, in_features, out_features, rank=4, alpha=1.0, dropout=0.0):
+    """标准 LoRA 层（含 rank_dropout / module_dropout）"""
+    def __init__(self, in_features, out_features, rank=4, alpha=1.0, dropout=0.0,
+                 rank_dropout=0.0, module_dropout=0.0):
         super().__init__()
         self.rank = rank
         self.alpha = alpha
@@ -1158,11 +1157,25 @@ class LoRALayer(torch.nn.Module):
         self.lora_down = torch.nn.Linear(in_features, rank, bias=False)
         self.lora_up = torch.nn.Linear(rank, out_features, bias=False)
         self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
+        self.rank_dropout = float(rank_dropout or 0.0)
+        self.module_dropout = float(module_dropout or 0.0)
         torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=5**0.5)
         torch.nn.init.zeros_(self.lora_up.weight)
 
     def forward(self, x):
-        return self.lora_up(self.dropout(self.lora_down(x))) * self.scaling
+        # Module dropout: 整个模块以 p 概率跳过（训练时）
+        if self.training and self.module_dropout > 0:
+            if torch.rand(1).item() < self.module_dropout:
+                return torch.zeros(*x.shape[:-1], self.lora_up.out_features,
+                                   device=x.device, dtype=x.dtype)
+        h = self.lora_down(self.dropout(x))
+        # Rank dropout: 随机置零 rank 中的某些通道（训练时，inverted dropout）
+        if self.training and self.rank_dropout > 0:
+            mask = torch.bernoulli(
+                torch.full((self.rank,), 1.0 - self.rank_dropout, device=h.device)
+            )
+            h = h * mask / (1.0 - self.rank_dropout + 1e-6)
+        return self.lora_up(h) * self.scaling
 
 
 class LoKrLayer(torch.nn.Module):
@@ -1180,7 +1193,8 @@ class LoKrLayer(torch.nn.Module):
     复杂度 O(B*factor*in_dim*rank + B*factor*rank*out_dim + B*factor^2*out_dim)，
     远小于原本的 O(B*factor^2*in_dim*out_dim)，且无需在 bf16 中保存巨型 kron 矩阵。
     """
-    def __init__(self, in_features, out_features, rank=4, alpha=1.0, factor=8, dropout=0.0):
+    def __init__(self, in_features, out_features, rank=4, alpha=1.0, factor=8, dropout=0.0,
+                 rank_dropout=0.0, module_dropout=0.0):
         super().__init__()
         self.alpha = alpha
         self.in_features = in_features
@@ -1202,6 +1216,8 @@ class LoKrLayer(torch.nn.Module):
         self.lokr_w2_a = torch.nn.Parameter(torch.empty(self.out_dim, self.rank))
         self.lokr_w2_b = torch.nn.Parameter(torch.empty(self.rank, self.in_dim))
         self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
+        self.rank_dropout = float(rank_dropout or 0.0)
+        self.module_dropout = float(module_dropout or 0.0)
 
         # ★ w1 用小 std 正态分布，配合 w2_b=0 初始时 ΔW=0；训练后 ΔW 量级由 scaling 控制
         torch.nn.init.normal_(self.lokr_w1, mean=0.0, std=0.1)
@@ -1216,10 +1232,24 @@ class LoKrLayer(torch.nn.Module):
         return 1
 
     def forward(self, x):
+        # Module dropout: 整个模块以 p 概率跳过（训练时）
+        if self.training and self.module_dropout > 0:
+            if torch.rand(1).item() < self.module_dropout:
+                return torch.zeros(*x.shape[:-1], self.out_features,
+                                   device=x.device, dtype=x.dtype)
+
         # bf16 下 kron 容易数值放大，统一转 fp32 中间运算
         w1 = self.lokr_w1.float()
         w2_a = self.lokr_w2_a.float()
         w2_b = self.lokr_w2_b.float()
+
+        # Rank dropout: 随机置零 rank 中的某些通道（训练时，inverted dropout）
+        if self.training and self.rank_dropout > 0:
+            mask = torch.bernoulli(
+                torch.full((self.rank,), 1.0 - self.rank_dropout, device=w2_b.device)
+            )
+            scale = 1.0 / (1.0 - self.rank_dropout + 1e-6)
+            w2_b = w2_b * (mask.unsqueeze(1) * scale)  # (rank, in_dim)
 
         x_drop = self.dropout(x)
         orig_shape = x_drop.shape
@@ -1241,7 +1271,8 @@ class LoKrLayer(torch.nn.Module):
 
 class LoRALinear(torch.nn.Module):
     """LoRA 包装的 Linear 层"""
-    def __init__(self, original, rank=4, alpha=1.0, dropout=0.0, use_lokr=False, factor=8):
+    def __init__(self, original, rank=4, alpha=1.0, dropout=0.0, use_lokr=False, factor=8,
+                 rank_dropout=0.0, module_dropout=0.0):
         super().__init__()
         self.original = original
         self.use_lokr = use_lokr
@@ -1249,12 +1280,14 @@ class LoRALinear(torch.nn.Module):
         if use_lokr:
             self.adapter = LoKrLayer(
                 original.in_features, original.out_features,
-                rank=rank, alpha=alpha, factor=factor, dropout=dropout
+                rank=rank, alpha=alpha, factor=factor, dropout=dropout,
+                rank_dropout=rank_dropout, module_dropout=module_dropout,
             )
         else:
             self.adapter = LoRALayer(
                 original.in_features, original.out_features,
-                rank=rank, alpha=alpha, dropout=dropout
+                rank=rank, alpha=alpha, dropout=dropout,
+                rank_dropout=rank_dropout, module_dropout=module_dropout,
             )
 
         self.adapter.to(device=original.weight.device, dtype=original.weight.dtype)
@@ -1274,55 +1307,123 @@ class LoRALinear(torch.nn.Module):
 
 
 class LoRAInjector:
-    """LoRA 注入器"""
-    DEFAULT_TARGETS = ["q_proj", "k_proj", "v_proj", "output_proj", "mlp.layer1", "mlp.layer2"]
-    # Anima 官方模型卡明确建议："Don't train the LLM adapter ... it is easy to degrade
-    # by training it." 该层处理文本 embedding 进入扩散模型前的桥接，影响过大且本身已含
-    # 大量知识。所以 codex-merge 默认就把 llm_adapter.* 排除掉 —— 这是与 base 主要区别。
-    # 想强制把它也训进去（一般不建议），yaml 里写：lora_exclude_prefixes: []
-    DEFAULT_EXCLUDE_PREFIXES = ("llm_adapter.",)
+    """LoRA 注入器（支持 regex 模块选择、模块级 rank/lr、LoRA+）
 
-    def __init__(self, rank=32, alpha=16.0, dropout=0.0, use_lokr=False, factor=8, targets=None, exclude_prefixes=None):
+    核心增强（从 kohya sd-scripts 借鉴）：
+    - exclude_patterns / include_patterns: 用 re.fullmatch 替代前缀匹配
+    - reg_dims: dict{regex: rank} 模块级 rank 控制
+    - reg_lrs:  dict{regex: lr}   模块级学习率控制
+    - loraplus_lr_ratio: LoRA+ w2_b/lora_up 用更高 lr
+    """
+    DEFAULT_TARGETS = ["q_proj", "k_proj", "v_proj", "output_proj", "mlp.layer1", "mlp.layer2"]
+    DEFAULT_EXCLUDE_PATTERNS = [r".*llm_adapter.*"]
+
+    def __init__(self, rank=32, alpha=16.0, dropout=0.0, use_lokr=False, factor=8,
+                 targets=None, exclude_prefixes=None,
+                 exclude_patterns=None, include_patterns=None,
+                 reg_dims=None, reg_lrs=None,
+                 rank_dropout=0.0, module_dropout=0.0,
+                 loraplus_lr_ratio=1.0):
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
         self.use_lokr = use_lokr
         self.factor = factor
         self.targets = targets or self.DEFAULT_TARGETS
-        # 区分"未指定"和"显式空列表"：未指定 → 用默认；显式 [] → 一个都不排除
-        if exclude_prefixes is None:
-            self.exclude_prefixes = tuple(self.DEFAULT_EXCLUDE_PREFIXES)
+        self.rank_dropout = float(rank_dropout or 0.0)
+        self.module_dropout = float(module_dropout or 0.0)
+        self.loraplus_lr_ratio = max(float(loraplus_lr_ratio or 1.0), 1.0)
+
+        # ── Regex 模块选择 ──────────────────────────────────────────────
+        if exclude_patterns is not None:
+            self.exclude_patterns = list(exclude_patterns)
+        elif exclude_prefixes is not None:
+            self.exclude_patterns = [re.escape(p) + r".*" for p in exclude_prefixes] if exclude_prefixes else []
         else:
-            self.exclude_prefixes = tuple(exclude_prefixes)
+            self.exclude_patterns = list(self.DEFAULT_EXCLUDE_PATTERNS)
+        self.include_patterns = list(include_patterns or [])
+
+        # ── 模块级 rank/lr 控制 ────────────────────────────────────────
+        self.reg_dims = dict(reg_dims) if reg_dims else {}
+        self.reg_lrs = dict(reg_lrs) if reg_lrs else {}
+
         self.injected = {}
+        self._module_ranks = {}
+        self._module_lrs = {}
+
+    def _should_inject(self, name):
+        """判断模块是否应该被注入 LoRA（regex 匹配）"""
+        if not any(t in name for t in self.targets):
+            return False
+        excluded = False
+        for pat in self.exclude_patterns:
+            if re.fullmatch(pat, name):
+                excluded = True
+                break
+        if excluded:
+            for pat in self.include_patterns:
+                if re.fullmatch(pat, name):
+                    return True
+            return False
+        return True
+
+    def _get_reg_dim(self, name):
+        """获取模块的 rank（优先 reg_dims 匹配，否则用全局 rank）"""
+        for pat, dim in self.reg_dims.items():
+            if re.fullmatch(pat, name):
+                return int(dim)
+        return self.rank
+
+    def _get_reg_lr(self, name):
+        """获取模块的自定义 lr（None 表示用全局）"""
+        for pat, lr in self.reg_lrs.items():
+            if re.fullmatch(pat, name):
+                return float(lr)
+        return None
 
     def inject(self, model):
         """注入 LoRA 到模型"""
+        rank_summary = {}
         for name, module in list(model.named_modules()):
             if not isinstance(module, torch.nn.Linear):
                 continue
-            if any(name.startswith(prefix) for prefix in self.exclude_prefixes):
+            if not self._should_inject(name):
                 continue
-            if not any(t in name for t in self.targets):
-                continue
+
+            mod_rank = self._get_reg_dim(name)
+            mod_lr = self._get_reg_lr(name)
 
             lora_linear = LoRALinear(
-                module, rank=self.rank, alpha=self.alpha,
-                dropout=self.dropout, use_lokr=self.use_lokr, factor=self.factor
+                module, rank=mod_rank, alpha=float(mod_rank),
+                dropout=self.dropout, use_lokr=self.use_lokr, factor=self.factor,
+                rank_dropout=self.rank_dropout, module_dropout=self.module_dropout,
             )
 
-            # 替换模块
             parts = name.split(".")
             parent = model
             for p in parts[:-1]:
                 parent = getattr(parent, p)
             setattr(parent, parts[-1], lora_linear)
             self.injected[name] = lora_linear
+            self._module_ranks[name] = mod_rank
+            self._module_lrs[name] = mod_lr
+            rank_summary[mod_rank] = rank_summary.get(mod_rank, 0) + 1
 
+        exc_str = ", ".join(self.exclude_patterns) or "无"
+        inc_str = ", ".join(self.include_patterns) or "无"
+        rank_dist = ", ".join(f"r{r}×{c}" for r, c in sorted(rank_summary.items()))
         logger.info(
-            f"注入 {'LoKr' if self.use_lokr else 'LoRA'} 到 {len(self.injected)} 层"
-            f"（排除前缀: {', '.join(self.exclude_prefixes) or '无'}）"
+            f"注入 {'LoKr' if self.use_lokr else 'LoRA'} 到 {len(self.injected)} 层 "
+            f"（排除: [{exc_str}], 包含: [{inc_str}], rank 分布: {rank_dist}）"
         )
+        if self.rank_dropout > 0 or self.module_dropout > 0:
+            logger.info(f"  rank_dropout={self.rank_dropout}, module_dropout={self.module_dropout}")
+        custom_lr_modules = {n: lr for n, lr in self._module_lrs.items() if lr is not None}
+        if custom_lr_modules:
+            for n, lr in list(custom_lr_modules.items())[:5]:
+                logger.info(f"  模块级 lr: {n} → {lr:.2e}")
+            if len(custom_lr_modules) > 5:
+                logger.info(f"  ... 共 {len(custom_lr_modules)} 个模块有自定义 lr")
         return self.injected
 
     def get_params(self):
@@ -1332,31 +1433,49 @@ class LoRAInjector:
             params.extend(lora.adapter.parameters())
         return params
 
-    def get_param_groups(self, weight_decay):
-        """获取参数组，LoKr 模式下 w1 排除 weight_decay"""
-        if not self.use_lokr or weight_decay == 0:
-            return [{"params": self.get_params(), "weight_decay": weight_decay}]
+    def get_param_groups(self, weight_decay, loraplus_lr_ratio=None):
+        """获取参数组（支持 LoRA+、模块级 lr、LoKr w1 排除 weight_decay）"""
+        ratio = max(float(loraplus_lr_ratio or self.loraplus_lr_ratio), 1.0)
+        groups_dict = {}  # (wd, lr_mult, custom_lr) -> [params]
 
-        no_decay_params = []  # w1
-        decay_params = []     # w2_a, w2_b
-        for lora in self.injected.values():
-            no_decay_params.append(lora.adapter.lokr_w1)
-            decay_params.append(lora.adapter.lokr_w2_a)
-            decay_params.append(lora.adapter.lokr_w2_b)
+        for name, lora in self.injected.items():
+            custom_lr = self._module_lrs.get(name)
+            if self.use_lokr:
+                key_w1 = (0.0, 1.0, custom_lr)
+                key_w2a = (weight_decay, 1.0, custom_lr)
+                key_w2b = (weight_decay, ratio, custom_lr)
+                groups_dict.setdefault(key_w1, []).append(lora.adapter.lokr_w1)
+                groups_dict.setdefault(key_w2a, []).append(lora.adapter.lokr_w2_a)
+                groups_dict.setdefault(key_w2b, []).append(lora.adapter.lokr_w2_b)
+            else:
+                key_down = (weight_decay, 1.0, custom_lr)
+                key_up = (weight_decay, ratio, custom_lr)
+                groups_dict.setdefault(key_down, []).append(lora.adapter.lora_down.weight)
+                groups_dict.setdefault(key_up, []).append(lora.adapter.lora_up.weight)
 
-        return [
-            {"params": decay_params, "weight_decay": weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ]
+        param_groups = []
+        for (wd, lr_mult, custom_lr), params in groups_dict.items():
+            if not params:
+                continue
+            group = {"params": params, "weight_decay": wd}
+            if custom_lr is not None:
+                group["lr"] = custom_lr * lr_mult
+            elif lr_mult != 1.0:
+                group["lr"] = lr_mult
+            param_groups.append(group)
+
+        if ratio > 1.0:
+            lr_target = "LoKr w2_b" if self.use_lokr else "lora_up"
+            logger.info(f"[LoRA+] {lr_target} lr ×{ratio:.1f}")
+        return param_groups
 
     def state_dict(self):
         """导出 LoRA 权重 (ComfyUI 兼容格式)"""
         sd = {}
         for name, lora in self.injected.items():
-            # ComfyUI 格式: lora_unet_{key} 其中 key 是模型路径的 . 替换成 _
             base = "lora_unet_" + name.replace(".", "_")
-            sd[f"{base}.alpha"] = torch.tensor(self.alpha)
-
+            mod_rank = self._module_ranks.get(name, self.rank)
+            sd[f"{base}.alpha"] = torch.tensor(float(mod_rank))
             if self.use_lokr:
                 sd[f"{base}.lokr_w1"] = lora.adapter.lokr_w1.data.clone()
                 sd[f"{base}.lokr_w2_a"] = lora.adapter.lokr_w2_a.data.clone()
@@ -2754,18 +2873,37 @@ def main():
     #   - None / 未设置  → 用 DEFAULT_EXCLUDE_PREFIXES（默认排除 llm_adapter.*，与 Anima 官方建议一致）
     #   - 字符串/列表    → 完全替换默认值（例如 [] 表示一个不排除）
     raw_exclude = getattr(args, "lora_exclude_prefixes", None)
-    if raw_exclude is None:
-        injector_kwargs = {}
-    else:
+    raw_exclude_patterns = getattr(args, "lora_exclude_patterns", None)
+    raw_include_patterns = getattr(args, "lora_include_patterns", None)
+
+    # 兼容旧参数：exclude_prefixes → regex 转换在 LoRAInjector.__init__ 内处理
+    injector_kwargs = {}
+    if raw_exclude_patterns is not None:
+        injector_kwargs["exclude_patterns"] = list(raw_exclude_patterns)
+    elif raw_exclude is not None:
         if isinstance(raw_exclude, str):
             raw_exclude = [s.strip() for s in raw_exclude.split(",") if s.strip()]
-        injector_kwargs = {"exclude_prefixes": tuple(raw_exclude)}
+        injector_kwargs["exclude_prefixes"] = tuple(raw_exclude)
+    if raw_include_patterns is not None:
+        injector_kwargs["include_patterns"] = list(raw_include_patterns)
+
+    # 模块级 rank/lr 控制
+    reg_dims = getattr(args, "lora_reg_dims", None)
+    reg_lrs = getattr(args, "lora_reg_lrs", None)
+    if reg_dims:
+        injector_kwargs["reg_dims"] = dict(reg_dims)
+    if reg_lrs:
+        injector_kwargs["reg_lrs"] = dict(reg_lrs)
+
     injector = LoRAInjector(
         rank=args.lora_rank,
         alpha=args.lora_alpha,
         dropout=float(getattr(args, "lora_dropout", 0.0) or 0.0),
         use_lokr=(args.lora_type == "lokr"),
         factor=args.lokr_factor,
+        rank_dropout=float(getattr(args, "rank_dropout", 0.0) or 0.0),
+        module_dropout=float(getattr(args, "module_dropout", 0.0) or 0.0),
+        loraplus_lr_ratio=float(getattr(args, "loraplus_lr_ratio", 1.0) or 1.0),
         **injector_kwargs,
     )
     injector.inject(model)
@@ -2884,8 +3022,11 @@ def main():
     if opt_type == "prodigyplus" and args.lr != 1.0:
         logger.warning(f"检测到正在使用 ProdigyPlus 优化器，但学习率为 {args.lr}。建议将学习率设为 1.0 以获得最佳自适应效果。")
 
-    # 获取参数组
-    param_groups = injector.get_param_groups(weight_decay)
+    # 获取参数组（支持 LoRA+、模块级 lr）
+    param_groups = injector.get_param_groups(
+        weight_decay,
+        loraplus_lr_ratio=float(getattr(args, "loraplus_lr_ratio", 1.0) or 1.0),
+    )
 
     # ── 透明路由 ──────────────────────────────────────────────────────────
     # YAML 中 `optimizer_args:` 下的所有 key 直接以 **kwargs 注入优化器。
@@ -2942,21 +3083,7 @@ def main():
     for group in optimizer.param_groups:
         trainable_params.extend(group["params"])
 
-    # ── 手动 OrthoGrad：建立 (full_name, param) 列表 ──────────────────────────
-    # 通过 id(p) 反向查名字，避免与 model.named_parameters 的迭代顺序耦合。
-    # 排除规则按完整路径名（含 transformer.blocks.X.cross_attn.q_proj.adapter.lokr_w2_b 这类）匹配。
-    _trainable_id_set = {id(p) for p in trainable_params}
-    orthograd_named_params = [
-        (n, p) for n, p in model.named_parameters() if id(p) in _trainable_id_set and p.requires_grad
-    ]
-    orthograd_cfg = build_orthograd_config(args)
-    assert_no_double_orthograd(args)
-    if orthograd_cfg.enable:
-        logger.info(
-            "[orthograd] 共捕获 %d 个可训练参数用于按名匹配；"
-            "默认排除关键字（含 lokr_w2_b/lokr_w1/lora_B 等磁场承载参数）将不被投影。",
-            len(orthograd_named_params),
-        )
+
 
     # 计算总步数
     try:
@@ -2998,7 +3125,7 @@ def main():
             logger.info(f"学习率调度: cosine (T_max={total_steps}, eta_min={eta_min})")
     elif lr_sched == "cosine_with_restart":
         t0 = int(getattr(args, "lr_scheduler_t0", 500) or 500)
-        t_mult = int(getattr(args, "lr_scheduler_t_mult", 2) or 2)
+        t_mult = float(getattr(args, "lr_scheduler_t_mult", 2) or 2)
         eta_min = float(getattr(args, "lr_scheduler_eta_min", 0.0) or 0.0)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=t0, T_mult=t_mult, eta_min=eta_min
@@ -3367,12 +3494,7 @@ def main():
                         float(grad_norm_before),
                     )
 
-                # 手动 OrthoGrad：在 optimizer.step 前对未排除的参数把梯度投影到
-                # 当前权重的正交子空间（与 ProdigyPlus 内置一致：whole-tensor flat
-                # view，rescale 回原 ||g||）。enable_after_step / ramp_steps / strength
-                # 控制何时启用与启用强度。详见 utils/orthograd.py。
-                if orthograd_cfg.enable:
-                    apply_partial_orthograd_(orthograd_named_params, global_step, orthograd_cfg)
+
 
                 optimizer.step()
                 if scheduler is not None:

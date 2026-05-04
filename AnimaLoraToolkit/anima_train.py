@@ -1477,9 +1477,11 @@ class LoRAInjector:
             mod_rank = self._module_ranks.get(name, self.rank)
             sd[f"{base}.alpha"] = torch.tensor(float(mod_rank))
             if self.use_lokr:
-                sd[f"{base}.lokr_w1"] = lora.adapter.lokr_w1.data.clone()
-                sd[f"{base}.lokr_w2_a"] = lora.adapter.lokr_w2_a.data.clone()
-                sd[f"{base}.lokr_w2_b"] = lora.adapter.lokr_w2_b.data.clone()
+                # fp32 存储：训练时 Kronecker 积在 fp32 下计算，ComfyUI 加载后
+                # 若张量是 fp32，合并时精度更接近训练行为（bf16 合并会损失小幅度 delta 的低位）
+                sd[f"{base}.lokr_w1"] = lora.adapter.lokr_w1.data.clone().float()
+                sd[f"{base}.lokr_w2_a"] = lora.adapter.lokr_w2_a.data.clone().float()
+                sd[f"{base}.lokr_w2_b"] = lora.adapter.lokr_w2_b.data.clone().float()
             else:
                 sd[f"{base}.lora_down.weight"] = lora.adapter.lora_down.weight.data.clone()
                 sd[f"{base}.lora_up.weight"] = lora.adapter.lora_up.weight.data.clone()

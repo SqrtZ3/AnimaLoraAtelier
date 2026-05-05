@@ -357,13 +357,6 @@ def apply_yaml_config(args, config):
     return args
 
 
-# Lazy imports after dependency check
-def _lazy_imports():
-    global np, Image
-    import numpy as np
-    from PIL import Image
-
-
 # ============================================================================
 # 进度和 Loss 曲线可视化
 # ============================================================================
@@ -1709,6 +1702,42 @@ class ImageDataset(Dataset):
         txt_count = len(self.samples) - json_count
         logger.info(f"数据集: {len(self.samples)} 样本 (JSON: {json_count}, TXT: {txt_count})")
 
+        # 用与 __getitem__ 完全一致的 PIL 路径填充 bucket_key
+        self._finalize_bucket_keys()
+        self.bucket_for_index = [s["bucket_key"] for s in self.samples]
+        # 诊断：统计 bucket 分布
+        from collections import Counter
+        dist = Counter(self.bucket_for_index)
+        logger.info(f"  bucket 分布: {len(dist)} 种, 例: {list(dist.most_common(5))}")
+
+    def _finalize_bucket_keys(self):
+        """For each sample, compute bucket_key via the same code path that __getitem__ uses,
+        so BucketBatchSampler can reliably group same-shape tensors. Caches per unique img path."""
+        from PIL import Image as _PILImage
+        cache = {}
+        for sample in self.samples:
+            img_path = sample["image"]
+            key = cache.get(img_path)
+            if key is None:
+                if self.bucket_mgr is None:
+                    key = (self.resolution, self.resolution)
+                else:
+                    try:
+                        img = _PILImage.open(img_path)
+                        # 与 __getitem__ 一致：读 width/height。.convert 不改变尺寸，可省。
+                        w, h = img.width, img.height
+                        try:
+                            img.close()
+                        except Exception:
+                            pass
+                        bw, bh = self.bucket_mgr.get_bucket(w, h)
+                        key = (bh, bw)  # (h, w)
+                    except Exception as e:
+                        logger.warning(f"[bucket_key] 无法读取 {img_path}: {e}，回退到 ({self.resolution},{self.resolution})")
+                        key = (self.resolution, self.resolution)
+                cache[img_path] = key
+            sample["bucket_key"] = key
+
     def _scan(self):
         samples = []
         # 扫描所有子目录，寻找图像及其对应的标签文件
@@ -1740,7 +1769,12 @@ class ImageDataset(Dataset):
                     continue
                 sample["json_path"] = None
                 sample["txt_path"] = txt_path
-            
+
+            # bucket_key 留空，等会在 _finalize_bucket_keys 里用与 __getitem__ 一致
+            # 的路径（Image.open + convert("RGB")）批量计算，避免 _scan 与运行时
+            # PIL 行为差异导致 sampler 分桶失效。
+            sample["bucket_key"] = None
+
             # 按重复次数添加样本
             for _ in range(repeats):
                 samples.append(sample.copy())
@@ -1881,7 +1915,8 @@ class MergedDataset(Dataset):
         self.bucket_for_index = self._build_bucket_for_index()
 
     def _get_cached_dataset(self, d):
-        if hasattr(d, "bucket_for_index"):
+        bfi = getattr(d, "bucket_for_index", None)
+        if bfi is not None and len(bfi) > 0:
             return d
         if hasattr(d, "dataset"):
             return self._get_cached_dataset(d.dataset)
@@ -1917,7 +1952,12 @@ class MergedDataset(Dataset):
 
 
 class BucketBatchSampler:
-    """Batch sampler that groups samples by bucket so latents in each batch have the same size."""
+    """Batch sampler that groups samples by bucket so tensors in each batch have the same size.
+
+    Per-index resolution: walks the dataset wrapping chain (RepeatDataset / MergedDataset)
+    for every outer index to look up the underlying ImageDataset / CachedLatentDataset's
+    bucket_for_index. This avoids any indirection bugs in pre-built bucket_for_index lists.
+    """
     def __init__(self, dataset, batch_size, drop_last=True, shuffle=True, seed=42):
         self.dataset = dataset
         self.batch_size = int(batch_size)
@@ -1925,14 +1965,59 @@ class BucketBatchSampler:
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.epoch = 0
-        self._cached_dataset = self._get_cached_dataset(dataset)
-        self._base_len = len(self._cached_dataset) if self._cached_dataset else 0
+        # Pre-compute per-index bucket keys via direct walk
+        self._bucket_keys = self._build_keys(dataset)
+        # Diagnostics
+        unique = set(self._bucket_keys)
+        none_count = sum(1 for k in self._bucket_keys if k is None)
+        logger.info(
+            "[BucketBatchSampler] dataset_len=%d unique_buckets=%d none=%d (e.g. %s)",
+            len(self._bucket_keys), len(unique), none_count,
+            list(unique)[:5],
+        )
+        if none_count == len(self._bucket_keys):
+            logger.warning(
+                "[BucketBatchSampler] 没有任何样本能解析到 bucket_key，"
+                "将退化为顺序分批（可能在 ARB 模式下因尺寸不一致而崩溃）。"
+                "请检查 ImageDataset/CachedLatentDataset 是否正确填充了 bucket_for_index。"
+            )
 
-    def _get_cached_dataset(self, d):
-        if hasattr(d, "bucket_for_index"):
-            return d
-        if hasattr(d, "dataset"):
-            return self._get_cached_dataset(d.dataset)
+    def _build_keys(self, dataset):
+        n = len(dataset)
+        keys = [None] * n
+        for i in range(n):
+            keys[i] = self._lookup(dataset, i)
+        return keys
+
+    def _lookup(self, d, idx):
+        """Resolve the bucket key for a given outer index by walking dataset wrappers.
+
+        Priority: MergedDataset routing → RepeatDataset (.dataset) → leaf bucket_for_index
+        → CachedLatentDataset (.base_dataset). Leaf is preferred over base_dataset because
+        CachedLatentDataset has its own complete bucket_for_index aligned with cached samples.
+        """
+        main = getattr(d, "main_dataset", None)
+        reg = getattr(d, "reg_dataset", None)
+        if main is not None and reg is not None:
+            ml = getattr(d, "_main_len", len(main))
+            if idx < ml:
+                return self._lookup(main, idx)
+            return self._lookup(reg, idx - ml)
+        # RepeatDataset wraps another dataset via .dataset
+        inner = getattr(d, "dataset", None)
+        if inner is not None and inner is not d and not isinstance(inner, list):
+            try:
+                return self._lookup(inner, idx % len(inner))
+            except TypeError:
+                pass
+        # Leaf: ImageDataset (.bucket_for_index present and indexed directly)
+        bfi = getattr(d, "bucket_for_index", None)
+        if bfi is not None and len(bfi) > 0:
+            return bfi[idx % len(bfi)]
+        # CachedLatentDataset fallback (rare: no bucket_for_index yet)
+        inner = getattr(d, "base_dataset", None)
+        if inner is not None and inner is not d:
+            return self._lookup(inner, idx % len(inner))
         return None
 
     def set_epoch(self, epoch):
@@ -1946,24 +2031,11 @@ class BucketBatchSampler:
 
     def __iter__(self):
         rng = random.Random(self.seed + self.epoch)
-        if self._cached_dataset is None:
-            indices = list(range(len(self.dataset)))
-            if self.shuffle:
-                rng.shuffle(indices)
-            for i in range(0, len(indices), self.batch_size):
-                batch = indices[i:i + self.batch_size]
-                if len(batch) < self.batch_size and self.drop_last:
-                    continue
-                yield batch
-            return
-
         bucket_to_indices = {}
-        for idx in range(len(self.dataset)):
-            base_idx = idx % self._base_len
-            bucket = self._cached_dataset.bucket_for_index[base_idx]
-            if bucket is None:
-                bucket = (0, 0)
-            bucket_to_indices.setdefault(bucket, []).append(idx)
+        for idx, key in enumerate(self._bucket_keys):
+            if key is None:
+                key = (0, 0)
+            bucket_to_indices.setdefault(tuple(key), []).append(idx)
 
         buckets = list(bucket_to_indices.keys())
         if self.shuffle:
@@ -2539,6 +2611,17 @@ def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: fl
 
 def collate_fn(batch):
     """DataLoader collate"""
+    shapes = [tuple(b["pixel_values"].shape) for b in batch]
+    if len(set(shapes)) > 1:
+        # 诊断信息：BucketBatchSampler 应该已按 bucket 分组，出现混合尺寸说明分桶失效
+        details = [
+            f"  - {b.get('image', '?')}: shape={tuple(b['pixel_values'].shape)}"
+            for b in batch
+        ]
+        raise RuntimeError(
+            "[collate_fn] 同一 batch 出现不同尺寸张量，BucketBatchSampler 分桶失效。\n"
+            "Batch 内容:\n" + "\n".join(details)
+        )
     pixels = torch.stack([b["pixel_values"] for b in batch])
     captions = [b["caption"] for b in batch]
     images = [b.get("image", "") for b in batch]
@@ -2547,6 +2630,16 @@ def collate_fn(batch):
 
 def collate_fn_cached(batch):
     """DataLoader collate for cached latents"""
+    shapes = [tuple(b["latent"].shape) for b in batch]
+    if len(set(shapes)) > 1:
+        details = [
+            f"  - {b.get('image', '?')}: latent_shape={tuple(b['latent'].shape)}"
+            for b in batch
+        ]
+        raise RuntimeError(
+            "[collate_fn_cached] 同一 batch 出现不同 latent 尺寸，BucketBatchSampler 分桶失效。\n"
+            "Batch 内容:\n" + "\n".join(details)
+        )
     latents = torch.stack([b["latent"] for b in batch])
     captions = [b["caption"] for b in batch]
     images = [b.get("image", "") for b in batch]
@@ -2994,9 +3087,15 @@ def main():
             num_workers=args.num_workers,
         )
     else:
-        dataloader = DataLoader(
+        # Use BucketBatchSampler so same-resolution images are always batched together.
+        # Without this, torch.stack fails when ARB produces tensors of different shapes.
+        batch_sampler = BucketBatchSampler(
             dataset, batch_size=args.batch_size,
-            shuffle=True,
+            drop_last=True, shuffle=True,
+            seed=getattr(args, "seed", 42),
+        )
+        dataloader = DataLoader(
+            dataset, batch_sampler=batch_sampler,
             collate_fn=collate_fn,
             num_workers=args.num_workers,
         )
@@ -3127,7 +3226,7 @@ def main():
             logger.info(f"学习率调度: cosine (T_max={total_steps}, eta_min={eta_min})")
     elif lr_sched == "cosine_with_restart":
         t0 = int(getattr(args, "lr_scheduler_t0", 500) or 500)
-        t_mult = float(getattr(args, "lr_scheduler_t_mult", 2) or 2)
+        t_mult = int(getattr(args, "lr_scheduler_t_mult", 2) or 2)
         eta_min = float(getattr(args, "lr_scheduler_eta_min", 0.0) or 0.0)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=t0, T_mult=t_mult, eta_min=eta_min
@@ -3292,7 +3391,7 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         current_epoch = epoch
-        if use_cached and hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_epoch"):
+        if hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_epoch"):
             dataloader.batch_sampler.set_epoch(epoch)
         for batch_idx, batch in enumerate(dataloader):
             # 在累积周期开始时记录时间
@@ -3313,9 +3412,9 @@ def main():
                 pixels = batch["pixel_values"].to(device, dtype=dtype)
                 with torch.no_grad():
                     pixels_5d = pixels.unsqueeze(2)
-                    # ★ VAE encode 在 fp32 下数值更稳定，随后再转回 bf16
-                    with torch.autocast("cuda", enabled=False):
-                        latents = vae.model.encode(pixels_5d.float(), vae.scale).to(dtype)
+                    # VAE 权重已是 bf16；与 _build_cache / roundtrip 自检保持一致，
+                    # 不再强转 fp32（否则 conv3d 会因 input/bias dtype 不匹配而崩）。
+                    latents = vae.model.encode(pixels_5d, vae.scale).to(dtype)
             bs = latents.shape[0]
 
             # 文本编码

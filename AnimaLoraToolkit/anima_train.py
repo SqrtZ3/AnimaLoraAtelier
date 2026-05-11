@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import types
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import torch
@@ -238,6 +239,21 @@ def apply_yaml_config(args, config):
         "module_dropout": "module_dropout",
         # LoRA+ for LoKr
         "loraplus_lr_ratio": "loraplus_lr_ratio",
+        # ─── 实验性参数（v5 引入）──────────────────────────
+        # ② frequency-balanced tag dropout：根据 tag 在数据集中的出现频率自适应地增加 dropout
+        "freq_balanced_dropout_strength": "freq_balanced_dropout_strength",
+        # ③ input perturbation noise：在 FM 噪声混合前给 latents 加一个小高斯扰动
+        "ip_noise_gamma": "ip_noise_gamma",
+        # ④ immiscible noise pairing：batch/pool 内做 (latent, noise) 的 Hungarian 配对
+        "immiscible_pool_size": "immiscible_pool_size",
+        # ⑤ LoRA EMA：训练过程维护 LoRA 参数的指数滑动平均
+        "lora_ema_decay": "lora_ema_decay",
+        # ⑥ high-frequency loss：主 loss 之外加一项 high-pass 残差 loss
+        "highfreq_loss_weight": "highfreq_loss_weight",
+        # ⑦ t-binned LR group：按 t 区间冻结/解冻不同模块（替代 detail_inv_t 的根本设计）
+        "t_binned_module_groups": "t_binned_module_groups",
+        # 番外 extreme-low t sampling
+        "timestep_mix_extreme_prob": "timestep_mix_extreme_prob",
     }
 
     # 需要特殊处理的默认值（用于判断命令行是否显式设置）
@@ -336,6 +352,14 @@ def apply_yaml_config(args, config):
         "rank_dropout": 0.0,
         "module_dropout": 0.0,
         "loraplus_lr_ratio": 1.0,
+        # ─── 实验性参数（v5 引入，默认全部关闭以保持向后兼容）──────────────────────────
+        "freq_balanced_dropout_strength": 0.0,   # >0 启用；推荐 0.2-0.3
+        "ip_noise_gamma": 0.0,                    # >0 启用；推荐 0.03-0.10
+        "immiscible_pool_size": 0,                # 0 或 1 = 关闭；>1 = pool/batch 内配对
+        "lora_ema_decay": 0.0,                    # 0 = 关闭；推荐 0.999-0.9999
+        "highfreq_loss_weight": 0.0,              # 0 = 关闭；推荐 0.1-0.3
+        "t_binned_module_groups": False,          # 替代 detail_inv_t 的更根本设计
+        "timestep_mix_extreme_prob": 0.0,         # mixed_uniform_low 中 extreme-low t 的比例
     }
 
     for yaml_key, arg_attr in mapping.items():
@@ -1533,6 +1557,78 @@ class LoRAInjector:
 
 
 # ============================================================================
+# ★ v5 ⑤ LoRA EMA：训练过程维护 LoRA 参数的指数滑动平均
+# ============================================================================
+
+class LoRAEmaShadow:
+    """LoRA 参数的指数滑动平均副本（Polyak averaging 的隐式正则）。
+
+    用法：
+      ema = LoRAEmaShadow(named_trainable_params, decay=0.9995)
+      # 每次 optimizer.step() 之后：
+      ema.update(named_trainable_params)
+      # 采样/保存时临时切换到 EMA 副本：
+      with ema.applied(named_trainable_params):
+          injector.save(path)
+          sample_image(...)
+
+    与 Schedule-Free 的区别：
+      - Schedule-Free 是优化器层 averaging，目标是收敛速度。
+      - LoRA EMA 是参数层 averaging，目标是泛化稳定性。
+      两者可并存无冲突。
+    """
+
+    def __init__(self, named_trainable_params, decay=0.9995):
+        self.decay = float(decay)
+        # named_trainable_params: list of (name, param) 元组
+        # 用 id(param) 作 key 而不是 name，避免 LoRAInjector 后某些 name 重复或动态变化。
+        # ★ 强制 shadow 用 fp32 存储：bf16 (7-bit mantissa) 下 decay=0.9995 的每次
+        # 更新增量 ≈ 0.0005×p 经常低于 bf16 可表示精度 → silently dropped → EMA 实际
+        # 等于"等同 p"，正则失效。fp32 shadow 占的显存极少（LoRA 参数总量很小）。
+        self.shadow = {}
+        for _, p in named_trainable_params:
+            if p.requires_grad:
+                self.shadow[id(p)] = p.detach().to(torch.float32).clone()
+
+    @torch.no_grad()
+    def update(self, named_trainable_params):
+        """每个 optimizer.step() 之后调用"""
+        for _, p in named_trainable_params:
+            if not p.requires_grad:
+                continue
+            key = id(p)
+            if key not in self.shadow:
+                # 新加入的参数（罕见，但稳健起见）
+                self.shadow[key] = p.detach().to(torch.float32).clone()
+                continue
+            s = self.shadow[key]
+            # shadow 始终在 fp32；p 可能在 bf16/fp16。device 万一漂移也要 follow。
+            if s.device != p.device:
+                s = s.to(device=p.device)
+                self.shadow[key] = s
+            # 在 fp32 域做 EMA 累积；p 升到 fp32 再加
+            s.mul_(self.decay).add_(p.detach().to(torch.float32), alpha=1.0 - self.decay)
+
+    @contextmanager
+    def applied(self, named_trainable_params):
+        """临时把 trainable_params 替换为 EMA 副本；退出时还原。"""
+        backup = {}
+        try:
+            for _, p in named_trainable_params:
+                key = id(p)
+                if key in self.shadow:
+                    backup[key] = p.data.detach().clone()
+                    # 把 fp32 shadow 转到 p 的 dtype/device
+                    p.data.copy_(self.shadow[key].to(dtype=p.dtype, device=p.device))
+            yield
+        finally:
+            for _, p in named_trainable_params:
+                key = id(p)
+                if key in backup:
+                    p.data.copy_(backup[key])
+
+
+# ============================================================================
 # 训练状态保存/恢复（断点续训）
 # ============================================================================
 
@@ -1659,7 +1755,8 @@ class ImageDataset(Dataset):
 
     def __init__(self, data_dir, resolution=1024, bucket_mgr=None,
                  shuffle_caption=False, keep_tokens=0, flip_augment=False,
-                 tag_dropout=0.0, prefer_json=True, caption_override=None):
+                 tag_dropout=0.0, prefer_json=True, caption_override=None,
+                 freq_balanced_dropout_strength=0.0):
         self.data_dir = Path(data_dir)
         self.resolution = resolution
         self.bucket_mgr = bucket_mgr
@@ -1669,6 +1766,11 @@ class ImageDataset(Dataset):
         self.tag_dropout = tag_dropout
         self.prefer_json = prefer_json
         self.caption_override = caption_override  # 正则集：统一 caption，如 "1girl, solo"
+        # ★ v5 ② frequency-balanced tag dropout
+        # 0 = 关闭；>0 启用。在数据集 init 时统计 tag 频率，对在数据集中过度共现的 tag 额外提高 dropout
+        # 概率，强迫模型把"风格"与"高频共现 tag"解耦。完全数据驱动，自动适配任何画师。
+        self.freq_balanced_dropout_strength = float(freq_balanced_dropout_strength or 0.0)
+        self.tag_freq = {}  # tag -> frequency in [0, 1]，scan 之后填充
         
         # 尝试导入 caption_utils（直接导入避开 __init__.py）
         self.caption_utils = None
@@ -1710,6 +1812,15 @@ class ImageDataset(Dataset):
         dist = Counter(self.bucket_for_index)
         logger.info(f"  bucket 分布: {len(dist)} 种, 例: {list(dist.most_common(5))}")
 
+        # ★ v5 ② 统计 tag 频率（仅在启用 freq_balanced dropout 时执行；避免无谓 IO）
+        if self.freq_balanced_dropout_strength > 0:
+            if json_count > 0:
+                logger.warning(
+                    f"[freq_balanced] 检测到 {json_count} 个 JSON caption；本机制只对 TXT caption 生效。"
+                    "JSON 走 caption_utils 内置的分类 shuffle / dropout，与频率均衡无关。"
+                )
+            self._compute_tag_freq()
+
     def _finalize_bucket_keys(self):
         """For each sample, compute bucket_key via the same code path that __getitem__ uses,
         so BucketBatchSampler can reliably group same-shape tensors. Caches per unique img path."""
@@ -1737,6 +1848,58 @@ class ImageDataset(Dataset):
                         key = (self.resolution, self.resolution)
                 cache[img_path] = key
             sample["bucket_key"] = key
+
+    def _compute_tag_freq(self):
+        """★ v5 ② 扫描全部 caption 文件，统计每个 tag 在数据集中出现的图片数 / 总图片数。
+
+        每张图只算一次（即使 tag 在 caption 里重复也只计 1），相同图（被 repeat 而进入 samples
+        多次）也只算一次，避免 repeat 高的图把它的 tag 频率人为放大。
+        """
+        from collections import Counter
+        cnt = Counter()
+        seen_imgs = set()
+        total_imgs = 0
+
+        for s in self.samples:
+            img_key = str(s.get("image", ""))
+            if img_key in seen_imgs:
+                continue
+            seen_imgs.add(img_key)
+
+            caption_text = None
+            # 优先 TXT（与 __getitem__ 的回退顺序一致）；JSON 结构性 tag 不参与此机制
+            txt_path = s.get("txt_path")
+            if txt_path:
+                try:
+                    caption_text = txt_path.read_text(encoding="utf-8").strip()
+                except Exception:
+                    caption_text = None
+
+            if not caption_text:
+                continue
+
+            total_imgs += 1
+            if "," in caption_text:
+                tags = [t.strip() for t in caption_text.split(",") if t.strip()]
+            else:
+                tags = [t for t in caption_text.split() if t]
+            # 每张图每个 tag 只计 1 次
+            for t in set(tags):
+                cnt[t] += 1
+
+        if total_imgs == 0:
+            logger.warning("[freq_balanced] 没有可统计的 TXT caption，禁用频率加权 dropout。")
+            self.tag_freq = {}
+            return
+
+        self.tag_freq = {t: c / total_imgs for t, c in cnt.items()}
+        # 诊断：打印共现最高的 10 个 tag
+        top = sorted(self.tag_freq.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        top_str = ", ".join(f"{t}={f:.2f}" for t, f in top)
+        logger.info(
+            f"[freq_balanced] 已统计 {len(self.tag_freq)} 个 tag 的频率 "
+            f"(strength={self.freq_balanced_dropout_strength:.2f}). Top10: {top_str}"
+        )
 
     def _scan(self):
         samples = []
@@ -1805,8 +1968,27 @@ class ImageDataset(Dataset):
             random.shuffle(rest)
 
         dropout = float(self.tag_dropout or 0.0)
-        if dropout > 0.0 and rest:
-            survivors = [t for t in rest if random.random() > dropout]
+        freq_strength = float(getattr(self, "freq_balanced_dropout_strength", 0.0) or 0.0)
+        tag_freq = getattr(self, "tag_freq", {}) or {}
+
+        if rest and (dropout > 0.0 or (freq_strength > 0.0 and tag_freq)):
+            survivors = []
+            for t in rest:
+                # 通用 dropout
+                if dropout > 0.0 and random.random() < dropout:
+                    continue
+                # ★ v5 ② 频率加权 dropout
+                # 触发词在 kept 里完全免疫；这里只对 rest 起作用。
+                # 公式：extra_drop = strength * max(0, freq - 0.3) / 0.7
+                #   freq=1.0 → extra_drop = strength；freq=0.3 → 0；线性插值。
+                #   0.3 是经验阈值：低于此值的 tag 视为"真实变量"不需要解耦。
+                if freq_strength > 0.0:
+                    freq = tag_freq.get(t, 0.0)
+                    if freq > 0.3:
+                        extra_drop = freq_strength * (freq - 0.3) / 0.7
+                        if random.random() < extra_drop:
+                            continue
+                survivors.append(t)
             if not survivors:
                 survivors = [random.choice(rest)]
             rest = survivors
@@ -2359,6 +2541,7 @@ def sample_t(
     mode: str = "logit_normal",
     shift: float = 3.0,
     mix_low_prob: float = 0.25,
+    mix_extreme_prob: float = 0.0,
 ):
     """采样 Flow Matching 时间步 t ∈ (0, 1)。
 
@@ -2366,19 +2549,45 @@ def sample_t(
       - "logit_normal": 经典 SD3/Anima 偏向中间 t 的分布，shift>1 进一步偏向高噪声端（默认）。
       - "uniform":      均匀采样 t，对低噪声端（细节）和高噪声端（结构）覆盖更均衡。
       - "logit_normal_low": logit-normal 但 shift 反向（推 t 偏向低噪声/细节端），适合刻画细节差的训练集。
+      - "extreme_low":  Beta(0.5, 5) 多数 t 在 [0.01, 0.2]；用于 logo/眼/发等需要近清洁 latent 的高频特征。
       - "mode":         SD3 式 mode-distribution（用 sigma 形式，需要 shift）。
-      - "mixed_uniform_low": 以 uniform 为主体，按 mix_low_prob 混入 logit_normal_low，用于一次训练中补低噪声细节。
+      - "mixed_uniform_low": 以 uniform 为主体，按 mix_low_prob 混入 logit_normal_low；
+                             若 mix_extreme_prob>0，再混入相应比例的 extreme_low（v5 新增）。
     """
     mode = (mode or "logit_normal").lower()
     if mode == "uniform":
         return torch.rand(bs, device=device).clamp(1e-4, 1.0 - 1e-4)
 
+    if mode == "extreme_low":
+        # Beta(0.5, 5)：mean≈0.091，多数样本 t<0.2。专为 high-freq 局部特征设计。
+        beta = torch.distributions.Beta(
+            torch.tensor(0.5, device=device),
+            torch.tensor(5.0, device=device),
+        )
+        return beta.sample((bs,)).clamp(1e-4, 1.0 - 1e-4)
+
     if mode in ("mixed_uniform_low", "uniform_low_mix"):
         uniform_t = torch.rand(bs, device=device)
         low_t = sample_t(bs, device, mode="logit_normal_low", shift=shift)
-        p = min(max(float(mix_low_prob), 0.0), 1.0)
-        use_low = (torch.rand(bs, device=device) < p)
-        return torch.where(use_low, low_t, uniform_t).clamp(1e-4, 1.0 - 1e-4)
+        p_low = min(max(float(mix_low_prob), 0.0), 1.0)
+        p_extreme = min(max(float(mix_extreme_prob), 0.0), 1.0)
+        # 保证 p_low + p_extreme <= 1.0；超出时按比例缩放
+        if p_low + p_extreme > 1.0:
+            scale = 1.0 / (p_low + p_extreme)
+            p_low *= scale
+            p_extreme *= scale
+        r = torch.rand(bs, device=device)
+        if p_extreme > 0:
+            extreme_t = sample_t(bs, device, mode="extreme_low", shift=shift)
+            # r < p_extreme → extreme；p_extreme ≤ r < p_extreme+p_low → low；其余 → uniform
+            t = torch.where(
+                r < p_extreme,
+                extreme_t,
+                torch.where(r < p_extreme + p_low, low_t, uniform_t),
+            )
+        else:
+            t = torch.where(r < p_low, low_t, uniform_t)
+        return t.clamp(1e-4, 1.0 - 1e-4)
 
     if mode in ("mixed_uniform_logit", "uniform_logit_mix"):
         uniform_t = torch.rand(bs, device=device)
@@ -2462,7 +2671,13 @@ def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
                 cur = cur + extra * (float(pyramid_discount) ** (i + 1))
                 if min(small_h, small_w) <= 1:
                     break
-            # 归一到与原噪声相同的方差，保持训练稳定
+            # ★ v5 修复：先减空间均值再归方差。bilinear 上采样的 coarse 分量天然带 DC 偏置，
+            # 仅做 std 归一会让训练样本带"低频亮度漂移"作为隐藏信号 → 模型学会预测它 →
+            # 推理时给的是标准正态（无漂移）→ 模型仍会补一个 → 输出整体亮/暗偏置被强化。
+            # 这是 Whitaker 原版的正确语义，许多 fork 漏了这一步。
+            # 形状：5D=(B,C,T,H,W) → 在 (T,H,W) 上减均值；4D=(B,C,H,W) → 在 (H,W) 上减。
+            spatial_mean_dims = tuple(range(2, cur.ndim))
+            cur = cur - cur.mean(dim=spatial_mean_dims, keepdim=True)
             cur = cur / cur.std().clamp(min=1e-6)
             noise = cur
         except Exception as _e:
@@ -3017,6 +3232,7 @@ def main():
         flip_augment=args.flip_augment,
         tag_dropout=args.tag_dropout,
         prefer_json=args.prefer_json,
+        freq_balanced_dropout_strength=float(getattr(args, "freq_balanced_dropout_strength", 0.0) or 0.0),
     )
     dataset = base_dataset
 
@@ -3039,6 +3255,7 @@ def main():
                 tag_dropout=0.0,  # 正则集通常不用 dropout
                 prefer_json=args.prefer_json,
                 caption_override=reg_caption if reg_caption else None,
+                freq_balanced_dropout_strength=0.0,  # 正则集不参与频率均衡
             )
             reg_dataset = reg_base
             cap_preview = f", caption=\"{reg_caption[:50]}{'...' if len(reg_caption) > 50 else ''}\"" if reg_caption else ""
@@ -3184,7 +3401,65 @@ def main():
     for group in optimizer.param_groups:
         trainable_params.extend(group["params"])
 
+    # ★ v5 ⑤ LoRA EMA 初始化
+    # 构造 (name, param) 列表，供 EMA 内部用 id(param) 索引。命名仅用于调试。
+    # 我们直接在 model.named_parameters() 中筛选 requires_grad=True 的参数。
+    named_trainable_params = [
+        (n, p) for n, p in model.named_parameters() if p.requires_grad
+    ]
+    ema_decay = float(getattr(args, "lora_ema_decay", 0.0) or 0.0)
+    lora_ema = None
+    if ema_decay > 0:
+        if ema_decay >= 1.0:
+            logger.warning(f"[ema] decay={ema_decay} >=1，禁用 EMA。合法范围 (0, 1)，推荐 0.999-0.9999。")
+        else:
+            lora_ema = LoRAEmaShadow(named_trainable_params, decay=ema_decay)
+            logger.info(
+                f"[ema] 启用 LoRA EMA，decay={ema_decay} "
+                f"(shadow {len(lora_ema.shadow)} 个张量；采样/保存时自动切换到 EMA 副本)"
+            )
 
+    def _ema_ctx():
+        """采样/保存时把当前 LoRA 权重临时换成 EMA 副本。未启用 EMA 时返回 nullcontext。"""
+        if lora_ema is not None:
+            return lora_ema.applied(named_trainable_params)
+        return nullcontext()
+
+    # ★ v5 ⑦ t-binned LR group：按 t 区间冻结不同模块的梯度
+    # 启用时，需要把每个 LoRA 参数按所属模块名归类，便于按 t_mean 选择性 zero_grad。
+    t_binned_enabled = bool(getattr(args, "t_binned_module_groups", False))
+    param_category = {}  # id(param) -> str: "mlp" / "self_attn" / "cross_attn" / "llm_adapter" / "other"
+    if t_binned_enabled:
+        for module_name, lora_mod in injector.injected.items():
+            # 按 module_name 做粗分类。用 dotted segment 完整匹配避免子串误判
+            # （例如某层名里同时含 "mlp" 与 "cross_attn" 时，子串顺序会决定结果，不稳健）。
+            segs = set(module_name.split("."))
+            if "llm_adapter" in segs or any("llm_adapter" in s for s in segs):
+                cat = "llm_adapter"
+            elif "mlp" in segs or any(s.startswith("mlp") for s in segs):
+                cat = "mlp"
+            elif "cross_attn" in segs or any("cross_attn" in s for s in segs):
+                cat = "cross_attn"
+            elif "self_attn" in segs or any("self_attn" in s for s in segs):
+                cat = "self_attn"
+            else:
+                cat = "other"
+            for p in lora_mod.parameters():
+                if p.requires_grad:
+                    param_category[id(p)] = cat
+        # 诊断：分类后每组参数数量
+        from collections import Counter
+        cat_count = Counter(param_category.values())
+        logger.info(
+            f"[t_binned] 启用 t-binned LR group；模块分类参数数: "
+            f"{dict(cat_count)} "
+            f"(t<0.3 时仅训练 mlp+llm_adapter+other；t>0.6 时仅训练 self_attn+cross_attn+other)"
+        )
+        if int(getattr(args, "grad_accum", 1) or 1) > 1:
+            logger.info(
+                "[t_binned] grad_accum>1 时启用了 pre-backward snapshot 机制，"
+                "确保每个微 batch 的 t 仅作用于自己的贡献。"
+            )
 
     # 计算总步数
     try:
@@ -3310,10 +3585,11 @@ def main():
                 monitor_data = get_state()
             except Exception:
                 pass
-        save_training_state(state_path, injector, optimizer, current_epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
-        # 同时保存 LoRA 权重
-        lora_path = output_dir / f"{args.output_name}_interrupted_step{global_step}.safetensors"
-        injector.save(lora_path)
+        with _ema_ctx():  # v5 ⑤
+            save_training_state(state_path, injector, optimizer, current_epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
+            # 同时保存 LoRA 权重
+            lora_path = output_dir / f"{args.output_name}_interrupted_step{global_step}.safetensors"
+            injector.save(lora_path)
         emit(f"已保存！下次使用 --resume-state \"{state_path}\" 继续训练")
         sys.exit(0)
     
@@ -3440,7 +3716,11 @@ def main():
             ts_mode = str(getattr(args, "timestep_sampling", "logit_normal") or "logit_normal")
             f_shift = float(getattr(args, "flow_shift", 3.0) or 3.0)
             mix_low_prob = float(getattr(args, "timestep_mix_low_prob", 0.25) or 0.0)
-            t = sample_t(bs, device, mode=ts_mode, shift=f_shift, mix_low_prob=mix_low_prob)
+            mix_extreme_prob = float(getattr(args, "timestep_mix_extreme_prob", 0.0) or 0.0)
+            t = sample_t(
+                bs, device, mode=ts_mode, shift=f_shift,
+                mix_low_prob=mix_low_prob, mix_extreme_prob=mix_extreme_prob,
+            )
 
             # SD3 式 σ schedule shift：作用于所有模式的 t（含 uniform / mixed_*），
             # 把噪声混合用的 sigma 整体偏向高噪声端。1.0=禁用，向后兼容。
@@ -3459,6 +3739,56 @@ def main():
                 random_offset_strength=bool(getattr(args, "noise_offset_random_strength", False)),
                 noise_offset_min=float(getattr(args, "noise_offset_min", 0.0) or 0.0),
             )
+
+            # ★ v5 ④ Immiscible noise pairing
+            # batch（或 pool）内做 (latent, noise) 的 Hungarian 配对，把每个 latent 配到
+            # transport cost 最小的 noise。显著降低梯度方差，对小 batch + ProdigyPlus 收益最大。
+            # 注意：必须在 ip_noise_gamma 扰动之前做 pairing，否则随机扰动会让 pairing 不稳定。
+            immiscible_pool = int(getattr(args, "immiscible_pool_size", 0) or 0)
+            if immiscible_pool > 1 and bs > 1:
+                try:
+                    from scipy.optimize import linear_sum_assignment
+                    actual_pool = max(immiscible_pool, bs)
+                    if actual_pool > bs:
+                        # 扩展 pool：再采 (actual_pool - bs) 个噪声，与原 noise 拼起来
+                        extra_shape = list(latents.shape)
+                        extra_shape[0] = actual_pool - bs
+                        extra_latents_proxy = latents[:1].expand(actual_pool - bs, *latents.shape[1:]).contiguous()
+                        extra_noise = make_noise(
+                            extra_latents_proxy,
+                            noise_offset=float(getattr(args, "noise_offset", 0.0) or 0.0),
+                            pyramid_iters=int(getattr(args, "pyramid_noise_iterations", 0) or 0),
+                            pyramid_discount=float(getattr(args, "pyramid_noise_discount", 0.3) or 0.3),
+                            random_offset_strength=bool(getattr(args, "noise_offset_random_strength", False)),
+                            noise_offset_min=float(getattr(args, "noise_offset_min", 0.0) or 0.0),
+                        )
+                        pool_noise = torch.cat([noise, extra_noise], dim=0)
+                    else:
+                        pool_noise = noise
+                    # 用未扰动的 latents 做距离矩阵（fp32, flatten 到 (B, D) / (pool, D)）
+                    L = latents.detach().float().reshape(bs, -1)
+                    P = pool_noise.detach().float().reshape(pool_noise.shape[0], -1)
+                    # cdist 在大维度上较慢；按 sample 做能够避免一次性产生 (bs, pool, D) 张量
+                    dist = torch.cdist(L, P).cpu().numpy()
+                    row_ind, col_ind = linear_sum_assignment(dist)
+                    noise = pool_noise[col_ind]
+                except ImportError:
+                    logger.warning(
+                        "[immiscible] scipy 未安装，无法做 Hungarian 配对；本次回退到随机配对。"
+                        "pip install scipy 即可启用。"
+                    )
+                except Exception as _e:
+                    logger.warning(f"[immiscible] 配对失败，回退到随机配对: {_e}")
+
+            # ★ v5 ③ Input perturbation noise (ip_noise_gamma)
+            # 在 FM 噪声混合之前给 clean latents 加一个小高斯扰动，把每张训练图扩展成
+            # ε-邻域副本，扩大训练分布支持。对 60-100 张小数据集泛化提升最显著。
+            # 注意：target 必须基于扰动后的 latents（target = noise - latents_perturbed），
+            # 否则 v 预测目标和实际 x_t 不一致。
+            ip_gamma = float(getattr(args, "ip_noise_gamma", 0.0) or 0.0)
+            if ip_gamma > 0:
+                latents = latents + ip_gamma * torch.randn_like(latents)
+
             noisy = (1 - t_exp) * latents + t_exp * noise
             target = noise - latents
 
@@ -3492,6 +3822,30 @@ def main():
                     loss = (per_sample * w).mean()
                 else:
                     loss = per_sample.mean()
+
+                # ★ v5 ⑥ High-frequency loss term
+                # 主 loss 之外加一项 high-pass 残差 loss，直接放大眼睛/头发/logo
+                # 这类高频信号的梯度；不依赖区域定位，对画师构图偏好完全中立。
+                hf_w = float(getattr(args, "highfreq_loss_weight", 0.0) or 0.0)
+                if hf_w > 0:
+                    def _spatial_highpass(x):
+                        # 仅在空间维 (H, W) 做 box-blur，得到 high-pass = x - blur
+                        if x.ndim == 5:
+                            b, c, tt, h, w_ = x.shape
+                            x2 = x.reshape(b * c * tt, 1, h, w_)
+                            blur = F.avg_pool2d(x2, kernel_size=5, stride=1, padding=2)
+                            return (x2 - blur).reshape(b, c, tt, h, w_)
+                        elif x.ndim == 4:
+                            b, c, h, w_ = x.shape
+                            x2 = x.reshape(b * c, 1, h, w_)
+                            blur = F.avg_pool2d(x2, kernel_size=5, stride=1, padding=2)
+                            return (x2 - blur).reshape(b, c, h, w_)
+                        else:
+                            return x  # 不支持的维度直接跳过
+                    pred_hf = _spatial_highpass(pred.float())
+                    target_hf = _spatial_highpass(target.float())
+                    hf_loss = (pred_hf - target_hf).square().mean()
+                    loss = loss + hf_w * hf_loss
 
             # ★ 守护 1：forward 结果 NaN/Inf 检查
             debug_n = int(getattr(args, "debug_first_batches", 0) or 0)
@@ -3549,8 +3903,52 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
+            # ★ v5 ⑦ t-binned LR group：按 t 区间冻结部分模块的梯度
+            # 替代 detail_inv_t × 5×：用"显式 module-level 冻结"避免低 t 梯度污染
+            # ProdigyPlus 的 d 估计。
+            #   t < 0.3 (细节端)：仅更新 mlp + llm_adapter + other（含 norm/bias 等）
+            #   t > 0.6 (构图端)：仅更新 self_attn + cross_attn + other
+            #   0.3 ≤ t ≤ 0.6 (过渡端)：全部更新
+            # 建议同时把 loss_weighting_scheme 设为 "none"，避免和它叠加。
+            #
+            # ★ grad_accum 安全的实现：在 backward 之前 snapshot 被 skip 类别的当前 grad
+            # （即"已累积到这里的合法贡献"），backward 之后把这些类别的 grad 恢复到 snapshot
+            # 值——这等于"把本微 batch 的贡献从被 skip 类别中减掉"。这样：
+            #   - grad_accum=1: snapshot 是 None/0，恢复后 grad=0 → 等同直接 zero_()。
+            #   - grad_accum>1: 前几个微 batch 累积的合法部分被保留，本微 batch 被禁的类别不污染。
+            t_binned_skip_cats = set()
+            t_binned_snapshots = {}
+            if t_binned_enabled and param_category:
+                t_mean = float(t.float().mean().detach())
+                if t_mean < 0.3:
+                    t_binned_skip_cats = {"self_attn", "cross_attn"}
+                elif t_mean > 0.6:
+                    t_binned_skip_cats = {"mlp"}
+                if t_binned_skip_cats:
+                    for p in trainable_params:
+                        cat = param_category.get(id(p))
+                        if cat in t_binned_skip_cats:
+                            # 若 p.grad 已存在（accumulation 中段），克隆；否则记 None 表示"原本就没有"
+                            t_binned_snapshots[id(p)] = (
+                                p.grad.detach().clone() if p.grad is not None else None
+                            )
+
             loss_to_backward = loss / args.grad_accum
             loss_to_backward.backward()
+
+            # backward 之后立刻恢复 skip 类别的 grad（撤销本微 batch 对它们的贡献）
+            if t_binned_snapshots:
+                for p in trainable_params:
+                    if id(p) not in t_binned_snapshots:
+                        continue
+                    snap = t_binned_snapshots[id(p)]
+                    if snap is None:
+                        # 原本没 grad → 抹除本次新增的 grad
+                        if p.grad is not None:
+                            p.grad = None
+                    else:
+                        p.grad.copy_(snap)
+                t_binned_snapshots.clear()
 
             if (batch_idx + 1) % args.grad_accum == 0:
                 # ★ 守护 2：梯度 NaN/Inf 检查
@@ -3602,6 +4000,10 @@ def main():
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+
+                # ★ v5 ⑤ EMA update（在 optimizer.step() 之后）
+                if lora_ema is not None:
+                    lora_ema.update(named_trainable_params)
 
                 # ★ 守护 3：优化器状态污染检测（Prodigy 内部 d 变 NaN 会连锁崩溃）
                 if opt_type == "prodigyplus" and global_step % 50 == 0:
@@ -3681,15 +4083,16 @@ def main():
                     s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
                     s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
                     s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
-                    img = sample_image(
-                        model, vae, qwen_model, qwen_tok, t5_tok,
-                        prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
-                        negative_prompt=(s_neg or None),
-                        sampler_name=s_sampler,
-                        scheduler=s_sched,
-                        device=device, dtype=dtype,
-                        use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
-                    )
+                    with _ema_ctx():  # v5 ⑤ 切换到 LoRA EMA 副本（如启用）
+                        img = sample_image(
+                            model, vae, qwen_model, qwen_tok, t5_tok,
+                            prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
+                            negative_prompt=(s_neg or None),
+                            sampler_name=s_sampler,
+                            scheduler=s_sched,
+                            device=device, dtype=dtype,
+                            use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                        )
                     sample_path = sample_dir / f"step_{global_step}.png"
                     img.save(sample_path)
                     emit(f"采样保存: step_{global_step}.png")
@@ -3706,7 +4109,8 @@ def main():
                 if save_every_steps > 0 and global_step % save_every_steps == 0:
                     if hasattr(optimizer, "eval"): optimizer.eval()
                     lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
-                    injector.save(lora_path)
+                    with _ema_ctx():  # v5 ⑤
+                        injector.save(lora_path)
                     emit(f"Saved LoRA: {lora_path}")
                     if hasattr(optimizer, "train"): optimizer.train()
 
@@ -3723,10 +4127,14 @@ def main():
                             monitor_data = get_state()
                         except Exception:
                             pass
-                    save_training_state(state_path, injector, optimizer, epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
-                    # 同时保存 LoRA 权重
-                    lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
-                    injector.save(lora_path)
+                    # 注意：training_state 包含 optimizer state（含 SF z），故 LoRA 权重和 LoRA
+                    # checkpoint 都用 EMA 视图保存，断点续训依然能恢复（resume 时不会从 LoRA
+                    # checkpoint 加载训练态，只用作起点；optimizer state 单独恢复）。
+                    with _ema_ctx():  # v5 ⑤
+                        save_training_state(state_path, injector, optimizer, epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
+                        # 同时保存 LoRA 权重
+                        lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
+                        injector.save(lora_path)
                     if hasattr(optimizer, "train"): optimizer.train()
 
                 # 检查 max_steps
@@ -3740,7 +4148,8 @@ def main():
             if args.save_every > 0 and current_epoch % args.save_every == 0:
                 if hasattr(optimizer, "eval"): optimizer.eval()
                 save_path = output_dir / f"{args.output_name}_epoch{current_epoch}.safetensors"
-                injector.save(save_path)
+                with _ema_ctx():  # v5 ⑤
+                    injector.save(save_path)
                 emit(f"Saved LoRA: {save_path}")
                 if hasattr(optimizer, "train"): optimizer.train()
 
@@ -3758,15 +4167,16 @@ def main():
                 s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
                 s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
                 s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
-                img = sample_image(
-                    model, vae, qwen_model, qwen_tok, t5_tok,
-                    prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
-                    negative_prompt=(s_neg or None),
-                    sampler_name=s_sampler,
-                    scheduler=s_sched,
-                    device=device, dtype=dtype,
-                    use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
-                )
+                with _ema_ctx():  # v5 ⑤
+                    img = sample_image(
+                        model, vae, qwen_model, qwen_tok, t5_tok,
+                        prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
+                        negative_prompt=(s_neg or None),
+                        sampler_name=s_sampler,
+                        scheduler=s_sched,
+                        device=device, dtype=dtype,
+                        use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                    )
                 sample_path = sample_dir / f"epoch_{current_epoch}.png"
                 img.save(sample_path)
                 emit(f"采样保存: epoch_{current_epoch}.png")
@@ -3787,7 +4197,8 @@ def main():
     # 最终保存
     if hasattr(optimizer, "eval"): optimizer.eval()
     final_path = output_dir / f"{args.output_name}.safetensors"
-    injector.save(final_path)
+    with _ema_ctx():  # v5 ⑤
+        injector.save(final_path)
 
     # 清理进度显示
     if live:

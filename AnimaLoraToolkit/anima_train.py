@@ -24,7 +24,6 @@ import subprocess
 import sys
 import time
 import types
-from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import torch
@@ -155,6 +154,9 @@ def apply_yaml_config(args, config):
         "lora_alpha": "lora_alpha",
         "lora_dropout": "lora_dropout",
         "lokr_factor": "lokr_factor",
+        "lora_variant": "lora_variant",
+        "dora_export_mode": "dora_export_mode",
+        "lora_targets": "lora_targets",
         "lora_exclude_prefixes": "lora_exclude_prefixes",
         "resume_lora": "resume_lora",
         # 训练参数
@@ -215,6 +217,16 @@ def apply_yaml_config(args, config):
         "schedule_shift": "schedule_shift",
         "timestep_sampling": "timestep_sampling",
         "timestep_mix_low_prob": "timestep_mix_low_prob",
+        "adaptive_timestep": "adaptive_timestep",
+        "adaptive_timestep_metric": "adaptive_timestep_metric",
+        "adaptive_timestep_highfreq_weight": "adaptive_timestep_highfreq_weight",
+        "adaptive_timestep_bins": "adaptive_timestep_bins",
+        "adaptive_timestep_ema_decay": "adaptive_timestep_ema_decay",
+        "adaptive_timestep_burn_in": "adaptive_timestep_burn_in",
+        "adaptive_timestep_min_factor": "adaptive_timestep_min_factor",
+        "adaptive_timestep_max_factor": "adaptive_timestep_max_factor",
+        "adaptive_timestep_base_mix": "adaptive_timestep_base_mix",
+        "adaptive_timestep_candidate_mult": "adaptive_timestep_candidate_mult",
         "min_snr_gamma": "min_snr_gamma",
         "loss_weighting_scheme": "loss_weighting_scheme",
         "weight_cap_ratio": "weight_cap_ratio",
@@ -239,22 +251,40 @@ def apply_yaml_config(args, config):
         "module_dropout": "module_dropout",
         # LoRA+ for LoKr
         "loraplus_lr_ratio": "loraplus_lr_ratio",
-        # ─── 实验性参数（v5 引入）──────────────────────────
-        # ② frequency-balanced tag dropout：根据 tag 在数据集中的出现频率自适应地增加 dropout
+        # 频率均衡 tag dropout：根据 tag 在数据集中的出现频率自适应地增加 dropout
         "freq_balanced_dropout_strength": "freq_balanced_dropout_strength",
-        # ③ input perturbation noise：在 FM 噪声混合前给 latents 加一个小高斯扰动
-        "ip_noise_gamma": "ip_noise_gamma",
-        # ④ immiscible noise pairing：batch/pool 内做 (latent, noise) 的 Hungarian 配对
-        "immiscible_pool_size": "immiscible_pool_size",
-        # ⑤ LoRA EMA：训练过程维护 LoRA 参数的指数滑动平均
-        "lora_ema_decay": "lora_ema_decay",
-        # ⑥ high-frequency loss：主 loss 之外加一项 high-pass 残差 loss
-        "highfreq_loss_weight": "highfreq_loss_weight",
-        # ⑦ t-binned LR group：按 t 区间冻结/解冻不同模块（替代 detail_inv_t 的根本设计）
-        "t_binned_module_groups": "t_binned_module_groups",
-        # 番外 extreme-low t sampling
-        "timestep_mix_extreme_prob": "timestep_mix_extreme_prob",
     }
+
+    deprecated_v5_keys = {
+        "ip_noise_gamma",
+        "ip_noise_target",
+        "ip_noise_gamma_decay_steps",
+        "immiscible_pool_size",
+        "lora_ema_decay",
+        "highfreq_loss_weight",
+        "t_binned_module_groups",
+        "timestep_mix_extreme_prob",
+        "pyramid_zero_dc",
+    }
+    def _is_active_deprecated_value(value):
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return abs(float(value)) > 0.0
+        if isinstance(value, str):
+            return value.strip().lower() not in ("", "0", "false", "none", "null", "off")
+        if isinstance(value, (list, tuple, set, dict)):
+            return len(value) > 0
+        return True
+
+    ignored = sorted(k for k in deprecated_v5_keys if k in config and _is_active_deprecated_value(config.get(k)))
+    if ignored:
+        logger.warning(
+            "Ignoring deprecated v5 training keys: %s. They no longer affect training.",
+            ", ".join(ignored),
+        )
 
     # 需要特殊处理的默认值（用于判断命令行是否显式设置）
     defaults = {
@@ -279,6 +309,9 @@ def apply_yaml_config(args, config):
         "lora_alpha": 32.0,
         "lora_dropout": 0.0,
         "lokr_factor": 8,
+        "lora_variant": "base",
+        "dora_export_mode": "native",
+        "lora_targets": None,
         "lora_exclude_prefixes": None,
         "resume_lora": "",
         "epochs": 10,
@@ -332,6 +365,16 @@ def apply_yaml_config(args, config):
         "schedule_shift": 1.0,
         "timestep_sampling": "logit_normal",
         "timestep_mix_low_prob": 0.25,
+        "adaptive_timestep": False,
+        "adaptive_timestep_metric": "raw",
+        "adaptive_timestep_highfreq_weight": 0.25,
+        "adaptive_timestep_bins": 16,
+        "adaptive_timestep_ema_decay": 0.95,
+        "adaptive_timestep_burn_in": 160,
+        "adaptive_timestep_min_factor": 0.5,
+        "adaptive_timestep_max_factor": 2.0,
+        "adaptive_timestep_base_mix": 0.25,
+        "adaptive_timestep_candidate_mult": 8,
         "min_snr_gamma": 0.0,
         "loss_weighting_scheme": "none",
         "weight_cap_ratio": 5.0,
@@ -352,14 +395,7 @@ def apply_yaml_config(args, config):
         "rank_dropout": 0.0,
         "module_dropout": 0.0,
         "loraplus_lr_ratio": 1.0,
-        # ─── 实验性参数（v5 引入，默认全部关闭以保持向后兼容）──────────────────────────
-        "freq_balanced_dropout_strength": 0.0,   # >0 启用；推荐 0.2-0.3
-        "ip_noise_gamma": 0.0,                    # >0 启用；推荐 0.03-0.10
-        "immiscible_pool_size": 0,                # 0 或 1 = 关闭；>1 = pool/batch 内配对
-        "lora_ema_decay": 0.0,                    # 0 = 关闭；推荐 0.999-0.9999
-        "highfreq_loss_weight": 0.0,              # 0 = 关闭；推荐 0.1-0.3
-        "t_binned_module_groups": False,          # 替代 detail_inv_t 的更根本设计
-        "timestep_mix_extreme_prob": 0.0,         # mixed_uniform_low 中 extreme-low t 的比例
+        "freq_balanced_dropout_strength": 0.0,
     }
 
     for yaml_key, arg_attr in mapping.items():
@@ -1285,14 +1321,34 @@ class LoKrLayer(torch.nn.Module):
         y = y.reshape(*orig_shape[:-1], self.factor * self.out_dim)
         return y.to(dtype=x.dtype) * self.scaling
 
+    def delta_weight(self, apply_rank_dropout: bool = False) -> torch.Tensor:
+        """Materialize ΔW for DoRA weight decomposition and export checks."""
+        w1 = self.lokr_w1.float()
+        w2_a = self.lokr_w2_a.float()
+        w2_b = self.lokr_w2_b.float()
+
+        if apply_rank_dropout and self.training and self.rank_dropout > 0:
+            mask = torch.bernoulli(
+                torch.full((self.rank,), 1.0 - self.rank_dropout, device=w2_b.device)
+            )
+            scale = 1.0 / (1.0 - self.rank_dropout + 1e-6)
+            w2_b = w2_b * (mask.unsqueeze(1) * scale)
+
+        w2 = torch.matmul(w2_a, w2_b)
+        return torch.kron(w1, w2) * self.scaling
+
 
 class LoRALinear(torch.nn.Module):
     """LoRA 包装的 Linear 层"""
     def __init__(self, original, rank=4, alpha=1.0, dropout=0.0, use_lokr=False, factor=8,
-                 rank_dropout=0.0, module_dropout=0.0):
+                 rank_dropout=0.0, module_dropout=0.0, lora_variant="base"):
         super().__init__()
         self.original = original
         self.use_lokr = use_lokr
+        self.lora_variant = (lora_variant or "base").lower()
+        self.use_dora = self.lora_variant == "dora"
+        if self.use_dora and not use_lokr:
+            raise ValueError("lora_variant='dora' is currently supported only with lora_type='lokr'")
 
         if use_lokr:
             self.adapter = LoKrLayer(
@@ -1308,10 +1364,26 @@ class LoRALinear(torch.nn.Module):
             )
 
         self.adapter.to(device=original.weight.device, dtype=original.weight.dtype)
+        if self.use_dora:
+            row_norm = original.weight.detach().float().norm(dim=1).clamp(min=1e-6)
+            self.dora_scale = torch.nn.Parameter(row_norm.to(device=original.weight.device))
         for p in self.original.parameters():
             p.requires_grad = False
 
     def forward(self, x):
+        if self.use_dora:
+            adapter = self.adapter
+            if self.training and adapter.module_dropout > 0:
+                if torch.rand(1, device=x.device).item() < adapter.module_dropout:
+                    return self.original(x)
+
+            delta = adapter.delta_weight(apply_rank_dropout=True).to(device=self.original.weight.device)
+            base_w = self.original.weight.float()
+            merged = base_w + delta
+            denom = merged.norm(dim=1, keepdim=True).clamp(min=1e-6)
+            scale = self.dora_scale.float().view(-1, 1) / denom
+            dora_w = (merged * scale).to(dtype=self.original.weight.dtype)
+            return F.linear(x, dora_w, self.original.bias)
         return self.original(x) + self.adapter(x)
 
     @property
@@ -1321,6 +1393,21 @@ class LoRALinear(torch.nn.Module):
     @property
     def bias(self):
         return self.original.bias
+
+    def merged_weight(self) -> torch.Tensor:
+        base_w = self.original.weight.float()
+        if self.use_lokr:
+            delta = self.adapter.delta_weight(apply_rank_dropout=False).to(device=base_w.device)
+        else:
+            delta = torch.matmul(
+                self.adapter.lora_up.weight.float(),
+                self.adapter.lora_down.weight.float(),
+            ) * self.adapter.scaling
+        merged = base_w + delta
+        if self.use_dora:
+            denom = merged.norm(dim=1, keepdim=True).clamp(min=1e-6)
+            merged = merged * (self.dora_scale.float().view(-1, 1) / denom)
+        return merged
 
 
 class LoRAInjector:
@@ -1340,12 +1427,20 @@ class LoRAInjector:
                  exclude_patterns=None, include_patterns=None,
                  reg_dims=None, reg_lrs=None,
                  rank_dropout=0.0, module_dropout=0.0,
-                 loraplus_lr_ratio=1.0):
+                 loraplus_lr_ratio=1.0, lora_variant="base", dora_export_mode="native"):
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
         self.use_lokr = use_lokr
         self.factor = factor
+        self.lora_variant = (lora_variant or "base").lower()
+        if self.lora_variant not in ("base", "dora"):
+            raise ValueError(f"Unknown lora_variant: {lora_variant}")
+        if self.lora_variant == "dora" and not self.use_lokr:
+            raise ValueError("lora_variant='dora' requires lora_type='lokr'")
+        self.dora_export_mode = (dora_export_mode or "native").lower()
+        if self.dora_export_mode not in ("native", "diff", "merged_model"):
+            raise ValueError(f"Unknown dora_export_mode: {dora_export_mode}")
         self.targets = targets or self.DEFAULT_TARGETS
         self.rank_dropout = float(rank_dropout or 0.0)
         self.module_dropout = float(module_dropout or 0.0)
@@ -1414,6 +1509,7 @@ class LoRAInjector:
                 module, rank=mod_rank, alpha=float(mod_rank),
                 dropout=self.dropout, use_lokr=self.use_lokr, factor=self.factor,
                 rank_dropout=self.rank_dropout, module_dropout=self.module_dropout,
+                lora_variant=self.lora_variant,
             )
 
             parts = name.split(".")
@@ -1430,7 +1526,7 @@ class LoRAInjector:
         inc_str = ", ".join(self.include_patterns) or "无"
         rank_dist = ", ".join(f"r{r}×{c}" for r, c in sorted(rank_summary.items()))
         logger.info(
-            f"注入 {'LoKr' if self.use_lokr else 'LoRA'} 到 {len(self.injected)} 层 "
+            f"注入 {'DoRA-LoKr' if self.lora_variant == 'dora' else ('LoKr' if self.use_lokr else 'LoRA')} 到 {len(self.injected)} 层 "
             f"（排除: [{exc_str}], 包含: [{inc_str}], rank 分布: {rank_dist}）"
         )
         if self.rank_dropout > 0 or self.module_dropout > 0:
@@ -1447,7 +1543,7 @@ class LoRAInjector:
         """获取可训练参数"""
         params = []
         for lora in self.injected.values():
-            params.extend(lora.adapter.parameters())
+            params.extend(p for p in lora.parameters() if p.requires_grad)
         return params
 
     def get_param_groups(self, weight_decay, loraplus_lr_ratio=None):
@@ -1464,6 +1560,9 @@ class LoRAInjector:
                 groups_dict.setdefault(key_w1, []).append(lora.adapter.lokr_w1)
                 groups_dict.setdefault(key_w2a, []).append(lora.adapter.lokr_w2_a)
                 groups_dict.setdefault(key_w2b, []).append(lora.adapter.lokr_w2_b)
+                if getattr(lora, "use_dora", False):
+                    key_dora = (0.0, 1.0, custom_lr)
+                    groups_dict.setdefault(key_dora, []).append(lora.dora_scale)
             else:
                 key_down = (weight_decay, 1.0, custom_lr)
                 key_up = (weight_decay, ratio, custom_lr)
@@ -1486,8 +1585,47 @@ class LoRAInjector:
             logger.info(f"[LoRA+] {lr_target} lr ×{ratio:.1f}")
         return param_groups
 
-    def state_dict(self):
-        """导出 LoRA 权重 (ComfyUI 兼容格式)"""
+    @staticmethod
+    def comfy_weight_decompose(base_weight: torch.Tensor, diff_weight: torch.Tensor,
+                               dora_scale: torch.Tensor) -> torch.Tensor:
+        """Emulate ComfyUI output-axis DoRA for 2D linear weights."""
+        base_f = base_weight.float()
+        diff_f = diff_weight.float().to(device=base_f.device)
+        calc = base_f + diff_f
+        scale = dora_scale.float().to(device=base_f.device).reshape(-1, 1)
+        base_norm = base_f.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        return calc * (scale / base_norm)
+
+    @staticmethod
+    def lycoris_output_axis_dora(base_weight: torch.Tensor, diff_weight: torch.Tensor,
+                                 dora_scale: torch.Tensor) -> torch.Tensor:
+        """LyCORIS-style output-axis DoRA formula used by training forward."""
+        calc = base_weight.float() + diff_weight.float().to(device=base_weight.device)
+        scale = dora_scale.float().to(device=calc.device).reshape(-1, 1)
+        calc_norm = calc.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        return calc * (scale / calc_norm)
+
+    @staticmethod
+    def comfy_native_dora_scale(lora: LoRALinear) -> torch.Tensor:
+        """Convert internal DoRA magnitude to a ComfyUI output-axis scale.
+
+        ComfyUI's output-axis weight_decompose normalizes by ||W||, while the
+        training forward normalizes by ||W + delta||. Export an adjusted scale
+        so native .lokr_w* + .dora_scale reproduces the trained merged weight.
+        """
+        base_w = lora.original.weight.detach().float()
+        delta = lora.adapter.delta_weight(apply_rank_dropout=False).detach().to(device=base_w.device)
+        merged = base_w + delta
+        base_norm = base_w.norm(dim=1).clamp(min=1e-6)
+        merged_norm = merged.norm(dim=1).clamp(min=1e-6)
+        magnitude = lora.dora_scale.detach().float().to(device=base_w.device)
+        return magnitude * (base_norm / merged_norm)
+
+    def state_dict(self, export_for_comfy=False):
+        """导出 LoRA 权重。"""
+        # Training checkpoints keep raw DoRA magnitude. ComfyUI native export
+        # gets an adjusted output-axis scale so its weight_decompose matches
+        # LoRALinear.merged_weight() exactly for the exported checkpoint.
         sd = {}
         for name, lora in self.injected.items():
             base = "lora_unet_" + name.replace(".", "_")
@@ -1499,21 +1637,85 @@ class LoRAInjector:
                 sd[f"{base}.lokr_w1"] = lora.adapter.lokr_w1.data.clone().float()
                 sd[f"{base}.lokr_w2_a"] = lora.adapter.lokr_w2_a.data.clone().float()
                 sd[f"{base}.lokr_w2_b"] = lora.adapter.lokr_w2_b.data.clone().float()
+                if getattr(lora, "use_dora", False):
+                    if export_for_comfy:
+                        dora_scale = self.comfy_native_dora_scale(lora).cpu()
+                    else:
+                        dora_scale = lora.dora_scale.data.clone().float()
+                    if export_for_comfy:
+                        dora_scale = dora_scale.view(-1, 1)
+                    sd[f"{base}.dora_scale"] = dora_scale
             else:
                 sd[f"{base}.lora_down.weight"] = lora.adapter.lora_down.weight.data.clone()
                 sd[f"{base}.lora_up.weight"] = lora.adapter.lora_up.weight.data.clone()
         return sd
 
-    def save(self, path):
+    def _diff_state_dict(self):
+        """Export exact ComfyUI .diff patches for final-checkpoint parity."""
+        sd = {}
+        for name, lora in self.injected.items():
+            base = "lora_unet_" + name.replace(".", "_")
+            diff = lora.merged_weight().detach().cpu().float() - lora.original.weight.detach().cpu().float()
+            sd[f"{base}.diff"] = diff.contiguous()
+        return sd
+
+    def _merged_model_state_dict(self, model):
+        """Export a full transformer state dict with adapter weights baked in."""
+        if model is None:
+            raise ValueError("dora_export_mode='merged_model' requires save(..., model=model)")
+        sd = {}
+        injected = dict(self.injected)
+        for key, tensor in model.state_dict().items():
+            if ".adapter." in key or key.endswith(".dora_scale"):
+                continue
+            if key.endswith(".original.weight"):
+                prefix = key[: -len(".original.weight")]
+                lora = injected.get(prefix)
+                if lora is not None:
+                    sd[f"{prefix}.weight"] = lora.merged_weight().detach().cpu()
+                    continue
+            if key.endswith(".original.bias"):
+                prefix = key[: -len(".original.bias")]
+                lora = injected.get(prefix)
+                if lora is not None and lora.original.bias is not None:
+                    sd[f"{prefix}.bias"] = lora.original.bias.detach().cpu()
+                    continue
+            sd[key] = tensor.detach().cpu()
+        return sd
+
+    def save(self, path, model=None):
         """保存为 safetensors (ComfyUI 兼容)"""
         from safetensors.torch import save_file
-        sd = self.state_dict()
+
+        if self.dora_export_mode == "merged_model":
+            sd = self._merged_model_state_dict(model)
+            save_file(sd, path, metadata={"format": "anima_merged_transformer"})
+            logger.info(f"合并模型保存到: {path}")
+            return
+
+        if self.dora_export_mode == "diff":
+            sd = self._diff_state_dict()
+            meta = {
+                "format": "anima_lora_diff",
+                "ss_network_module": "diff",
+                "anima_export_mode": "diff",
+            }
+            save_file(sd, path, metadata=meta)
+            logger.info(f"LoRA diff 保存到: {path}")
+            return
+
+        sd = self.state_dict(export_for_comfy=True)
+        network_args = f'{{"algo": "lokr", "factor": {self.factor}}}' if self.use_lokr else "{}"
+        if self.use_lokr and self.lora_variant == "dora":
+            network_args = f'{{"algo": "lokr", "factor": {self.factor}, "dora_wd": true}}'
         meta = {
             "ss_network_dim": str(self.rank),
             "ss_network_alpha": str(self.alpha),
             "ss_network_module": "lycoris.kohya" if self.use_lokr else "networks.lora",
-            "ss_network_args": f'{{"algo": "lokr", "factor": {self.factor}}}' if self.use_lokr else "{}",
+            "ss_network_args": network_args,
         }
+        if self.use_lokr and self.lora_variant == "dora":
+            meta["anima_dora_scale_format"] = "comfy_output_axis_adjusted"
         save_file(sd, path, metadata=meta)
         logger.info(f"LoRA 保存到: {path}")
 
@@ -1537,11 +1739,15 @@ class LoRAInjector:
                 w1_key = f"{base}.lokr_w1"
                 w2a_key = f"{base}.lokr_w2_a"
                 w2b_key = f"{base}.lokr_w2_b"
+                dora_key = f"{base}.dora_scale"
                 w2_old_key = f"{base}.lokr_w2"
                 if w1_key in sd and w2a_key in sd and w2b_key in sd:
                     lora.adapter.lokr_w1.data.copy_(sd[w1_key])
                     lora.adapter.lokr_w2_a.data.copy_(sd[w2a_key])
                     lora.adapter.lokr_w2_b.data.copy_(sd[w2b_key])
+                    if getattr(lora, "use_dora", False) and dora_key in sd:
+                        dora_scale = sd[dora_key].reshape(-1)
+                        lora.dora_scale.data.copy_(dora_scale.to(device=lora.dora_scale.device, dtype=lora.dora_scale.dtype))
                     loaded_count += 1
                 elif w1_key in sd and w2_old_key in sd:
                     logger.warning(f"跳过旧格式 lokr_w2 全矩阵层: {name}（需重新训练）")
@@ -1554,78 +1760,6 @@ class LoRAInjector:
                     loaded_count += 1
 
         logger.info(f"从 checkpoint 加载了 {loaded_count}/{len(self.injected)} 层 LoRA 权重")
-
-
-# ============================================================================
-# ★ v5 ⑤ LoRA EMA：训练过程维护 LoRA 参数的指数滑动平均
-# ============================================================================
-
-class LoRAEmaShadow:
-    """LoRA 参数的指数滑动平均副本（Polyak averaging 的隐式正则）。
-
-    用法：
-      ema = LoRAEmaShadow(named_trainable_params, decay=0.9995)
-      # 每次 optimizer.step() 之后：
-      ema.update(named_trainable_params)
-      # 采样/保存时临时切换到 EMA 副本：
-      with ema.applied(named_trainable_params):
-          injector.save(path)
-          sample_image(...)
-
-    与 Schedule-Free 的区别：
-      - Schedule-Free 是优化器层 averaging，目标是收敛速度。
-      - LoRA EMA 是参数层 averaging，目标是泛化稳定性。
-      两者可并存无冲突。
-    """
-
-    def __init__(self, named_trainable_params, decay=0.9995):
-        self.decay = float(decay)
-        # named_trainable_params: list of (name, param) 元组
-        # 用 id(param) 作 key 而不是 name，避免 LoRAInjector 后某些 name 重复或动态变化。
-        # ★ 强制 shadow 用 fp32 存储：bf16 (7-bit mantissa) 下 decay=0.9995 的每次
-        # 更新增量 ≈ 0.0005×p 经常低于 bf16 可表示精度 → silently dropped → EMA 实际
-        # 等于"等同 p"，正则失效。fp32 shadow 占的显存极少（LoRA 参数总量很小）。
-        self.shadow = {}
-        for _, p in named_trainable_params:
-            if p.requires_grad:
-                self.shadow[id(p)] = p.detach().to(torch.float32).clone()
-
-    @torch.no_grad()
-    def update(self, named_trainable_params):
-        """每个 optimizer.step() 之后调用"""
-        for _, p in named_trainable_params:
-            if not p.requires_grad:
-                continue
-            key = id(p)
-            if key not in self.shadow:
-                # 新加入的参数（罕见，但稳健起见）
-                self.shadow[key] = p.detach().to(torch.float32).clone()
-                continue
-            s = self.shadow[key]
-            # shadow 始终在 fp32；p 可能在 bf16/fp16。device 万一漂移也要 follow。
-            if s.device != p.device:
-                s = s.to(device=p.device)
-                self.shadow[key] = s
-            # 在 fp32 域做 EMA 累积；p 升到 fp32 再加
-            s.mul_(self.decay).add_(p.detach().to(torch.float32), alpha=1.0 - self.decay)
-
-    @contextmanager
-    def applied(self, named_trainable_params):
-        """临时把 trainable_params 替换为 EMA 副本；退出时还原。"""
-        backup = {}
-        try:
-            for _, p in named_trainable_params:
-                key = id(p)
-                if key in self.shadow:
-                    backup[key] = p.data.detach().clone()
-                    # 把 fp32 shadow 转到 p 的 dtype/device
-                    p.data.copy_(self.shadow[key].to(dtype=p.dtype, device=p.device))
-            yield
-        finally:
-            for _, p in named_trainable_params:
-                key = id(p)
-                if key in backup:
-                    p.data.copy_(backup[key])
 
 
 # ============================================================================
@@ -1666,11 +1800,15 @@ def load_training_state(path, injector, optimizer, scheduler=None):
             w1_key = f"{base}.lokr_w1"
             w2a_key = f"{base}.lokr_w2_a"
             w2b_key = f"{base}.lokr_w2_b"
+            dora_key = f"{base}.dora_scale"
             w2_old_key = f"{base}.lokr_w2"
             if w1_key in lora_sd and w2a_key in lora_sd and w2b_key in lora_sd:
                 lora.adapter.lokr_w1.data.copy_(lora_sd[w1_key])
                 lora.adapter.lokr_w2_a.data.copy_(lora_sd[w2a_key])
                 lora.adapter.lokr_w2_b.data.copy_(lora_sd[w2b_key])
+                if getattr(lora, "use_dora", False) and dora_key in lora_sd:
+                    dora_scale = lora_sd[dora_key].reshape(-1)
+                    lora.dora_scale.data.copy_(dora_scale.to(device=lora.dora_scale.device, dtype=lora.dora_scale.dtype))
             elif w1_key in lora_sd and w2_old_key in lora_sd:
                 logger.warning(f"跳过旧格式 lokr_w2 全矩阵层: {name}（需重新训练）")
         else:
@@ -2541,7 +2679,6 @@ def sample_t(
     mode: str = "logit_normal",
     shift: float = 3.0,
     mix_low_prob: float = 0.25,
-    mix_extreme_prob: float = 0.0,
 ):
     """采样 Flow Matching 时间步 t ∈ (0, 1)。
 
@@ -2549,44 +2686,19 @@ def sample_t(
       - "logit_normal": 经典 SD3/Anima 偏向中间 t 的分布，shift>1 进一步偏向高噪声端（默认）。
       - "uniform":      均匀采样 t，对低噪声端（细节）和高噪声端（结构）覆盖更均衡。
       - "logit_normal_low": logit-normal 但 shift 反向（推 t 偏向低噪声/细节端），适合刻画细节差的训练集。
-      - "extreme_low":  Beta(0.5, 5) 多数 t 在 [0.01, 0.2]；用于 logo/眼/发等需要近清洁 latent 的高频特征。
       - "mode":         SD3 式 mode-distribution（用 sigma 形式，需要 shift）。
       - "mixed_uniform_low": 以 uniform 为主体，按 mix_low_prob 混入 logit_normal_low；
-                             若 mix_extreme_prob>0，再混入相应比例的 extreme_low（v5 新增）。
     """
     mode = (mode or "logit_normal").lower()
     if mode == "uniform":
         return torch.rand(bs, device=device).clamp(1e-4, 1.0 - 1e-4)
 
-    if mode == "extreme_low":
-        # Beta(0.5, 5)：mean≈0.091，多数样本 t<0.2。专为 high-freq 局部特征设计。
-        beta = torch.distributions.Beta(
-            torch.tensor(0.5, device=device),
-            torch.tensor(5.0, device=device),
-        )
-        return beta.sample((bs,)).clamp(1e-4, 1.0 - 1e-4)
-
     if mode in ("mixed_uniform_low", "uniform_low_mix"):
         uniform_t = torch.rand(bs, device=device)
         low_t = sample_t(bs, device, mode="logit_normal_low", shift=shift)
         p_low = min(max(float(mix_low_prob), 0.0), 1.0)
-        p_extreme = min(max(float(mix_extreme_prob), 0.0), 1.0)
-        # 保证 p_low + p_extreme <= 1.0；超出时按比例缩放
-        if p_low + p_extreme > 1.0:
-            scale = 1.0 / (p_low + p_extreme)
-            p_low *= scale
-            p_extreme *= scale
         r = torch.rand(bs, device=device)
-        if p_extreme > 0:
-            extreme_t = sample_t(bs, device, mode="extreme_low", shift=shift)
-            # r < p_extreme → extreme；p_extreme ≤ r < p_extreme+p_low → low；其余 → uniform
-            t = torch.where(
-                r < p_extreme,
-                extreme_t,
-                torch.where(r < p_extreme + p_low, low_t, uniform_t),
-            )
-        else:
-            t = torch.where(r < p_low, low_t, uniform_t)
+        t = torch.where(r < p_low, low_t, uniform_t)
         return t.clamp(1e-4, 1.0 - 1e-4)
 
     if mode in ("mixed_uniform_logit", "uniform_logit_mix"):
@@ -2615,6 +2727,109 @@ def sample_t(
     s = float(shift)
     u = (u * s) / (1 + (s - 1) * u)
     return u.clamp(1e-4, 1.0 - 1e-4)
+
+
+def apply_timestep_schedule_shift(t: torch.Tensor, schedule_shift: float) -> torch.Tensor:
+    sched_shift = float(schedule_shift or 1.0)
+    if sched_shift > 0 and abs(sched_shift - 1.0) > 1e-6:
+        t = (t * sched_shift) / (1 + (sched_shift - 1) * t)
+    return t.clamp(1e-4, 1.0 - 1e-4)
+
+
+class AdaptiveTimestepSampler:
+    """Conservative loss-aware resampler layered on top of sample_t()."""
+    def __init__(
+        self,
+        enabled: bool = False,
+        bins: int = 16,
+        ema_decay: float = 0.95,
+        burn_in_steps: int = 160,
+        min_factor: float = 0.5,
+        max_factor: float = 2.0,
+        base_mix: float = 0.25,
+        candidate_mult: int = 8,
+        metric: str = "raw",
+        highfreq_weight: float = 0.25,
+    ):
+        self.enabled = bool(enabled)
+        self.bins = max(int(bins or 16), 2)
+        self.ema_decay = min(max(float(ema_decay), 0.0), 0.999)
+        self.burn_in_steps = max(int(burn_in_steps or 0), 0)
+        self.min_factor = max(float(min_factor), 1e-3)
+        self.max_factor = max(float(max_factor), self.min_factor)
+        self.base_mix = min(max(float(base_mix), 0.0), 1.0)
+        self.candidate_mult = max(int(candidate_mult or 1), 1)
+        self.metric = (metric or "raw").lower()
+        if self.metric not in ("raw", "highfreq", "mixed"):
+            raise ValueError(f"Unknown adaptive_timestep_metric: {metric}")
+        self.highfreq_weight = max(float(highfreq_weight or 0.0), 0.0)
+        self.loss_ema = torch.zeros(self.bins, dtype=torch.float32)
+        self.counts = torch.zeros(self.bins, dtype=torch.long)
+
+    @property
+    def ready(self) -> bool:
+        return self.enabled and bool((self.counts > 0).all())
+
+    def _bin_index(self, t: torch.Tensor) -> torch.Tensor:
+        return torch.clamp((t.float().detach().cpu() * self.bins).long(), 0, self.bins - 1)
+
+    def update(self, t: torch.Tensor, per_sample: torch.Tensor) -> None:
+        if not self.enabled:
+            return
+        t_bins = self._bin_index(t)
+        losses = per_sample.detach().float().cpu()
+        for idx in range(self.bins):
+            mask = t_bins == idx
+            if not bool(mask.any()):
+                continue
+            val = losses[mask].mean()
+            if self.counts[idx] == 0:
+                self.loss_ema[idx] = val
+            else:
+                self.loss_ema[idx] = self.ema_decay * self.loss_ema[idx] + (1.0 - self.ema_decay) * val
+            self.counts[idx] += int(mask.sum().item())
+
+    def factors(self) -> torch.Tensor:
+        if not self.ready:
+            return torch.ones(self.bins, dtype=torch.float32)
+        losses = self.loss_ema.clamp(min=1e-8)
+        rel = losses / losses.mean().clamp(min=1e-8)
+        return rel.clamp(self.min_factor, self.max_factor)
+
+    def sample(self, bs, device, *, mode: str, shift: float, mix_low_prob: float,
+               schedule_shift: float = 1.0,
+               global_step: int) -> torch.Tensor:
+        base_t = sample_t(bs, device, mode=mode, shift=shift, mix_low_prob=mix_low_prob)
+        if (not self.enabled) or global_step < self.burn_in_steps or not self.ready:
+            return base_t
+
+        adaptive_count = int(round(bs * (1.0 - self.base_mix)))
+        if adaptive_count <= 0:
+            return base_t
+
+        candidates_n = max(adaptive_count * self.candidate_mult, adaptive_count)
+        candidates = sample_t(candidates_n, device, mode=mode, shift=shift, mix_low_prob=mix_low_prob)
+        candidates_final = apply_timestep_schedule_shift(candidates, schedule_shift)
+        candidate_bins = torch.clamp((candidates_final.float() * self.bins).long(), 0, self.bins - 1)
+        weights = self.factors().to(device=candidates.device)[candidate_bins]
+        probs = weights / weights.sum().clamp(min=1e-8)
+        chosen = torch.multinomial(probs, adaptive_count, replacement=True)
+        adapted = candidates[chosen]
+
+        if adaptive_count >= bs:
+            return adapted[:bs].clamp(1e-4, 1.0 - 1e-4)
+        out = base_t.clone()
+        out[:adaptive_count] = adapted
+        perm = torch.randperm(bs, device=device)
+        return out[perm].clamp(1e-4, 1.0 - 1e-4)
+
+    def summary(self) -> str:
+        factors = self.factors()
+        return (
+            f"metric={self.metric} hf_weight={self.highfreq_weight:.3f} "
+            f"bins={self.bins} burn_in={self.burn_in_steps} "
+            f"factor_min/max={float(factors.min()):.2f}/{float(factors.max()):.2f}"
+        )
 
 
 def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
@@ -2671,13 +2886,7 @@ def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
                 cur = cur + extra * (float(pyramid_discount) ** (i + 1))
                 if min(small_h, small_w) <= 1:
                     break
-            # ★ v5 修复：先减空间均值再归方差。bilinear 上采样的 coarse 分量天然带 DC 偏置，
-            # 仅做 std 归一会让训练样本带"低频亮度漂移"作为隐藏信号 → 模型学会预测它 →
-            # 推理时给的是标准正态（无漂移）→ 模型仍会补一个 → 输出整体亮/暗偏置被强化。
-            # 这是 Whitaker 原版的正确语义，许多 fork 漏了这一步。
-            # 形状：5D=(B,C,T,H,W) → 在 (T,H,W) 上减均值；4D=(B,C,H,W) → 在 (H,W) 上减。
-            spatial_mean_dims = tuple(range(2, cur.ndim))
-            cur = cur - cur.mean(dim=spatial_mean_dims, keepdim=True)
+            # 归一到与原噪声相同的方差，保持训练稳定
             cur = cur / cur.std().clamp(min=1e-6)
             noise = cur
         except Exception as _e:
@@ -2742,6 +2951,50 @@ def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "
         loss_map = F.mse_loss(pred_f, target_f, reduction="none")
 
     return loss_map.view(loss_map.shape[0], -1).mean(dim=1)
+
+
+def per_sample_highfreq_loss(pred: torch.Tensor, target: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
+    """Return per-sample high-frequency residual energy for latent tensors.
+
+    This is only used as an adaptive timestep sampling signal; it does not
+    change the training objective or gradients.
+    """
+    diff = (pred.float() - target.float())
+    if diff.ndim < 4:
+        return diff.square().view(diff.shape[0], -1).mean(dim=1)
+
+    b = diff.shape[0]
+    h, w = diff.shape[-2], diff.shape[-1]
+    k = max(int(kernel_size or 5), 1)
+    if k % 2 == 0:
+        k += 1
+    if min(h, w) <= 1 or k <= 1:
+        return diff.square().view(b, -1).mean(dim=1)
+
+    flat = diff.reshape(-1, 1, h, w)
+    blur = F.avg_pool2d(flat, kernel_size=k, stride=1, padding=k // 2, count_include_pad=False)
+    high = flat - blur
+    return high.square().reshape(b, -1).mean(dim=1)
+
+
+def adaptive_timestep_metric_signal(
+    per_sample: torch.Tensor,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    metric: str = "raw",
+    highfreq_weight: float = 0.25,
+) -> torch.Tensor:
+    """Build the detached per-sample signal used by AdaptiveTimestepSampler."""
+    metric = (metric or "raw").lower()
+    raw = per_sample.detach().float()
+    if metric == "raw":
+        return raw
+    highfreq = per_sample_highfreq_loss(pred.detach(), target.detach())
+    if metric == "highfreq":
+        return highfreq
+    if metric == "mixed":
+        return raw + max(float(highfreq_weight or 0.0), 0.0) * highfreq
+    raise ValueError(f"Unknown adaptive_timestep_metric: {metric}")
 
 
 def compute_grad_norm(parameters) -> float:
@@ -2914,6 +3167,12 @@ def parse_args():
     p.add_argument("--lora-alpha", type=float, default=32.0)
     p.add_argument("--lora-dropout", type=float, default=0.0)
     p.add_argument("--lokr-factor", type=int, default=8)
+    p.add_argument("--lora-variant", choices=["base", "dora"], default="base",
+                   help="Adapter variant. 'dora' enables LyCORIS/ComfyUI-compatible DoRA-LoKr.")
+    p.add_argument("--dora-export-mode", choices=["native", "diff", "merged_model"], default="native",
+                   help="Export mode: native LoKr + .dora_scale, exact ComfyUI .diff, or full merged transformer safetensors.")
+    p.add_argument("--lora-targets", default=None,
+                   help="逗号分隔的 Linear 模块名片段；默认使用 q/k/v/output_proj 和 mlp.layer1/2。")
     p.add_argument("--lora-exclude-prefixes", default=None,
                    help="逗号分隔，命中前缀的 Linear 不被注入 LoRA/LoKr，例如 'llm_adapter.'。默认空（与 base 一致）")
     p.add_argument("--resume-lora", default="", help="从已有 LoRA 继续训练（safetensors 路径）")
@@ -2960,6 +3219,19 @@ def parse_args():
     p.add_argument("--use-t5-token-weights", action="store_true", default=True)
     p.add_argument("--no-t5-token-weights", dest="use_t5_token_weights", action="store_false")
     p.add_argument("--timestep-mix-low-prob", type=float, default=0.25, help="mixed_uniform_low 中低噪声样本比例")
+    p.add_argument("--adaptive-timestep", action="store_true",
+                   help="启用保守自适应 timestep：按 per-timestep raw loss 重采样，不改变 loss 权重。")
+    p.add_argument("--adaptive-timestep-metric", choices=["raw", "highfreq", "mixed"], default="raw",
+                   help="自适应 timestep 的统计信号：raw / highfreq / mixed。")
+    p.add_argument("--adaptive-timestep-highfreq-weight", type=float, default=0.25,
+                   help="adaptive_timestep_metric=mixed 时的高频 residual 权重。")
+    p.add_argument("--adaptive-timestep-bins", type=int, default=16, help="自适应 timestep loss 统计分桶数")
+    p.add_argument("--adaptive-timestep-ema-decay", type=float, default=0.95, help="自适应 timestep loss EMA 衰减")
+    p.add_argument("--adaptive-timestep-burn-in", type=int, default=160, help="开始重采样前的 warmup step 数")
+    p.add_argument("--adaptive-timestep-min-factor", type=float, default=0.5, help="分桶采样倍率下限")
+    p.add_argument("--adaptive-timestep-max-factor", type=float, default=2.0, help="分桶采样倍率上限")
+    p.add_argument("--adaptive-timestep-base-mix", type=float, default=0.25, help="每个 batch 保留基础采样的比例")
+    p.add_argument("--adaptive-timestep-candidate-mult", type=int, default=8, help="proposal-resampling 候选倍数")
     p.add_argument("--schedule-shift", type=float, default=1.0,
                    help="SD3 式 σ schedule shift（应用于所有 t 在噪声混合前）。1.0=不偏移；"
                         "1024 高分辨率训练 SD3 论文推荐 3.0；与 timestep_sampling 模式无关，对 uniform 也生效。")
@@ -3100,6 +3372,17 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    # ★ TF32 优化：在 Ampere/Hopper (A100/H100/RTX 30+/40+) GPU 上对 fp32 矩阵乘法
+    # 启用 TensorFloat-32，单乘 ~8× 加速 fp32 路径，bf16 路径不受影响。
+    # 训练里 fp32 残留路径主要在 loss 计算和某些 reduce 上，开 high 是安全的零代价收益。
+    # 旧 GPU（V100、Turing）这个调用是 no-op，不会出错。
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+    # 注意：cudnn.benchmark 这里**故意不开启**。
+    # 理由：ARB 分桶导致 batch 之间 conv shape 在多个 bucket 之间切换，
+    # 每个新 shape 都触发 ~1-5 秒的算法 profiling。短训练（几百-几千步）下
+    # profiling 开销难以摊销，可能反而变慢；只有 shape 完全固定且训练很长才推荐开。
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
 
@@ -3178,7 +3461,11 @@ def main():
     )
 
     # 注入 LoRA
-    logger.info(f"注入 {args.lora_type.upper()}...")
+    lora_variant = str(getattr(args, "lora_variant", "base") or "base").lower()
+    dora_export_mode = str(getattr(args, "dora_export_mode", "native") or "native").lower()
+    if lora_variant == "dora" and args.lora_type != "lokr":
+        raise ValueError("lora_variant='dora' requires lora_type='lokr'")
+    logger.info(f"注入 {args.lora_type.upper()} ({lora_variant})...")
     # exclude_prefixes 语义：
     #   - None / 未设置  → 用 DEFAULT_EXCLUDE_PREFIXES（默认排除 llm_adapter.*，与 Anima 官方建议一致）
     #   - 字符串/列表    → 完全替换默认值（例如 [] 表示一个不排除）
@@ -3197,6 +3484,16 @@ def main():
     if raw_include_patterns is not None:
         injector_kwargs["include_patterns"] = list(raw_include_patterns)
 
+    raw_targets = getattr(args, "lora_targets", None)
+    if raw_targets is not None:
+        if isinstance(raw_targets, str):
+            raw_targets = [s.strip() for s in raw_targets.split(",") if s.strip()]
+        else:
+            raw_targets = [str(s).strip() for s in raw_targets if str(s).strip()]
+        if raw_targets:
+            injector_kwargs["targets"] = raw_targets
+            logger.info("LoRA targets: %s", ", ".join(raw_targets))
+
     # 模块级 rank/lr 控制
     reg_dims = getattr(args, "lora_reg_dims", None)
     reg_lrs = getattr(args, "lora_reg_lrs", None)
@@ -3214,6 +3511,8 @@ def main():
         rank_dropout=float(getattr(args, "rank_dropout", 0.0) or 0.0),
         module_dropout=float(getattr(args, "module_dropout", 0.0) or 0.0),
         loraplus_lr_ratio=float(getattr(args, "loraplus_lr_ratio", 1.0) or 1.0),
+        lora_variant=lora_variant,
+        dora_export_mode=dora_export_mode,
         **injector_kwargs,
     )
     injector.inject(model)
@@ -3292,6 +3591,12 @@ def main():
         logger.warning("num_workers > 0 在 Windows 上容易崩溃：已强制设为 0（避免多进程 spawn 问题）")
         args.num_workers = 0
 
+    # num_workers>0 时启用 worker 持久化与适度预取，省每 epoch 的 spawn 开销
+    _loader_kwargs = {}
+    if args.num_workers > 0:
+        _loader_kwargs["persistent_workers"] = True
+        _loader_kwargs["prefetch_factor"] = 2
+
     if use_cached:
         batch_sampler = BucketBatchSampler(
             dataset, batch_size=args.batch_size,
@@ -3302,6 +3607,7 @@ def main():
             dataset, batch_sampler=batch_sampler,
             collate_fn=collate_fn_cached,
             num_workers=args.num_workers,
+            **_loader_kwargs,
         )
     else:
         # Use BucketBatchSampler so same-resolution images are always batched together.
@@ -3315,6 +3621,7 @@ def main():
             dataset, batch_sampler=batch_sampler,
             collate_fn=collate_fn,
             num_workers=args.num_workers,
+            **_loader_kwargs,
         )
 
     # 训练前自检：VAE encode->decode 循环（快速排除 VAE/scale/shape 问题）
@@ -3400,66 +3707,6 @@ def main():
     trainable_params = []
     for group in optimizer.param_groups:
         trainable_params.extend(group["params"])
-
-    # ★ v5 ⑤ LoRA EMA 初始化
-    # 构造 (name, param) 列表，供 EMA 内部用 id(param) 索引。命名仅用于调试。
-    # 我们直接在 model.named_parameters() 中筛选 requires_grad=True 的参数。
-    named_trainable_params = [
-        (n, p) for n, p in model.named_parameters() if p.requires_grad
-    ]
-    ema_decay = float(getattr(args, "lora_ema_decay", 0.0) or 0.0)
-    lora_ema = None
-    if ema_decay > 0:
-        if ema_decay >= 1.0:
-            logger.warning(f"[ema] decay={ema_decay} >=1，禁用 EMA。合法范围 (0, 1)，推荐 0.999-0.9999。")
-        else:
-            lora_ema = LoRAEmaShadow(named_trainable_params, decay=ema_decay)
-            logger.info(
-                f"[ema] 启用 LoRA EMA，decay={ema_decay} "
-                f"(shadow {len(lora_ema.shadow)} 个张量；采样/保存时自动切换到 EMA 副本)"
-            )
-
-    def _ema_ctx():
-        """采样/保存时把当前 LoRA 权重临时换成 EMA 副本。未启用 EMA 时返回 nullcontext。"""
-        if lora_ema is not None:
-            return lora_ema.applied(named_trainable_params)
-        return nullcontext()
-
-    # ★ v5 ⑦ t-binned LR group：按 t 区间冻结不同模块的梯度
-    # 启用时，需要把每个 LoRA 参数按所属模块名归类，便于按 t_mean 选择性 zero_grad。
-    t_binned_enabled = bool(getattr(args, "t_binned_module_groups", False))
-    param_category = {}  # id(param) -> str: "mlp" / "self_attn" / "cross_attn" / "llm_adapter" / "other"
-    if t_binned_enabled:
-        for module_name, lora_mod in injector.injected.items():
-            # 按 module_name 做粗分类。用 dotted segment 完整匹配避免子串误判
-            # （例如某层名里同时含 "mlp" 与 "cross_attn" 时，子串顺序会决定结果，不稳健）。
-            segs = set(module_name.split("."))
-            if "llm_adapter" in segs or any("llm_adapter" in s for s in segs):
-                cat = "llm_adapter"
-            elif "mlp" in segs or any(s.startswith("mlp") for s in segs):
-                cat = "mlp"
-            elif "cross_attn" in segs or any("cross_attn" in s for s in segs):
-                cat = "cross_attn"
-            elif "self_attn" in segs or any("self_attn" in s for s in segs):
-                cat = "self_attn"
-            else:
-                cat = "other"
-            for p in lora_mod.parameters():
-                if p.requires_grad:
-                    param_category[id(p)] = cat
-        # 诊断：分类后每组参数数量
-        from collections import Counter
-        cat_count = Counter(param_category.values())
-        logger.info(
-            f"[t_binned] 启用 t-binned LR group；模块分类参数数: "
-            f"{dict(cat_count)} "
-            f"(t<0.3 时仅训练 mlp+llm_adapter+other；t>0.6 时仅训练 self_attn+cross_attn+other)"
-        )
-        if int(getattr(args, "grad_accum", 1) or 1) > 1:
-            logger.info(
-                "[t_binned] grad_accum>1 时启用了 pre-backward snapshot 机制，"
-                "确保每个微 batch 的 t 仅作用于自己的贡献。"
-            )
 
     # 计算总步数
     try:
@@ -3585,11 +3832,10 @@ def main():
                 monitor_data = get_state()
             except Exception:
                 pass
-        with _ema_ctx():  # v5 ⑤
-            save_training_state(state_path, injector, optimizer, current_epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
-            # 同时保存 LoRA 权重
-            lora_path = output_dir / f"{args.output_name}_interrupted_step{global_step}.safetensors"
-            injector.save(lora_path)
+        save_training_state(state_path, injector, optimizer, current_epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
+        # 同时保存 LoRA 权重
+        lora_path = output_dir / f"{args.output_name}_interrupted_step{global_step}.safetensors"
+        injector.save(lora_path, model=model)
         emit(f"已保存！下次使用 --resume-state \"{state_path}\" 继续训练")
         sys.exit(0)
     
@@ -3610,6 +3856,21 @@ def main():
     if not sample_prompts and args.sample_prompt:
         sample_prompts = [args.sample_prompt]
     sample_prompt_idx = 0
+
+    adaptive_ts = AdaptiveTimestepSampler(
+        enabled=bool(getattr(args, "adaptive_timestep", False)),
+        bins=int(getattr(args, "adaptive_timestep_bins", 16) or 16),
+        ema_decay=float(getattr(args, "adaptive_timestep_ema_decay", 0.95) or 0.95),
+        burn_in_steps=int(getattr(args, "adaptive_timestep_burn_in", 160) or 0),
+        min_factor=float(getattr(args, "adaptive_timestep_min_factor", 0.5) or 0.5),
+        max_factor=float(getattr(args, "adaptive_timestep_max_factor", 2.0) or 2.0),
+        base_mix=float(getattr(args, "adaptive_timestep_base_mix", 0.25) or 0.0),
+        candidate_mult=int(getattr(args, "adaptive_timestep_candidate_mult", 8) or 8),
+        metric=str(getattr(args, "adaptive_timestep_metric", "raw") or "raw"),
+        highfreq_weight=float(getattr(args, "adaptive_timestep_highfreq_weight", 0.25) or 0.0),
+    )
+    if adaptive_ts.enabled:
+        logger.info("[adaptive_timestep] enabled: %s", adaptive_ts.summary())
 
     def get_next_sample_prompt():
         """获取下一个采样提示词（轮换）"""
@@ -3716,18 +3977,16 @@ def main():
             ts_mode = str(getattr(args, "timestep_sampling", "logit_normal") or "logit_normal")
             f_shift = float(getattr(args, "flow_shift", 3.0) or 3.0)
             mix_low_prob = float(getattr(args, "timestep_mix_low_prob", 0.25) or 0.0)
-            mix_extreme_prob = float(getattr(args, "timestep_mix_extreme_prob", 0.0) or 0.0)
-            t = sample_t(
+            sched_shift = float(getattr(args, "schedule_shift", 1.0) or 1.0)
+            t = adaptive_ts.sample(
                 bs, device, mode=ts_mode, shift=f_shift,
-                mix_low_prob=mix_low_prob, mix_extreme_prob=mix_extreme_prob,
+                mix_low_prob=mix_low_prob, schedule_shift=sched_shift,
+                global_step=global_step,
             )
 
             # SD3 式 σ schedule shift：作用于所有模式的 t（含 uniform / mixed_*），
             # 把噪声混合用的 sigma 整体偏向高噪声端。1.0=禁用，向后兼容。
-            sched_shift = float(getattr(args, "schedule_shift", 1.0) or 1.0)
-            if sched_shift > 0 and abs(sched_shift - 1.0) > 1e-6:
-                t = (t * sched_shift) / (1 + (sched_shift - 1) * t)
-                t = t.clamp(1e-4, 1.0 - 1e-4)
+            t = apply_timestep_schedule_shift(t, sched_shift)
 
             t_exp = t.view(-1, 1, 1, 1, 1)
 
@@ -3739,55 +3998,6 @@ def main():
                 random_offset_strength=bool(getattr(args, "noise_offset_random_strength", False)),
                 noise_offset_min=float(getattr(args, "noise_offset_min", 0.0) or 0.0),
             )
-
-            # ★ v5 ④ Immiscible noise pairing
-            # batch（或 pool）内做 (latent, noise) 的 Hungarian 配对，把每个 latent 配到
-            # transport cost 最小的 noise。显著降低梯度方差，对小 batch + ProdigyPlus 收益最大。
-            # 注意：必须在 ip_noise_gamma 扰动之前做 pairing，否则随机扰动会让 pairing 不稳定。
-            immiscible_pool = int(getattr(args, "immiscible_pool_size", 0) or 0)
-            if immiscible_pool > 1 and bs > 1:
-                try:
-                    from scipy.optimize import linear_sum_assignment
-                    actual_pool = max(immiscible_pool, bs)
-                    if actual_pool > bs:
-                        # 扩展 pool：再采 (actual_pool - bs) 个噪声，与原 noise 拼起来
-                        extra_shape = list(latents.shape)
-                        extra_shape[0] = actual_pool - bs
-                        extra_latents_proxy = latents[:1].expand(actual_pool - bs, *latents.shape[1:]).contiguous()
-                        extra_noise = make_noise(
-                            extra_latents_proxy,
-                            noise_offset=float(getattr(args, "noise_offset", 0.0) or 0.0),
-                            pyramid_iters=int(getattr(args, "pyramid_noise_iterations", 0) or 0),
-                            pyramid_discount=float(getattr(args, "pyramid_noise_discount", 0.3) or 0.3),
-                            random_offset_strength=bool(getattr(args, "noise_offset_random_strength", False)),
-                            noise_offset_min=float(getattr(args, "noise_offset_min", 0.0) or 0.0),
-                        )
-                        pool_noise = torch.cat([noise, extra_noise], dim=0)
-                    else:
-                        pool_noise = noise
-                    # 用未扰动的 latents 做距离矩阵（fp32, flatten 到 (B, D) / (pool, D)）
-                    L = latents.detach().float().reshape(bs, -1)
-                    P = pool_noise.detach().float().reshape(pool_noise.shape[0], -1)
-                    # cdist 在大维度上较慢；按 sample 做能够避免一次性产生 (bs, pool, D) 张量
-                    dist = torch.cdist(L, P).cpu().numpy()
-                    row_ind, col_ind = linear_sum_assignment(dist)
-                    noise = pool_noise[col_ind]
-                except ImportError:
-                    logger.warning(
-                        "[immiscible] scipy 未安装，无法做 Hungarian 配对；本次回退到随机配对。"
-                        "pip install scipy 即可启用。"
-                    )
-                except Exception as _e:
-                    logger.warning(f"[immiscible] 配对失败，回退到随机配对: {_e}")
-
-            # ★ v5 ③ Input perturbation noise (ip_noise_gamma)
-            # 在 FM 噪声混合之前给 clean latents 加一个小高斯扰动，把每张训练图扩展成
-            # ε-邻域副本，扩大训练分布支持。对 60-100 张小数据集泛化提升最显著。
-            # 注意：target 必须基于扰动后的 latents（target = noise - latents_perturbed），
-            # 否则 v 预测目标和实际 x_t 不一致。
-            ip_gamma = float(getattr(args, "ip_noise_gamma", 0.0) or 0.0)
-            if ip_gamma > 0:
-                latents = latents + ip_gamma * torch.randn_like(latents)
 
             noisy = (1 - t_exp) * latents + t_exp * noise
             target = noise - latents
@@ -3822,30 +4032,6 @@ def main():
                     loss = (per_sample * w).mean()
                 else:
                     loss = per_sample.mean()
-
-                # ★ v5 ⑥ High-frequency loss term
-                # 主 loss 之外加一项 high-pass 残差 loss，直接放大眼睛/头发/logo
-                # 这类高频信号的梯度；不依赖区域定位，对画师构图偏好完全中立。
-                hf_w = float(getattr(args, "highfreq_loss_weight", 0.0) or 0.0)
-                if hf_w > 0:
-                    def _spatial_highpass(x):
-                        # 仅在空间维 (H, W) 做 box-blur，得到 high-pass = x - blur
-                        if x.ndim == 5:
-                            b, c, tt, h, w_ = x.shape
-                            x2 = x.reshape(b * c * tt, 1, h, w_)
-                            blur = F.avg_pool2d(x2, kernel_size=5, stride=1, padding=2)
-                            return (x2 - blur).reshape(b, c, tt, h, w_)
-                        elif x.ndim == 4:
-                            b, c, h, w_ = x.shape
-                            x2 = x.reshape(b * c, 1, h, w_)
-                            blur = F.avg_pool2d(x2, kernel_size=5, stride=1, padding=2)
-                            return (x2 - blur).reshape(b, c, h, w_)
-                        else:
-                            return x  # 不支持的维度直接跳过
-                    pred_hf = _spatial_highpass(pred.float())
-                    target_hf = _spatial_highpass(target.float())
-                    hf_loss = (pred_hf - target_hf).square().mean()
-                    loss = loss + hf_w * hf_loss
 
             # ★ 守护 1：forward 结果 NaN/Inf 检查
             debug_n = int(getattr(args, "debug_first_batches", 0) or 0)
@@ -3903,52 +4089,17 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
-            # ★ v5 ⑦ t-binned LR group：按 t 区间冻结部分模块的梯度
-            # 替代 detail_inv_t × 5×：用"显式 module-level 冻结"避免低 t 梯度污染
-            # ProdigyPlus 的 d 估计。
-            #   t < 0.3 (细节端)：仅更新 mlp + llm_adapter + other（含 norm/bias 等）
-            #   t > 0.6 (构图端)：仅更新 self_attn + cross_attn + other
-            #   0.3 ≤ t ≤ 0.6 (过渡端)：全部更新
-            # 建议同时把 loss_weighting_scheme 设为 "none"，避免和它叠加。
-            #
-            # ★ grad_accum 安全的实现：在 backward 之前 snapshot 被 skip 类别的当前 grad
-            # （即"已累积到这里的合法贡献"），backward 之后把这些类别的 grad 恢复到 snapshot
-            # 值——这等于"把本微 batch 的贡献从被 skip 类别中减掉"。这样：
-            #   - grad_accum=1: snapshot 是 None/0，恢复后 grad=0 → 等同直接 zero_()。
-            #   - grad_accum>1: 前几个微 batch 累积的合法部分被保留，本微 batch 被禁的类别不污染。
-            t_binned_skip_cats = set()
-            t_binned_snapshots = {}
-            if t_binned_enabled and param_category:
-                t_mean = float(t.float().mean().detach())
-                if t_mean < 0.3:
-                    t_binned_skip_cats = {"self_attn", "cross_attn"}
-                elif t_mean > 0.6:
-                    t_binned_skip_cats = {"mlp"}
-                if t_binned_skip_cats:
-                    for p in trainable_params:
-                        cat = param_category.get(id(p))
-                        if cat in t_binned_skip_cats:
-                            # 若 p.grad 已存在（accumulation 中段），克隆；否则记 None 表示"原本就没有"
-                            t_binned_snapshots[id(p)] = (
-                                p.grad.detach().clone() if p.grad is not None else None
-                            )
-
+            if adaptive_ts.enabled:
+                adaptive_signal = adaptive_timestep_metric_signal(
+                    per_sample,
+                    pred,
+                    target,
+                    metric=adaptive_ts.metric,
+                    highfreq_weight=adaptive_ts.highfreq_weight,
+                )
+                adaptive_ts.update(t.float(), adaptive_signal)
             loss_to_backward = loss / args.grad_accum
             loss_to_backward.backward()
-
-            # backward 之后立刻恢复 skip 类别的 grad（撤销本微 batch 对它们的贡献）
-            if t_binned_snapshots:
-                for p in trainable_params:
-                    if id(p) not in t_binned_snapshots:
-                        continue
-                    snap = t_binned_snapshots[id(p)]
-                    if snap is None:
-                        # 原本没 grad → 抹除本次新增的 grad
-                        if p.grad is not None:
-                            p.grad = None
-                    else:
-                        p.grad.copy_(snap)
-                t_binned_snapshots.clear()
 
             if (batch_idx + 1) % args.grad_accum == 0:
                 # ★ 守护 2：梯度 NaN/Inf 检查
@@ -4001,10 +4152,6 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-                # ★ v5 ⑤ EMA update（在 optimizer.step() 之后）
-                if lora_ema is not None:
-                    lora_ema.update(named_trainable_params)
-
                 # ★ 守护 3：优化器状态污染检测（Prodigy 内部 d 变 NaN 会连锁崩溃）
                 if opt_type == "prodigyplus" and global_step % 50 == 0:
                     try:
@@ -4041,6 +4188,8 @@ def main():
                         )
                 else:
                     lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else 0.0
+                if adaptive_ts.enabled and global_step % 50 == 0:
+                    logger.info("[step %d] adaptive_timestep %s", global_step, adaptive_ts.summary())
                 
                 # 更新训练监控面板
                 if monitor_server:
@@ -4083,16 +4232,15 @@ def main():
                     s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
                     s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
                     s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
-                    with _ema_ctx():  # v5 ⑤ 切换到 LoRA EMA 副本（如启用）
-                        img = sample_image(
-                            model, vae, qwen_model, qwen_tok, t5_tok,
-                            prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
-                            negative_prompt=(s_neg or None),
-                            sampler_name=s_sampler,
-                            scheduler=s_sched,
-                            device=device, dtype=dtype,
-                            use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
-                        )
+                    img = sample_image(
+                        model, vae, qwen_model, qwen_tok, t5_tok,
+                        prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
+                        negative_prompt=(s_neg or None),
+                        sampler_name=s_sampler,
+                        scheduler=s_sched,
+                        device=device, dtype=dtype,
+                        use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                    )
                     sample_path = sample_dir / f"step_{global_step}.png"
                     img.save(sample_path)
                     emit(f"采样保存: step_{global_step}.png")
@@ -4109,8 +4257,7 @@ def main():
                 if save_every_steps > 0 and global_step % save_every_steps == 0:
                     if hasattr(optimizer, "eval"): optimizer.eval()
                     lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
-                    with _ema_ctx():  # v5 ⑤
-                        injector.save(lora_path)
+                    injector.save(lora_path, model=model)
                     emit(f"Saved LoRA: {lora_path}")
                     if hasattr(optimizer, "train"): optimizer.train()
 
@@ -4127,14 +4274,10 @@ def main():
                             monitor_data = get_state()
                         except Exception:
                             pass
-                    # 注意：training_state 包含 optimizer state（含 SF z），故 LoRA 权重和 LoRA
-                    # checkpoint 都用 EMA 视图保存，断点续训依然能恢复（resume 时不会从 LoRA
-                    # checkpoint 加载训练态，只用作起点；optimizer state 单独恢复）。
-                    with _ema_ctx():  # v5 ⑤
-                        save_training_state(state_path, injector, optimizer, epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
-                        # 同时保存 LoRA 权重
-                        lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
-                        injector.save(lora_path)
+                    save_training_state(state_path, injector, optimizer, epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
+                    # 同时保存 LoRA 权重
+                    lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
+                    injector.save(lora_path, model=model)
                     if hasattr(optimizer, "train"): optimizer.train()
 
                 # 检查 max_steps
@@ -4148,8 +4291,7 @@ def main():
             if args.save_every > 0 and current_epoch % args.save_every == 0:
                 if hasattr(optimizer, "eval"): optimizer.eval()
                 save_path = output_dir / f"{args.output_name}_epoch{current_epoch}.safetensors"
-                with _ema_ctx():  # v5 ⑤
-                    injector.save(save_path)
+                injector.save(save_path, model=model)
                 emit(f"Saved LoRA: {save_path}")
                 if hasattr(optimizer, "train"): optimizer.train()
 
@@ -4167,16 +4309,15 @@ def main():
                 s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
                 s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
                 s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
-                with _ema_ctx():  # v5 ⑤
-                    img = sample_image(
-                        model, vae, qwen_model, qwen_tok, t5_tok,
-                        prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
-                        negative_prompt=(s_neg or None),
-                        sampler_name=s_sampler,
-                        scheduler=s_sched,
-                        device=device, dtype=dtype,
-                        use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
-                    )
+                img = sample_image(
+                    model, vae, qwen_model, qwen_tok, t5_tok,
+                    prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
+                    negative_prompt=(s_neg or None),
+                    sampler_name=s_sampler,
+                    scheduler=s_sched,
+                    device=device, dtype=dtype,
+                    use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                )
                 sample_path = sample_dir / f"epoch_{current_epoch}.png"
                 img.save(sample_path)
                 emit(f"采样保存: epoch_{current_epoch}.png")
@@ -4197,8 +4338,7 @@ def main():
     # 最终保存
     if hasattr(optimizer, "eval"): optimizer.eval()
     final_path = output_dir / f"{args.output_name}.safetensors"
-    with _ema_ctx():  # v5 ⑤
-        injector.save(final_path)
+    injector.save(final_path, model=model)
 
     # 清理进度显示
     if live:

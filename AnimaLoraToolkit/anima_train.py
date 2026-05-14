@@ -4068,14 +4068,21 @@ def main():
         optimizer.train()
     model.train()
 
+    # 累积周期状态：当周期内任一 micro-batch 出现 NaN 时置 False。
+    # 旧实现是出 NaN 立即 `zero_grad()` —— 会抹掉同周期内之前已经累计好的梯度，
+    # 接着继续累计剩下的 micro-batch，最后用"半截"梯度调用 optimizer.step()。
+    # 新做法：保留已累计的梯度，但记号本周期"脏了"，到周期边界时整体丢弃这次 step。
+    accum_clean = True
+
     for epoch in range(start_epoch, args.epochs):
         current_epoch = epoch
         if hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_epoch"):
             dataloader.batch_sampler.set_epoch(epoch)
         for batch_idx, batch in enumerate(dataloader):
-            # 在累积周期开始时记录时间
+            # 在累积周期开始时记录时间 + 重置 clean 标志
             if batch_idx % args.grad_accum == 0:
                 step_start_time = time.perf_counter()
+                accum_clean = True
 
             captions = batch["captions"]
 
@@ -4209,7 +4216,8 @@ def main():
                     f"pred stats: min={pred.float().min().item():.3e} "
                     f"max={pred.float().max().item():.3e}"
                 )
-                optimizer.zero_grad(set_to_none=True)
+                # 不要 zero_grad！保留同周期内其他 micro-batch 的梯度，整周期边界统一丢弃。
+                accum_clean = False
                 continue
 
             if adaptive_ts.enabled:
@@ -4225,7 +4233,16 @@ def main():
             loss_to_backward.backward()
 
             if (batch_idx + 1) % args.grad_accum == 0:
-                # ★ 守护 2：梯度 NaN/Inf 检查
+                # ★ 守护 1：周期内有 micro-batch NaN/Inf loss → 整周期作废，不做 step
+                if not accum_clean:
+                    logger.warning(
+                        f"[step {global_step}] Accumulation cycle contained a non-finite "
+                        f"micro-batch loss; discarding the entire cycle's gradients."
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                # ★ 守护 2：梯度 NaN/Inf 检查（即使 loss 全 finite，反向也可能出 NaN）
                 bad_grad = False
                 for p in trainable_params:
                     if p.grad is not None and not torch.isfinite(p.grad).all():

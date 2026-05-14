@@ -2286,6 +2286,25 @@ class BucketBatchSampler:
                 "将退化为顺序分批（可能在 ARB 模式下因尺寸不一致而崩溃）。"
                 "请检查 ImageDataset/CachedLatentDataset 是否正确填充了 bucket_for_index。"
             )
+        # 计算每个桶的批数（drop_last 在每个桶内独立生效）。旧实现 `n // bs` 在多桶 +
+        # drop_last 时会高估批数 —— 例如 2 个桶各 5 张图、bs=4、drop_last=True，真实是
+        # 1+1=2 个 batch，旧实现报 10//4=2（巧合相同）或在 [3,5] 这种分布下报 8//4=2
+        # 但真实是 0+1=1。`total_steps = len(dataloader) * epochs / grad_accum` 会跟着
+        # 偏，进而把 cosine 调度器的 T_max 设错。
+        self._total_batches = self._compute_total_batches()
+
+    def _compute_total_batches(self):
+        from collections import Counter
+        counts = Counter(tuple(k) if k is not None else (0, 0) for k in self._bucket_keys)
+        bs = self.batch_size
+        total = 0
+        if self.drop_last:
+            for n in counts.values():
+                total += n // bs
+        else:
+            for n in counts.values():
+                total += (n + bs - 1) // bs
+        return total
 
     def _build_keys(self, dataset):
         n = len(dataset)
@@ -2329,10 +2348,8 @@ class BucketBatchSampler:
         self.epoch = int(epoch)
 
     def __len__(self):
-        n = len(self.dataset)
-        if self.drop_last:
-            return n // self.batch_size
-        return (n + self.batch_size - 1) // self.batch_size
+        # 用预计算的 per-bucket 加和（见 __init__ 末尾）。
+        return self._total_batches
 
     def __iter__(self):
         rng = random.Random(self.seed + self.epoch)

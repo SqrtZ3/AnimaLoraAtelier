@@ -2915,28 +2915,22 @@ def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
     noise_offset: 给每个样本/通道加一个低频偏移，缓解“总是中等亮度”的偏差，对学习明暗对比尤其有效（来自 SDXL 的 noise_offset 思路）。
     noise_offset_min: random_offset_strength=true 时的随机下限；默认 0 兼容旧行为。
     pyramid_iters: 叠加多尺度低频噪声，帮助模型快速学习全局光照/构图（参考 multires noise / pyramid noise）。
+
+    ⚠ 顺序很重要：
+      先做 pyramid 叠加 + 整体归一化（让噪声仍保持 std≈1，避免方差爆炸），
+      然后再加 noise_offset。这样 offset 的实际幅度与配置数字一致。
+      旧实现先 offset 再 pyramid 归一化，offset 会被 std-rescale 一起缩水。
+
+    pyramid_discount 当前用 `discount ** (i+1)`（i 从 0 起），比 Whitaker/kohya 标准
+    实现 `discount ** i` 弱一个量级。这是有意为之的"弱模式"：对追求绝对还原的训练
+    更友好（pyramid 几乎不引入全局色调泛化）。若想要标准 multires noise 的强度，
+    把配置里的 discount 从默认 0.3 提到 ~0.5-0.7 即可获得近似 Whitaker 效果。
     """
     out_dtype = latents.dtype
     noise = torch.randn_like(latents, dtype=torch.float32)
 
-    if noise_offset and noise_offset > 0:
-        # 形状: (B, C, T, 1, 1) 或 (B, C, 1, 1) — 与 latents 兼容的"低频"扰动
-        leading_shape = list(latents.shape)
-        for ax in range(2, latents.ndim):
-            leading_shape[ax] = 1
-        offset = torch.randn(*leading_shape, device=latents.device, dtype=torch.float32)
-        scale = float(noise_offset)
-        if random_offset_strength:
-            lo = max(float(noise_offset_min or 0.0), 0.0)
-            hi = max(scale, 0.0)
-            if lo > hi:
-                lo, hi = hi, lo
-            scale_shape = [latents.shape[0]] + [1] * (latents.ndim - 1)
-            scale = lo + (hi - lo) * torch.rand(scale_shape, device=latents.device, dtype=torch.float32)
-        noise = noise + scale * offset
-
+    # === Step 1: Pyramid 叠加 + 归一化（如果启用） ===
     if pyramid_iters and int(pyramid_iters) > 0:
-        # 简化的 pyramid noise：在多个降采样尺度上叠加噪声，再 upsample 加回原噪声
         try:
             import torch.nn.functional as _F
             spatial_dims = list(latents.shape[-2:])
@@ -2962,12 +2956,31 @@ def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
                 cur = cur + extra * (float(pyramid_discount) ** (i + 1))
                 if min(small_h, small_w) <= 1:
                     break
-            # 归一到与原噪声相同的方差，保持训练稳定
+            # 归一到与原噪声相同的方差，保持训练稳定。
             reduce_dims = tuple(range(1, cur.ndim))
             cur = cur / cur.std(dim=reduce_dims, keepdim=True).clamp(min=1e-6)
             noise = cur
         except Exception as _e:
             logger.warning(f"pyramid_noise 计算失败，回退到标准噪声: {_e}")
+
+    # === Step 2: noise_offset 加在归一化后的噪声上 ===
+    # 这样配置里的 noise_offset 强度就是实际生效的强度（旧实现里这一步被
+    # 后续 pyramid 的 cur/cur.std() 吃掉过一次）。
+    if noise_offset and noise_offset > 0:
+        # 形状: (B, C, T, 1, 1) 或 (B, C, 1, 1) — 与 latents 兼容的"低频"扰动
+        leading_shape = list(latents.shape)
+        for ax in range(2, latents.ndim):
+            leading_shape[ax] = 1
+        offset = torch.randn(*leading_shape, device=latents.device, dtype=torch.float32)
+        scale = float(noise_offset)
+        if random_offset_strength:
+            lo = max(float(noise_offset_min or 0.0), 0.0)
+            hi = max(scale, 0.0)
+            if lo > hi:
+                lo, hi = hi, lo
+            scale_shape = [latents.shape[0]] + [1] * (latents.ndim - 1)
+            scale = lo + (hi - lo) * torch.rand(scale_shape, device=latents.device, dtype=torch.float32)
+        noise = noise + scale * offset
 
     return noise.to(dtype=out_dtype)
 

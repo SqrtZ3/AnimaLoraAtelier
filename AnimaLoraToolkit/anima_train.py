@@ -3075,16 +3075,22 @@ def adaptive_timestep_metric_signal(
 
 
 def compute_grad_norm(parameters) -> float:
-    total_sq = 0.0
-    for p in parameters:
-        if p.grad is None:
-            continue
-        grad = p.grad.detach()
-        if not torch.isfinite(grad).all():
-            return float("inf")
-        param_norm = grad.float().norm(2).item()
-        total_sq += param_norm * param_norm
-    return total_sq ** 0.5
+    """L2 范数（全局），用 foreach 一次性算所有 grad，避免逐参数 `.item()` 同步。
+
+    LoKr 注入了 100+ 个小 Linear，旧实现每个 grad 都跑一次 .item()，每次 grad_norm
+    日志都要触发 100+ 次 GPU↔CPU 同步；新实现只在最后做一次同步。
+    """
+    grads = [p.grad.detach() for p in parameters if p.grad is not None]
+    if not grads:
+        return 0.0
+    # 任一 grad 含 NaN/Inf 直接报 inf（与旧实现语义一致）。
+    finite_check = torch.stack([torch.isfinite(g).all() for g in grads])
+    if not bool(finite_check.all()):
+        return float("inf")
+    # torch._foreach_norm 在新版 PyTorch 上是融合 kernel，比 Python loop 快很多。
+    per_grad_norms = torch._foreach_norm(grads, 2.0)
+    total = torch.linalg.vector_norm(torch.stack([n.to(torch.float32) for n in per_grad_norms]))
+    return float(total.item())
 
 
 def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: float = 0.0,

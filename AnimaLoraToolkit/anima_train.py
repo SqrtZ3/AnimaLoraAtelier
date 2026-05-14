@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import types
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -173,7 +174,6 @@ def apply_yaml_config(args, config):
         "grad_clip_max_norm": "grad_clip_max_norm",
         "mixed_precision": "mixed_precision",
         "grad_checkpoint": "grad_checkpoint",
-        "xformers": "xformers",
         "num_workers": "num_workers",
         # 输出与保存
         "output_dir": "output_dir",
@@ -245,6 +245,7 @@ def apply_yaml_config(args, config):
         "lora_include_patterns": "lora_include_patterns",
         # 模块级 rank/lr 控制（kohya 风格）
         "lora_reg_dims": "lora_reg_dims",
+        "lora_reg_alphas": "lora_reg_alphas",
         "lora_reg_lrs": "lora_reg_lrs",
         # 精细正则化
         "rank_dropout": "rank_dropout",
@@ -327,7 +328,6 @@ def apply_yaml_config(args, config):
         "grad_clip_max_norm": 1.0,
         "mixed_precision": "bf16",
         "grad_checkpoint": False,
-        "xformers": False,
         "num_workers": 0,
         "output_dir": "./output",
         "output_name": "anima_lora",
@@ -391,6 +391,7 @@ def apply_yaml_config(args, config):
         "lora_exclude_patterns": None,
         "lora_include_patterns": None,
         "lora_reg_dims": None,
+        "lora_reg_alphas": None,
         "lora_reg_lrs": None,
         "rank_dropout": 0.0,
         "module_dropout": 0.0,
@@ -520,37 +521,6 @@ def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_m
 
     x_B_T_H_W_O = model.final_layer(x_B_T_H_W_D, t_embedding, adaln_lora_B_T_3D=adaln_lora)
     return model.unpatchify(x_B_T_H_W_O)
-
-
-# ============================================================================
-# xformers 支持
-# ============================================================================
-
-def enable_xformers(model):
-    """为模型启用 xformers memory efficient attention"""
-    try:
-        from xformers.ops import memory_efficient_attention
-    except ImportError:
-        logger.warning("xformers 未安装，跳过启用")
-        return False
-
-    enabled_count = 0
-    for name, module in model.named_modules():
-        # 查找 attention 模块并替换
-        if hasattr(module, "set_use_memory_efficient_attention_xformers"):
-            module.set_use_memory_efficient_attention_xformers(True)
-            enabled_count += 1
-        elif hasattr(module, "enable_xformers_memory_efficient_attention"):
-            module.enable_xformers_memory_efficient_attention()
-            enabled_count += 1
-
-    if enabled_count > 0:
-        logger.info(f"xformers 已启用: {enabled_count} 个模块")
-        return True
-
-    # 如果模型没有内置支持，尝试 monkey patch
-    logger.info("xformers 已加载，将在 attention 计算中使用")
-    return True
 
 
 # ============================================================================
@@ -1425,7 +1395,7 @@ class LoRAInjector:
     def __init__(self, rank=32, alpha=16.0, dropout=0.0, use_lokr=False, factor=8,
                  targets=None, exclude_prefixes=None,
                  exclude_patterns=None, include_patterns=None,
-                 reg_dims=None, reg_lrs=None,
+                 reg_dims=None, reg_lrs=None, reg_alphas=None,
                  rank_dropout=0.0, module_dropout=0.0,
                  loraplus_lr_ratio=1.0, lora_variant="base", dora_export_mode="native"):
         self.rank = rank
@@ -1457,10 +1427,12 @@ class LoRAInjector:
 
         # ── 模块级 rank/lr 控制 ────────────────────────────────────────
         self.reg_dims = dict(reg_dims) if reg_dims else {}
+        self.reg_alphas = dict(reg_alphas) if reg_alphas else {}
         self.reg_lrs = dict(reg_lrs) if reg_lrs else {}
 
         self.injected = {}
         self._module_ranks = {}
+        self._module_alphas = {}
         self._module_lrs = {}
 
     def _should_inject(self, name):
@@ -1493,6 +1465,12 @@ class LoRAInjector:
                 return float(lr)
         return None
 
+    def _get_reg_alpha(self, name):
+        for pat, alpha in self.reg_alphas.items():
+            if re.fullmatch(pat, name):
+                return float(alpha)
+        return float(self.alpha)
+
     def inject(self, model):
         """注入 LoRA 到模型"""
         rank_summary = {}
@@ -1503,10 +1481,11 @@ class LoRAInjector:
                 continue
 
             mod_rank = self._get_reg_dim(name)
+            mod_alpha = self._get_reg_alpha(name)
             mod_lr = self._get_reg_lr(name)
 
             lora_linear = LoRALinear(
-                module, rank=mod_rank, alpha=float(mod_rank),
+                module, rank=mod_rank, alpha=mod_alpha,
                 dropout=self.dropout, use_lokr=self.use_lokr, factor=self.factor,
                 rank_dropout=self.rank_dropout, module_dropout=self.module_dropout,
                 lora_variant=self.lora_variant,
@@ -1519,6 +1498,7 @@ class LoRAInjector:
             setattr(parent, parts[-1], lora_linear)
             self.injected[name] = lora_linear
             self._module_ranks[name] = mod_rank
+            self._module_alphas[name] = mod_alpha
             self._module_lrs[name] = mod_lr
             rank_summary[mod_rank] = rank_summary.get(mod_rank, 0) + 1
 
@@ -1531,6 +1511,16 @@ class LoRAInjector:
         )
         if self.rank_dropout > 0 or self.module_dropout > 0:
             logger.info(f"  rank_dropout={self.rank_dropout}, module_dropout={self.module_dropout}")
+        custom_alpha_modules = {
+            n: a for n, a in self._module_alphas.items()
+            if abs(float(a) - float(self.alpha)) > 1e-12
+        }
+        if custom_alpha_modules:
+            for n, alpha in list(custom_alpha_modules.items())[:5]:
+                rank = max(int(self._module_ranks.get(n, self.rank)), 1)
+                logger.info(f"  module alpha: {n} -> {alpha:.3g} (scale={alpha / rank:.3g})")
+            if len(custom_alpha_modules) > 5:
+                logger.info(f"  ... {len(custom_alpha_modules)} modules have custom alpha")
         custom_lr_modules = {n: lr for n, lr in self._module_lrs.items() if lr is not None}
         if custom_lr_modules:
             for n, lr in list(custom_lr_modules.items())[:5]:
@@ -1546,7 +1536,7 @@ class LoRAInjector:
             params.extend(p for p in lora.parameters() if p.requires_grad)
         return params
 
-    def get_param_groups(self, weight_decay, loraplus_lr_ratio=None):
+    def get_param_groups(self, weight_decay, base_lr: float = 1.0, loraplus_lr_ratio=None):
         """获取参数组（支持 LoRA+、模块级 lr、LoKr w1 排除 weight_decay）"""
         ratio = max(float(loraplus_lr_ratio or self.loraplus_lr_ratio), 1.0)
         groups_dict = {}  # (wd, lr_mult, custom_lr) -> [params]
@@ -1577,7 +1567,7 @@ class LoRAInjector:
             if custom_lr is not None:
                 group["lr"] = custom_lr * lr_mult
             elif lr_mult != 1.0:
-                group["lr"] = lr_mult
+                group["lr"] = float(base_lr) * lr_mult
             param_groups.append(group)
 
         if ratio > 1.0:
@@ -1629,8 +1619,8 @@ class LoRAInjector:
         sd = {}
         for name, lora in self.injected.items():
             base = "lora_unet_" + name.replace(".", "_")
-            mod_rank = self._module_ranks.get(name, self.rank)
-            sd[f"{base}.alpha"] = torch.tensor(float(mod_rank))
+            mod_alpha = self._module_alphas.get(name, self.alpha)
+            sd[f"{base}.alpha"] = torch.tensor(float(mod_alpha))
             if self.use_lokr:
                 # fp32 存储：训练时 Kronecker 积在 fp32 下计算，ComfyUI 加载后
                 # 若张量是 fp32，合并时精度更接近训练行为（bf16 合并会损失小幅度 delta 的低位）
@@ -2673,6 +2663,90 @@ def sample_image(
 # 训练辅助
 # ============================================================================
 
+@dataclass(frozen=True)
+class TimestepConfig:
+    mode: str = "logit_normal"
+    flow_shift: float = 3.0
+    mix_low_prob: float = 0.25
+    schedule_shift: float = 1.0
+
+
+@dataclass(frozen=True)
+class NoiseConfig:
+    offset: float = 0.0
+    offset_min: float = 0.0
+    random_offset_strength: bool = False
+    pyramid_iterations: int = 0
+    pyramid_discount: float = 0.3
+
+
+@dataclass(frozen=True)
+class LossConfig:
+    loss_type: str = "mse"
+    huber_c: float = 0.1
+    huber_schedule: str = "constant"
+    weighting_scheme: str = "none"
+    min_snr_gamma: float = 0.0
+    weight_cap_ratio: float = 0.0
+
+
+@dataclass(frozen=True)
+class TrainingObjectiveConfig:
+    timestep: TimestepConfig
+    noise: NoiseConfig
+    loss: LossConfig
+
+
+def build_training_objective_config(args) -> TrainingObjectiveConfig:
+    return TrainingObjectiveConfig(
+        timestep=TimestepConfig(
+            mode=str(getattr(args, "timestep_sampling", "logit_normal") or "logit_normal"),
+            flow_shift=float(getattr(args, "flow_shift", 3.0) or 3.0),
+            mix_low_prob=float(getattr(args, "timestep_mix_low_prob", 0.25) or 0.0),
+            schedule_shift=float(getattr(args, "schedule_shift", 1.0) or 1.0),
+        ),
+        noise=NoiseConfig(
+            offset=float(getattr(args, "noise_offset", 0.0) or 0.0),
+            offset_min=float(getattr(args, "noise_offset_min", 0.0) or 0.0),
+            random_offset_strength=bool(getattr(args, "noise_offset_random_strength", False)),
+            pyramid_iterations=int(getattr(args, "pyramid_noise_iterations", 0) or 0),
+            pyramid_discount=float(getattr(args, "pyramid_noise_discount", 0.3) or 0.3),
+        ),
+        loss=LossConfig(
+            loss_type=str(getattr(args, "loss_type", "mse") or "mse"),
+            huber_c=float(getattr(args, "huber_c", 0.1) or 0.1),
+            huber_schedule=str(getattr(args, "huber_schedule", "constant") or "constant"),
+            weighting_scheme=str(getattr(args, "loss_weighting_scheme", "none") or "none"),
+            min_snr_gamma=float(getattr(args, "min_snr_gamma", 0.0) or 0.0),
+            weight_cap_ratio=float(getattr(args, "weight_cap_ratio", 0.0) or 0.0),
+        ),
+    )
+
+
+def make_noise_from_config(latents: torch.Tensor, cfg: NoiseConfig) -> torch.Tensor:
+    return make_noise(
+        latents,
+        noise_offset=cfg.offset,
+        pyramid_iters=cfg.pyramid_iterations,
+        pyramid_discount=cfg.pyramid_discount,
+        random_offset_strength=cfg.random_offset_strength,
+        noise_offset_min=cfg.offset_min,
+    )
+
+
+def apply_loss_weighting(per_sample: torch.Tensor, t: torch.Tensor, cfg: LossConfig) -> torch.Tensor:
+    if cfg.weighting_scheme == "none":
+        return per_sample.mean()
+    w = compute_loss_weight(
+        t.float(),
+        scheme=cfg.weighting_scheme,
+        min_snr_gamma=cfg.min_snr_gamma,
+        weight_cap_ratio=cfg.weight_cap_ratio,
+    )
+    w = w / w.mean().clamp(min=1e-6)
+    return (per_sample * w).mean()
+
+
 def sample_t(
     bs,
     device,
@@ -2842,21 +2916,23 @@ def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
     noise_offset_min: random_offset_strength=true 时的随机下限；默认 0 兼容旧行为。
     pyramid_iters: 叠加多尺度低频噪声，帮助模型快速学习全局光照/构图（参考 multires noise / pyramid noise）。
     """
-    noise = torch.randn_like(latents)
+    out_dtype = latents.dtype
+    noise = torch.randn_like(latents, dtype=torch.float32)
 
     if noise_offset and noise_offset > 0:
         # 形状: (B, C, T, 1, 1) 或 (B, C, 1, 1) — 与 latents 兼容的"低频"扰动
         leading_shape = list(latents.shape)
         for ax in range(2, latents.ndim):
             leading_shape[ax] = 1
-        offset = torch.randn(*leading_shape, device=latents.device, dtype=latents.dtype)
+        offset = torch.randn(*leading_shape, device=latents.device, dtype=torch.float32)
         scale = float(noise_offset)
         if random_offset_strength:
             lo = max(float(noise_offset_min or 0.0), 0.0)
             hi = max(scale, 0.0)
             if lo > hi:
                 lo, hi = hi, lo
-            scale = lo + (hi - lo) * float(torch.rand(1, device=latents.device).item())
+            scale_shape = [latents.shape[0]] + [1] * (latents.ndim - 1)
+            scale = lo + (hi - lo) * torch.rand(scale_shape, device=latents.device, dtype=torch.float32)
         noise = noise + scale * offset
 
     if pyramid_iters and int(pyramid_iters) > 0:
@@ -2875,24 +2951,25 @@ def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
                 # 导致规则小结构（如扣子、文字、网格）训练后变形。bilinear 提供平滑的 LF 噪声。
                 if latents.ndim == 5:
                     extra = torch.randn(latents.shape[0], latents.shape[1], latents.shape[2], small_h, small_w,
-                                        device=latents.device, dtype=latents.dtype)
+                                        device=latents.device, dtype=torch.float32)
                     extra = _F.interpolate(extra.flatten(0, 1), size=spatial_dims, mode="bilinear",
                                            align_corners=False).view(
                         latents.shape[0], latents.shape[1], latents.shape[2], spatial_dims[0], spatial_dims[1])
                 else:
                     extra = torch.randn(latents.shape[0], latents.shape[1], small_h, small_w,
-                                        device=latents.device, dtype=latents.dtype)
+                                        device=latents.device, dtype=torch.float32)
                     extra = _F.interpolate(extra, size=spatial_dims, mode="bilinear", align_corners=False)
                 cur = cur + extra * (float(pyramid_discount) ** (i + 1))
                 if min(small_h, small_w) <= 1:
                     break
             # 归一到与原噪声相同的方差，保持训练稳定
-            cur = cur / cur.std().clamp(min=1e-6)
+            reduce_dims = tuple(range(1, cur.ndim))
+            cur = cur / cur.std(dim=reduce_dims, keepdim=True).clamp(min=1e-6)
             noise = cur
         except Exception as _e:
             logger.warning(f"pyramid_noise 计算失败，回退到标准噪声: {_e}")
 
-    return noise
+    return noise.to(dtype=out_dtype)
 
 
 def _huber_delta_for_t(t: torch.Tensor | None, huber_c: float, schedule: str):
@@ -3145,7 +3222,6 @@ def parse_args():
     p.add_argument("--resolution", type=int, default=1024)
     p.add_argument("--mixed-precision", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--grad-checkpoint", action="store_true", help="启用梯度检查点减少显存")
-    p.add_argument("--xformers", action="store_true", help="启用 xformers memory efficient attention")
     p.add_argument("--max-steps", type=int, default=0, help="最大训练步数 (0=无限制)")
     p.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
 
@@ -3218,6 +3294,10 @@ def parse_args():
     p.add_argument("--interactive", action="store_true", help="交互模式，提示输入缺失参数")
     p.add_argument("--use-t5-token-weights", action="store_true", default=True)
     p.add_argument("--no-t5-token-weights", dest="use_t5_token_weights", action="store_false")
+    p.add_argument("--flow-shift", type=float, default=3.0, help="logit/timestep shift used by shifted timestep samplers")
+    p.add_argument("--timestep-sampling", default="logit_normal",
+                   choices=["logit_normal", "uniform", "logit_normal_low", "mode", "mixed_uniform_low", "mixed_uniform_logit"],
+                   help="timestep sampling distribution")
     p.add_argument("--timestep-mix-low-prob", type=float, default=0.25, help="mixed_uniform_low 中低噪声样本比例")
     p.add_argument("--adaptive-timestep", action="store_true",
                    help="启用保守自适应 timestep：按 per-timestep raw loss 重采样，不改变 loss 权重。")
@@ -3238,10 +3318,20 @@ def parse_args():
     p.add_argument("--loss-type", default="mse", choices=["mse", "l2", "l1", "huber", "smooth_l1"], help="训练损失类型")
     p.add_argument("--huber-c", type=float, default=0.1, help="Huber/SmoothL1 切换阈值")
     p.add_argument("--huber-schedule", default="constant", choices=["constant", "snr", "sigma"], help="Huber 阈值随 timestep 的调度")
+    p.add_argument("--loss-weighting-scheme", default="none",
+                   choices=["none", "min_snr", "max_snr_inv", "logit_normal", "sigma_sqrt", "sigma_sqrt_sd3", "detail_inv_t", "cosmap"],
+                   help="per-sample loss weighting scheme")
+    p.add_argument("--min-snr-gamma", type=float, default=0.0, help="gamma used by min_snr/max_snr_inv weighting")
     p.add_argument("--weight-cap-ratio", type=float, default=5.0,
                    help="loss 加权时单 batch 内 max/min 比上限。0=禁用；推荐 5-10（小 batch + Prodigy）。"
                         "防止 detail_inv_t / sigma_sqrt_sd3 等激进权重让单样本主导 batch loss → 破坏 Prodigy 的 d 估计。")
     p.add_argument("--noise-offset-min", type=float, default=0.0, help="随机 noise_offset 的下限；仅 random_strength=true 时生效")
+
+    p.add_argument("--noise-offset", type=float, default=0.0, help="low-frequency noise offset strength")
+    p.add_argument("--noise-offset-random-strength", action="store_true", help="randomize noise_offset strength per sample")
+    p.add_argument("--pyramid-noise-iterations", type=int, default=0, help="number of multires/pyramid noise levels")
+    p.add_argument("--pyramid-noise-discount", type=float, default=0.3, help="pyramid noise decay per level")
+    p.add_argument("--caption-dropout-rate", type=float, default=0.0, help="drop whole captions with this probability")
 
     return p.parse_args()
 
@@ -3378,6 +3468,11 @@ def main():
     # 旧 GPU（V100、Turing）这个调用是 no-op，不会出错。
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
+        # SDPA 是 PyTorch 2.x 内置的注意力实现，会在 Flash / memory-efficient / math
+        # 三个 backend 中自动选最优。Anima/Cosmos 的 attention 算子通过 F.scaled_dot_product_attention
+        # 调用它，所以这里不需要手动启用 xformers；过往版本 `--xformers` 开关在 Anima 上
+        # 实际上从未生效（钩子名不匹配），已经移除。
+        logger.info("Attention backend: PyTorch SDPA (auto-selects flash/memory-efficient/math)")
     # 注意：cudnn.benchmark 这里**故意不开启**。
     # 理由：ARB 分桶导致 batch 之间 conv shape 在多个 bucket 之间切换，
     # 每个新 shape 都触发 ~1-5 秒的算法 profiling。短训练（几百-几千步）下
@@ -3448,10 +3543,6 @@ def main():
     logger.info("加载 Transformer...")
     model = load_anima_model(args.transformer, device, dtype, repo_root)
 
-    # 启用 xformers
-    if args.xformers:
-        enable_xformers(model)
-
     logger.info("加载 VAE...")
     vae = load_vae(args.vae, device, dtype, repo_root)
 
@@ -3496,9 +3587,12 @@ def main():
 
     # 模块级 rank/lr 控制
     reg_dims = getattr(args, "lora_reg_dims", None)
+    reg_alphas = getattr(args, "lora_reg_alphas", None)
     reg_lrs = getattr(args, "lora_reg_lrs", None)
     if reg_dims:
         injector_kwargs["reg_dims"] = dict(reg_dims)
+    if reg_alphas:
+        injector_kwargs["reg_alphas"] = dict(reg_alphas)
     if reg_lrs:
         injector_kwargs["reg_lrs"] = dict(reg_lrs)
 
@@ -3650,6 +3744,7 @@ def main():
     # 获取参数组（支持 LoRA+、模块级 lr）
     param_groups = injector.get_param_groups(
         weight_decay,
+        base_lr=args.lr,
         loraplus_lr_ratio=float(getattr(args, "loraplus_lr_ratio", 1.0) or 1.0),
     )
 
@@ -3815,6 +3910,7 @@ def main():
     
     # Ctrl+C 信号处理：保存状态后退出
     interrupted = False
+    current_epoch = start_epoch
     def signal_handler(sig, frame):
         nonlocal interrupted
         if interrupted:
@@ -3841,8 +3937,6 @@ def main():
     
     import signal
     signal.signal(signal.SIGINT, signal_handler)
-    
-    current_epoch = start_epoch
     
     # 确保优化器在训练模式
     if hasattr(optimizer, "train"):
@@ -3871,6 +3965,23 @@ def main():
     )
     if adaptive_ts.enabled:
         logger.info("[adaptive_timestep] enabled: %s", adaptive_ts.summary())
+    objective_cfg = build_training_objective_config(args)
+    logger.info(
+        "[objective] timestep=%s flow_shift=%.3f schedule_shift=%.3f mix_low=%.3f "
+        "noise_offset=%.4f pyramid=%d discount=%.3f loss=%s huber=%s/%.3f weight=%s cap=%.3f",
+        objective_cfg.timestep.mode,
+        objective_cfg.timestep.flow_shift,
+        objective_cfg.timestep.schedule_shift,
+        objective_cfg.timestep.mix_low_prob,
+        objective_cfg.noise.offset,
+        objective_cfg.noise.pyramid_iterations,
+        objective_cfg.noise.pyramid_discount,
+        objective_cfg.loss.loss_type,
+        objective_cfg.loss.huber_schedule,
+        objective_cfg.loss.huber_c,
+        objective_cfg.loss.weighting_scheme,
+        objective_cfg.loss.weight_cap_ratio,
+    )
 
     def get_next_sample_prompt():
         """获取下一个采样提示词（轮换）"""
@@ -3974,10 +4085,10 @@ def main():
                     cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
 
             # Flow Matching：t 采样、噪声生成、目标计算
-            ts_mode = str(getattr(args, "timestep_sampling", "logit_normal") or "logit_normal")
-            f_shift = float(getattr(args, "flow_shift", 3.0) or 3.0)
-            mix_low_prob = float(getattr(args, "timestep_mix_low_prob", 0.25) or 0.0)
-            sched_shift = float(getattr(args, "schedule_shift", 1.0) or 1.0)
+            ts_mode = objective_cfg.timestep.mode
+            f_shift = objective_cfg.timestep.flow_shift
+            mix_low_prob = objective_cfg.timestep.mix_low_prob
+            sched_shift = objective_cfg.timestep.schedule_shift
             t = adaptive_ts.sample(
                 bs, device, mode=ts_mode, shift=f_shift,
                 mix_low_prob=mix_low_prob, schedule_shift=sched_shift,
@@ -3990,14 +4101,7 @@ def main():
 
             t_exp = t.view(-1, 1, 1, 1, 1)
 
-            noise = make_noise(
-                latents,
-                noise_offset=float(getattr(args, "noise_offset", 0.0) or 0.0),
-                pyramid_iters=int(getattr(args, "pyramid_noise_iterations", 0) or 0),
-                pyramid_discount=float(getattr(args, "pyramid_noise_discount", 0.3) or 0.3),
-                random_offset_strength=bool(getattr(args, "noise_offset_random_strength", False)),
-                noise_offset_min=float(getattr(args, "noise_offset_min", 0.0) or 0.0),
-            )
+            noise = make_noise_from_config(latents, objective_cfg.noise)
 
             noisy = (1 - t_exp) * latents + t_exp * noise
             target = noise - latents
@@ -4013,25 +4117,13 @@ def main():
                 per_sample = per_sample_loss(
                     pred,
                     target,
-                    loss_type=str(getattr(args, "loss_type", "mse") or "mse"),
-                    huber_c=float(getattr(args, "huber_c", 0.1) or 0.1),
-                    huber_schedule=str(getattr(args, "huber_schedule", "constant") or "constant"),
+                    loss_type=objective_cfg.loss.loss_type,
+                    huber_c=objective_cfg.loss.huber_c,
+                    huber_schedule=objective_cfg.loss.huber_schedule,
                     t=t.float(),
                 )
 
-                w_scheme = str(getattr(args, "loss_weighting_scheme", "none") or "none")
-                if w_scheme != "none":
-                    w = compute_loss_weight(
-                        t.float(),
-                        scheme=w_scheme,
-                        min_snr_gamma=float(getattr(args, "min_snr_gamma", 0.0) or 0.0),
-                        weight_cap_ratio=float(getattr(args, "weight_cap_ratio", 0.0) or 0.0),
-                    )
-                    # 归一到均值 1，避免间接改变 LR
-                    w = w / w.mean().clamp(min=1e-6)
-                    loss = (per_sample * w).mean()
-                else:
-                    loss = per_sample.mean()
+                loss = apply_loss_weighting(per_sample, t, objective_cfg.loss)
 
             # ★ 守护 1：forward 结果 NaN/Inf 检查
             debug_n = int(getattr(args, "debug_first_batches", 0) or 0)
@@ -4064,12 +4156,12 @@ def main():
                         f_shift,
                         sched_shift,
                         mix_low_prob,
-                        float(getattr(args, "noise_offset", 0.0) or 0.0),
-                        float(getattr(args, "noise_offset_min", 0.0) or 0.0),
-                        int(getattr(args, "pyramid_noise_iterations", 0) or 0),
-                        str(getattr(args, "loss_type", "mse") or "mse"),
-                        float(getattr(args, "huber_c", 0.1) or 0.1),
-                        str(getattr(args, "loss_weighting_scheme", "none") or "none"),
+                        objective_cfg.noise.offset,
+                        objective_cfg.noise.offset_min,
+                        objective_cfg.noise.pyramid_iterations,
+                        objective_cfg.loss.loss_type,
+                        objective_cfg.loss.huber_c,
+                        objective_cfg.loss.weighting_scheme,
                         float(getattr(args, "caption_dropout_rate", 0.0) or 0.0),
                         float(getattr(args, "tag_dropout", 0.0) or 0.0),
                         float(getattr(args, "lora_dropout", 0.0) or 0.0),

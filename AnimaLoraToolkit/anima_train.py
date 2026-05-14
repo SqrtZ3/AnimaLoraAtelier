@@ -495,32 +495,27 @@ def render_curve_panel(losses, width=60, height=10):
 # ============================================================================
 
 def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_mask, use_checkpoint=False):
-    """带可选梯度检查点的前向传播"""
+    """带可选梯度检查点的前向传播。
+
+    ⚠ 旧实现手动展开了 `model.blocks` 的循环，并自己处理了 `prepare_embedded_sequence` /
+    `t_embedder` / `final_layer` / `unpatchify`，但**没有把 padding_mask 透传给各 block**。
+    这与 `model.forward()` 路径不等价 —— 一旦 Anima/Cosmos 的 block 内部用到 padding_mask
+    （比如 attention mask），grad_checkpoint=True 跟 False 就会产出不同的梯度。
+
+    新实现直接把整个 `model.forward` 包进单个 `checkpoint(...)` 调用：
+      - 不会漏传任何参数
+      - 不依赖 Anima 内部 block 列表 / 命名（未来模型结构变化也不会破）
+      - `use_reentrant=False` 与 `torch.compile` 兼容
+    显存收益从"每个 block 重算"变成"整体一次重算"，对 LoKr 训练来说仍然显著。
+    """
     if not use_checkpoint:
         return model(latents, timesteps, cross, padding_mask=padding_mask)
     from torch.utils.checkpoint import checkpoint
 
-    x_B_T_H_W_D, rope_emb, extra_pos_emb = model.prepare_embedded_sequence(
-        latents, fps=None, padding_mask=padding_mask,
-    )
-    if timesteps.ndim == 1:
-        timesteps = timesteps.unsqueeze(1)
-    t_embedding, adaln_lora = model.t_embedder(timesteps)
-    t_embedding = model.t_embedding_norm(t_embedding)
+    def _fwd(latents_in, timesteps_in, cross_in):
+        return model(latents_in, timesteps_in, cross_in, padding_mask=padding_mask)
 
-    block_kwargs = {
-        "rope_emb_L_1_1_D": rope_emb,
-        "adaln_lora_B_T_3D": adaln_lora,
-        "extra_per_block_pos_emb": extra_pos_emb,
-    }
-
-    for block in model.blocks:
-        def custom_forward(x, blk=block):
-            return blk(x, t_embedding, cross, **block_kwargs)
-        x_B_T_H_W_D = checkpoint(custom_forward, x_B_T_H_W_D, use_reentrant=False)
-
-    x_B_T_H_W_O = model.final_layer(x_B_T_H_W_D, t_embedding, adaln_lora_B_T_3D=adaln_lora)
-    return model.unpatchify(x_B_T_H_W_O)
+    return checkpoint(_fwd, latents, timesteps, cross, use_reentrant=False)
 
 
 # ============================================================================

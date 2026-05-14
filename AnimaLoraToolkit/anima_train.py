@@ -415,7 +415,59 @@ def apply_yaml_config(args, config):
         if current_value == default_value or current_value is None:
             setattr(args, arg_attr, yaml_value)
 
+    _resolve_weight_decay(args, config)
+
     return args
+
+
+def _resolve_weight_decay(args, config: dict | None = None):
+    """统一 `weight_decay` 来源，避免顶层 wd 与 optimizer_args.weight_decay 矛盾时的隐性吞值。
+
+    历史 bug：当 YAML 顶层 `weight_decay: 0.0` 与 `optimizer_args.weight_decay: 0.01`
+    同时存在时，`injector.get_param_groups(wd=args.weight_decay)` 会把每个 param group
+    强制写成 wd=0.0，而 PyTorch 优化器规则是 per-group wd 完全覆盖 default wd。结果就是
+    `optimizer_args.weight_decay` 被静默吞掉，真实 wd ≡ 0。
+
+    解决（按用户偏好）：让 `optimizer_args.weight_decay` 作为权威来源。
+
+    关键：要区分"用户在 YAML 显式写了 weight_decay"和"argparse 默认值 0.01"。前者是用户
+    设置，需要参与冲突判断；后者只是兜底，不算"两个都设了"。靠 raw config dict 来判断。
+    """
+    opt_args = getattr(args, "optimizer_args", None) or {}
+    if not isinstance(opt_args, dict):
+        return
+
+    user_set_top = bool(config and "weight_decay" in config and config["weight_decay"] is not None)
+    user_set_opt = "weight_decay" in opt_args and opt_args["weight_decay"] is not None
+
+    top_wd = getattr(args, "weight_decay", None)
+    opt_wd = opt_args.get("weight_decay", None)
+
+    # 两个都是用户显式设的 → 冲突就 warn，否则静默用 optimizer_args 的值
+    if user_set_top and user_set_opt:
+        if abs(float(top_wd) - float(opt_wd)) > 1e-12:
+            logger.warning(
+                "weight_decay 在 YAML 中被设置了两次（顶层=%s, optimizer_args=%s）。"
+                "优先使用 optimizer_args.weight_decay=%s；顶层 %s 被忽略。"
+                "建议把顶层的 weight_decay 删除或改成与 optimizer_args 一致，避免歧义。",
+                top_wd, opt_wd, opt_wd, top_wd,
+            )
+        args.weight_decay = float(opt_wd)
+        return
+
+    # 只有 optimizer_args 是用户设的 → 把它同步回顶层
+    if user_set_opt:
+        args.weight_decay = float(opt_wd)
+        return
+
+    # 只有顶层是用户设的 → 把它推进 optimizer_args，建立 single source of truth
+    if user_set_top:
+        opt_args["weight_decay"] = float(top_wd)
+        args.optimizer_args = opt_args
+        return
+
+    # 两个都没在 YAML 中显式设 → 不做任何事，沿用 argparse 默认值（顶层默认 0.01）。
+    # 顶层默认值会通过 `create_optimizer(..., weight_decay=args.weight_decay)` 流向 opt_args。
 
 
 # ============================================================================

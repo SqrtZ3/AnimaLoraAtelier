@@ -4,3 +4,4 @@ AnimaLoraToolkit/Dataset/*
 output/*
 **/__pycache__
 AnimaLoraToolkit/monitor_data/*
+*.log

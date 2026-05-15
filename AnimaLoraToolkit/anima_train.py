@@ -274,7 +274,15 @@ def parse_args():
     p.add_argument("--lr-scheduler-eta-min", type=float, default=0.0, help="cosine/cosine_with_restart: 最小学习率")
     p.add_argument("--weight-decay", type=float, default=0.01, help="AdamW 权重衰减 (L2 正则, 0=禁用)")
     p.add_argument("--grad-clip-max-norm", type=float, default=1.0, help="梯度裁剪最大范数 (0=禁用；ProdigyPlus 推荐设 0)")
-    p.add_argument("--resolution", type=int, default=1024)
+    p.add_argument("--resolution", type=int, default=1024,
+                   help="ARB 分桶的 base 边长（桶围着 base² 面积 ±10% 造）")
+    p.add_argument("--min-bucket-reso", type=int, default=512,
+                   help="ARB 单维下限（小于此的边长不会作为桶候选；默认 512）")
+    p.add_argument("--max-bucket-reso", type=int, default=2048,
+                   help="ARB 单维上限（大于此的边长不会作为桶候选；1024 base 默认 2048，"
+                        "1536 base 想要全 AR=2.0 支持需要 2240+）")
+    p.add_argument("--bucket-reso-steps", type=int, default=64,
+                   help="ARB 桶的边长步长（默认 64；VAE 8× + patch 2× 要求是 16 的倍数，64 安全）")
     p.add_argument("--mixed-precision", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--grad-checkpoint", action="store_true", help="启用梯度检查点减少显存")
     p.add_argument("--max-steps", type=int, default=0, help="最大训练步数 (0=无限制)")
@@ -689,7 +697,20 @@ def main():
         logger.info(f"将从已有 LoRA 继续训练: {args.resume_lora}")
 
     # 数据集
-    bucket_mgr = BucketManager(args.resolution)
+    bucket_min_reso = int(getattr(args, "min_bucket_reso", 512) or 512)
+    bucket_max_reso = int(getattr(args, "max_bucket_reso", 2048) or 2048)
+    bucket_step = int(getattr(args, "bucket_reso_steps", 64) or 64)
+    bucket_mgr = BucketManager(
+        base_reso=args.resolution,
+        min_reso=bucket_min_reso,
+        max_reso=bucket_max_reso,
+        step=bucket_step,
+    )
+    logger.info(
+        "[BucketManager] base=%d, min=%d, max=%d, step=%d, 桶数=%d",
+        args.resolution, bucket_min_reso, bucket_max_reso, bucket_step,
+        len(bucket_mgr.buckets),
+    )
     base_dataset = ImageDataset(
         args.data_dir, args.resolution, bucket_mgr,
         shuffle_caption=args.shuffle_caption,

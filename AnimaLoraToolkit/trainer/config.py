@@ -165,6 +165,11 @@ YAML_TO_ARGS = {
     "loraplus_lr_ratio": "loraplus_lr_ratio",
     # 频率均衡 tag dropout
     "freq_balanced_dropout_strength": "freq_balanced_dropout_strength",
+    # 画风预设：sharp / hazy / balanced，详见 STYLE_PROFILES
+    "style_profile": "style_profile",
+    # detail_inv_t 权重的可调上下限（默认 [1, 5]）
+    "detail_inv_t_min": "detail_inv_t_min",
+    "detail_inv_t_max": "detail_inv_t_max",
 }
 
 
@@ -278,7 +283,86 @@ DEFAULTS = {
     "module_dropout": 0.0,
     "loraplus_lr_ratio": 1.0,
     "freq_balanced_dropout_strength": 0.0,
+    "style_profile": "",
+    "detail_inv_t_min": 1.0,
+    "detail_inv_t_max": 5.0,
 }
+
+
+# ============================================================================
+# Style profile presets
+# ============================================================================
+
+# 不同画师风格对 timestep / loss 权重栈的反应不同：
+#   - sharp（清晰硬朗，高对比）：当前 train_my.yaml 默认值最适合
+#   - hazy（雾蒙蒙 / 低饱和 / 滤镜风）：当前默认会出现细节溶解，因为 detail_inv_t
+#     在低 t 把权重拉到 5×、adaptive_timestep 又把高 loss bin 反复采样，低饱和图的
+#     "细节"本来就是低对比，被这两层加权 + adaptive 反复学习反而被磨平
+#   - balanced：完全关掉 detail_inv_t 和 mixed_uniform_low，纯 uniform 训练（最保守）
+#
+# 用户在 YAML 顶层加 `style_profile: hazy` 即可应用对应 override；未设此字段时不做改动，
+# 完全沿用 YAML 的其它字段（向后兼容）。
+STYLE_PROFILES = {
+    "sharp": {
+        # 当前默认值，留作显式记录方便对照
+        "loss_weighting_scheme": "detail_inv_t",
+        "detail_inv_t_min": 1.0,
+        "detail_inv_t_max": 5.0,
+        "timestep_sampling": "mixed_uniform_low",
+        "timestep_mix_low_prob": 0.15,
+        "adaptive_timestep_base_mix": 0.25,
+        "adaptive_timestep_max_factor": 2.0,
+    },
+    "hazy": {
+        # 低饱和 / 雾蒙蒙画师：把 detail_inv_t 的强度收一半，让 adaptive 更保守，
+        # 减少 mixed_uniform_low 的低 t 占比 —— 整体把"低 t 多看"的偏置降下来。
+        "loss_weighting_scheme": "detail_inv_t",
+        "detail_inv_t_min": 1.0,
+        "detail_inv_t_max": 3.0,
+        "timestep_sampling": "mixed_uniform_low",
+        "timestep_mix_low_prob": 0.08,
+        "adaptive_timestep_base_mix": 0.5,
+        "adaptive_timestep_max_factor": 1.5,
+    },
+    "balanced": {
+        # 关掉所有低 t 偏置，纯 uniform；最接近"原 logit_normal 加一点 uniform"的早期成功配置。
+        "loss_weighting_scheme": "none",
+        "timestep_sampling": "uniform",
+        "timestep_mix_low_prob": 0.0,
+        "adaptive_timestep_base_mix": 1.0,  # 等价禁用 adaptive 重采样
+    },
+}
+
+
+def _apply_style_profile(args, config: dict | None = None):
+    """根据 `style_profile` 覆盖一组 timestep/loss 相关参数。
+
+    优先级：style_profile override > YAML 其它字段 > argparse 默认。
+    既不破坏用户的细粒度自定义（不设 style_profile 就完全不动），又能一行切换风格。
+    """
+    profile_name = (getattr(args, "style_profile", "") or "").strip().lower()
+    if not profile_name:
+        return
+    if profile_name not in STYLE_PROFILES:
+        logger.warning(
+            "Unknown style_profile=%s, ignoring. Available: %s",
+            profile_name, ", ".join(STYLE_PROFILES.keys()),
+        )
+        return
+
+    overrides = STYLE_PROFILES[profile_name]
+    applied = []
+    for attr, value in overrides.items():
+        # 用户在 YAML 显式写了这个字段就尊重用户（细粒度优先）
+        if config and attr in config and config[attr] is not None:
+            continue
+        old = getattr(args, attr, None)
+        setattr(args, attr, value)
+        applied.append(f"{attr}={value} (was {old})")
+    logger.info(
+        "[style_profile=%s] 应用了 %d 项 override: %s",
+        profile_name, len(applied), "; ".join(applied),
+    )
 
 
 DEPRECATED_V5_KEYS = {
@@ -338,6 +422,8 @@ def apply_yaml_config(args, config):
         if current_value == default_value or current_value is None:
             setattr(args, arg_attr, yaml_value)
 
+    # style_profile 在 wd 解析前应用 —— 它可能覆盖 timestep/loss 字段，但不动 wd
+    _apply_style_profile(args, config)
     _resolve_weight_decay(args, config)
 
     return args

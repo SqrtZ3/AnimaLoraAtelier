@@ -53,6 +53,10 @@ class LossConfig:
     weighting_scheme: str = "none"
     min_snr_gamma: float = 0.0
     weight_cap_ratio: float = 0.0
+    # detail_inv_t weighting 的可调上下限。默认 [1, 5] = 历史行为，更保守可设
+    # [1.5, 3]（hazy 画风）或彻底关掉 detail_inv_t（balanced 配方）。
+    detail_inv_t_min: float = 1.0
+    detail_inv_t_max: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,8 @@ def build_training_objective_config(args) -> TrainingObjectiveConfig:
             weighting_scheme=str(getattr(args, "loss_weighting_scheme", "none") or "none"),
             min_snr_gamma=float(getattr(args, "min_snr_gamma", 0.0) or 0.0),
             weight_cap_ratio=float(getattr(args, "weight_cap_ratio", 0.0) or 0.0),
+            detail_inv_t_min=float(getattr(args, "detail_inv_t_min", 1.0) or 1.0),
+            detail_inv_t_max=float(getattr(args, "detail_inv_t_max", 5.0) or 5.0),
         ),
     )
 
@@ -451,7 +457,8 @@ def adaptive_timestep_metric_signal(
 
 
 def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: float = 0.0,
-                        weight_cap_ratio: float = 0.0):
+                        weight_cap_ratio: float = 0.0,
+                        detail_inv_t_min: float = 1.0, detail_inv_t_max: float = 5.0):
     """根据 scheme 返回每样本的 loss 权重 (B,)。
 
     Flow Matching CONST 调度下：alpha_t = 1 - t，sigma_t = t；SNR(t) = ((1-t)/t)^2
@@ -500,8 +507,13 @@ def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: fl
         # ⚠️ 仅适合大 batch (>=64)。小 batch + Prodigy 会让单样本独占 loss → d 估计崩坏。
         w = (t_c ** -2).clamp(max=1000.0)
     elif scheme == "detail_inv_t":
-        # 温和细节端强化：w = 1/t 但 clamp 到 [1, 5]；与小 batch + Prodigy 兼容。
-        w = (1.0 / t_c).clamp(min=1.0, max=5.0)
+        # 温和细节端强化：w = 1/t 但 clamp 到可配置上下限（默认 [1, 5]）；与小 batch + Prodigy 兼容。
+        # 雾蒙蒙画风的 dataset 把上限调到 3 左右能显著减少细节溶解（hazy style_profile 的默认行为）。
+        lo = float(detail_inv_t_min or 1.0)
+        hi = float(detail_inv_t_max or 5.0)
+        if lo > hi:
+            lo, hi = hi, lo
+        w = (1.0 / t_c).clamp(min=lo, max=hi)
     elif scheme == "cosmap":
         bot = 1 - 2 * t_c + 2 * t_c ** 2
         w = 2.0 / (math.pi * bot)
@@ -525,6 +537,8 @@ def apply_loss_weighting(per_sample: torch.Tensor, t: torch.Tensor, cfg: LossCon
         scheme=cfg.weighting_scheme,
         min_snr_gamma=cfg.min_snr_gamma,
         weight_cap_ratio=cfg.weight_cap_ratio,
+        detail_inv_t_min=cfg.detail_inv_t_min,
+        detail_inv_t_max=cfg.detail_inv_t_max,
     )
     w = w / w.mean().clamp(min=1e-6)
     return (per_sample * w).mean()

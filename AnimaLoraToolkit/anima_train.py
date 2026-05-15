@@ -388,6 +388,18 @@ def parse_args():
     p.add_argument("--pyramid-noise-discount", type=float, default=0.3, help="pyramid noise decay per level")
     p.add_argument("--caption-dropout-rate", type=float, default=0.0, help="drop whole captions with this probability")
 
+    # 风格预设：在 YAML 顶层设 `style_profile: hazy` 或命令行 `--style-profile hazy`
+    # 会按预设覆盖一组相关参数（loss_weighting_scheme / detail_inv_t_* /
+    # timestep_sampling / mix_low_prob / adaptive_*）。详见 trainer/config.py
+    # 的 STYLE_PROFILES。YAML 里显式写的字段优先级 > 预设。
+    p.add_argument("--style-profile", default="",
+                   choices=["", "sharp", "hazy", "balanced"],
+                   help="一行切换画风预设：sharp / hazy / balanced（详见 STYLE_PROFILES）")
+    p.add_argument("--detail-inv-t-min", type=float, default=1.0,
+                   help="detail_inv_t 加权下限（默认 1.0）")
+    p.add_argument("--detail-inv-t-max", type=float, default=5.0,
+                   help="detail_inv_t 加权上限（默认 5.0；hazy 画风可降到 ~3.0）")
+
     return p.parse_args()
 
 

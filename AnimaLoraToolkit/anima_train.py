@@ -283,6 +283,11 @@ def parse_args():
                         "1536 base 想要全 AR=2.0 支持需要 2240+）")
     p.add_argument("--bucket-reso-steps", type=int, default=64,
                    help="ARB 桶的边长步长（默认 64；VAE 8× + patch 2× 要求是 16 的倍数，64 安全）")
+    p.add_argument("--max-img-h", type=int, default=0,
+                   help="RoPE 位置嵌入支持的最大单维（latent 单位 = image / 8）。0=自动从 "
+                        "max_bucket_reso 推算并兜底到 240。preview3 训练在 240 = 120 patches，"
+                        "1536 base 训练需要 >= 272 (image 2176)，建议 288。")
+    p.add_argument("--max-img-w", type=int, default=0, help="同 max_img_h，宽度方向。")
     p.add_argument("--mixed-precision", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--grad-checkpoint", action="store_true", help="启用梯度检查点减少显存")
     p.add_argument("--max-steps", type=int, default=0, help="最大训练步数 (0=无限制)")
@@ -620,8 +625,23 @@ def main():
     normalize_resume_paths(args, output_dir)
 
     # 加载模型
+    # 自动确定 max_img_h / max_img_w（RoPE 位置嵌入支持的单维上限）：
+    #   - 用户在 YAML / CLI 显式设了 → 用用户给的
+    #   - 否则按 max_bucket_reso 推算（latent 单位 = image / 8）
+    #   - 历史最小值 240（= 1920 image 单维 = 120 patches）作为兜底
+    # ARB 桶单维最大 = max_bucket_reso；要求 max_img_h >= max_bucket_reso / 8。
+    # 留 8 个 latent 的余量 + 偶数对齐（patch_spatial=2）。
+    _user_max_h = getattr(args, "max_img_h", 0)
+    _user_max_w = getattr(args, "max_img_w", 0)
+    _bucket_max = int(getattr(args, "max_bucket_reso", 2048) or 2048)
+    _auto_max = max(240, ((_bucket_max // 8) + 8 + 1) // 2 * 2)
+    max_img_h = int(_user_max_h) if _user_max_h and int(_user_max_h) > 0 else _auto_max
+    max_img_w = int(_user_max_w) if _user_max_w and int(_user_max_w) > 0 else _auto_max
     logger.info("加载 Transformer...")
-    model = load_anima_model(args.transformer, device, dtype, repo_root)
+    model = load_anima_model(
+        args.transformer, device, dtype, repo_root,
+        max_img_h=max_img_h, max_img_w=max_img_w,
+    )
 
     logger.info("加载 VAE...")
     vae = load_vae(args.vae, device, dtype, repo_root)
@@ -711,6 +731,30 @@ def main():
         args.resolution, bucket_min_reso, bucket_max_reso, bucket_step,
         len(bucket_mgr.buckets),
     )
+
+    # 模型 RoPE 能容纳的最大单维（image pixels）= max_img_h * 8。
+    # 在训练第一步崩溃之前，提前 fail-fast：把所有超出 RoPE 容量的桶过滤掉，
+    # 并在控制台 emit 一个清楚的错误说明 —— 否则用户会看到一个看起来像随机崩溃
+    # 的 AssertionError 出现在 forward 里。
+    rope_max_image_dim = max_img_h * 8  # max_img_h 在 latent 单位（已经包含 patch_spatial=2 的余量）
+    bad_buckets = [(bw, bh) for (bw, bh) in bucket_mgr.buckets
+                   if bw > rope_max_image_dim or bh > rope_max_image_dim]
+    if bad_buckets:
+        good = [b for b in bucket_mgr.buckets if b not in bad_buckets]
+        if not good:
+            raise RuntimeError(
+                f"全部 {len(bucket_mgr.buckets)} 个 ARB 桶都超出了模型 RoPE 单维上限 "
+                f"{rope_max_image_dim} image pixels。\n"
+                f"解决方案：提高 max_img_h / max_img_w（latent 单位），或者降低 max_bucket_reso。\n"
+                f"例如 resolution=1536 + AR=2.0 需要 max_img_h >= 272（image 2176），建议 288。"
+            )
+        logger.warning(
+            "[BucketManager] 检测到 %d 个桶超出 RoPE 单维上限 %d image pixels（max_img_h=%d）："
+            "%s ... 已从桶集合中过滤。如需保留这些桶，请提高 YAML 里的 max_img_h / max_img_w。",
+            len(bad_buckets), rope_max_image_dim, max_img_h,
+            ", ".join(f"{w}x{h}" for w, h in bad_buckets[:5]),
+        )
+        bucket_mgr.buckets = good
     base_dataset = ImageDataset(
         args.data_dir, args.resolution, bucket_mgr,
         shuffle_caption=args.shuffle_caption,

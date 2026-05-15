@@ -57,6 +57,9 @@ YAML_TO_ARGS = {
     "min_bucket_reso": "min_bucket_reso",
     "max_bucket_reso": "max_bucket_reso",
     "bucket_reso_steps": "bucket_reso_steps",
+    # RoPE 位置嵌入上限（latent 单位）；0 = 自动从 max_bucket_reso 算
+    "max_img_h": "max_img_h",
+    "max_img_w": "max_img_w",
     "repeats": "repeats",
     "shuffle_caption": "shuffle_caption",
     "keep_tokens": "keep_tokens",
@@ -191,6 +194,8 @@ DEFAULTS = {
     "min_bucket_reso": 512,
     "max_bucket_reso": 2048,
     "bucket_reso_steps": 64,
+    "max_img_h": 0,
+    "max_img_w": 0,
     "repeats": 1,
     "shuffle_caption": False,
     "keep_tokens": 0,

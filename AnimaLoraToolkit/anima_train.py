@@ -532,9 +532,14 @@ def main():
     # ★ TF32 优化：在 Ampere/Hopper (A100/H100/RTX 30+/40+) GPU 上对 fp32 矩阵乘法
     # 启用 TensorFloat-32，单乘 ~8× 加速 fp32 路径，bf16 路径不受影响。
     # 训练里 fp32 残留路径主要在 loss 计算和某些 reduce 上，开 high 是安全的零代价收益。
-    # 旧 GPU（V100、Turing）这个调用是 no-op，不会出错。
+    # 旧 GPU（V100、Turing）这些调用是 no-op，不会出错。
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
+        # 显式开 matmul + cudnn 的 TF32 flag。`high` 已经等价启用 matmul TF32，但
+        # PyTorch 在不同小版本里的默认值会漂移；写出来更稳定。cudnn 那个 flag 对 conv 也生效，
+        # 本训练里基本不走 conv（仅 VAE encode 阶段），不过开着也无害。
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         # SDPA 是 PyTorch 2.x 内置的注意力实现，会在 Flash / memory-efficient / math
         # 三个 backend 中自动选最优。Anima/Cosmos 的 attention 算子通过 F.scaled_dot_product_attention
         # 调用它，所以这里不需要手动启用 xformers；过往版本 `--xformers` 开关在 Anima 上
@@ -800,6 +805,20 @@ def main():
     except Exception as e:
         logger.warning(f"VAE roundtrip 自检失败（若 sample 仍是噪点，请优先修这个）: {e}")
 
+    # ── VAE CPU offload（仅在 cache_latents=True 时）────────────────────────
+    # latent 缓存建好后，训练主循环再也不调用 vae.model（取 batch 时直接读 npz）。
+    # 把 VAE 主网络挪到 CPU 上省 1-2GB 显存；sample_image 用到时再 .to(device)。
+    # mean / std 张量小（fp32 16 channels × 2 = 128 bytes 量级），保持在 GPU 上没问题。
+    vae_offloaded_to_cpu = False
+    if use_cached:
+        try:
+            vae.model = vae.model.cpu()
+            torch.cuda.empty_cache()
+            vae_offloaded_to_cpu = True
+            logger.info("VAE 主网络已 offload 到 CPU（cache_latents=True 后训练循环不再使用 VAE）")
+        except Exception as _e:
+            logger.warning(f"VAE CPU offload 失败（忽略，继续训练）: {_e}")
+
     # 优化器
     weight_decay = float(getattr(args, "weight_decay", 0.01) or 0.0)
     opt_type = getattr(args, "optimizer_type", "adamw")
@@ -1018,6 +1037,21 @@ def main():
         sample_prompts = [args.sample_prompt]
     sample_prompt_idx = 0
 
+    def _sample_with_vae_swap(*args_pos, **kwargs_pos):
+        """sample_image 的薄包装：如果 VAE 被 offload 到 CPU 了，临时搬回 GPU 出图，
+        出完再搬回去，省显存。否则直接透传。"""
+        if vae_offloaded_to_cpu:
+            try:
+                vae.model = vae.model.to(device=device, dtype=dtype)
+                return sample_image(*args_pos, **kwargs_pos)
+            finally:
+                try:
+                    vae.model = vae.model.cpu()
+                    torch.cuda.empty_cache()
+                except Exception as _e:
+                    logger.warning(f"VAE 出图后回 CPU 失败（忽略）: {_e}")
+        return sample_image(*args_pos, **kwargs_pos)
+
     adaptive_ts = AdaptiveTimestepSampler(
         enabled=bool(getattr(args, "adaptive_timestep", False)),
         bins=int(getattr(args, "adaptive_timestep_bins", 16) or 16),
@@ -1077,7 +1111,7 @@ def main():
         for i, prompt in enumerate(sample_prompts[:3]):  # 最多测试 3 个
             if s_seed:
                 torch.manual_seed(s_seed + i)
-            img = sample_image(
+            img = _sample_with_vae_swap(
                 model, vae, qwen_model, qwen_tok, t5_tok,
                 prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
                 negative_prompt=(s_neg or None),
@@ -1408,7 +1442,7 @@ def main():
                     s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
                     s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
                     s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
-                    img = sample_image(
+                    img = _sample_with_vae_swap(
                         model, vae, qwen_model, qwen_tok, t5_tok,
                         prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
                         negative_prompt=(s_neg or None),
@@ -1485,7 +1519,7 @@ def main():
                 s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
                 s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
                 s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
-                img = sample_image(
+                img = _sample_with_vae_swap(
                     model, vae, qwen_model, qwen_tok, t5_tok,
                     prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
                     negative_prompt=(s_neg or None),

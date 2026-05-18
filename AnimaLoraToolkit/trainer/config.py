@@ -57,6 +57,7 @@ YAML_TO_ARGS = {
     "min_bucket_reso": "min_bucket_reso",
     "max_bucket_reso": "max_bucket_reso",
     "bucket_reso_steps": "bucket_reso_steps",
+    "bucket_drop_last": "bucket_drop_last",
     # RoPE 位置嵌入上限（latent 单位）；0 = 自动从 max_bucket_reso 算
     "max_img_h": "max_img_h",
     "max_img_w": "max_img_w",

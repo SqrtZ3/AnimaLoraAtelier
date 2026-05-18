@@ -436,7 +436,7 @@ class BucketBatchSampler:
     for every outer index to look up the underlying ImageDataset / CachedLatentDataset's
     bucket_for_index. This avoids any indirection bugs in pre-built bucket_for_index lists.
     """
-    def __init__(self, dataset, batch_size, drop_last=True, shuffle=True, seed=42):
+    def __init__(self, dataset, batch_size, drop_last=False, shuffle=True, seed=42):
         self.dataset = dataset
         self.batch_size = int(batch_size)
         self.drop_last = bool(drop_last)
@@ -458,6 +458,26 @@ class BucketBatchSampler:
                 "将退化为顺序分批（可能在 ARB 模式下因尺寸不一致而崩溃）。"
                 "请检查 ImageDataset/CachedLatentDataset 是否正确填充了 bucket_for_index。"
             )
+        # 让用户在训练开始时就直观看到 ARB 分桶对样本的影响（丢弃数或小 batch 数）
+        from collections import Counter
+        _counts = Counter(tuple(k) if k is not None else (0, 0) for k in self._bucket_keys)
+        _bs = self.batch_size
+        if self.drop_last:
+            _dropped = sum(n % _bs for n in _counts.values())
+            if _dropped > 0:
+                logger.warning(
+                    "[BucketBatchSampler] drop_last=True：将丢弃 %d/%d 张图片"
+                    "（来自不满 batch_size=%d 的余数）。设 bucket_drop_last=false 可让所有图都参训。",
+                    _dropped, len(self._bucket_keys), _bs,
+                )
+        else:
+            _small_batches = sum(1 for n in _counts.values() if n % _bs != 0)
+            logger.info(
+                "[BucketBatchSampler] drop_last=False：所有 %d 张图都将参训；"
+                "其中 %d 个桶会产生 1 个小于 batch_size=%d 的余数 batch。",
+                len(self._bucket_keys), _small_batches, _bs,
+            )
+
         # 预计算 per-bucket 批数（drop_last 在每个桶内独立生效）。
         # 旧实现 `n // bs` 在多桶 + drop_last 时会高估批数，进而把 cosine 调度器的 T_max 设错。
         self._total_batches = self._compute_total_batches()

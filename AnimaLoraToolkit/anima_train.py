@@ -283,6 +283,10 @@ def parse_args():
                         "1536 base 想要全 AR=2.0 支持需要 2240+）")
     p.add_argument("--bucket-reso-steps", type=int, default=64,
                    help="ARB 桶的边长步长（默认 64；VAE 8× + patch 2× 要求是 16 的倍数，64 安全）")
+    p.add_argument("--bucket-drop-last", action="store_true",
+                   help="ARB 分桶时，每个桶里不足 batch_size 的余数图片是否丢弃。"
+                        "默认 False —— 不丢弃，余数桶产生小 batch，保证每张图每 epoch 1 次曝光。"
+                        "显式传该 flag 恢复旧行为（丢弃残缺桶）。")
     p.add_argument("--max-img-h", type=int, default=0,
                    help="RoPE 位置嵌入支持的最大单维（latent 单位 = image / 8）。0=自动从 "
                         "max_bucket_reso 推算并兜底到 240。preview3 训练在 240 = 120 patches，"
@@ -856,10 +860,11 @@ def main():
         _loader_kwargs["persistent_workers"] = True
         _loader_kwargs["prefetch_factor"] = 2
 
+    _bucket_drop_last = bool(getattr(args, "bucket_drop_last", False))
     if use_cached:
         batch_sampler = BucketBatchSampler(
             dataset, batch_size=args.batch_size,
-            drop_last=True, shuffle=True,
+            drop_last=_bucket_drop_last, shuffle=True,
             seed=getattr(args, "seed", 42),
         )
         dataloader = DataLoader(
@@ -873,7 +878,7 @@ def main():
         # Without this, torch.stack fails when ARB produces tensors of different shapes.
         batch_sampler = BucketBatchSampler(
             dataset, batch_size=args.batch_size,
-            drop_last=True, shuffle=True,
+            drop_last=_bucket_drop_last, shuffle=True,
             seed=getattr(args, "seed", 42),
         )
         dataloader = DataLoader(

@@ -619,17 +619,43 @@ def compute_grad_norm(parameters) -> float:
 
 
 def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_mask, use_checkpoint=False):
-    """带可选梯度检查点的前向传播。
+    """带可选梯度检查点的前向传播（per-block checkpoint 策略）。
 
-    旧实现手动展开 `model.blocks` 循环但漏传了 `padding_mask`，跟 `model(...)` 路径
-    不等价。新实现把整个 `model.forward` 包进单个 checkpoint，永远不漏传参数。
-    `use_reentrant=False` 让本调用对 `torch.compile` 也保持兼容。
+    ⚠ 关于策略选择的历史教训：
+    曾经一版实现把整个 `model.forward` 包进**单个** checkpoint 调用，理由是简单且永远不漏参数。
+    后来发现对于大模型这意味着 backward 时要一次性重放整个 forward 的所有激活 →
+    峰值显存 ≈ N × (单 block 激活)，把训练显存推到无法接受的高度（实测 10GB → 70GB 量级）。
+
+    本实现回退到 per-block checkpoint：每个 transformer block 单独 checkpoint，峰值激活
+    ≈ 1 × (单 block 激活)。同时把 `padding_mask` 显式透传给每个 block —— 这是上一版整体
+    checkpoint 当初引入的本意（旧 per-block 实现漏传了 padding_mask）。block 不接受该 kwarg
+    时 try/except 兜底，行为与不传一致。
     """
     if not use_checkpoint:
         return model(latents, timesteps, cross, padding_mask=padding_mask)
     from torch.utils.checkpoint import checkpoint
 
-    def _fwd(latents_in, timesteps_in, cross_in):
-        return model(latents_in, timesteps_in, cross_in, padding_mask=padding_mask)
+    x_B_T_H_W_D, rope_emb, extra_pos_emb = model.prepare_embedded_sequence(
+        latents, fps=None, padding_mask=padding_mask,
+    )
+    if timesteps.ndim == 1:
+        timesteps = timesteps.unsqueeze(1)
+    t_embedding, adaln_lora = model.t_embedder(timesteps)
+    t_embedding = model.t_embedding_norm(t_embedding)
 
-    return checkpoint(_fwd, latents, timesteps, cross, use_reentrant=False)
+    block_kwargs = {
+        "rope_emb_L_1_1_D": rope_emb,
+        "adaln_lora_B_T_3D": adaln_lora,
+        "extra_per_block_pos_emb": extra_pos_emb,
+    }
+
+    for block in model.blocks:
+        def custom_forward(x, blk=block):
+            try:
+                return blk(x, t_embedding, cross, padding_mask=padding_mask, **block_kwargs)
+            except TypeError:
+                return blk(x, t_embedding, cross, **block_kwargs)
+        x_B_T_H_W_D = checkpoint(custom_forward, x_B_T_H_W_D, use_reentrant=False)
+
+    x_B_T_H_W_O = model.final_layer(x_B_T_H_W_D, t_embedding, adaln_lora_B_T_3D=adaln_lora)
+    return model.unpatchify(x_B_T_H_W_O)

@@ -145,6 +145,10 @@ YAML_TO_ARGS = {
     "adaptive_timestep_max_factor": "adaptive_timestep_max_factor",
     "adaptive_timestep_base_mix": "adaptive_timestep_base_mix",
     "adaptive_timestep_candidate_mult": "adaptive_timestep_candidate_mult",
+    # InfoNoise (arxiv:2602.18647) — entropy_rate 模式专用闸门 / 配置
+    "adaptive_timestep_low_noise_gate": "adaptive_timestep_low_noise_gate",
+    "adaptive_timestep_gate_n": "adaptive_timestep_gate_n",
+    "adaptive_timestep_gate_c": "adaptive_timestep_gate_c",
     "min_snr_gamma": "min_snr_gamma",
     "loss_weighting_scheme": "loss_weighting_scheme",
     "weight_cap_ratio": "weight_cap_ratio",
@@ -168,6 +172,12 @@ YAML_TO_ARGS = {
     # 精细正则化
     "rank_dropout": "rank_dropout",
     "module_dropout": "module_dropout",
+    # T-LoRA (arxiv:2507.05964) — 仅 lora_variant=tlora 时生效
+    "tlora_rmin_ratio": "tlora_rmin_ratio",
+    "tlora_alpha": "tlora_alpha",
+    "tlora_init": "tlora_init",
+    "tlora_lokr_experimental": "tlora_lokr_experimental",
+    "tlora_lokr_ortho_init": "tlora_lokr_ortho_init",
     # LoRA+ for LoKr
     "loraplus_lr_ratio": "loraplus_lr_ratio",
     # 频率均衡 tag dropout
@@ -273,6 +283,9 @@ DEFAULTS = {
     "adaptive_timestep_max_factor": 2.0,
     "adaptive_timestep_base_mix": 0.25,
     "adaptive_timestep_candidate_mult": 8,
+    "adaptive_timestep_low_noise_gate": False,
+    "adaptive_timestep_gate_n": 3.0,
+    "adaptive_timestep_gate_c": 0.05,
     "min_snr_gamma": 0.0,
     "loss_weighting_scheme": "none",
     "weight_cap_ratio": 5.0,
@@ -293,6 +306,12 @@ DEFAULTS = {
     "lora_reg_lrs": None,
     "rank_dropout": 0.0,
     "module_dropout": 0.0,
+    # T-LoRA 默认值（lora_variant != 'tlora' 时被忽略）
+    "tlora_rmin_ratio": 0.5,
+    "tlora_alpha": 1.0,
+    "tlora_init": "ortho",
+    "tlora_lokr_experimental": False,
+    "tlora_lokr_ortho_init": False,
     "loraplus_lr_ratio": 1.0,
     "freq_balanced_dropout_strength": 0.0,
     "style_profile": "",

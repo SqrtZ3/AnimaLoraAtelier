@@ -166,6 +166,7 @@ def sample_image(
     device="cuda",
     dtype=torch.bfloat16,
     use_t5_token_weights: bool = True,
+    injector=None,
 ):
     """训练时采样预览（尽量对齐 ComfyUI KSampler）。
 
@@ -251,10 +252,18 @@ def sample_image(
         sigma_b = sigma_in.view(1, 1).to(device=x_in.device, dtype=dtype)
         sigma_5d = sigma_in.view(1, 1, 1, 1, 1).to(device=x_in.device, dtype=torch.float32)
 
-        with torch.autocast(device_type=device_type, dtype=dtype):
-            v_cond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_cond, padding_mask=pad_mask)
-            v_uncond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_uncond, padding_mask=pad_mask)
-            v = v_uncond + cfg_scale * (v_cond - v_uncond)
+        # T-LoRA：把当前 σ 写到 LoRA adapter（B=1 here）。其它 variant 自动跳过。
+        # 在 try/finally 内确保即便 forward 抛错也能 reset，避免污染后续 step。
+        if injector is not None:
+            injector.set_current_t(sigma_in.view(-1).to(device=x_in.device, dtype=torch.float32))
+        try:
+            with torch.autocast(device_type=device_type, dtype=dtype):
+                v_cond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_cond, padding_mask=pad_mask)
+                v_uncond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_uncond, padding_mask=pad_mask)
+                v = v_uncond + cfg_scale * (v_cond - v_uncond)
+        finally:
+            if injector is not None:
+                injector.set_current_t(None)
 
         if torch.isnan(v).any():
             raise RuntimeError("v contains NaN during sampling")

@@ -162,7 +162,13 @@ def apply_timestep_schedule_shift(t: torch.Tensor, schedule_shift: float) -> tor
 
 
 class AdaptiveTimestepSampler:
-    """Conservative loss-aware resampler layered on top of sample_t()."""
+    """Conservative loss-aware resampler layered on top of sample_t().
+
+    metric=entropy_rate 时改用 InfoNoise 风格信号：factor ∝ (mse_hat / t³) / w(t)，
+    再经 low_noise_gate g(t) = t^n / (t^n + c^n) 抑制 t→0 端的失控分配。这是 arxiv
+    2602.18647 的核心思路在 flow-matching t-空间下的重述（线性 FM 下 σ_t = t，
+    I-MMSE 等式可直接搬过来）。论文只在 EDM/DDPM 上验证过，因此该 metric 默认关。
+    """
     def __init__(
         self,
         enabled: bool = False,
@@ -175,6 +181,11 @@ class AdaptiveTimestepSampler:
         candidate_mult: int = 8,
         metric: str = "raw",
         highfreq_weight: float = 0.25,
+        # InfoNoise / entropy_rate 模式专用
+        low_noise_gate: bool = False,
+        gate_n: float = 3.0,
+        gate_c: float = 0.05,
+        loss_weight_fn=None,
     ):
         self.enabled = bool(enabled)
         self.bins = max(int(bins or 16), 2)
@@ -185,11 +196,18 @@ class AdaptiveTimestepSampler:
         self.base_mix = min(max(float(base_mix), 0.0), 1.0)
         self.candidate_mult = max(int(candidate_mult or 1), 1)
         self.metric = (metric or "raw").lower()
-        if self.metric not in ("raw", "highfreq", "mixed"):
+        if self.metric not in ("raw", "highfreq", "mixed", "entropy_rate"):
             raise ValueError(f"Unknown adaptive_timestep_metric: {metric}")
         self.highfreq_weight = max(float(highfreq_weight or 0.0), 0.0)
         self.loss_ema = torch.zeros(self.bins, dtype=torch.float32)
         self.counts = torch.zeros(self.bins, dtype=torch.long)
+        # InfoNoise 闸门 + 损失权重补偿
+        self.low_noise_gate = bool(low_noise_gate)
+        self.gate_n = max(float(gate_n or 0.0), 1e-3)
+        self.gate_c = max(float(gate_c or 0.0), 1e-6)
+        # loss_weight_fn(t_tensor) -> tensor of same shape；用于 entropy_rate 模式
+        # 把当前 loss-weighting scheme 的 w(t) 除掉，让 π·w ∝ ρ。
+        self.loss_weight_fn = loss_weight_fn
 
     @property
     def ready(self) -> bool:
@@ -218,7 +236,34 @@ class AdaptiveTimestepSampler:
         if not self.ready:
             return torch.ones(self.bins, dtype=torch.float32)
         losses = self.loss_ema.clamp(min=1e-8)
-        rel = losses / losses.mean().clamp(min=1e-8)
+
+        if self.metric == "entropy_rate":
+            # InfoNoise: factor_k ∝ (mse_hat_k / t_k³) / w(t_k)
+            # bin 中心：每个 bin 覆盖 [k/bins, (k+1)/bins]，取中点 (k+0.5)/bins
+            bin_centers = (torch.arange(self.bins, dtype=torch.float32) + 0.5) / float(self.bins)
+            # I-MMSE 风格熵率代理：mse / t³，clamp 防止 t→0 处爆炸
+            t_cubed = bin_centers.pow(3).clamp(min=1e-6)
+            entropy_rate = losses / t_cubed
+
+            # 除以 w(t)，让 π·w ∝ ρ（与论文 Eq.16 一致：π(σ) ∝ ρ(σ)/w(σ)）
+            if self.loss_weight_fn is not None:
+                try:
+                    w = self.loss_weight_fn(bin_centers).clamp(min=1e-6)
+                    entropy_rate = entropy_rate / w
+                except Exception as _e:
+                    logger.warning(f"loss_weight_fn 调用失败，回退到不除 w(t): {_e}")
+
+            # 低噪闸门 g(t) = t^n / (t^n + c^n)：t→0 时趋于 0，抑制极低噪 bin 的过度分配
+            if self.low_noise_gate:
+                t_n = bin_centers.pow(self.gate_n)
+                c_n = float(self.gate_c) ** self.gate_n
+                gate = t_n / (t_n + c_n)
+                entropy_rate = entropy_rate * gate
+
+            rel = entropy_rate / entropy_rate.mean().clamp(min=1e-8)
+        else:
+            rel = losses / losses.mean().clamp(min=1e-8)
+
         return rel.clamp(self.min_factor, self.max_factor)
 
     def sample(self, bs, device, *, mode: str, shift: float, mix_low_prob: float,
@@ -250,10 +295,16 @@ class AdaptiveTimestepSampler:
 
     def summary(self) -> str:
         factors = self.factors()
+        extra = ""
+        if self.metric == "entropy_rate":
+            extra = f" (entropy_rate; gate={'on' if self.low_noise_gate else 'off'}"
+            if self.low_noise_gate:
+                extra += f" n={self.gate_n:.1f} c={self.gate_c:.3f}"
+            extra += ")"
         return (
             f"metric={self.metric} hf_weight={self.highfreq_weight:.3f} "
             f"bins={self.bins} burn_in={self.burn_in_steps} "
-            f"factor_min/max={float(factors.min()):.2f}/{float(factors.max()):.2f}"
+            f"factor_min/max={float(factors.min()):.2f}/{float(factors.max()):.2f}{extra}"
         )
 
 
@@ -446,7 +497,7 @@ def adaptive_timestep_metric_signal(
     """Build the detached per-sample signal used by AdaptiveTimestepSampler."""
     metric = (metric or "raw").lower()
     raw = per_sample.detach().float()
-    if metric == "raw":
+    if metric in ("raw", "entropy_rate"):
         return raw
     highfreq = per_sample_highfreq_loss(pred.detach(), target.detach())
     if metric == "highfreq":

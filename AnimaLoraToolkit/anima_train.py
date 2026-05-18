@@ -311,8 +311,22 @@ def parse_args():
     p.add_argument("--lora-alpha", type=float, default=32.0)
     p.add_argument("--lora-dropout", type=float, default=0.0)
     p.add_argument("--lokr-factor", type=int, default=8)
-    p.add_argument("--lora-variant", choices=["base", "dora"], default="base",
-                   help="Adapter variant. 'dora' enables LyCORIS/ComfyUI-compatible DoRA-LoKr.")
+    p.add_argument("--lora-variant", choices=["base", "dora", "tlora"], default="base",
+                   help="Adapter variant. 'dora' enables LyCORIS/ComfyUI-compatible DoRA-LoKr. "
+                        "'tlora' enables timestep-dependent rank mask (arxiv:2507.05964); "
+                        "ComfyUI 推理需 bghira/ComfyUI-T-LoRA。")
+    # T-LoRA 参数（仅 lora_variant=tlora 时生效）
+    p.add_argument("--tlora-rmin-ratio", type=float, default=0.5,
+                   help="T-LoRA r_min 占 r 的比例。默认 0.5（论文推荐）。")
+    p.add_argument("--tlora-alpha", type=float, default=1.0,
+                   help="T-LoRA rank-schedule 幂律指数（alpha=1 即论文线性 schedule）。")
+    p.add_argument("--tlora-init", choices=["ortho", "default"], default="ortho",
+                   help="T-LoRA 初始化：ortho=SVD-based Ortho-LoRA（论文方案）；default=kaiming+zeros（仅 mask）。")
+    p.add_argument("--tlora-lokr-experimental", action="store_true",
+                   help="允许 lora_variant=tlora 与 lora_type=lokr 组合（实验性，论文未覆盖；"
+                        "保存的 checkpoint 在 ComfyUI 中退化为标准 LoKr）。")
+    p.add_argument("--tlora-lokr-ortho-init", action="store_true",
+                   help="LoKr+T-LoRA 时启用 (w2_a, w2_b) 上的 Ortho 初始化（启发式扩展）。")
     p.add_argument("--dora-export-mode", choices=["native", "diff", "merged_model"], default="native",
                    help="Export mode: native LoKr + .dora_scale, exact ComfyUI .diff, or full merged transformer safetensors.")
     p.add_argument("--lora-targets", default=None,
@@ -369,8 +383,15 @@ def parse_args():
     p.add_argument("--timestep-mix-low-prob", type=float, default=0.25, help="mixed_uniform_low 中低噪声样本比例")
     p.add_argument("--adaptive-timestep", action="store_true",
                    help="启用保守自适应 timestep：按 per-timestep raw loss 重采样，不改变 loss 权重。")
-    p.add_argument("--adaptive-timestep-metric", choices=["raw", "highfreq", "mixed"], default="raw",
-                   help="自适应 timestep 的统计信号：raw / highfreq / mixed。")
+    p.add_argument("--adaptive-timestep-metric", choices=["raw", "highfreq", "mixed", "entropy_rate"], default="raw",
+                   help="自适应 timestep 的统计信号：raw / highfreq / mixed / entropy_rate "
+                        "（entropy_rate = InfoNoise 风格 ρ(t)/w(t)，配合 --adaptive-timestep-low-noise-gate 使用）。")
+    p.add_argument("--adaptive-timestep-low-noise-gate", action="store_true",
+                   help="InfoNoise 低噪闸门 g(t) = t^n/(t^n + c^n)；entropy_rate 模式专用。")
+    p.add_argument("--adaptive-timestep-gate-n", type=float, default=3.0,
+                   help="InfoNoise 闸门指数 n（论文默认 3）。")
+    p.add_argument("--adaptive-timestep-gate-c", type=float, default=0.05,
+                   help="InfoNoise 闸门拐点 c（t 远小于 c 时压制采样）。")
     p.add_argument("--adaptive-timestep-highfreq-weight", type=float, default=0.25,
                    help="adaptive_timestep_metric=mixed 时的高频 residual 权重。")
     p.add_argument("--adaptive-timestep-bins", type=int, default=16, help="自适应 timestep loss 统计分桶数")
@@ -656,6 +677,8 @@ def main():
     dora_export_mode = str(getattr(args, "dora_export_mode", "native") or "native").lower()
     if lora_variant == "dora" and args.lora_type != "lokr":
         raise ValueError("lora_variant='dora' requires lora_type='lokr'")
+    # T-LoRA × LoKr 的组合校验交给 LoRAInjector.__init__（带详细错误提示）；
+    # 这里只在标准 LoRA 路径下记录一行 info。
     logger.info(f"注入 {args.lora_type.upper()} ({lora_variant})...")
     # exclude_prefixes 语义：
     #   - None / 未设置  → 用 DEFAULT_EXCLUDE_PREFIXES（默认排除 llm_adapter.*，与 Anima 官方建议一致）
@@ -707,6 +730,11 @@ def main():
         loraplus_lr_ratio=float(getattr(args, "loraplus_lr_ratio", 1.0) or 1.0),
         lora_variant=lora_variant,
         dora_export_mode=dora_export_mode,
+        tlora_rmin_ratio=float(getattr(args, "tlora_rmin_ratio", 0.5) or 0.5),
+        tlora_alpha=float(getattr(args, "tlora_alpha", 1.0) or 1.0),
+        tlora_init=str(getattr(args, "tlora_init", "ortho") or "ortho"),
+        tlora_lokr_experimental=bool(getattr(args, "tlora_lokr_experimental", False)),
+        tlora_lokr_ortho_init=bool(getattr(args, "tlora_lokr_ortho_init", False)),
         **injector_kwargs,
     )
     injector.inject(model)
@@ -1117,6 +1145,23 @@ def main():
                     logger.warning(f"VAE 出图后回 CPU 失败（忽略）: {_e}")
         return sample_image(*args_pos, **kwargs_pos)
 
+    objective_cfg = build_training_objective_config(args)
+
+    # InfoNoise entropy_rate 模式需要在 .factors() 里除以当前 loss-weighting w(t)。
+    # 构造一个轻量闭包，复用 trainer.objective.compute_loss_weight，参数从 objective_cfg.loss 取。
+    from trainer.objective import compute_loss_weight as _compute_loss_weight
+    _loss_cfg_for_weight = objective_cfg.loss
+
+    def _loss_weight_fn(t_tensor):
+        return _compute_loss_weight(
+            t_tensor.float(),
+            scheme=_loss_cfg_for_weight.weighting_scheme,
+            min_snr_gamma=_loss_cfg_for_weight.min_snr_gamma,
+            weight_cap_ratio=0.0,  # bin-level 估计不需要 batch-level cap
+            detail_inv_t_min=_loss_cfg_for_weight.detail_inv_t_min,
+            detail_inv_t_max=_loss_cfg_for_weight.detail_inv_t_max,
+        )
+
     adaptive_ts = AdaptiveTimestepSampler(
         enabled=bool(getattr(args, "adaptive_timestep", False)),
         bins=int(getattr(args, "adaptive_timestep_bins", 16) or 16),
@@ -1128,10 +1173,13 @@ def main():
         candidate_mult=int(getattr(args, "adaptive_timestep_candidate_mult", 8) or 8),
         metric=str(getattr(args, "adaptive_timestep_metric", "raw") or "raw"),
         highfreq_weight=float(getattr(args, "adaptive_timestep_highfreq_weight", 0.25) or 0.0),
+        low_noise_gate=bool(getattr(args, "adaptive_timestep_low_noise_gate", False)),
+        gate_n=float(getattr(args, "adaptive_timestep_gate_n", 3.0) or 3.0),
+        gate_c=float(getattr(args, "adaptive_timestep_gate_c", 0.05) or 0.05),
+        loss_weight_fn=_loss_weight_fn,
     )
     if adaptive_ts.enabled:
         logger.info("[adaptive_timestep] enabled: %s", adaptive_ts.summary())
-    objective_cfg = build_training_objective_config(args)
     logger.info(
         "[objective] timestep=%s flow_shift=%.3f schedule_shift=%.3f mix_low=%.3f "
         "noise_offset=%.4f pyramid=%d discount=%.3f loss=%s huber=%s/%.3f weight=%s cap=%.3f",
@@ -1184,6 +1232,7 @@ def main():
                 scheduler=s_sched,
                 device=device, dtype=dtype,
                 use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                injector=injector,
             )
             sample_path = sample_dir / f"step_0_baseline_{i}.png"
             img.save(sample_path)
@@ -1281,22 +1330,29 @@ def main():
 
             # 前向
             pad_mask = torch.zeros(bs, 1, latents.shape[-2], latents.shape[-1], device=device, dtype=dtype)
-            with torch.autocast("cuda", dtype=dtype):
-                pred = forward_with_optional_checkpoint(
-                    model, noisy, t.view(-1, 1), cross, pad_mask,
-                    use_checkpoint=args.grad_checkpoint
-                )
-                # ★ 损失始终 fp32 计算（per-sample，便于按 t 加权）
-                per_sample = per_sample_loss(
-                    pred,
-                    target,
-                    loss_type=objective_cfg.loss.loss_type,
-                    huber_c=objective_cfg.loss.huber_c,
-                    huber_schedule=objective_cfg.loss.huber_schedule,
-                    t=t.float(),
-                )
+            # T-LoRA: 把当前 batch 的 timestep 写到每个注入的 LoRA adapter，让其在 forward
+            # 内按 r(t) 应用 rank mask；其它 variant 该调用是空操作。完成后 reset 避免
+            # 跨 step 残留（采样 / eval / 其它前向不应受影响）。
+            injector.set_current_t(t.float().detach())
+            try:
+                with torch.autocast("cuda", dtype=dtype):
+                    pred = forward_with_optional_checkpoint(
+                        model, noisy, t.view(-1, 1), cross, pad_mask,
+                        use_checkpoint=args.grad_checkpoint
+                    )
+                    # ★ 损失始终 fp32 计算（per-sample，便于按 t 加权）
+                    per_sample = per_sample_loss(
+                        pred,
+                        target,
+                        loss_type=objective_cfg.loss.loss_type,
+                        huber_c=objective_cfg.loss.huber_c,
+                        huber_schedule=objective_cfg.loss.huber_schedule,
+                        t=t.float(),
+                    )
 
-                loss = apply_loss_weighting(per_sample, t, objective_cfg.loss)
+                    loss = apply_loss_weighting(per_sample, t, objective_cfg.loss)
+            finally:
+                injector.set_current_t(None)
 
             # ★ 守护 1：forward 结果 NaN/Inf 检查
             debug_n = int(getattr(args, "debug_first_batches", 0) or 0)
@@ -1515,6 +1571,7 @@ def main():
                         scheduler=s_sched,
                         device=device, dtype=dtype,
                         use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                        injector=injector,
                     )
                     sample_path = sample_dir / f"step_{global_step}.png"
                     img.save(sample_path)
@@ -1592,6 +1649,7 @@ def main():
                     scheduler=s_sched,
                     device=device, dtype=dtype,
                     use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                    injector=injector,
                 )
                 sample_path = sample_dir / f"epoch_{current_epoch}.png"
                 img.save(sample_path)

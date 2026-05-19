@@ -487,6 +487,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>
 """
+def get_vram_info():
+    """获取 CUDA VRAM 信息"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            free, total = torch.cuda.mem_get_info(device)
+            free_mb = free // (1024 * 1024)
+            total_mb = total // (1024 * 1024)
+            used_mb = total_mb - free_mb
+            return {
+                "free": free_mb,
+                "total": total_mb,
+                "used": used_mb,
+                "percentage": round(used_mb / total_mb * 100, 1) if total_mb > 0 else 0
+            }
+    except Exception:
+        pass
+    return None
 
 
 class MonitorHandler(SimpleHTTPRequestHandler):
@@ -525,6 +544,9 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             state = get_state()
+            vram = get_vram_info()
+            if vram:
+                state["vram"] = vram
             if max_points > 0:
                 # 不修改全局状态，只对返回值裁剪
                 if "losses" in state:
@@ -532,6 +554,25 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                 if "lr_history" in state:
                     state["lr_history"] = _downsample_uniform(state["lr_history"], max_points)
             self.wfile.write(json.dumps(state).encode("utf-8"))
+        elif self.path.startswith("/api/logs"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            
+            logs = []
+            log_file = Path("anima_training.log")
+            if not log_file.exists():
+                log_file = Path(__file__).resolve().parent.parent / "anima_training.log"
+            
+            if log_file.exists():
+                try:
+                    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()
+                        logs = [line.strip() for line in lines[-100:]]
+                except Exception:
+                    pass
+            self.wfile.write(json.dumps({"logs": logs}).encode("utf-8"))
         elif self.path.startswith("/samples/"):
             # 提供采样图片
             filename = self.path.split("/")[-1]
@@ -562,7 +603,15 @@ def start_monitor_server(port=8765, host="127.0.0.1", output_dir=None, open_brow
     
     def run():
         shown_host = "localhost" if host in ("0.0.0.0", "127.0.0.1") else host
-        print(f"📊 训练监控面板: http://{shown_host}:{port}")
+        try:
+            print(f"[Monitor] 训练监控面板: http://{shown_host}:{port}")
+        except UnicodeEncodeError:
+            try:
+                print(f"[Monitor] Training Monitor: http://{shown_host}:{port}")
+            except Exception:
+                pass
+        except Exception:
+            pass
         server.serve_forever()
     
     thread = threading.Thread(target=run, daemon=True)

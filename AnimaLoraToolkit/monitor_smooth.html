@@ -3,23 +3,25 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ANIMA TRAIN // MONITOR</title>
+    <title>ANIMA TRAIN // MONITOR v3</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
-            --bg-primary: #0a0a0a;
-            --bg-secondary: #111111;
-            --bg-tertiary: #1a1a1a;
-            --border: #2a2a2a;
-            --text-primary: #e0e0e0;
-            --text-secondary: #666;
-            --text-dim: #444;
-            --accent: #39ff14;
-            --accent-dim: rgba(57, 255, 20, 0.15);
-            --accent-glow: rgba(57, 255, 20, 0.4);
+            --bg-primary: #050505;
+            --bg-secondary: #0c0c0c;
+            --bg-tertiary: #141414;
+            --border: #222222;
+            --border-glow: rgba(57, 255, 20, 0.08);
+            --text-primary: #e5e5e5;
+            --text-secondary: #888888;
+            --text-dim: #555555;
+            --accent: #39ff14; /* Neon green */
+            --accent-blue: #00d4ff; /* Electric cyan */
+            --accent-dim: rgba(57, 255, 20, 0.1);
+            --accent-glow: rgba(57, 255, 20, 0.35);
             --warning: #ff6b35;
+            --warning-dim: rgba(255, 107, 53, 0.1);
             --error: #ff3366;
             --mono: 'JetBrains Mono', 'Consolas', monospace;
             --display: 'Space Mono', monospace;
@@ -35,30 +37,31 @@
             color: var(--text-primary);
             min-height: 100vh;
             line-height: 1.5;
-            padding-bottom: 30px;
+            padding-bottom: 40px;
             overflow-x: hidden;
         }
 
-        /* CRT scanline */
+        /* CRT scanline and subtle glow */
         body::before {
             content: "";
             position: fixed;
             inset: 0;
             pointer-events: none;
-            background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.08) 2px, rgba(0,0,0,0.08) 4px);
+            background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.12) 2px, rgba(0,0,0,0.12) 4px);
             z-index: 9999;
         }
 
         /* ==================== HEADER ==================== */
         .header {
             border-bottom: 1px solid var(--border);
-            padding: 12px 20px;
+            padding: 14px 20px;
             display: flex;
             justify-content: space-between;
             align-items: center;
             background: var(--bg-secondary);
             flex-wrap: wrap;
             gap: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
         }
 
         .header-left {
@@ -70,9 +73,9 @@
 
         .logo {
             font-family: var(--display);
-            font-size: 1.1rem;
+            font-size: 1.2rem;
             font-weight: 700;
-            letter-spacing: 0.15em;
+            letter-spacing: 0.2em;
             color: var(--accent);
             text-shadow: 0 0 10px var(--accent-glow);
             white-space: nowrap;
@@ -83,37 +86,40 @@
         .status-badge {
             display: flex;
             align-items: center;
-            gap: 6px;
-            padding: 4px 10px;
+            gap: 8px;
+            padding: 4px 12px;
             background: var(--accent-dim);
             border: 1px solid var(--accent);
             font-size: 0.75rem;
             text-transform: uppercase;
-            letter-spacing: 0.1em;
+            letter-spacing: 0.15em;
+            box-shadow: 0 0 8px rgba(57, 255, 20, 0.1);
         }
 
         .status-dot {
-            width: 6px;
-            height: 6px;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
             background: var(--accent);
-            box-shadow: 0 0 6px var(--accent);
-            animation: blink 1s infinite;
+            box-shadow: 0 0 8px var(--accent);
+            animation: pulse-glow 1.5s infinite ease-in-out;
         }
 
-        @keyframes blink {
-            0%, 50% { opacity: 1; }
-            51%, 100% { opacity: 0.3; }
+        @keyframes pulse-glow {
+            0%, 100% { transform: scale(1); opacity: 1; box-shadow: 0 0 6px var(--accent); }
+            50% { transform: scale(1.2); opacity: 0.4; box-shadow: 0 0 1px var(--accent); }
         }
 
         .header-right {
-            font-size: 0.8rem;
+            font-size: 0.85rem;
             color: var(--text-secondary);
+            font-family: var(--display);
         }
 
         /* ==================== STATS BAR ==================== */
         .stats-bar {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: 1px;
             background: var(--border);
             border-bottom: 1px solid var(--border);
@@ -121,31 +127,41 @@
 
         .stat-cell {
             background: var(--bg-secondary);
-            padding: 16px 20px;
+            padding: 18px 20px;
             text-align: center;
+            transition: background 0.2s;
+        }
+
+        .stat-cell:hover {
+            background: var(--bg-tertiary);
         }
 
         .stat-label {
             font-size: 0.65rem;
             color: var(--text-secondary);
             text-transform: uppercase;
-            letter-spacing: 0.15em;
-            margin-bottom: 4px;
+            letter-spacing: 0.2em;
+            margin-bottom: 6px;
         }
 
         .stat-value {
             font-family: var(--display);
-            font-size: 1.6rem;
+            font-size: 1.8rem;
             font-weight: 700;
+            color: var(--accent-blue);
+            text-shadow: 0 0 15px rgba(0, 212, 255, 0.2);
+            line-height: 1.2;
+        }
+
+        #loss.stat-value {
             color: var(--accent);
             text-shadow: 0 0 15px var(--accent-glow);
-            line-height: 1.2;
         }
 
         .stat-sub {
             font-size: 0.7rem;
             color: var(--text-dim);
-            margin-top: 2px;
+            margin-top: 4px;
         }
 
         .stat-trend {
@@ -153,14 +169,15 @@
             padding: 2px 6px;
             font-size: 0.65rem;
             margin-left: 4px;
+            font-weight: bold;
         }
 
-        .stat-trend.down { background: rgba(57,255,20,0.15); color: var(--accent); }
-        .stat-trend.up { background: rgba(255,107,53,0.15); color: var(--warning); }
+        .stat-trend.down { background: rgba(57,255,20,0.12); color: var(--accent); }
+        .stat-trend.up { background: rgba(255,107,53,0.12); color: var(--warning); }
 
         /* ==================== PROGRESS ==================== */
         .progress-section {
-            padding: 12px 20px;
+            padding: 14px 20px;
             background: var(--bg-secondary);
             border-bottom: 1px solid var(--border);
         }
@@ -175,17 +192,20 @@
         }
 
         .progress-track {
-            height: 4px;
-            background: var(--bg-tertiary);
+            height: 6px;
+            background: #000;
+            border: 1px solid var(--border);
             position: relative;
             overflow: hidden;
+            border-radius: 3px;
         }
 
         .progress-fill {
             height: 100%;
-            background: var(--accent);
-            box-shadow: 0 0 8px var(--accent-glow);
-            transition: width 0.5s ease-out;
+            background: linear-gradient(90deg, var(--accent-blue) 0%, var(--accent) 100%);
+            box-shadow: 0 0 10px var(--accent-glow);
+            transition: width 0.8s cubic-bezier(0.1, 0.8, 0.25, 1);
+            border-radius: 2px;
         }
 
         .progress-info {
@@ -198,6 +218,7 @@
         }
 
         .progress-info span { white-space: nowrap; }
+        .progress-info strong { color: var(--text-primary); }
 
         /* ==================== MAIN CONTENT ==================== */
         .main-content {
@@ -221,7 +242,7 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 12px;
+            margin-bottom: 14px;
             padding-bottom: 8px;
             border-bottom: 1px solid var(--border);
             flex-wrap: wrap;
@@ -231,8 +252,9 @@
         .chart-title {
             font-size: 0.75rem;
             text-transform: uppercase;
-            letter-spacing: 0.15em;
+            letter-spacing: 0.2em;
             color: var(--text-secondary);
+            font-weight: bold;
         }
 
         .chart-legend {
@@ -248,7 +270,7 @@
         }
 
         .legend-dot { width: 12px; height: 2px; }
-        .legend-dot.raw { background: rgba(255,255,255,0.2); }
+        .legend-dot.raw { background: rgba(255,255,255,0.25); }
         .legend-dot.smooth { background: var(--accent); }
         .legend-dot.lr { background: var(--warning); }
 
@@ -265,32 +287,36 @@
         /* ==================== PANELS GRID ==================== */
         .panels-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
             gap: 1px;
             background: var(--border);
         }
 
         .panel {
             background: var(--bg-secondary);
+            display: flex;
+            flex-direction: column;
         }
 
         .panel-header {
-            padding: 12px 16px;
+            padding: 12px 18px;
             font-size: 0.7rem;
             text-transform: uppercase;
-            letter-spacing: 0.15em;
+            letter-spacing: 0.2em;
             color: var(--text-secondary);
             background: var(--bg-tertiary);
             border-bottom: 1px solid var(--border);
+            font-weight: bold;
         }
 
         .panel-content {
             padding: 16px;
+            flex: 1;
         }
 
-        /* Samples panel 需要更大的高度 */
+        /* Samples panel */
         .panel-samples .panel-content {
-            min-height: 360px;
+            min-height: 400px;
         }
 
         /* ==================== SAMPLES GRID ==================== */
@@ -301,14 +327,14 @@
             height: 100%;
         }
 
-        /* 缩略图网格 - 响应式换行 */
         .samples-grid {
             display: flex;
             flex-wrap: wrap;
             gap: 6px;
             padding: 8px;
-            background: var(--bg-tertiary);
-            border-radius: 8px;
+            background: #000;
+            border: 1px solid var(--border);
+            border-radius: 6px;
             max-height: 120px;
             overflow-y: auto;
         }
@@ -316,23 +342,23 @@
         .sample-thumb {
             width: 48px;
             height: 48px;
-            border-radius: 6px;
+            border-radius: 4px;
             overflow: hidden;
             cursor: pointer;
-            border: 2px solid transparent;
+            border: 1.5px solid transparent;
             background: var(--bg-primary);
-            transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+            transition: all 0.15s ease;
             flex-shrink: 0;
         }
 
         .sample-thumb:hover {
-            border-color: var(--text-dim);
+            border-color: var(--text-secondary);
             transform: scale(1.05);
         }
 
         .sample-thumb.active {
             border-color: var(--accent);
-            box-shadow: 0 0 8px var(--accent-glow);
+            box-shadow: 0 0 10px var(--accent-glow);
         }
 
         .sample-thumb img {
@@ -341,21 +367,16 @@
             object-fit: cover;
         }
 
-        .sample-thumb .step-label {
-            display: none;
-        }
-
-        /* 大图预览区 */
         .sample-preview {
             flex: 1;
             display: flex;
             justify-content: center;
             align-items: center;
-            background: var(--bg-primary);
+            background: #000;
             border: 1px solid var(--border);
-            border-radius: 8px;
+            border-radius: 6px;
             overflow: hidden;
-            min-height: 200px;
+            min-height: 240px;
             position: relative;
         }
 
@@ -363,24 +384,22 @@
             max-width: 100%;
             max-height: 100%;
             object-fit: contain;
-            transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.2s;
-        }
-
-        .sample-preview.zoomed img {
-            transform: scale(1.1);
+            transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
         }
 
         .sample-preview-label {
             position: absolute;
-            bottom: 8px;
+            bottom: 10px;
             left: 50%;
             transform: translateX(-50%);
-            background: rgba(0,0,0,0.8);
-            padding: 4px 12px;
+            background: rgba(0,0,0,0.85);
+            padding: 4px 14px;
             border-radius: 4px;
             font-size: 0.7rem;
             color: var(--text-secondary);
             border: 1px solid var(--border);
+            letter-spacing: 0.05em;
+            backdrop-filter: blur(4px);
         }
 
         .sample-preview-label strong {
@@ -394,41 +413,89 @@
         }
 
         .sample-empty-icon {
-            font-size: 2rem;
+            font-size: 2.2rem;
             margin-bottom: 8px;
-            opacity: 0.3;
+            opacity: 0.25;
+            color: var(--accent-blue);
         }
 
         /* Analysis */
         .analysis-row {
             display: flex;
             justify-content: space-between;
-            padding: 6px 0;
+            padding: 8px 0;
             border-bottom: 1px dashed var(--border);
-            font-size: 0.8rem;
+            font-size: 0.78rem;
         }
 
         .analysis-row:last-child { border-bottom: none; }
         .analysis-label { color: var(--text-secondary); }
-        .analysis-value { font-weight: 500; }
-        .analysis-value.positive { color: var(--accent); }
+        .analysis-value { font-weight: 500; font-family: var(--mono); color: var(--text-primary); }
+        .analysis-value.positive { color: var(--accent); text-shadow: 0 0 5px rgba(57, 255, 20, 0.2); }
         .analysis-value.negative { color: var(--warning); }
 
         /* Config */
-        .config-list { margin: -16px; }
+        .config-list { margin: -16px; max-height: 400px; overflow-y: auto; }
 
         .config-row {
             display: flex;
             justify-content: space-between;
-            padding: 8px 16px;
+            padding: 10px 18px;
             border-bottom: 1px solid var(--border);
             font-size: 0.75rem;
+            transition: background 0.15s;
         }
 
         .config-row:last-child { border-bottom: none; }
         .config-row:hover { background: var(--bg-tertiary); }
-        .config-key { color: var(--text-dim); }
+        .config-key { color: var(--text-secondary); }
         .config-value { color: var(--text-primary); font-weight: 500; }
+
+        /* Terminal Body */
+        .terminal-body {
+            background: #020202;
+            color: #a5f3fc; /* Cyan tinted */
+            font-family: var(--mono);
+            font-size: 0.75rem;
+            padding: 14px 18px;
+            height: 220px;
+            overflow-y: auto;
+            border-top: 1px solid var(--border);
+            line-height: 1.6;
+        }
+        
+        .terminal-body::-webkit-scrollbar {
+            width: 6px;
+        }
+        .terminal-body::-webkit-scrollbar-track {
+            background: #020202;
+        }
+        .terminal-body::-webkit-scrollbar-thumb {
+            background: var(--border);
+        }
+        .terminal-body::-webkit-scrollbar-thumb:hover {
+            background: var(--text-dim);
+        }
+        
+        .terminal-line {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 3px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .terminal-prefix {
+            color: var(--accent);
+            flex-shrink: 0;
+            user-select: none;
+            font-weight: bold;
+        }
+        .terminal-content {
+            color: #e2e8f0;
+        }
+        .terminal-content.info { color: #38bdf8; }
+        .terminal-content.warning { color: #fb923c; }
+        .terminal-content.error { color: #f43f5e; font-weight: bold; }
 
         /* ==================== FOOTER ==================== */
         .footer {
@@ -436,17 +503,18 @@
             bottom: 0;
             left: 0;
             right: 0;
-            height: 28px;
+            height: 30px;
             background: var(--bg-tertiary);
             border-top: 1px solid var(--border);
             display: flex;
             align-items: center;
-            padding: 0 16px;
+            padding: 0 20px;
             font-size: 0.7rem;
             color: var(--text-dim);
             gap: 24px;
             z-index: 100;
             flex-wrap: wrap;
+            box-shadow: 0 -4px 15px rgba(0,0,0,0.4);
         }
 
         .footer-item {
@@ -459,6 +527,7 @@
         .footer-dot {
             width: 4px;
             height: 4px;
+            border-radius: 50%;
             background: var(--accent);
         }
 
@@ -475,8 +544,8 @@
             gap: 8px;
             font-size: 0.7rem;
             color: var(--text-secondary);
-            background: rgba(255,255,255,0.03);
-            padding: 2px 8px;
+            background: rgba(255,255,255,0.02);
+            padding: 3px 8px;
             border-radius: 4px;
             border: 1px solid var(--border);
         }
@@ -522,39 +591,24 @@
             box-shadow: 0 0 5px var(--accent-glow);
         }
 
+        .full-width { grid-column: 1 / -1; }
+
         /* ==================== RESPONSIVE ==================== */
         @media (min-width: 1200px) {
             .main-content {
                 grid-template-columns: 1fr 1fr;
             }
-            
-            /* Remove span to make them side-by-side */
-            /* .chart-section.loss { grid-column: 1 / -1; } */
-            
             .chart-container { height: 320px; }
-            /* Make LR chart same height as Loss chart on big screens */
             .chart-container.small { height: 320px; }
         }
 
-        @media (max-width: 600px) {
+        @media (max-width: 768px) {
             html { font-size: 13px; }
-            
-            .stats-bar {
-                grid-template-columns: repeat(2, 1fr);
-            }
-            
-            .stat-value { font-size: 1.3rem; }
-            
+            .stats-bar { grid-template-columns: repeat(2, 1fr); }
+            .stat-value { font-size: 1.4rem; }
             .chart-container { height: 220px; }
-            .chart-container.small { height: 150px; }
-            
-            .sample-grid {
-                grid-template-columns: repeat(2, 1fr);
-            }
-            
-            .panels-grid {
-                grid-template-columns: 1fr;
-            }
+            .chart-container.small { height: 160px; }
+            .panels-grid { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -595,6 +649,11 @@
             <div class="stat-value" id="speed">0.00</div>
             <div class="stat-sub">it/s</div>
         </div>
+        <div class="stat-cell">
+            <div class="stat-label">GPU VRAM</div>
+            <div class="stat-value" id="vram-val">-.-- <span style="font-size:0.8rem;color:var(--text-secondary)">GB</span></div>
+            <div class="stat-sub"><span id="vram-pct" class="stat-trend down">0.0%</span> used</div>
+        </div>
     </div>
 
     <!-- PROGRESS -->
@@ -623,7 +682,7 @@
                         <div class="control-group">
                             <label class="control-label" for="ema-slider">Smooth</label>
                             <input type="range" id="ema-slider" min="0.001" max="0.3" step="0.001" value="0.02">
-                            <span id="ema-value" style="font-family: var(--display); color: var(--accent); width: 3ch; text-align:right;">0.02</span>
+                            <span id="ema-value" style="font-family: var(--display); color: var(--accent); width: 4ch; text-align:right;">0.02</span>
                         </div>
                         <div class="control-group">
                             <input type="checkbox" id="show-raw" checked>
@@ -661,11 +720,11 @@
             <div class="panel-header">Samples</div>
             <div class="panel-content">
                 <div class="samples-container" id="samples-container">
-                    <!-- 缩略图网格 -->
+                    <!-- Thumbnail grid -->
                     <div class="samples-grid" id="samples-grid">
                         <div class="sample-empty">Awaiting samples...</div>
                     </div>
-                    <!-- 大图预览 -->
+                    <!-- Preview -->
                     <div class="sample-preview" id="sample-preview">
                         <div class="sample-empty">
                             <div class="sample-empty-icon">◇</div>
@@ -699,6 +758,21 @@
                 </div>
             </div>
         </div>
+
+        <!-- Logs Terminal -->
+        <div class="panel full-width">
+            <div class="panel-header" style="display:flex; justify-content:space-between; align-items:center;">
+                <span>Training Console Logs // stdout</span>
+                <label style="display:flex; align-items:center; gap:6px; font-size:0.65rem; cursor:pointer; text-transform:none; color:var(--text-secondary)">
+                    <input type="checkbox" id="auto-scroll" checked> Auto Scroll
+                </label>
+            </div>
+            <div class="panel-content" style="padding:0;">
+                <div id="terminal-logs" class="terminal-body">
+                    <div style="color:var(--text-dim)">[System] Connecting to training logs...</div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- FOOTER -->
@@ -707,28 +781,23 @@
             <div class="footer-dot"></div>
             <span>AnimaLoraToolkit</span>
         </div>
-        <div class="footer-item" style="color: var(--accent);">Grid v3</div>
+        <div class="footer-item" style="color: var(--accent);">Cyberpunk Grid v3</div>
         <div class="footer-item">Refresh: 1s</div>
         <div class="footer-item" id="connection-status">Connecting...</div>
     </footer>
 
     <script>
-        // 自动检测 API 地址：支持本地和云端训练
-        // - 本地训练：直接访问 localhost:8765
-        // - 云端训练：访问 http://服务器IP:8765/，自动使用当前 host
-        // - 也可通过 URL 参数指定：?api=http://192.168.1.100:8765
+        // Dynamic API binding
         const API_BASE = (() => {
             const params = new URLSearchParams(window.location.search);
             if (params.get('api')) return params.get('api').replace(/\/$/, '');
-            // 如果通过 HTTP(S) 访问（无论是否显式端口），使用当前 origin
             if (window.location.protocol.startsWith('http') && window.location.hostname) {
                 return window.location.origin;
             }
-            // 本地文件或默认
             return 'http://localhost:8765';
         })();
 
-        // Chart config
+        // Chart styles
         const chartDefaults = {
             responsive: true,
             maintainAspectRatio: false,
@@ -737,29 +806,86 @@
             scales: {
                 x: {
                     grid: { color: 'rgba(255,255,255,0.03)', drawBorder: false },
-                    ticks: { color: '#444', font: { family: "'JetBrains Mono'", size: 10 }, maxTicksLimit: 8 }
+                    ticks: { color: '#555', font: { family: "'JetBrains Mono'", size: 10 }, maxTicksLimit: 8 }
                 },
                 y: {
                     grid: { color: 'rgba(255,255,255,0.03)', drawBorder: false },
-                    ticks: { color: '#444', font: { family: "'JetBrains Mono'", size: 10 } }
+                    ticks: { color: '#555', font: { family: "'JetBrains Mono'", size: 10 } }
                 }
             },
             plugins: {
                 legend: { display: false },
                 tooltip: {
-                    backgroundColor: '#1a1a1a',
-                    borderColor: '#2a2a2a',
+                    backgroundColor: '#0c0c0c',
+                    borderColor: '#222',
                     borderWidth: 1,
                     titleFont: { family: "'JetBrains Mono'" },
                     bodyFont: { family: "'JetBrains Mono'" },
-                    cornerRadius: 0
+                    cornerRadius: 4
                 }
             }
         };
 
-        let currentEMAAlpha = 0.02;
+        // Multi-CDN Script Loader for Chart.js
+        const CDNs = [
+            'https://cdn.jsdelivr.net/npm/chart.js',
+            'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js',
+            'https://unpkg.com/chart.js@3.9.1/dist/chart.min.js',
+            'https://cdn.staticfile.org/Chart.js/3.9.1/chart.min.js',
+            'https://lib.baomitu.com/Chart.js/3.9.1/chart.min.js'
+        ];
 
-        // Controls
+        function loadScript(url) {
+            return new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = url;
+                script.onload = () => resolve(url);
+                script.onerror = () => reject(new Error(`Failed to load ${url}`));
+                document.head.appendChild(script);
+            });
+        }
+
+        async function initChartJS() {
+            let loaded = false;
+            for (const url of CDNs) {
+                try {
+                    await loadScript(url);
+                    loaded = true;
+                    break;
+                } catch (e) {
+                    console.warn(`CDN unreachable: ${url}`);
+                }
+            }
+            if (!loaded) {
+                console.error("All Chart.js CDNs failed to load. The dashboard will run in offline mode.");
+                const offlineAlert = document.createElement('div');
+                offlineAlert.style.position = 'fixed';
+                offlineAlert.style.top = '14px';
+                offlineAlert.style.right = '20px';
+                offlineAlert.style.backgroundColor = 'var(--error)';
+                offlineAlert.style.color = '#fff';
+                offlineAlert.style.padding = '8px 16px';
+                offlineAlert.style.fontFamily = 'var(--mono)';
+                offlineAlert.style.zIndex = '10000';
+                offlineAlert.style.fontSize = '0.75rem';
+                offlineAlert.style.border = '1px solid #ff3366';
+                offlineAlert.style.boxShadow = '0 0 15px rgba(255, 51, 102, 0.4)';
+                offlineAlert.innerHTML = '⚠️ OFFLINE MODE: Chart.js CDN unreachable. Graph display disabled.';
+                document.body.appendChild(offlineAlert);
+                return false;
+            }
+            return true;
+        }
+
+        let currentEMAAlpha = 0.02;
+        let lastUpdate = Date.now();
+        let lastData = null;
+        const MAX_CHART_POINTS = 1500;
+
+        let lossChart = null;
+        let lrChart = null;
+
+        // UI Controls
         const emaSlider = document.getElementById('ema-slider');
         const emaValue = document.getElementById('ema-value');
         const showRawCheck = document.getElementById('show-raw');
@@ -767,34 +893,14 @@
         emaSlider.addEventListener('input', (e) => {
             currentEMAAlpha = parseFloat(e.target.value);
             emaValue.textContent = currentEMAAlpha.toFixed(2);
-            // Trigger update immediately if we have data
             if (lastData) updateCharts(lastData);
         });
 
         showRawCheck.addEventListener('change', (e) => {
-            lossChart.data.datasets[0].hidden = !e.target.checked;
-            lossChart.update('none');
-        });
-
-        const lossChart = new Chart(document.getElementById('lossChart'), {
-            type: 'line',
-            data: {
-                labels: [],
-                datasets: [
-                    { label: 'Raw', data: [], borderColor: 'rgba(255,255,255,0.15)', backgroundColor: 'rgba(255,255,255,0.02)', fill: true, tension: 0, pointRadius: 0, borderWidth: 1 },
-                    { label: 'EMA', data: [], borderColor: '#39ff14', backgroundColor: 'transparent', fill: false, tension: 0.3, pointRadius: 0, borderWidth: 2 }
-                ]
-            },
-            options: chartDefaults
-        });
-
-        const lrChart = new Chart(document.getElementById('lrChart'), {
-            type: 'line',
-            data: {
-                labels: [],
-                datasets: [{ label: 'LR', data: [], borderColor: '#ff6b35', backgroundColor: 'rgba(255,107,53,0.05)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5 }]
-            },
-            options: chartDefaults
+            if (lossChart) {
+                lossChart.data.datasets[0].hidden = !e.target.checked;
+                lossChart.update('none');
+            }
         });
 
         function calcEMA(data, alpha) {
@@ -804,7 +910,6 @@
             return ema;
         }
 
-        // 降采样函数：保持完整时间跨度，均匀采样到目标点数
         function downsample(arr, targetPoints) {
             if (arr.length <= targetPoints) return arr;
             const result = [];
@@ -821,7 +926,7 @@
             const h = Math.floor(sec / 3600);
             const m = Math.floor((sec % 3600) / 60);
             const s = Math.floor(sec % 60);
-            return h > 0 ? `${h}h${String(m).padStart(2,'0')}m` : `${m}m${String(s).padStart(2,'0')}s`;
+            return h > 0 ? `${h}h ${String(m).padStart(2,'0')}m` : `${m}m ${String(s).padStart(2,'0')}s`;
         }
 
         function updateClock() {
@@ -830,14 +935,10 @@
         setInterval(updateClock, 1000);
         updateClock();
 
-        let lastUpdate = Date.now();
-        let lastData = null;
-
-        const MAX_CHART_POINTS = 1500;  // 图表最大显示点数
-
         function updateCharts(data) {
+            if (!lossChart || !lrChart) return;
+
             if (data.losses?.length > 0) {
-                // 使用降采样显示完整历史，而非只取最近 N 个点
                 const display = downsample(data.losses, MAX_CHART_POINTS);
                 const raw = display.map(l => l.loss);
                 const smooth = calcEMA(raw, currentEMAAlpha);
@@ -850,10 +951,8 @@
                 lossChart.data.datasets[1].data = smooth;
                 lossChart.update('none');
 
-                // Analysis update logic...
-                let analysisHtml = '';
+                // Update Loss Trend Badge
                 const trendEl = document.getElementById('loss-trend');
-                
                 if (smooth.length >= 200) {
                      const recent = smooth.slice(-100).reduce((a,b) => a+b, 0) / 100;
                      const before = smooth.slice(-200, -100).reduce((a,b) => a+b, 0) / 100;
@@ -861,6 +960,36 @@
                      trendEl.textContent = `${change > 0 ? '+' : ''}${change}%`;
                      trendEl.className = `stat-trend ${change < 0 ? 'down' : 'up'}`;
                 }
+
+                // Render dynamic Analysis
+                const minLoss = Math.min(...raw);
+                const maxLoss = Math.max(...raw);
+                const avgLoss = (raw.reduce((a,b) => a+b, 0) / raw.length);
+                const statusStr = lastSmooth < 0.1 ? 'Excellent' : (lastSmooth < 0.25 ? 'Stable' : 'Converging');
+                
+                const analysisHtml = `
+                    <div class="analysis-row">
+                        <span class="analysis-label">Conv. Status</span>
+                        <span class="analysis-value positive">${statusStr}</span>
+                    </div>
+                    <div class="analysis-row">
+                        <span class="analysis-label">EMA Loss (now)</span>
+                        <span class="analysis-value">${lastSmooth.toFixed(5)}</span>
+                    </div>
+                    <div class="analysis-row">
+                        <span class="analysis-label">Min Raw Loss</span>
+                        <span class="analysis-value positive">${minLoss.toFixed(5)}</span>
+                    </div>
+                    <div class="analysis-row">
+                        <span class="analysis-label">Max Raw Loss</span>
+                        <span class="analysis-value">${maxLoss.toFixed(5)}</span>
+                    </div>
+                    <div class="analysis-row">
+                        <span class="analysis-label">Avg Raw Loss</span>
+                        <span class="analysis-value">${avgLoss.toFixed(5)}</span>
+                    </div>
+                `;
+                document.getElementById('analysis').innerHTML = analysisHtml;
             }
         }
 
@@ -874,16 +1003,33 @@
                 document.getElementById('status-text').textContent = 'TRAINING';
                 document.getElementById('connection-status').innerHTML = '<span style="color:#39ff14">● Connected</span>';
 
-                // Stats
+                // Core Stats
                 document.getElementById('epoch').textContent = data.epoch || 0;
                 document.getElementById('step').textContent = data.step || 0;
                 document.getElementById('speed').textContent = (data.speed || 0).toFixed(2);
-                if (data.total_steps) document.getElementById('total-steps').textContent = data.total_steps;
+                if (data.total_steps) {
+                    document.getElementById('total-steps').textContent = data.total_steps;
+                    if (data.config && data.config.epochs) {
+                        document.getElementById('total-epochs').textContent = data.config.epochs;
+                    }
+                }
+
+                // VRAM Monitor update
+                if (data.vram) {
+                    const usedGB = (data.vram.used / 1024).toFixed(2);
+                    const totalGB = (data.vram.total / 1024).toFixed(2);
+                    document.getElementById('vram-val').innerHTML = `${usedGB} <span style="font-size:0.8rem;color:var(--text-secondary)">/ ${totalGB} GB</span>`;
+                    
+                    const pctEl = document.getElementById('vram-pct');
+                    pctEl.textContent = `${data.vram.percentage}%`;
+                    pctEl.className = `stat-trend ${data.vram.percentage > 90 ? 'up' : 'down'}`;
+                    pctEl.style.color = data.vram.percentage > 90 ? 'var(--warning)' : 'var(--accent)';
+                }
 
                 // Charts
                 updateCharts(data);
 
-                if (data.lr_history?.length > 0) {
+                if (lrChart && data.lr_history?.length > 0) {
                     const lr = data.lr_history.slice(-500);
                     lrChart.data.labels = lr.map(l => l.step);
                     lrChart.data.datasets[0].data = lr.map(l => l.lr);
@@ -901,7 +1047,7 @@
                     document.getElementById('eta').textContent = formatTime(eta);
                 }
 
-                // Samples - Dock style
+                // Samples
                 if (data.samples?.length > 0) {
                     updateSamplesGrid(data.samples);
                 }
@@ -925,39 +1071,76 @@
             }
         }
 
-        setInterval(updateData, 1000);
-        updateData();
+        // Live Log Terminal implementation
+        let lastLogLines = "";
+        
+        function escapeHtml(str) {
+            return str
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
 
-        // ==================== 缩略图网格 ====================
+        async function updateLogs() {
+            try {
+                const resp = await fetch(`${API_BASE}/api/logs?_=${Date.now()}`);
+                const data = await resp.json();
+                if (data.logs && data.logs.length > 0) {
+                    const terminal = document.getElementById('terminal-logs');
+                    if (!terminal) return;
+                    
+                    const joined = data.logs.join('\n');
+                    if (joined === lastLogLines) return;
+                    lastLogLines = joined;
+                    
+                    const autoScroll = document.getElementById('auto-scroll').checked;
+                    
+                    terminal.innerHTML = data.logs.map(line => {
+                        let cls = 'info';
+                        if (line.includes('WARNING') || line.includes('warning') || line.includes('Warning')) cls = 'warning';
+                        if (line.includes('ERROR') || line.includes('error') || line.includes('FATAL') || line.includes('Exception')) cls = 'error';
+                        
+                        return `
+                            <div class="terminal-line">
+                                <span class="terminal-prefix">&gt;</span>
+                                <span class="terminal-content ${cls}">${escapeHtml(line)}</span>
+                            </div>
+                        `;
+                    }).join('');
+                    
+                    if (autoScroll) {
+                        terminal.scrollTop = terminal.scrollHeight;
+                    }
+                }
+            } catch (e) {
+                console.warn('Failed to fetch logs:', e);
+            }
+        }
+
+        // ==================== Thumbnail Grid ====================
         let currentSamples = [];
         let activeIndex = 0;
         let gridEventsInitialized = false;
 
         function updateSamplesGrid(samples) {
-            const list = samples.slice(-24).reverse(); // 最多显示24个，最新的在前
+            const list = samples.slice(-24).reverse();
             currentSamples = list;
             
             const grid = document.getElementById('samples-grid');
             if (!grid) return;
 
-            // clamp active index
-            if (list.length > 0) {
-                activeIndex = Math.min(activeIndex, list.length - 1);
-            } else {
-                activeIndex = 0;
-            }
+            activeIndex = list.length > 0 ? Math.min(activeIndex, list.length - 1) : 0;
             
-            // 生成缩略图
             grid.innerHTML = list.map((s, i) => `
                 <div class="sample-thumb ${i === activeIndex ? 'active' : ''}" data-index="${i}" title="Step ${s.step}">
                     <img src="${API_BASE}/samples/${s.path.split(/[\\\\/]/).pop()}" onerror="this.parentElement.style.display='none'">
                 </div>
             `).join('');
 
-            // 绑定事件（只初始化一次）
             setupGridEvents();
             
-            // 更新大图预览
             if (list.length > 0) {
                 showPreview(activeIndex);
             }
@@ -969,7 +1152,6 @@
             if (gridEventsInitialized) return;
             gridEventsInitialized = true;
 
-            // 点击选择（事件委托）
             grid.addEventListener('click', (e) => {
                 const target = e.target;
                 if (!(target instanceof Element)) return;
@@ -981,7 +1163,6 @@
 
                 activeIndex = idx;
 
-                // 更新 active 状态
                 grid.querySelectorAll('.sample-thumb').forEach((el, i) => {
                     el.classList.toggle('active', i === idx);
                 });
@@ -992,11 +1173,9 @@
         function showPreview(index) {
             const preview = document.getElementById('sample-preview');
             const sample = currentSamples[index];
-            
             if (!sample) return;
             
             const imgUrl = `${API_BASE}/samples/${sample.path.split(/[\\\\/]/).pop()}`;
-            
             preview.innerHTML = `
                 <img src="${imgUrl}" alt="Step ${sample.step}">
                 <div class="sample-preview-label">
@@ -1004,6 +1183,43 @@
                 </div>
             `;
         }
+
+        // Dashboard Initializer
+        async function initDashboard() {
+            const hasChartJS = await initChartJS();
+            
+            if (hasChartJS) {
+                lossChart = new Chart(document.getElementById('lossChart'), {
+                    type: 'line',
+                    data: {
+                        labels: [],
+                        datasets: [
+                            { label: 'Raw', data: [], borderColor: 'rgba(255,255,255,0.12)', backgroundColor: 'rgba(255,255,255,0.01)', fill: true, tension: 0, pointRadius: 0, borderWidth: 1 },
+                            { label: 'EMA', data: [], borderColor: '#39ff14', backgroundColor: 'transparent', fill: false, tension: 0.3, pointRadius: 0, borderWidth: 2 }
+                        ]
+                    },
+                    options: chartDefaults
+                });
+
+                lrChart = new Chart(document.getElementById('lrChart'), {
+                    type: 'line',
+                    data: {
+                        labels: [],
+                        datasets: [{ label: 'LR', data: [], borderColor: '#ff6b35', backgroundColor: 'rgba(255,107,53,0.02)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5 }]
+                    },
+                    options: chartDefaults
+                });
+            }
+            
+            // Periodical pollers
+            setInterval(updateData, 1000);
+            updateData();
+            
+            setInterval(updateLogs, 1000);
+            updateLogs();
+        }
+
+        window.addEventListener('DOMContentLoaded', initDashboard);
     </script>
 </body>
 </html>

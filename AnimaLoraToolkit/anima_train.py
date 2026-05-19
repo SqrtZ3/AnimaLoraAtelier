@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 import types
-from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -102,284 +102,6 @@ def ensure_dependencies(auto_install=False):
         raise SystemExit(1)
 
 
-# ============================================================================
-# YAML 配置加载
-# ============================================================================
-
-def load_yaml_config(config_path):
-    """加载 YAML 配置文件"""
-    try:
-        import yaml
-    except ImportError:
-        print("PyYAML not installed. Install with: pip install pyyaml")
-        raise SystemExit(1)
-
-    config_path = Path(config_path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    if config is None:
-        config = {}
-
-    return config
-
-
-def apply_yaml_config(args, config):
-    """将 YAML 配置应用到 args，命令行参数优先"""
-    # 字段映射: YAML key -> args attribute
-    mapping = {
-        # 模型路径
-        "transformer_path": "transformer",
-        "vae_path": "vae",
-        "text_encoder_path": "qwen",
-        "t5_tokenizer_path": "t5_tokenizer",
-        # 数据集
-        "data_dir": "data_dir",
-        "reg_data_dir": "reg_data_dir",
-        "reg_repeats": "reg_repeats",
-        "reg_caption": "reg_caption",
-        "resolution": "resolution",
-        "repeats": "repeats",
-        "shuffle_caption": "shuffle_caption",
-        "keep_tokens": "keep_tokens",
-        "flip_augment": "flip_augment",
-        "tag_dropout": "tag_dropout",
-        "prefer_json": "prefer_json",
-        "cache_latents": "cache_latents",
-        # LoRA 配置
-        "lora_type": "lora_type",
-        "lora_rank": "lora_rank",
-        "lora_alpha": "lora_alpha",
-        "lora_dropout": "lora_dropout",
-        "lokr_factor": "lokr_factor",
-        "lora_exclude_prefixes": "lora_exclude_prefixes",
-        "resume_lora": "resume_lora",
-        # 训练参数
-        "epochs": "epochs",
-        "max_steps": "max_steps",
-        "batch_size": "batch_size",
-        "grad_accum": "grad_accum",
-        "learning_rate": "lr",
-        "lr_scheduler": "lr_scheduler",
-        "lr_scheduler_t0": "lr_scheduler_t0",
-        "lr_scheduler_t_mult": "lr_scheduler_t_mult",
-        "lr_scheduler_eta_min": "lr_scheduler_eta_min",
-        "weight_decay": "weight_decay",
-        "grad_clip_max_norm": "grad_clip_max_norm",
-        "mixed_precision": "mixed_precision",
-        "grad_checkpoint": "grad_checkpoint",
-        "xformers": "xformers",
-        "num_workers": "num_workers",
-        # 输出与保存
-        "output_dir": "output_dir",
-        "output_name": "output_name",
-        "save_every": "save_every",
-        "save_every_steps": "save_every_steps",
-        "save_state_every": "save_state_every",
-        "resume_state": "resume_state",
-        "seed": "seed",
-        # 采样
-        "sample_every": "sample_every",
-        "sample_steps": "sample_steps",
-        "sample_prompt": "sample_prompt",
-        "sample_prompts": "sample_prompts",
-        "sample_cfg_scale": "sample_cfg_scale",
-        "sample_negative_prompt": "sample_negative_prompt",
-        "sample_width": "sample_width",
-        "sample_height": "sample_height",
-        "sample_seed": "sample_seed",
-        "sample_infer_steps": "sample_infer_steps",
-        "sample_sampler_name": "sample_sampler_name",
-        "sample_scheduler": "sample_scheduler",
-        # 进度显示与监控
-        "loss_curve_steps": "loss_curve_steps",
-        "no_progress": "no_progress",
-        "log_every": "log_every",
-        "no_monitor": "no_monitor",
-        "monitor_host": "monitor_host",
-        "monitor_port": "monitor_port",
-        "no_browser": "no_browser",
-        "debug_first_batches": "debug_first_batches",
-        # 优化器配置映射
-        "optimizer_type": "optimizer_type",
-        "prodigyplus_d0": "prodigyplus_d0",
-        "prodigyplus_use_stableadamw": "prodigyplus_use_stableadamw",
-        # 优化器透明路由（任意 key 直接以 **kwargs 传入优化器，未识别的会被自动过滤并 warning）
-        "optimizer_args": "optimizer_args",
-        "use_t5_token_weights": "use_t5_token_weights",
-        # Flow Matching / 损失权重 / 噪声增强
-        "flow_shift": "flow_shift",
-        "schedule_shift": "schedule_shift",
-        "timestep_sampling": "timestep_sampling",
-        "timestep_mix_low_prob": "timestep_mix_low_prob",
-        "min_snr_gamma": "min_snr_gamma",
-        "loss_weighting_scheme": "loss_weighting_scheme",
-        "weight_cap_ratio": "weight_cap_ratio",
-        "loss_type": "loss_type",
-        "huber_c": "huber_c",
-        "huber_schedule": "huber_schedule",
-        "noise_offset": "noise_offset",
-        "noise_offset_min": "noise_offset_min",
-        "noise_offset_random_strength": "noise_offset_random_strength",
-        "pyramid_noise_iterations": "pyramid_noise_iterations",
-        "pyramid_noise_discount": "pyramid_noise_discount",
-        "caption_dropout_rate": "caption_dropout_rate",
-        "grad_norm_log_every": "grad_norm_log_every",
-        # Regex 模块选择（kohya 风格）
-        "lora_exclude_patterns": "lora_exclude_patterns",
-        "lora_include_patterns": "lora_include_patterns",
-        # 模块级 rank/lr 控制（kohya 风格）
-        "lora_reg_dims": "lora_reg_dims",
-        "lora_reg_lrs": "lora_reg_lrs",
-        # 精细正则化
-        "rank_dropout": "rank_dropout",
-        "module_dropout": "module_dropout",
-        # LoRA+ for LoKr
-        "loraplus_lr_ratio": "loraplus_lr_ratio",
-        # ─── 实验性参数（v5 引入）──────────────────────────
-        # ② frequency-balanced tag dropout：根据 tag 在数据集中的出现频率自适应地增加 dropout
-        "freq_balanced_dropout_strength": "freq_balanced_dropout_strength",
-        # ③ input perturbation noise：在 FM 噪声混合前给 latents 加一个小高斯扰动
-        "ip_noise_gamma": "ip_noise_gamma",
-        # ④ immiscible noise pairing：batch/pool 内做 (latent, noise) 的 Hungarian 配对
-        "immiscible_pool_size": "immiscible_pool_size",
-        # ⑤ LoRA EMA：训练过程维护 LoRA 参数的指数滑动平均
-        "lora_ema_decay": "lora_ema_decay",
-        # ⑥ high-frequency loss：主 loss 之外加一项 high-pass 残差 loss
-        "highfreq_loss_weight": "highfreq_loss_weight",
-        # ⑦ t-binned LR group：按 t 区间冻结/解冻不同模块（替代 detail_inv_t 的根本设计）
-        "t_binned_module_groups": "t_binned_module_groups",
-        # 番外 extreme-low t sampling
-        "timestep_mix_extreme_prob": "timestep_mix_extreme_prob",
-    }
-
-    # 需要特殊处理的默认值（用于判断命令行是否显式设置）
-    defaults = {
-        "transformer": "",
-        "vae": "",
-        "qwen": "",
-        "t5_tokenizer": "",
-        "data_dir": "",
-        "reg_data_dir": "",
-        "reg_repeats": 1,
-        "reg_caption": "",
-        "resolution": 1024,
-        "repeats": 1,
-        "shuffle_caption": False,
-        "keep_tokens": 0,
-        "flip_augment": False,
-        "tag_dropout": 0.0,
-        "prefer_json": True,
-        "cache_latents": False,
-        "lora_type": "lokr",
-        "lora_rank": 32,
-        "lora_alpha": 32.0,
-        "lora_dropout": 0.0,
-        "lokr_factor": 8,
-        "lora_exclude_prefixes": None,
-        "resume_lora": "",
-        "epochs": 10,
-        "max_steps": 0,
-        "batch_size": 1,
-        "grad_accum": 1,
-        "lr": 1e-4,
-        "lr_scheduler": "none",
-        "lr_scheduler_t0": 500,
-        "lr_scheduler_t_mult": 2.0,
-        "lr_scheduler_eta_min": 0.0,
-        "weight_decay": 0.01,
-        "grad_clip_max_norm": 1.0,
-        "mixed_precision": "bf16",
-        "grad_checkpoint": False,
-        "xformers": False,
-        "num_workers": 0,
-        "output_dir": "./output",
-        "output_name": "anima_lora",
-        "save_every": 0,
-        "save_every_steps": 0,
-        "save_state_every": 0,
-        "resume_state": "",
-        "seed": 42,
-        "sample_every": 0,
-        "sample_steps": 0,
-        "sample_prompt": "1girl, masterpiece",
-        "sample_prompts": [],
-        "sample_cfg_scale": 4.0,
-        "sample_negative_prompt": "",
-        "sample_width": 0,
-        "sample_height": 0,
-        "sample_seed": 0,
-        "sample_infer_steps": 25,
-        "sample_sampler_name": "er_sde",
-        "sample_scheduler": "simple",
-        "loss_curve_steps": 100,
-        "no_progress": False,
-        "log_every": 10,
-        "no_monitor": False,
-        "monitor_host": "0.0.0.0",
-        "monitor_port": 8765,
-        "no_browser": False,
-        "debug_first_batches": 0,
-        "optimizer_type": "adamw",
-        "prodigyplus_d0": 1e-6,
-        "prodigyplus_use_stableadamw": True,
-        "optimizer_args": None,
-        "use_t5_token_weights": True,
-        "flow_shift": 3.0,
-        "schedule_shift": 1.0,
-        "timestep_sampling": "logit_normal",
-        "timestep_mix_low_prob": 0.25,
-        "min_snr_gamma": 0.0,
-        "loss_weighting_scheme": "none",
-        "weight_cap_ratio": 5.0,
-        "loss_type": "mse",
-        "huber_c": 0.1,
-        "huber_schedule": "constant",
-        "noise_offset": 0.0,
-        "noise_offset_min": 0.0,
-        "noise_offset_random_strength": False,
-        "pyramid_noise_iterations": 0,
-        "pyramid_noise_discount": 0.3,
-        "caption_dropout_rate": 0.0,
-        "grad_norm_log_every": 0,
-        "lora_exclude_patterns": None,
-        "lora_include_patterns": None,
-        "lora_reg_dims": None,
-        "lora_reg_lrs": None,
-        "rank_dropout": 0.0,
-        "module_dropout": 0.0,
-        "loraplus_lr_ratio": 1.0,
-        # ─── 实验性参数（v5 引入，默认全部关闭以保持向后兼容）──────────────────────────
-        "freq_balanced_dropout_strength": 0.0,   # >0 启用；推荐 0.2-0.3
-        "ip_noise_gamma": 0.0,                    # >0 启用；推荐 0.03-0.10
-        "immiscible_pool_size": 0,                # 0 或 1 = 关闭；>1 = pool/batch 内配对
-        "lora_ema_decay": 0.0,                    # 0 = 关闭；推荐 0.999-0.9999
-        "highfreq_loss_weight": 0.0,              # 0 = 关闭；推荐 0.1-0.3
-        "t_binned_module_groups": False,          # 替代 detail_inv_t 的更根本设计
-        "timestep_mix_extreme_prob": 0.0,         # mixed_uniform_low 中 extreme-low t 的比例
-    }
-
-    for yaml_key, arg_attr in mapping.items():
-        if yaml_key not in config:
-            continue
-        yaml_value = config[yaml_key]
-        if yaml_value is None:
-            continue
-
-        # 检查命令行是否显式设置了该参数（与默认值不同）
-        current_value = getattr(args, arg_attr, None)
-        default_value = defaults.get(arg_attr)
-
-        # 如果当前值等于默认值，或者属性不存在（current_value 为 None），则使用 YAML 配置
-        # 特殊处理：列表类型的默认值用 [] 表示，但 argparse 未定义时返回 None
-        if current_value == default_value or current_value is None:
-            setattr(args, arg_attr, yaml_value)
-
-    return args
-
 
 # ============================================================================
 # 进度和 Loss 曲线可视化
@@ -454,2411 +176,74 @@ def render_curve_panel(losses, width=60, height=10):
 
 
 # ============================================================================
-# 梯度检查点
+# 文本编码 / 训练时采样：迁移到 trainer/text_encode.py 和 trainer/sampling.py
 # ============================================================================
-
-def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_mask, use_checkpoint=False):
-    """带可选梯度检查点的前向传播"""
-    if not use_checkpoint:
-        return model(latents, timesteps, cross, padding_mask=padding_mask)
-    from torch.utils.checkpoint import checkpoint
-
-    x_B_T_H_W_D, rope_emb, extra_pos_emb = model.prepare_embedded_sequence(
-        latents, fps=None, padding_mask=padding_mask,
-    )
-    if timesteps.ndim == 1:
-        timesteps = timesteps.unsqueeze(1)
-    t_embedding, adaln_lora = model.t_embedder(timesteps)
-    t_embedding = model.t_embedding_norm(t_embedding)
-
-    block_kwargs = {
-        "rope_emb_L_1_1_D": rope_emb,
-        "adaln_lora_B_T_3D": adaln_lora,
-        "extra_per_block_pos_emb": extra_pos_emb,
-    }
-
-    for block in model.blocks:
-        def custom_forward(x, blk=block):
-            return blk(x, t_embedding, cross, **block_kwargs)
-        x_B_T_H_W_D = checkpoint(custom_forward, x_B_T_H_W_D, use_reentrant=False)
-
-    x_B_T_H_W_O = model.final_layer(x_B_T_H_W_D, t_embedding, adaln_lora_B_T_3D=adaln_lora)
-    return model.unpatchify(x_B_T_H_W_O)
-
-
-# ============================================================================
-# xformers 支持
-# ============================================================================
-
-def enable_xformers(model):
-    """为模型启用 xformers memory efficient attention"""
-    try:
-        from xformers.ops import memory_efficient_attention
-    except ImportError:
-        logger.warning("xformers 未安装，跳过启用")
-        return False
-
-    enabled_count = 0
-    for name, module in model.named_modules():
-        # 查找 attention 模块并替换
-        if hasattr(module, "set_use_memory_efficient_attention_xformers"):
-            module.set_use_memory_efficient_attention_xformers(True)
-            enabled_count += 1
-        elif hasattr(module, "enable_xformers_memory_efficient_attention"):
-            module.enable_xformers_memory_efficient_attention()
-            enabled_count += 1
-
-    if enabled_count > 0:
-        logger.info(f"xformers 已启用: {enabled_count} 个模块")
-        return True
-
-    # 如果模型没有内置支持，尝试 monkey patch
-    logger.info("xformers 已加载，将在 attention 计算中使用")
-    return True
-
-
-# ============================================================================
-# 模型加载工具
-# ============================================================================
-
-def find_diffusion_pipe_root():
-    """查找 diffusion-pipe 模型代码路径"""
-    candidates = [
-        Path(__file__).parent / "diffusion_models",
-        Path(__file__).parent / "models",
-        Path(os.environ.get("DIFFUSION_PIPE_ROOT", "")) if os.environ.get("DIFFUSION_PIPE_ROOT") else None,
-    ]
-    for candidate in candidates:
-        if candidate and (candidate / "anima_modeling.py").exists():
-            return candidate
-        if candidate and (candidate / "models" / "anima_modeling.py").exists():
-            return candidate / "models"
-    raise RuntimeError("找不到 anima_modeling.py，请设置 DIFFUSION_PIPE_ROOT 或放置模型代码")
-
-
-def load_module_from_path(module_name, file_path):
-    """动态加载 Python 模块"""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _strip_prefixes(key: str, prefixes: list[str]) -> str:
-    """反复剥离前缀（支持 module.model. 这种复合前缀）"""
-    if not prefixes:
-        return key
-    changed = True
-    while changed:
-        changed = False
-        for p in prefixes:
-            if key.startswith(p):
-                key = key[len(p) :]
-                changed = True
-    return key
-
-
-def _pick_best_prefix_remap(sd_keys: list[str], model_keys: set[str]) -> tuple[list[str], int]:
-    """
-    从常见前缀组合里选择“命中最多 model_keys”的 remap 方案。
-    返回 (prefixes, matched_count)。
-    """
-    candidates: list[tuple[str, list[str]]] = [
-        ("none", []),
-        ("net.", ["net."]),
-        ("model.", ["model."]),
-        ("module.", ["module."]),
-        ("module.+model.", ["module.", "model."]),
-        ("module.model.", ["module.model."]),
-        ("diffusion_model.", ["diffusion_model."]),
-        ("model.diffusion_model.", ["model.diffusion_model."]),
-        ("transformer.", ["transformer."]),
-        ("vae.", ["vae."]),
-        ("first_stage_model.", ["first_stage_model."]),
-        ("net.+model.", ["net.", "model."]),
-        ("net.model.", ["net.model."]),
-    ]
-
-    best_prefixes: list[str] = []
-    best_matched = -1
-    for _name, prefixes in candidates:
-        matched = 0
-        for k in sd_keys:
-            kk = _strip_prefixes(k, prefixes)
-            if kk in model_keys:
-                matched += 1
-        if matched > best_matched:
-            best_matched = matched
-            best_prefixes = prefixes
-    return best_prefixes, best_matched
-
-
-def _load_safetensors_state_dict(path: Path) -> dict:
-    from safetensors import safe_open
-
-    sd = {}
-    with safe_open(path, framework="pt", device="cpu") as f:
-        for k in f.keys():
-            sd[k] = f.get_tensor(k)
-    return sd
-
-
-def resolve_path_best_effort(path_str: str, bases: list[Path]) -> str:
-    """
-    将相对路径按多个 base 尝试解析到一个真实存在的路径。
-    主要用于：无论从 repo 根目录还是 AnimaLoraToolkit 目录启动，都能找到 models/* 文件。
-    """
-    if not path_str:
-        return path_str
-
-    p = Path(path_str)
-    if p.is_absolute():
-        return str(p)
-
-    # 先按原样（相对 cwd）试一下
-    if p.exists():
-        return str(p)
-
-    # 逐 base 拼接尝试
-    for b in bases:
-        if not b:
-            continue
-        try:
-            cand = (Path(b) / p).resolve()
-        except Exception:
-            cand = Path(b) / p
-        if cand.exists():
-            return str(cand)
-
-    # 常见：配置写了 AnimaLoraToolkit/xxx，但启动目录已经在 AnimaLoraToolkit 下
-    parts = p.parts
-    if parts and parts[0].lower() in ("animaloratoolkit", "anima_trainer", "anima-trainer"):
-        p2 = Path(*parts[1:])
-        if p2.exists():
-            return str(p2)
-        for b in bases:
-            if not b:
-                continue
-            cand = Path(b) / p2
-            if cand.exists():
-                return str(cand)
-
-    return path_str
-
-
-def normalize_resume_paths(args, output_dir: Path):
-    """Validate resume paths and recover common resume_lora/resume_state mixups."""
-    resume_lora = str(getattr(args, "resume_lora", "") or "").strip()
-    resume_state = str(getattr(args, "resume_state", "") or "").strip()
-
-    if resume_lora:
-        lora_path = Path(resume_lora)
-        if lora_path.suffix.lower() == ".pt":
-            if resume_state:
-                logger.warning(
-                    "resume_lora points to a .pt training state, but resume_state is already set; "
-                    "ignoring resume_lora: %s",
-                    resume_lora,
-                )
-                args.resume_lora = ""
-            else:
-                step_match = re.search(r"step(\d+)", lora_path.stem)
-                companion = None
-                if step_match:
-                    step = step_match.group(1)
-                    search_dir = lora_path.parent if str(lora_path.parent) != "." else output_dir
-                    candidates = sorted(search_dir.glob(f"*_step{step}.safetensors"))
-                    if candidates:
-                        companion = candidates[0]
-
-                if companion and companion.exists():
-                    args.resume_lora = str(companion)
-                    logger.warning(
-                        "resume_lora was a .pt training state; using matching LoRA weights instead: %s",
-                        companion,
-                    )
-                else:
-                    args.resume_lora = ""
-                    args.resume_state = resume_lora
-                    logger.warning(
-                        "resume_lora was a .pt training state and no matching .safetensors was found; "
-                        "using resume_state instead: %s",
-                        resume_lora,
-                    )
-        elif not lora_path.exists():
-            logger.warning("resume_lora path does not exist; ignoring it: %s", resume_lora)
-            args.resume_lora = ""
-
-    resume_state = str(getattr(args, "resume_state", "") or "").strip()
-    if resume_state and not Path(resume_state).exists():
-        logger.warning("resume_state path does not exist; ignoring it: %s", resume_state)
-        args.resume_state = ""
-
-
-def _load_weights_best_effort(model: torch.nn.Module, sd: dict, label: str) -> dict:
-    """
-    更健壮的权重加载：
-    - 自动尝试剥离常见前缀（model./module./...）
-    - 打印匹配率、missing/unexpected
-    - 关键模块未加载时直接报错（避免“采样全噪点”还继续训练）
-    """
-    model_keys = set(model.state_dict().keys())
-    sd_keys = list(sd.keys())
-    prefixes, matched = _pick_best_prefix_remap(sd_keys, model_keys)
-    remapped = {_strip_prefixes(k, prefixes): v for k, v in sd.items()}
-
-    incompatible = model.load_state_dict(remapped, strict=False)
-    missing = list(getattr(incompatible, "missing_keys", []) or [])
-    unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
-
-    matched_after = len(set(remapped.keys()) & model_keys)
-    coverage = matched_after / max(1, len(model_keys))
-    remap_name = "+".join(prefixes) if prefixes else "none"
-
-    logger.info(
-        f"{label} 权重加载: remap={remap_name}, 匹配 {matched_after}/{len(model_keys)} ({coverage:.1%}), "
-        f"missing={len(missing)}, unexpected={len(unexpected)}"
-    )
-
-    # 关键层缺失会直接导致输出接近 0，采样就是纯噪点
-    critical_prefixes = ("x_embedder.", "blocks.", "final_layer.")
-    critical_missing = [k for k in missing if k.startswith(critical_prefixes)]
-    if coverage < 0.60 or len(critical_missing) > 0:
-        preview_missing = ", ".join(critical_missing[:8])
-        raise RuntimeError(
-            f"{label} 权重看起来没有正确加载（remap={remap_name}, coverage={coverage:.1%}）。"
-            f"关键参数缺失: {preview_missing or 'N/A'}。\n"
-            f"这通常表示你选错了 .safetensors（不是完整 transformer/vae 权重），或 checkpoint key 前缀不匹配。"
-        )
-    return {
-        "remap": remap_name,
-        "coverage": coverage,
-        "missing": missing,
-        "unexpected": unexpected,
-    }
-
-
-def ensure_models_namespace(repo_root):
-    """确保 models 命名空间可用"""
-    repo_root = Path(repo_root)
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    if str(repo_root.parent) not in sys.path:
-        sys.path.insert(0, str(repo_root.parent))
-
-
-def load_anima_model(transformer_path, device, dtype, repo_root):
-    """加载 Anima transformer 模型"""
-    from safetensors import safe_open
-
-    ensure_models_namespace(repo_root)
-
-    # 加载模型类
-    cosmos_modeling = load_module_from_path(
-        "cosmos_predict2_modeling",
-        repo_root / "cosmos_predict2_modeling.py",
-    )
-    anima_modeling = load_module_from_path(
-        "anima_modeling",
-        repo_root / "anima_modeling.py",
-    )
-    Anima = anima_modeling.Anima
-
-    # 从 checkpoint 推断配置
-    with safe_open(transformer_path, framework="pt", device="cpu") as f:
-        for k in f.keys():
-            if k.endswith("x_embedder.proj.1.weight"):
-                w = f.get_tensor(k)
-                break
-
-    in_channels = (w.shape[1] // 4) - 1  # concat_padding_mask=True
-    model_channels = w.shape[0]
-
-    if model_channels == 2048:
-        num_blocks, num_heads = 28, 16
-    elif model_channels == 5120:
-        num_blocks, num_heads = 36, 40
-    else:
-        raise RuntimeError(f"未知的 model_channels={model_channels}")
-
-    config = dict(
-        max_img_h=240, max_img_w=240, max_frames=128,
-        in_channels=in_channels, out_channels=16,
-        patch_spatial=2, patch_temporal=1,
-        concat_padding_mask=True,
-        model_channels=model_channels,
-        num_blocks=num_blocks, num_heads=num_heads,
-        crossattn_emb_channels=1024,
-        pos_emb_cls="rope3d", pos_emb_learnable=True,
-        pos_emb_interpolation="crop",
-        use_adaln_lora=True, adaln_lora_dim=256,
-        rope_h_extrapolation_ratio=4.0 if in_channels == 16 else 3.0,
-        rope_w_extrapolation_ratio=4.0 if in_channels == 16 else 3.0,
-        rope_t_extrapolation_ratio=1.0,
-    )
-
-    model = Anima(**config)
-
-    # 加载权重
-    sd = _load_safetensors_state_dict(Path(transformer_path))
-    info = _load_weights_best_effort(model, sd, label="Transformer")
-
-    # 如果 checkpoint 中完全没有 llm_adapter 权重，随机初始化会把 cross-attn 条件搞乱，直接禁用更安全
-    has_llm_adapter = any("llm_adapter" in k for k in sd.keys())
-    if not has_llm_adapter and hasattr(model, "llm_adapter"):
-        try:
-            model.llm_adapter = None
-            logger.warning("检测到 checkpoint 不包含 llm_adapter 权重：已禁用 llm_adapter（回退为直接使用 Qwen embeddings）")
-        except Exception:
-            pass
-    model = model.to(device=device, dtype=dtype)
-    model.requires_grad_(False)
-
-    logger.info(f"Anima 模型加载完成: {model_channels}ch, {num_blocks} blocks")
-    return model
-
-
-def load_vae(vae_path, device, dtype, repo_root):
-    """加载 VAE"""
-    wan_vae = load_module_from_path("wan_vae", repo_root / "wan" / "vae2_1.py")
-    WanVAE = wan_vae.WanVAE_
-
-    cfg = dict(
-        dim=96, z_dim=16, dim_mult=[1, 2, 4, 4],
-        num_res_blocks=2, attn_scales=[],
-        temperal_downsample=[False, True, True], dropout=0.0,
-    )
-
-    model = WanVAE(**cfg).eval().requires_grad_(False)
-
-    sd = _load_safetensors_state_dict(Path(vae_path))
-    _load_weights_best_effort(model, sd, label="VAE")
-    model = model.to(device=device, dtype=dtype)
-
-    # VAE 归一化参数
-    mean = torch.tensor([
-        -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
-        0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
-    ], dtype=dtype, device=device)
-    std = torch.tensor([
-        2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
-        3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
-    ], dtype=dtype, device=device)
-
-    class VAEWrapper:
-        pass
-
-    wrapper = VAEWrapper()
-    wrapper.model = model
-    wrapper.mean = mean
-    wrapper.std = std
-    wrapper.scale = [mean, 1.0 / std]
-
-    logger.info("VAE 加载完成")
-    return wrapper
-
-
-def load_text_encoders(qwen_path, t5_tokenizer_path, device, dtype):
-    """加载文本编码器"""
-    from transformers import AutoModelForCausalLM, AutoTokenizer, T5Tokenizer
-
-    # Qwen
-    qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_path, trust_remote_code=True)
-    qwen_model = AutoModelForCausalLM.from_pretrained(
-        qwen_path, torch_dtype=dtype, trust_remote_code=True
-    ).to(device).eval().requires_grad_(False)
-
-    # T5 tokenizer
-    if t5_tokenizer_path and Path(t5_tokenizer_path).exists():
-        t5_tokenizer = T5Tokenizer.from_pretrained(t5_tokenizer_path)
-    else:
-        t5_tokenizer = T5Tokenizer.from_pretrained("google/t5-v1_1-xxl")
-
-    logger.info("文本编码器加载完成")
-    return qwen_model, qwen_tokenizer, t5_tokenizer
-
-
-# ============================================================================
-# 文本编码
-# ============================================================================
-
-def encode_qwen(model, tokenizer, texts, device, max_length=512):
-    """Qwen 文本编码"""
-    # Qwen3 tokenizer 对空字符串可能返回 0 tokens（会导致模型内部 reshape 失败）
-    # ComfyUI 的 AnimaTokenizer 设置了 min_length=1，这里做同等兜底。
-    if isinstance(texts, str):
-        texts = [texts]
-    texts = [(" " if (t is None or str(t).strip() == "") else str(t)) for t in texts]
-
-    inputs = tokenizer(
-        texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        add_special_tokens=False,
-    )
-    # 仍可能出现空序列（极端 tokenizer 行为），强制塞 1 个 token
-    if inputs["input_ids"].ndim == 2 and inputs["input_ids"].shape[1] == 0:
-        pad_id = tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = tokenizer.eos_token_id
-        if pad_id is None:
-            pad_id = 0
-        bs = len(texts)
-        inputs["input_ids"] = torch.full((bs, 1), int(pad_id), dtype=torch.long)
-        inputs["attention_mask"] = torch.ones((bs, 1), dtype=torch.long)
-    inputs = inputs.to(device)
-
-    with torch.inference_mode():
-        outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            output_hidden_states=True,
-            return_dict=True,
-            use_cache=False,
-        )
-
-    hidden = outputs.hidden_states[-1]
-    # 清零 padding 位置
-    mask = inputs["attention_mask"].unsqueeze(-1)
-    hidden = hidden * mask
-
-    return hidden, inputs["attention_mask"]
-
-
-def _time_snr_shift(alpha: float, t: torch.Tensor) -> torch.Tensor:
-    """ComfyUI ModelSamplingDiscreteFlow.time_snr_shift"""
-    if alpha == 1.0:
-        return t
-    return alpha * t / (1 + (alpha - 1) * t)
-
-
-def _flow_sigmas_simple(steps: int, *, shift: float = 3.0, timesteps: int = 1000, device: str = "cpu") -> torch.Tensor:
-    """
-    复刻 ComfyUI:
-    - supported_models.Anima 的 sampling_settings: shift=3.0, multiplier=1.0
-    - ModelSamplingDiscreteFlow + simple_scheduler(model_sampling, steps)
-
-    返回：sigmas (steps+1,) float32，从高到低，末尾带 0.0
-    """
-    ts = torch.arange(1, timesteps + 1, device=device, dtype=torch.float32) / float(timesteps)  # (0, 1]
-    sigmas_full = _time_snr_shift(float(shift), ts)  # (0, 1]
-
-    ss = len(sigmas_full) / float(steps)
-    sigmas = [float(sigmas_full[-(1 + int(i * ss))]) for i in range(steps)]
-    sigmas.append(0.0)
-    sigmas = torch.tensor(sigmas, device=device, dtype=torch.float32)
-
-    # ComfyUI offset_first_sigma_for_snr: CONST 下避免 sigma=1 导致 logit inf
-    if sigmas.numel() > 0 and sigmas[0] >= 1.0:
-        sigmas[0] = float(_time_snr_shift(float(shift), torch.tensor(1.0 - 1e-4, device=device, dtype=torch.float32)))
-    return sigmas
-
-
-def _default_noise_sampler(x: torch.Tensor, seed: int | None):
-    """参考 ComfyUI k_diffusion_sampling.default_noise_sampler"""
-    if seed is not None:
-        if x.device.type == "cpu":
-            seed = int(seed) + 1
-        g = torch.Generator(device=x.device)
-        g.manual_seed(int(seed))
-    else:
-        g = None
-
-    def _sample(_sigma, _sigma_next):
-        return torch.randn(x.size(), dtype=x.dtype, layout=x.layout, device=x.device, generator=g)
-
-    return _sample
-
-
-@torch.no_grad()
-def _sample_er_sde_const_x0(
-    denoise_fn,
-    x: torch.Tensor,
-    sigmas: torch.Tensor,
-    *,
-    seed: int | None = None,
-    s_noise: float = 1.0,
-    max_stage: int = 3,
-):
-    """
-    Extended Reverse-Time SDE solver（ER-SDE-Solver-3）在 CONST(flow) 噪声日程下的实现。
-    参考 ComfyUI 的 k_diffusion_sampling.sample_er_sde（删去 model_patcher 依赖）。
-    """
-    sigmas = sigmas.to(device=x.device, dtype=torch.float32)
-    if sigmas.numel() <= 1:
-        return x
-
-    noise_sampler = _default_noise_sampler(x, seed=seed)
-
-    # CONST: half_log_snr = log((1 - t) / t) = -logit(t)
-    eps = 1e-12
-    t = sigmas.clamp(min=eps, max=1.0 - eps)
-    half_log_snrs = torch.log((1 - t) / t)
-    er_lambdas = half_log_snrs.neg().exp()  # er_lambda = t / (1 - t)
-
-    old_denoised = None
-    old_denoised_d = None
-
-    def noise_scaler(lam: torch.Tensor) -> torch.Tensor:
-        # default_er_sde_noise_scaler
-        lam = lam.to(x.device, dtype=torch.float32)
-        return lam * ((lam ** 0.3).exp() + 10.0)
-
-    num_integration_points = 200.0
-    point_indice = torch.arange(0, num_integration_points, dtype=torch.float32, device=x.device)
-
-    for i in range(len(sigmas) - 1):
-        sigma = sigmas[i]
-        denoised = denoise_fn(x, sigma)
-
-        stage_used = min(int(max_stage), i + 1)
-        if sigmas[i + 1] == 0:
-            x = denoised
-        else:
-            er_lambda_s, er_lambda_t = er_lambdas[i], er_lambdas[i + 1]
-            alpha_s = 1.0 - sigmas[i]
-            alpha_t = 1.0 - sigmas[i + 1]
-            r_alpha = alpha_t / alpha_s
-            r = noise_scaler(er_lambda_t) / noise_scaler(er_lambda_s)
-
-            # Stage 1 (Euler)
-            x = r_alpha * r * x + alpha_t * (1 - r) * denoised
-
-            if stage_used >= 2 and old_denoised is not None:
-                dt = er_lambda_t - er_lambda_s
-                lambda_step_size = -dt / num_integration_points
-                lambda_pos = er_lambda_t + point_indice * lambda_step_size
-                scaled_pos = noise_scaler(lambda_pos)
-
-                # Stage 2
-                s = torch.sum(1 / scaled_pos) * lambda_step_size
-                denoised_d = (denoised - old_denoised) / (er_lambda_s - er_lambdas[i - 1])
-                x = x + alpha_t * (dt + s * noise_scaler(er_lambda_t)) * denoised_d
-
-                if stage_used >= 3 and old_denoised_d is not None:
-                    # Stage 3
-                    s_u = torch.sum((lambda_pos - er_lambda_s) / scaled_pos) * lambda_step_size
-                    denoised_u = (denoised_d - old_denoised_d) / ((er_lambda_s - er_lambdas[i - 2]) / 2)
-                    x = x + alpha_t * ((dt ** 2) / 2 + s_u * noise_scaler(er_lambda_t)) * denoised_u
-
-                old_denoised_d = denoised_d
-
-            # Stochastic term
-            if s_noise and float(s_noise) > 0:
-                noise = noise_sampler(float(sigmas[i]), float(sigmas[i + 1]))
-                sde_scale = (er_lambda_t ** 2 - (er_lambda_s ** 2) * (r ** 2)).clamp(min=0).sqrt().nan_to_num(nan=0.0)
-                x = x + alpha_t * noise * float(s_noise) * sde_scale
-
-        old_denoised = denoised
-
-    return x
-
-
-def _parse_weighted_tag(tag: str) -> tuple[str, float]:
-    """
-    解析单个 tag 的权重（参考指南“权重控制”）。
-    支持：
-    - (tag:1.5)
-    - (tag) / ((tag))  => 1.1^n
-    - [tag]            => 1/1.1
-    """
-    import re
-
-    s = tag.strip()
-    if not s:
-        return "", 1.0
-
-    # 显式 (xxx:1.23)
-    m = re.fullmatch(r"\(\s*(.+?)\s*:\s*([+-]?\d+(?:\.\d+)?)\s*\)", s)
-    if m:
-        return m.group(1).strip(), float(m.group(2))
-
-    # 统计外层 () / [] 深度
-    w = 1.0
-    while True:
-        s2 = s.strip()
-        if len(s2) >= 2 and s2[0] == "(" and s2[-1] == ")":
-            s = s2[1:-1].strip()
-            w *= 1.1
-            continue
-        if len(s2) >= 2 and s2[0] == "[" and s2[-1] == "]":
-            s = s2[1:-1].strip()
-            w /= 1.1
-            continue
-        break
-    return s.strip(), float(w)
-
-
-def _build_qwen_text_from_prompt(prompt: str) -> str:
-    # Qwen 通道不传权重，只传“干净标签文本”（参考 ComfyUI anima-kai 的做法）
-    parts = [p.strip() for p in prompt.split(",") if p.strip()]
-    clean = []
-    for p in parts:
-        t, _w = _parse_weighted_tag(p)
-        if t:
-            clean.append(t)
-    return ", ".join(clean)
-
-
-def tokenize_t5_weighted(tokenizer, texts, max_length=512):
-    """
-    参考 ComfyUI 的 anima-kai：按逗号切分 tag，逐 tag 分词，并为每个 token 附带权重。
-    返回：input_ids, attention_mask(1=有效), token_weights
-    """
-    import torch
-
-    if isinstance(texts, str):
-        texts = [texts]
-
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 1
-
-    all_ids = []
-    all_w = []
-    for text in texts:
-        tags = [t.strip() for t in str(text).split(",") if t.strip()]
-        ids = []
-        ws = []
-        for tag in tags:
-            clean_tag, weight = _parse_weighted_tag(tag)
-            if not clean_tag:
-                continue
-            tok = tokenizer(clean_tag, add_special_tokens=False)
-            for tid in tok["input_ids"]:
-                ids.append(int(tid))
-                ws.append(float(weight))
-
-        # 末尾补一个 eos（ComfyUI 也是最后加一个终止 token）
-        ids.append(int(eos_id))
-        ws.append(1.0)
-
-        # 截断到 max_length（保留最后一个 eos）
-        if max_length and len(ids) > max_length:
-            ids = ids[: max_length - 1] + [int(eos_id)]
-            ws = ws[: max_length - 1] + [1.0]
-
-        all_ids.append(torch.tensor(ids, dtype=torch.long))
-        all_w.append(torch.tensor(ws, dtype=torch.float32))
-
-    # pad 到 batch 内最长
-    max_len = max(x.numel() for x in all_ids) if all_ids else 1
-    input_ids = torch.full((len(all_ids), max_len), pad_id, dtype=torch.long)
-    # padding 位的权重置 1（恒等），避免下游 cross *= t5_w 把 pad 位置的条件信号抹零
-    token_w = torch.ones((len(all_w), max_len), dtype=torch.float32)
-    attention_mask = torch.zeros((len(all_ids), max_len), dtype=torch.long)
-
-    for i, (ids, ws) in enumerate(zip(all_ids, all_w)):
-        L = ids.numel()
-        input_ids[i, :L] = ids
-        token_w[i, :L] = ws
-        attention_mask[i, :L] = 1
-
-    return input_ids, attention_mask, token_w
-
-
-# ============================================================================
-# LoRA 实现
-# ============================================================================
-
-class LoRALayer(torch.nn.Module):
-    """标准 LoRA 层（含 rank_dropout / module_dropout）"""
-    def __init__(self, in_features, out_features, rank=4, alpha=1.0, dropout=0.0,
-                 rank_dropout=0.0, module_dropout=0.0):
-        super().__init__()
-        self.rank = rank
-        self.alpha = alpha
-        self.scaling = alpha / rank
-        self.lora_down = torch.nn.Linear(in_features, rank, bias=False)
-        self.lora_up = torch.nn.Linear(rank, out_features, bias=False)
-        self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
-        self.rank_dropout = float(rank_dropout or 0.0)
-        self.module_dropout = float(module_dropout or 0.0)
-        torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=5**0.5)
-        torch.nn.init.zeros_(self.lora_up.weight)
-
-    def forward(self, x):
-        # Module dropout: 整个模块以 p 概率跳过（训练时）
-        if self.training and self.module_dropout > 0:
-            if torch.rand(1).item() < self.module_dropout:
-                return torch.zeros(*x.shape[:-1], self.lora_up.out_features,
-                                   device=x.device, dtype=x.dtype)
-        h = self.lora_down(self.dropout(x))
-        # Rank dropout: 随机置零 rank 中的某些通道（训练时，inverted dropout）
-        if self.training and self.rank_dropout > 0:
-            mask = torch.bernoulli(
-                torch.full((self.rank,), 1.0 - self.rank_dropout, device=h.device)
-            )
-            h = h * mask / (1.0 - self.rank_dropout + 1e-6)
-        return self.lora_up(h) * self.scaling
-
-
-class LoKrLayer(torch.nn.Module):
-    """LyCORIS LoKr 层 (ComfyUI 兼容) — w2 低秩分解版
-
-    分解: ΔW = kron(w1, w2_a @ w2_b)
-        w1   : (factor, factor)
-        w2_a : (out_dim, rank)
-        w2_b : (rank,    in_dim)
-        其中 in_dim = in_features // factor, out_dim = out_features // factor
-
-    forward 用 kron-bypass 数学等价但完全不实例化 (out_features, in_features) 全矩阵：
-        将 x 视作 (..., factor, in_dim)，则 y = w1 @ ((x @ w2_b^T) @ w2_a^T)
-        最后 reshape 回 (..., factor * out_dim)。
-    复杂度 O(B*factor*in_dim*rank + B*factor*rank*out_dim + B*factor^2*out_dim)，
-    远小于原本的 O(B*factor^2*in_dim*out_dim)，且无需在 bf16 中保存巨型 kron 矩阵。
-    """
-    def __init__(self, in_features, out_features, rank=4, alpha=1.0, factor=8, dropout=0.0,
-                 rank_dropout=0.0, module_dropout=0.0):
-        super().__init__()
-        self.alpha = alpha
-        self.in_features = in_features
-        self.out_features = out_features
-
-        # 自动调整 factor 确保能整除
-        factor = self._find_factor(in_features, out_features, factor)
-        self.factor = factor
-
-        self.in_dim = in_features // factor
-        self.out_dim = out_features // factor
-
-        # cap rank 防止小层溢出
-        self.rank = min(rank, self.out_dim, self.in_dim)
-        self.scaling = alpha / self.rank
-
-        # LoKr 分解: ΔW = kron(w1, w2_a @ w2_b)（命名与 LyCORIS 一致，可直接被 ComfyUI 加载）
-        self.lokr_w1 = torch.nn.Parameter(torch.empty(factor, factor))
-        self.lokr_w2_a = torch.nn.Parameter(torch.empty(self.out_dim, self.rank))
-        self.lokr_w2_b = torch.nn.Parameter(torch.empty(self.rank, self.in_dim))
-        self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
-        self.rank_dropout = float(rank_dropout or 0.0)
-        self.module_dropout = float(module_dropout or 0.0)
-
-        # ★ w1 用小 std 正态分布，配合 w2_b=0 初始时 ΔW=0；训练后 ΔW 量级由 scaling 控制
-        torch.nn.init.normal_(self.lokr_w1, mean=0.0, std=0.1)
-        torch.nn.init.kaiming_uniform_(self.lokr_w2_a, a=5**0.5)
-        torch.nn.init.zeros_(self.lokr_w2_b)
-
-    def _find_factor(self, in_f, out_f, target_factor):
-        """找到能同时整除 in_features 和 out_features 的 factor"""
-        for f in [target_factor, 4, 2, 1]:
-            if in_f % f == 0 and out_f % f == 0:
-                return f
-        return 1
-
-    def forward(self, x):
-        # Module dropout: 整个模块以 p 概率跳过（训练时）
-        if self.training and self.module_dropout > 0:
-            if torch.rand(1).item() < self.module_dropout:
-                return torch.zeros(*x.shape[:-1], self.out_features,
-                                   device=x.device, dtype=x.dtype)
-
-        # bf16 下 kron 容易数值放大，统一转 fp32 中间运算
-        w1 = self.lokr_w1.float()
-        w2_a = self.lokr_w2_a.float()
-        w2_b = self.lokr_w2_b.float()
-
-        # Rank dropout: 随机置零 rank 中的某些通道（训练时，inverted dropout）
-        if self.training and self.rank_dropout > 0:
-            mask = torch.bernoulli(
-                torch.full((self.rank,), 1.0 - self.rank_dropout, device=w2_b.device)
-            )
-            scale = 1.0 / (1.0 - self.rank_dropout + 1e-6)
-            w2_b = w2_b * (mask.unsqueeze(1) * scale)  # (rank, in_dim)
-
-        x_drop = self.dropout(x)
-        orig_shape = x_drop.shape
-        # (..., in_features) → (B*, factor, in_dim)；保留前置维度
-        x_flat = x_drop.reshape(-1, self.factor, self.in_dim).float()
-
-        # 两段低秩矩阵乘代替 kron 全矩阵：
-        #   tmp = x_flat @ w2_b^T  → (B*, factor, rank)
-        #   tmp = tmp     @ w2_a^T → (B*, factor, out_dim)
-        tmp = torch.matmul(x_flat, w2_b.transpose(0, 1))
-        tmp = torch.matmul(tmp, w2_a.transpose(0, 1))
-        # 用 (factor, factor) 在前广播：w1 @ (B*, factor, out_dim) → (B*, factor, out_dim)
-        y = torch.matmul(w1, tmp)
-
-        # reshape 回 (..., out_features)
-        y = y.reshape(*orig_shape[:-1], self.factor * self.out_dim)
-        return y.to(dtype=x.dtype) * self.scaling
-
-
-class LoRALinear(torch.nn.Module):
-    """LoRA 包装的 Linear 层"""
-    def __init__(self, original, rank=4, alpha=1.0, dropout=0.0, use_lokr=False, factor=8,
-                 rank_dropout=0.0, module_dropout=0.0):
-        super().__init__()
-        self.original = original
-        self.use_lokr = use_lokr
-
-        if use_lokr:
-            self.adapter = LoKrLayer(
-                original.in_features, original.out_features,
-                rank=rank, alpha=alpha, factor=factor, dropout=dropout,
-                rank_dropout=rank_dropout, module_dropout=module_dropout,
-            )
-        else:
-            self.adapter = LoRALayer(
-                original.in_features, original.out_features,
-                rank=rank, alpha=alpha, dropout=dropout,
-                rank_dropout=rank_dropout, module_dropout=module_dropout,
-            )
-
-        self.adapter.to(device=original.weight.device, dtype=original.weight.dtype)
-        for p in self.original.parameters():
-            p.requires_grad = False
-
-    def forward(self, x):
-        return self.original(x) + self.adapter(x)
-
-    @property
-    def weight(self):
-        return self.original.weight
-
-    @property
-    def bias(self):
-        return self.original.bias
-
-
-class LoRAInjector:
-    """LoRA 注入器（支持 regex 模块选择、模块级 rank/lr、LoRA+）
-
-    核心增强（从 kohya sd-scripts 借鉴）：
-    - exclude_patterns / include_patterns: 用 re.fullmatch 替代前缀匹配
-    - reg_dims: dict{regex: rank} 模块级 rank 控制
-    - reg_lrs:  dict{regex: lr}   模块级学习率控制
-    - loraplus_lr_ratio: LoRA+ w2_b/lora_up 用更高 lr
-    """
-    DEFAULT_TARGETS = ["q_proj", "k_proj", "v_proj", "output_proj", "mlp.layer1", "mlp.layer2"]
-    DEFAULT_EXCLUDE_PATTERNS = [r".*llm_adapter.*"]
-
-    def __init__(self, rank=32, alpha=16.0, dropout=0.0, use_lokr=False, factor=8,
-                 targets=None, exclude_prefixes=None,
-                 exclude_patterns=None, include_patterns=None,
-                 reg_dims=None, reg_lrs=None,
-                 rank_dropout=0.0, module_dropout=0.0,
-                 loraplus_lr_ratio=1.0):
-        self.rank = rank
-        self.alpha = alpha
-        self.dropout = dropout
-        self.use_lokr = use_lokr
-        self.factor = factor
-        self.targets = targets or self.DEFAULT_TARGETS
-        self.rank_dropout = float(rank_dropout or 0.0)
-        self.module_dropout = float(module_dropout or 0.0)
-        self.loraplus_lr_ratio = max(float(loraplus_lr_ratio or 1.0), 1.0)
-
-        # ── Regex 模块选择 ──────────────────────────────────────────────
-        if exclude_patterns is not None:
-            self.exclude_patterns = list(exclude_patterns)
-        elif exclude_prefixes is not None:
-            self.exclude_patterns = [re.escape(p) + r".*" for p in exclude_prefixes] if exclude_prefixes else []
-        else:
-            self.exclude_patterns = list(self.DEFAULT_EXCLUDE_PATTERNS)
-        self.include_patterns = list(include_patterns or [])
-
-        # ── 模块级 rank/lr 控制 ────────────────────────────────────────
-        self.reg_dims = dict(reg_dims) if reg_dims else {}
-        self.reg_lrs = dict(reg_lrs) if reg_lrs else {}
-
-        self.injected = {}
-        self._module_ranks = {}
-        self._module_lrs = {}
-
-    def _should_inject(self, name):
-        """判断模块是否应该被注入 LoRA（regex 匹配）"""
-        if not any(t in name for t in self.targets):
-            return False
-        excluded = False
-        for pat in self.exclude_patterns:
-            if re.fullmatch(pat, name):
-                excluded = True
-                break
-        if excluded:
-            for pat in self.include_patterns:
-                if re.fullmatch(pat, name):
-                    return True
-            return False
-        return True
-
-    def _get_reg_dim(self, name):
-        """获取模块的 rank（优先 reg_dims 匹配，否则用全局 rank）"""
-        for pat, dim in self.reg_dims.items():
-            if re.fullmatch(pat, name):
-                return int(dim)
-        return self.rank
-
-    def _get_reg_lr(self, name):
-        """获取模块的自定义 lr（None 表示用全局）"""
-        for pat, lr in self.reg_lrs.items():
-            if re.fullmatch(pat, name):
-                return float(lr)
-        return None
-
-    def inject(self, model):
-        """注入 LoRA 到模型"""
-        rank_summary = {}
-        for name, module in list(model.named_modules()):
-            if not isinstance(module, torch.nn.Linear):
-                continue
-            if not self._should_inject(name):
-                continue
-
-            mod_rank = self._get_reg_dim(name)
-            mod_lr = self._get_reg_lr(name)
-
-            lora_linear = LoRALinear(
-                module, rank=mod_rank, alpha=float(mod_rank),
-                dropout=self.dropout, use_lokr=self.use_lokr, factor=self.factor,
-                rank_dropout=self.rank_dropout, module_dropout=self.module_dropout,
-            )
-
-            parts = name.split(".")
-            parent = model
-            for p in parts[:-1]:
-                parent = getattr(parent, p)
-            setattr(parent, parts[-1], lora_linear)
-            self.injected[name] = lora_linear
-            self._module_ranks[name] = mod_rank
-            self._module_lrs[name] = mod_lr
-            rank_summary[mod_rank] = rank_summary.get(mod_rank, 0) + 1
-
-        exc_str = ", ".join(self.exclude_patterns) or "无"
-        inc_str = ", ".join(self.include_patterns) or "无"
-        rank_dist = ", ".join(f"r{r}×{c}" for r, c in sorted(rank_summary.items()))
-        logger.info(
-            f"注入 {'LoKr' if self.use_lokr else 'LoRA'} 到 {len(self.injected)} 层 "
-            f"（排除: [{exc_str}], 包含: [{inc_str}], rank 分布: {rank_dist}）"
-        )
-        if self.rank_dropout > 0 or self.module_dropout > 0:
-            logger.info(f"  rank_dropout={self.rank_dropout}, module_dropout={self.module_dropout}")
-        custom_lr_modules = {n: lr for n, lr in self._module_lrs.items() if lr is not None}
-        if custom_lr_modules:
-            for n, lr in list(custom_lr_modules.items())[:5]:
-                logger.info(f"  模块级 lr: {n} → {lr:.2e}")
-            if len(custom_lr_modules) > 5:
-                logger.info(f"  ... 共 {len(custom_lr_modules)} 个模块有自定义 lr")
-        return self.injected
-
-    def get_params(self):
-        """获取可训练参数"""
-        params = []
-        for lora in self.injected.values():
-            params.extend(lora.adapter.parameters())
-        return params
-
-    def get_param_groups(self, weight_decay, loraplus_lr_ratio=None):
-        """获取参数组（支持 LoRA+、模块级 lr、LoKr w1 排除 weight_decay）"""
-        ratio = max(float(loraplus_lr_ratio or self.loraplus_lr_ratio), 1.0)
-        groups_dict = {}  # (wd, lr_mult, custom_lr) -> [params]
-
-        for name, lora in self.injected.items():
-            custom_lr = self._module_lrs.get(name)
-            if self.use_lokr:
-                key_w1 = (0.0, 1.0, custom_lr)
-                key_w2a = (weight_decay, 1.0, custom_lr)
-                key_w2b = (weight_decay, ratio, custom_lr)
-                groups_dict.setdefault(key_w1, []).append(lora.adapter.lokr_w1)
-                groups_dict.setdefault(key_w2a, []).append(lora.adapter.lokr_w2_a)
-                groups_dict.setdefault(key_w2b, []).append(lora.adapter.lokr_w2_b)
-            else:
-                key_down = (weight_decay, 1.0, custom_lr)
-                key_up = (weight_decay, ratio, custom_lr)
-                groups_dict.setdefault(key_down, []).append(lora.adapter.lora_down.weight)
-                groups_dict.setdefault(key_up, []).append(lora.adapter.lora_up.weight)
-
-        param_groups = []
-        for (wd, lr_mult, custom_lr), params in groups_dict.items():
-            if not params:
-                continue
-            group = {"params": params, "weight_decay": wd}
-            if custom_lr is not None:
-                group["lr"] = custom_lr * lr_mult
-            elif lr_mult != 1.0:
-                group["lr"] = lr_mult
-            param_groups.append(group)
-
-        if ratio > 1.0:
-            lr_target = "LoKr w2_b" if self.use_lokr else "lora_up"
-            logger.info(f"[LoRA+] {lr_target} lr ×{ratio:.1f}")
-        return param_groups
-
-    def state_dict(self):
-        """导出 LoRA 权重 (ComfyUI 兼容格式)"""
-        sd = {}
-        for name, lora in self.injected.items():
-            base = "lora_unet_" + name.replace(".", "_")
-            mod_rank = self._module_ranks.get(name, self.rank)
-            sd[f"{base}.alpha"] = torch.tensor(float(mod_rank))
-            if self.use_lokr:
-                # fp32 存储：训练时 Kronecker 积在 fp32 下计算，ComfyUI 加载后
-                # 若张量是 fp32，合并时精度更接近训练行为（bf16 合并会损失小幅度 delta 的低位）
-                sd[f"{base}.lokr_w1"] = lora.adapter.lokr_w1.data.clone().float()
-                sd[f"{base}.lokr_w2_a"] = lora.adapter.lokr_w2_a.data.clone().float()
-                sd[f"{base}.lokr_w2_b"] = lora.adapter.lokr_w2_b.data.clone().float()
-            else:
-                sd[f"{base}.lora_down.weight"] = lora.adapter.lora_down.weight.data.clone()
-                sd[f"{base}.lora_up.weight"] = lora.adapter.lora_up.weight.data.clone()
-        return sd
-
-    def save(self, path):
-        """保存为 safetensors (ComfyUI 兼容)"""
-        from safetensors.torch import save_file
-        sd = self.state_dict()
-        meta = {
-            "ss_network_dim": str(self.rank),
-            "ss_network_alpha": str(self.alpha),
-            "ss_network_module": "lycoris.kohya" if self.use_lokr else "networks.lora",
-            "ss_network_args": f'{{"algo": "lokr", "factor": {self.factor}}}' if self.use_lokr else "{}",
-        }
-        save_file(sd, path, metadata=meta)
-        logger.info(f"LoRA 保存到: {path}")
-
-    def load(self, path):
-        """从 safetensors 加载已有 LoRA 权重（用于继续训练）"""
-        from safetensors import safe_open
-        
-        logger.info(f"加载已有 LoRA 权重: {path}")
-        
-        # 读取权重
-        sd = {}
-        with safe_open(path, framework="pt", device="cpu") as f:
-            for k in f.keys():
-                sd[k] = f.get_tensor(k)
-        
-        loaded_count = 0
-        for name, lora in self.injected.items():
-            base = "lora_unet_" + name.replace(".", "_")
-            
-            if self.use_lokr:
-                w1_key = f"{base}.lokr_w1"
-                w2a_key = f"{base}.lokr_w2_a"
-                w2b_key = f"{base}.lokr_w2_b"
-                w2_old_key = f"{base}.lokr_w2"
-                if w1_key in sd and w2a_key in sd and w2b_key in sd:
-                    lora.adapter.lokr_w1.data.copy_(sd[w1_key])
-                    lora.adapter.lokr_w2_a.data.copy_(sd[w2a_key])
-                    lora.adapter.lokr_w2_b.data.copy_(sd[w2b_key])
-                    loaded_count += 1
-                elif w1_key in sd and w2_old_key in sd:
-                    logger.warning(f"跳过旧格式 lokr_w2 全矩阵层: {name}（需重新训练）")
-            else:
-                down_key = f"{base}.lora_down.weight"
-                up_key = f"{base}.lora_up.weight"
-                if down_key in sd and up_key in sd:
-                    lora.adapter.lora_down.weight.data.copy_(sd[down_key])
-                    lora.adapter.lora_up.weight.data.copy_(sd[up_key])
-                    loaded_count += 1
-
-        logger.info(f"从 checkpoint 加载了 {loaded_count}/{len(self.injected)} 层 LoRA 权重")
-
-
-# ============================================================================
-# ★ v5 ⑤ LoRA EMA：训练过程维护 LoRA 参数的指数滑动平均
-# ============================================================================
-
-class LoRAEmaShadow:
-    """LoRA 参数的指数滑动平均副本（Polyak averaging 的隐式正则）。
-
-    用法：
-      ema = LoRAEmaShadow(named_trainable_params, decay=0.9995)
-      # 每次 optimizer.step() 之后：
-      ema.update(named_trainable_params)
-      # 采样/保存时临时切换到 EMA 副本：
-      with ema.applied(named_trainable_params):
-          injector.save(path)
-          sample_image(...)
-
-    与 Schedule-Free 的区别：
-      - Schedule-Free 是优化器层 averaging，目标是收敛速度。
-      - LoRA EMA 是参数层 averaging，目标是泛化稳定性。
-      两者可并存无冲突。
-    """
-
-    def __init__(self, named_trainable_params, decay=0.9995):
-        self.decay = float(decay)
-        # named_trainable_params: list of (name, param) 元组
-        # 用 id(param) 作 key 而不是 name，避免 LoRAInjector 后某些 name 重复或动态变化。
-        # ★ 强制 shadow 用 fp32 存储：bf16 (7-bit mantissa) 下 decay=0.9995 的每次
-        # 更新增量 ≈ 0.0005×p 经常低于 bf16 可表示精度 → silently dropped → EMA 实际
-        # 等于"等同 p"，正则失效。fp32 shadow 占的显存极少（LoRA 参数总量很小）。
-        self.shadow = {}
-        for _, p in named_trainable_params:
-            if p.requires_grad:
-                self.shadow[id(p)] = p.detach().to(torch.float32).clone()
-
-    @torch.no_grad()
-    def update(self, named_trainable_params):
-        """每个 optimizer.step() 之后调用"""
-        for _, p in named_trainable_params:
-            if not p.requires_grad:
-                continue
-            key = id(p)
-            if key not in self.shadow:
-                # 新加入的参数（罕见，但稳健起见）
-                self.shadow[key] = p.detach().to(torch.float32).clone()
-                continue
-            s = self.shadow[key]
-            # shadow 始终在 fp32；p 可能在 bf16/fp16。device 万一漂移也要 follow。
-            if s.device != p.device:
-                s = s.to(device=p.device)
-                self.shadow[key] = s
-            # 在 fp32 域做 EMA 累积；p 升到 fp32 再加
-            s.mul_(self.decay).add_(p.detach().to(torch.float32), alpha=1.0 - self.decay)
-
-    @contextmanager
-    def applied(self, named_trainable_params):
-        """临时把 trainable_params 替换为 EMA 副本；退出时还原。"""
-        backup = {}
-        try:
-            for _, p in named_trainable_params:
-                key = id(p)
-                if key in self.shadow:
-                    backup[key] = p.data.detach().clone()
-                    # 把 fp32 shadow 转到 p 的 dtype/device
-                    p.data.copy_(self.shadow[key].to(dtype=p.dtype, device=p.device))
-            yield
-        finally:
-            for _, p in named_trainable_params:
-                key = id(p)
-                if key in backup:
-                    p.data.copy_(backup[key])
-
-
-# ============================================================================
-# 训练状态保存/恢复（断点续训）
-# ============================================================================
-
-def save_training_state(path, injector, optimizer, epoch, global_step, loss_history=None, rng_state=None, monitor_state=None, scheduler=None):
-    """保存完整训练状态，支持断点续训"""
-    state = {
-        "lora_state_dict": injector.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "epoch": epoch,
-        "global_step": global_step,
-        "loss_history": loss_history or [],
-        "rng_state": {
-            "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-            "random": random.getstate(),
-        },
-        "monitor_state": monitor_state,  # 保存监控面板数据（用于恢复 loss 曲线）
-    }
-    if scheduler is not None:
-        state["scheduler_state_dict"] = scheduler.state_dict()
-    torch.save(state, path)
-    logger.info(f"训练状态已保存: {path} (epoch={epoch}, step={global_step})")
-
-
-def load_training_state(path, injector, optimizer, scheduler=None):
-    """加载训练状态，返回 (epoch, global_step, loss_history, monitor_state)"""
-    logger.info(f"加载训练状态: {path}")
-    state = torch.load(path, map_location="cpu", weights_only=False)
-    
-    # 加载 LoRA 权重
-    lora_sd = state["lora_state_dict"]
-    for name, lora in injector.injected.items():
-        base = "lora_unet_" + name.replace(".", "_")
-        if injector.use_lokr:
-            w1_key = f"{base}.lokr_w1"
-            w2a_key = f"{base}.lokr_w2_a"
-            w2b_key = f"{base}.lokr_w2_b"
-            w2_old_key = f"{base}.lokr_w2"
-            if w1_key in lora_sd and w2a_key in lora_sd and w2b_key in lora_sd:
-                lora.adapter.lokr_w1.data.copy_(lora_sd[w1_key])
-                lora.adapter.lokr_w2_a.data.copy_(lora_sd[w2a_key])
-                lora.adapter.lokr_w2_b.data.copy_(lora_sd[w2b_key])
-            elif w1_key in lora_sd and w2_old_key in lora_sd:
-                logger.warning(f"跳过旧格式 lokr_w2 全矩阵层: {name}（需重新训练）")
-        else:
-            down_key = f"{base}.lora_down.weight"
-            up_key = f"{base}.lora_up.weight"
-            if down_key in lora_sd and up_key in lora_sd:
-                lora.adapter.lora_down.weight.data.copy_(lora_sd[down_key])
-                lora.adapter.lora_up.weight.data.copy_(lora_sd[up_key])
-    
-    # 加载优化器状态
-    optimizer.load_state_dict(state["optimizer_state_dict"])
-
-    # 加载调度器状态
-    if scheduler is not None and "scheduler_state_dict" in state:
-        try:
-            scheduler.load_state_dict(state["scheduler_state_dict"])
-        except Exception as e:
-            logger.warning(f"调度器状态恢复失败（将从头开始）: {e}")
-
-    # 恢复随机数状态
-    if "rng_state" in state:
-        rng = state["rng_state"]
-        if rng.get("torch") is not None:
-            torch.set_rng_state(rng["torch"])
-        if rng.get("cuda") is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state(rng["cuda"])
-        if rng.get("random") is not None:
-            random.setstate(rng["random"])
-    
-    epoch = state.get("epoch", 0)
-    global_step = state.get("global_step", 0)
-    loss_history = state.get("loss_history", [])
-    monitor_state = state.get("monitor_state", None)  # 恢复监控数据
-    
-    logger.info(f"训练状态已恢复: epoch={epoch}, step={global_step}")
-    return epoch, global_step, loss_history, monitor_state
-
-
-# ============================================================================
-# 数据集
-# ============================================================================
-
-class BucketManager:
-    """ARB 分桶管理"""
-    def __init__(self, base_reso=1024, min_reso=512, max_reso=2048, step=64):
-        self.base_reso = base_reso
-        self.buckets = self._generate(min_reso, max_reso, step, base_reso)
-
-    def _generate(self, min_r, max_r, step, base):
-        buckets = []
-        base_area = base * base
-        for w in range(min_r, max_r + 1, step):
-            for h in range(min_r, max_r + 1, step):
-                if abs(w * h - base_area) / base_area > 0.1:
-                    continue
-                if max(w/h, h/w) > 2.0:
-                    continue
-                buckets.append((w, h))
-        return buckets
-
-    def get_bucket(self, w, h):
-        aspect = w / h
-        best = (self.base_reso, self.base_reso)
-        best_diff = float("inf")
-        for bw, bh in self.buckets:
-            diff = abs(aspect - bw/bh)
-            if diff < best_diff:
-                best_diff = diff
-                best = (bw, bh)
-        return best
-
-
-class ImageDataset(Dataset):
-    """
-    图像数据集
-    
-    支持两种 caption 格式：
-    1. JSON 文件（优先）- 支持分类 shuffle
-    2. TXT 文件（回退）- 传统 shuffle
-    """
-    EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-
-    def __init__(self, data_dir, resolution=1024, bucket_mgr=None,
-                 shuffle_caption=False, keep_tokens=0, flip_augment=False,
-                 tag_dropout=0.0, prefer_json=True, caption_override=None,
-                 freq_balanced_dropout_strength=0.0):
-        self.data_dir = Path(data_dir)
-        self.resolution = resolution
-        self.bucket_mgr = bucket_mgr
-        self.shuffle_caption = shuffle_caption
-        self.keep_tokens = keep_tokens
-        self.flip_augment = flip_augment
-        self.tag_dropout = tag_dropout
-        self.prefer_json = prefer_json
-        self.caption_override = caption_override  # 正则集：统一 caption，如 "1girl, solo"
-        # ★ v5 ② frequency-balanced tag dropout
-        # 0 = 关闭；>0 启用。在数据集 init 时统计 tag 频率，对在数据集中过度共现的 tag 额外提高 dropout
-        # 概率，强迫模型把"风格"与"高频共现 tag"解耦。完全数据驱动，自动适配任何画师。
-        self.freq_balanced_dropout_strength = float(freq_balanced_dropout_strength or 0.0)
-        self.tag_freq = {}  # tag -> frequency in [0, 1]，scan 之后填充
-        
-        # 尝试导入 caption_utils（直接导入避开 __init__.py）
-        self.caption_utils = None
-        if prefer_json:
-            try:
-                import importlib.util
-                import sys
-                
-                # 直接加载 caption_utils.py
-                utils_path = Path(__file__).parent / "utils" / "caption_utils.py"
-                if utils_path.exists():
-                    spec = importlib.util.spec_from_file_location("caption_utils", utils_path)
-                    caption_module = importlib.util.module_from_spec(spec)
-                    sys.modules["caption_utils"] = caption_module
-                    spec.loader.exec_module(caption_module)
-                    
-                    self.caption_utils = {
-                        "load_and_build": caption_module.load_and_build_caption,
-                        "load_json": caption_module.load_caption_json,
-                        "normalize": caption_module.normalize_caption_json,
-                        "build": caption_module.build_caption_from_json,
-                    }
-                    logger.info("JSON caption 模式已启用（分类 shuffle）")
-                else:
-                    logger.warning(f"caption_utils.py 未找到: {utils_path}")
-            except Exception as e:
-                logger.warning(f"caption_utils 加载失败: {e}，回退到 TXT 模式")
-        
-        self.samples = self._scan()
-        json_count = sum(1 for s in self.samples if s.get("json_path"))
-        txt_count = len(self.samples) - json_count
-        logger.info(f"数据集: {len(self.samples)} 样本 (JSON: {json_count}, TXT: {txt_count})")
-
-        # 用与 __getitem__ 完全一致的 PIL 路径填充 bucket_key
-        self._finalize_bucket_keys()
-        self.bucket_for_index = [s["bucket_key"] for s in self.samples]
-        # 诊断：统计 bucket 分布
-        from collections import Counter
-        dist = Counter(self.bucket_for_index)
-        logger.info(f"  bucket 分布: {len(dist)} 种, 例: {list(dist.most_common(5))}")
-
-        # ★ v5 ② 统计 tag 频率（仅在启用 freq_balanced dropout 时执行；避免无谓 IO）
-        if self.freq_balanced_dropout_strength > 0:
-            if json_count > 0:
-                logger.warning(
-                    f"[freq_balanced] 检测到 {json_count} 个 JSON caption；本机制只对 TXT caption 生效。"
-                    "JSON 走 caption_utils 内置的分类 shuffle / dropout，与频率均衡无关。"
-                )
-            self._compute_tag_freq()
-
-    def _finalize_bucket_keys(self):
-        """For each sample, compute bucket_key via the same code path that __getitem__ uses,
-        so BucketBatchSampler can reliably group same-shape tensors. Caches per unique img path."""
-        from PIL import Image as _PILImage
-        cache = {}
-        for sample in self.samples:
-            img_path = sample["image"]
-            key = cache.get(img_path)
-            if key is None:
-                if self.bucket_mgr is None:
-                    key = (self.resolution, self.resolution)
-                else:
-                    try:
-                        img = _PILImage.open(img_path)
-                        # 与 __getitem__ 一致：读 width/height。.convert 不改变尺寸，可省。
-                        w, h = img.width, img.height
-                        try:
-                            img.close()
-                        except Exception:
-                            pass
-                        bw, bh = self.bucket_mgr.get_bucket(w, h)
-                        key = (bh, bw)  # (h, w)
-                    except Exception as e:
-                        logger.warning(f"[bucket_key] 无法读取 {img_path}: {e}，回退到 ({self.resolution},{self.resolution})")
-                        key = (self.resolution, self.resolution)
-                cache[img_path] = key
-            sample["bucket_key"] = key
-
-    def _compute_tag_freq(self):
-        """★ v5 ② 扫描全部 caption 文件，统计每个 tag 在数据集中出现的图片数 / 总图片数。
-
-        每张图只算一次（即使 tag 在 caption 里重复也只计 1），相同图（被 repeat 而进入 samples
-        多次）也只算一次，避免 repeat 高的图把它的 tag 频率人为放大。
-        """
-        from collections import Counter
-        cnt = Counter()
-        seen_imgs = set()
-        total_imgs = 0
-
-        for s in self.samples:
-            img_key = str(s.get("image", ""))
-            if img_key in seen_imgs:
-                continue
-            seen_imgs.add(img_key)
-
-            caption_text = None
-            # 优先 TXT（与 __getitem__ 的回退顺序一致）；JSON 结构性 tag 不参与此机制
-            txt_path = s.get("txt_path")
-            if txt_path:
-                try:
-                    caption_text = txt_path.read_text(encoding="utf-8").strip()
-                except Exception:
-                    caption_text = None
-
-            if not caption_text:
-                continue
-
-            total_imgs += 1
-            if "," in caption_text:
-                tags = [t.strip() for t in caption_text.split(",") if t.strip()]
-            else:
-                tags = [t for t in caption_text.split() if t]
-            # 每张图每个 tag 只计 1 次
-            for t in set(tags):
-                cnt[t] += 1
-
-        if total_imgs == 0:
-            logger.warning("[freq_balanced] 没有可统计的 TXT caption，禁用频率加权 dropout。")
-            self.tag_freq = {}
-            return
-
-        self.tag_freq = {t: c / total_imgs for t, c in cnt.items()}
-        # 诊断：打印共现最高的 10 个 tag
-        top = sorted(self.tag_freq.items(), key=lambda kv: kv[1], reverse=True)[:10]
-        top_str = ", ".join(f"{t}={f:.2f}" for t, f in top)
-        logger.info(
-            f"[freq_balanced] 已统计 {len(self.tag_freq)} 个 tag 的频率 "
-            f"(strength={self.freq_balanced_dropout_strength:.2f}). Top10: {top_str}"
-        )
-
-    def _scan(self):
-        samples = []
-        # 扫描所有子目录，寻找图像及其对应的标签文件
-        for img_path in self.data_dir.rglob("*"):
-            if img_path.suffix.lower() not in self.EXTS:
-                continue
-            
-            # 解析目录名中的重复次数 (例如 10_tags)
-            repeats = 1
-            parent_name = img_path.parent.name
-            if "_" in parent_name:
-                prefix = parent_name.split("_", 1)[0]
-                if prefix.isdigit():
-                    repeats = max(1, int(prefix))
-            
-            sample = {"image": img_path}
-            
-            # 优先查找 JSON
-            json_path = img_path.with_suffix(".json")
-            if self.prefer_json and json_path.exists():
-                sample["json_path"] = json_path
-                sample["txt_path"] = None
-            else:
-                # 回退到 TXT
-                txt_path = img_path.with_suffix(".txt")
-                if not txt_path.exists():
-                    txt_path = img_path.with_suffix(".caption")
-                if not txt_path.exists():
-                    continue
-                sample["json_path"] = None
-                sample["txt_path"] = txt_path
-
-            # bucket_key 留空，等会在 _finalize_bucket_keys 里用与 __getitem__ 一致
-            # 的路径（Image.open + convert("RGB")）批量计算，避免 _scan 与运行时
-            # PIL 行为差异导致 sampler 分桶失效。
-            sample["bucket_key"] = None
-
-            # 按重复次数添加样本
-            for _ in range(repeats):
-                samples.append(sample.copy())
-        return samples
-
-    def _process_caption_txt(self, caption):
-        """处理 TXT caption: 传统 tag 打乱 + keep_tokens + tag_dropout
-
-        tag_dropout 与 caption_utils.build_caption_from_json 中的语义一致：
-          - 仅丢弃 keep_tokens 之后的可变标签；keep_tokens（角色名/触发词）始终保留
-          - 若 dropout 后可变部分全空，强制保留其中随机一个，避免 caption 退化为只有触发词
-        """
-        if not caption:
-            return ""
-        if "," in caption:
-            tags = [t.strip() for t in caption.split(",") if t.strip()]
-        else:
-            tags = [t for t in caption.split() if t]
-
-        if not tags:
-            return ""
-
-        keep_n = max(int(self.keep_tokens or 0), 0)
-        kept = tags[:keep_n]
-        rest = tags[keep_n:]
-
-        if self.shuffle_caption and rest:
-            random.shuffle(rest)
-
-        dropout = float(self.tag_dropout or 0.0)
-        freq_strength = float(getattr(self, "freq_balanced_dropout_strength", 0.0) or 0.0)
-        tag_freq = getattr(self, "tag_freq", {}) or {}
-
-        if rest and (dropout > 0.0 or (freq_strength > 0.0 and tag_freq)):
-            survivors = []
-            for t in rest:
-                # 通用 dropout
-                if dropout > 0.0 and random.random() < dropout:
-                    continue
-                # ★ v5 ② 频率加权 dropout
-                # 触发词在 kept 里完全免疫；这里只对 rest 起作用。
-                # 公式：extra_drop = strength * max(0, freq - 0.3) / 0.7
-                #   freq=1.0 → extra_drop = strength；freq=0.3 → 0；线性插值。
-                #   0.3 是经验阈值：低于此值的 tag 视为"真实变量"不需要解耦。
-                if freq_strength > 0.0:
-                    freq = tag_freq.get(t, 0.0)
-                    if freq > 0.3:
-                        extra_drop = freq_strength * (freq - 0.3) / 0.7
-                        if random.random() < extra_drop:
-                            continue
-                survivors.append(t)
-            if not survivors:
-                survivors = [random.choice(rest)]
-            rest = survivors
-
-        return ", ".join(kept + rest)
-
-    def _process_caption_json(self, json_path):
-        """处理 JSON caption: 分类 shuffle"""
-        if self.caption_utils is None:
-            return None
-        
-        try:
-            raw_json = self.caption_utils["load_json"](json_path)
-            if raw_json is None:
-                return None
-            
-            # 检查是否已经是标准格式
-            if "tags" in raw_json and "meta" in raw_json:
-                normalized = raw_json
-            else:
-                normalized = self.caption_utils["normalize"](raw_json)
-            
-            # 构建 caption（分类 shuffle）
-            return self.caption_utils["build"](
-                normalized,
-                shuffle_appearance=self.shuffle_caption,
-                shuffle_tags=self.shuffle_caption,
-                shuffle_environment=self.shuffle_caption,
-                tag_dropout=self.tag_dropout,
-            )
-        except Exception as e:
-            logger.warning(f"JSON 处理失败 {json_path}: {e}")
-            return None
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        import numpy as np
-        from PIL import Image
-        sample = self.samples[idx]
-        img = Image.open(sample["image"]).convert("RGB")
-        
-        # 获取 caption（正则集可用 caption_override 统一覆盖）
-        caption = None
-        if self.caption_override is not None:
-            caption = self.caption_override
-        elif sample.get("json_path"):
-            caption = self._process_caption_json(sample["json_path"])
-        
-        if caption is None and sample.get("txt_path"):
-            caption = sample["txt_path"].read_text(encoding="utf-8").strip()
-            caption = self._process_caption_txt(caption)
-        
-        if caption is None:
-            caption = ""
-
-        # ARB 分桶
-        if self.bucket_mgr:
-            tw, th = self.bucket_mgr.get_bucket(img.width, img.height)
-        else:
-            tw = th = self.resolution
-
-        # 缩放裁剪
-        scale = max(tw / img.width, th / img.height)
-        nw, nh = int(img.width * scale), int(img.height * scale)
-        img = img.resize((nw, nh), Image.LANCZOS)
-
-        left = (nw - tw) // 2
-        top = (nh - th) // 2
-        img = img.crop((left, top, left + tw, top + th))
-
-        # 水平翻转增强
-        if self.flip_augment and random.random() > 0.5:
-            img = img.transpose(Image.FLIP_LEFT_RIGHT)
-
-        # 转 tensor [-1, 1]
-        arr = np.array(img).astype(np.float32) / 127.5 - 1.0
-        tensor = torch.from_numpy(arr).permute(2, 0, 1)
-
-        return {"pixel_values": tensor, "caption": caption, "image": str(sample["image"])}
-
-
-class RepeatDataset(Dataset):
-    """Kohya 风格数据集重复"""
-    def __init__(self, dataset, repeats=1):
-        self.dataset = dataset
-        self.repeats = max(1, int(repeats))
-
-    def __len__(self):
-        return len(self.dataset) * self.repeats
-
-    def __getitem__(self, idx):
-        return self.dataset[idx % len(self.dataset)]
-
-
-class MergedDataset(Dataset):
-    """合并主数据集与正则数据集（Kohya 风格 reg）"""
-    def __init__(self, main_dataset, reg_dataset):
-        self.main_dataset = main_dataset
-        self.reg_dataset = reg_dataset
-        self._main_len = len(main_dataset)
-        self._reg_len = len(reg_dataset)
-
-        # 为 BucketBatchSampler 构建 bucket_for_index
-        self.bucket_for_index = self._build_bucket_for_index()
-
-    def _get_cached_dataset(self, d):
-        bfi = getattr(d, "bucket_for_index", None)
-        if bfi is not None and len(bfi) > 0:
-            return d
-        if hasattr(d, "dataset"):
-            return self._get_cached_dataset(d.dataset)
-        return None
-
-    def _build_bucket_for_index(self):
-        main_cached = self._get_cached_dataset(self.main_dataset)
-        reg_cached = self._get_cached_dataset(self.reg_dataset)
-        buckets = []
-        if main_cached and main_cached.bucket_for_index:
-            main_base_len = len(main_cached.bucket_for_index)
-            for idx in range(self._main_len):
-                b = main_cached.bucket_for_index[idx % main_base_len]
-                buckets.append(b if b is not None else (0, 0))
-        else:
-            buckets.extend([(0, 0)] * self._main_len)
-        if reg_cached and reg_cached.bucket_for_index:
-            reg_base_len = len(reg_cached.bucket_for_index)
-            for idx in range(self._reg_len):
-                b = reg_cached.bucket_for_index[idx % reg_base_len]
-                buckets.append(b if b is not None else (0, 0))
-        else:
-            buckets.extend([(0, 0)] * self._reg_len)
-        return buckets
-
-    def __len__(self):
-        return self._main_len + self._reg_len
-
-    def __getitem__(self, idx):
-        if idx < self._main_len:
-            return self.main_dataset[idx]
-        return self.reg_dataset[idx - self._main_len]
-
-
-class BucketBatchSampler:
-    """Batch sampler that groups samples by bucket so tensors in each batch have the same size.
-
-    Per-index resolution: walks the dataset wrapping chain (RepeatDataset / MergedDataset)
-    for every outer index to look up the underlying ImageDataset / CachedLatentDataset's
-    bucket_for_index. This avoids any indirection bugs in pre-built bucket_for_index lists.
-    """
-    def __init__(self, dataset, batch_size, drop_last=True, shuffle=True, seed=42):
-        self.dataset = dataset
-        self.batch_size = int(batch_size)
-        self.drop_last = bool(drop_last)
-        self.shuffle = bool(shuffle)
-        self.seed = int(seed)
-        self.epoch = 0
-        # Pre-compute per-index bucket keys via direct walk
-        self._bucket_keys = self._build_keys(dataset)
-        # Diagnostics
-        unique = set(self._bucket_keys)
-        none_count = sum(1 for k in self._bucket_keys if k is None)
-        logger.info(
-            "[BucketBatchSampler] dataset_len=%d unique_buckets=%d none=%d (e.g. %s)",
-            len(self._bucket_keys), len(unique), none_count,
-            list(unique)[:5],
-        )
-        if none_count == len(self._bucket_keys):
-            logger.warning(
-                "[BucketBatchSampler] 没有任何样本能解析到 bucket_key，"
-                "将退化为顺序分批（可能在 ARB 模式下因尺寸不一致而崩溃）。"
-                "请检查 ImageDataset/CachedLatentDataset 是否正确填充了 bucket_for_index。"
-            )
-
-    def _build_keys(self, dataset):
-        n = len(dataset)
-        keys = [None] * n
-        for i in range(n):
-            keys[i] = self._lookup(dataset, i)
-        return keys
-
-    def _lookup(self, d, idx):
-        """Resolve the bucket key for a given outer index by walking dataset wrappers.
-
-        Priority: MergedDataset routing → RepeatDataset (.dataset) → leaf bucket_for_index
-        → CachedLatentDataset (.base_dataset). Leaf is preferred over base_dataset because
-        CachedLatentDataset has its own complete bucket_for_index aligned with cached samples.
-        """
-        main = getattr(d, "main_dataset", None)
-        reg = getattr(d, "reg_dataset", None)
-        if main is not None and reg is not None:
-            ml = getattr(d, "_main_len", len(main))
-            if idx < ml:
-                return self._lookup(main, idx)
-            return self._lookup(reg, idx - ml)
-        # RepeatDataset wraps another dataset via .dataset
-        inner = getattr(d, "dataset", None)
-        if inner is not None and inner is not d and not isinstance(inner, list):
-            try:
-                return self._lookup(inner, idx % len(inner))
-            except TypeError:
-                pass
-        # Leaf: ImageDataset (.bucket_for_index present and indexed directly)
-        bfi = getattr(d, "bucket_for_index", None)
-        if bfi is not None and len(bfi) > 0:
-            return bfi[idx % len(bfi)]
-        # CachedLatentDataset fallback (rare: no bucket_for_index yet)
-        inner = getattr(d, "base_dataset", None)
-        if inner is not None and inner is not d:
-            return self._lookup(inner, idx % len(inner))
-        return None
-
-    def set_epoch(self, epoch):
-        self.epoch = int(epoch)
-
-    def __len__(self):
-        n = len(self.dataset)
-        if self.drop_last:
-            return n // self.batch_size
-        return (n + self.batch_size - 1) // self.batch_size
-
-    def __iter__(self):
-        rng = random.Random(self.seed + self.epoch)
-        bucket_to_indices = {}
-        for idx, key in enumerate(self._bucket_keys):
-            if key is None:
-                key = (0, 0)
-            bucket_to_indices.setdefault(tuple(key), []).append(idx)
-
-        buckets = list(bucket_to_indices.keys())
-        if self.shuffle:
-            rng.shuffle(buckets)
-        for bucket in buckets:
-            indices = bucket_to_indices[bucket]
-            if self.shuffle:
-                rng.shuffle(indices)
-            for i in range(0, len(indices), self.batch_size):
-                batch = indices[i:i + self.batch_size]
-                if len(batch) < self.batch_size and self.drop_last:
-                    continue
-                yield batch
-
-
-class CachedLatentDataset(Dataset):
-    """Kohya 风格 npz 文件缓存的数据集"""
-    def __init__(self, base_dataset, vae, device, dtype, cache_dir=None):
-        import numpy as np
-        self.base_dataset = base_dataset
-        self.np = np
-        # 获取原始数据集的 samples 列表
-        self.samples = self._get_base_samples(base_dataset)
-        self.cache_dir = Path(cache_dir) if cache_dir else None
-        self.bucket_for_index = []
-        self._build_cache(vae, device, dtype)
-
-    def _get_base_samples(self, dataset):
-        """获取原始 ImageDataset 的 samples"""
-        if hasattr(dataset, "samples"):
-            return dataset.samples
-        elif hasattr(dataset, "dataset"):
-            return self._get_base_samples(dataset.dataset)
-        return []
-
-    def _get_npz_path(self, img_path):
-        """获取图像对应的 npz 缓存路径"""
-        img_path = Path(img_path)
-        return img_path.with_suffix(".npz")
-
-    def _is_cache_valid(self, img_path, npz_path):
-        """检查缓存是否有效（图像未修改，且格式含 latent 键）。
-        若为其他模型的不兼容缓存，则删除并返回 False。"""
-        if not npz_path.exists():
-            return False
-        if npz_path.stat().st_mtime < img_path.stat().st_mtime:
-            return False
-        try:
-            data = self.np.load(npz_path)
-            if "latent" not in data.files:
-                npz_path.unlink()
-                logger.debug(f"已删除不兼容缓存: {npz_path.name}")
-                return False
-            latent = data["latent"]
-            if latent.ndim != 4:
-                logger.warning(f"删除异常 latent 缓存（维度应为 C,T,H,W）: {npz_path}")
-                npz_path.unlink()
-                return False
-            if latent.shape[0] != 16:
-                logger.warning(f"删除疑似非 Anima/Qwen VAE 缓存（C={latent.shape[0]}，应为 16）: {npz_path}")
-                npz_path.unlink()
-                return False
-            if not self.np.isfinite(latent).all():
-                logger.warning(f"删除非有限 latent 缓存: {npz_path}")
-                npz_path.unlink()
-                return False
-        except Exception:
-            try:
-                npz_path.unlink()
-            except Exception:
-                pass
-            return False
-        return True
-
-    def _build_cache(self, vae, device, dtype):
-        """构建/加载 npz 缓存"""
-        logger.info("检查 VAE latent 缓存...")
-        to_encode = []
-        for i, sample in enumerate(self.samples):
-            img_path = sample["image"]
-            npz_path = self._get_npz_path(img_path)
-            if not self._is_cache_valid(img_path, npz_path):
-                to_encode.append(i)
-
-        if to_encode:
-            logger.info(f"需要编码 {len(to_encode)}/{len(self.samples)} 张图像...")
-            self._encode_and_save(to_encode, vae, device, dtype)
-        else:
-            logger.info(f"所有 {len(self.samples)} 张图像已缓存")
-
-        self._fill_bucket_for_index()
-
-    def _fill_bucket_for_index(self):
-        """Fill bucket_for_index for all samples (needed for BucketBatchSampler).
-        Uses latent spatial shape (h, w) as grouping key so batches have consistent tensor sizes."""
-        self.bucket_for_index = [None] * len(self.samples)
-        for i in range(len(self.samples)):
-            npz_path = self._get_npz_path(self.samples[i]["image"])
-            if not npz_path.exists():
-                continue
-            data = self.np.load(npz_path)
-            latent = data["latent"]
-            s = latent.shape
-            if len(s) == 5:
-                _, _, _, h, w = s
-            else:
-                _, _, h, w = s
-            self.bucket_for_index[i] = (int(h), int(w))
-
-    def _encode_and_save(self, indices, vae, device, dtype):
-        """编码图像并保存为 npz"""
-        for count, i in enumerate(indices):
-            item = self.base_dataset[i]
-            pixels = item["pixel_values"].unsqueeze(0).to(device, dtype=dtype)
-            _, _, ph, pw = pixels.shape
-            bucket_w, bucket_h = pw, ph
-            with torch.no_grad():
-                pixels_5d = pixels.unsqueeze(2)
-                latent = vae.model.encode(pixels_5d, vae.scale)
-            if not torch.isfinite(latent).all():
-                logger.warning(f"VAE 编码产生非有限 latent，跳过缓存: {self.samples[i]['image']}")
-                continue
-            latent_np = latent.squeeze(0).cpu().float().numpy()
-            npz_path = self._get_npz_path(self.samples[i]["image"])
-            self.np.savez(npz_path, latent=latent_np, bucket_w=bucket_w, bucket_h=bucket_h)
-            if (count + 1) % 10 == 0 or count == len(indices) - 1:
-                logger.info(f"  编码进度: {count + 1}/{len(indices)}")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        npz_path = self._get_npz_path(sample["image"])
-        data = self.np.load(npz_path)
-        latent = torch.from_numpy(data["latent"])
-        if not torch.isfinite(latent).all():
-            raise RuntimeError(f"读取到非有限 latent 缓存: {npz_path}")
-        
-        # 获取 base_dataset 的引用（处理可能的嵌套）
-        base = self.base_dataset
-        while hasattr(base, "dataset"):
-            base = base.dataset
-
-        # NOTE: 不要在缓存 latent 上做空间 flip！
-        # Anima/Qwen VAE 的 conv encoder 不是 flip-equivariant，
-        # 即 flip(encode(img)) ≠ encode(flip(img))；
-        # 在 latent 空间翻转会喂给训练"非自然"的潜变量，模型学到的是
-        # 偏离真实分布的 latent，推理时表现为马赛克 / 边缘溶解。
-        # flip 增强在缓存阶段（base ImageDataset 的 __getitem__ 里做图像 flip
-        # 后再 encode）已经生效一次；想要每个 epoch 重新 flip，请关闭 cache_latents。
-
-        # 处理 caption（正则集 caption_override 优先）
-        caption = None
-        if getattr(base, "caption_override", None) is not None:
-            caption = base.caption_override
-        elif sample.get("json_path") and hasattr(base, "_process_caption_json"):
-            caption = base._process_caption_json(sample["json_path"])
-        
-        if caption is None and sample.get("txt_path"):
-            caption = sample["txt_path"].read_text(encoding="utf-8").strip()
-            if hasattr(base, "_process_caption_txt"):
-                caption = base._process_caption_txt(caption)
-        
-        if caption is None:
-            caption = ""
-        
-        return {"latent": latent, "caption": caption, "image": str(sample["image"])}
-
-
-# ============================================================================
-# 训练时推理
-# ============================================================================
-
-@torch.no_grad()
-def sample_image(
-    model, vae, qwen_model, qwen_tokenizer, t5_tokenizer,
-    prompt, height=1024, width=1024, steps=25, cfg_scale=4.0, 
-    negative_prompt=None,
-    sampler_name: str = "er_sde",
-    scheduler: str = "simple",
-    device="cuda",
-    dtype=torch.bfloat16,
-    use_t5_token_weights: bool = True,
-):
-    """训练时采样预览（尽量对齐 ComfyUI KSampler）
-    
-    Args:
-        negative_prompt: 负面提示词，默认使用标准负面提示词
-        sampler_name: 采样器（推荐：er_sde）
-        scheduler: 调度器（推荐：simple）
-    """
-    import numpy as np
-    from PIL import Image
-    model.eval()
-    
-    logger.info(f"[Debug] Sampling start. Prompt: {prompt[:50]}...")
-    
-    # Check VAE scale
-    if isinstance(vae.scale, list) and len(vae.scale) == 2:
-        m, s = vae.scale
-        logger.info(f"[Debug] VAE scale: mean_shape={m.shape}, std_inv_shape={s.shape}")
-        logger.info(f"[Debug] VAE scale values: mean={m.mean().item():.4f}, std_inv={s.mean().item():.4f}")
-
-    # 默认负面提示词 (参考 Anima Prompt Guide)
-    if negative_prompt is None:
-        negative_prompt = "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, bad anatomy, bad hands, bad feet, missing fingers, extra fingers, text, watermark, logo, signature, username, artist name, copyright name"
-
-    # 文本编码
-    try:
-        # 有条件 (positive prompt)
-        qwen_text = _build_qwen_text_from_prompt(prompt)
-        qwen_embeds, qwen_attn = encode_qwen(qwen_model, qwen_tokenizer, [qwen_text], device)
-        logger.info(f"[Debug] Qwen embeds: {qwen_embeds.shape}, mean={qwen_embeds.mean().item():.4f}")
-        
-        t5_ids, t5_attn, t5_w = tokenize_t5_weighted(t5_tokenizer, [prompt], max_length=512)
-        t5_ids = t5_ids.to(device)
-        t5_attn = t5_attn.to(device)
-        t5_w = t5_w.to(device, dtype=torch.float32)
-        cross_cond = model.preprocess_text_embeds(qwen_embeds, t5_ids, t5_attn, qwen_attn)
-        if (
-            use_t5_token_weights
-            and getattr(model, "llm_adapter", None) is not None
-            and cross_cond.shape[1] == t5_w.shape[1]
-        ):
-            cross_cond = cross_cond * t5_w.to(cross_cond.dtype).unsqueeze(-1)
-        if cross_cond.shape[1] < 512:
-            cross_cond = F.pad(cross_cond, (0, 0, 0, 512 - cross_cond.shape[1]))
-
-        # 无条件/负面提示词 (negative prompt)
-        qwen_text_uncond = _build_qwen_text_from_prompt(negative_prompt)
-        qwen_embeds_uncond, qwen_attn_uncond = encode_qwen(qwen_model, qwen_tokenizer, [qwen_text_uncond], device)
-        t5_ids_uncond, t5_attn_uncond, t5_w_uncond = tokenize_t5_weighted(t5_tokenizer, [negative_prompt], max_length=512)
-        t5_ids_uncond = t5_ids_uncond.to(device)
-        t5_attn_uncond = t5_attn_uncond.to(device)
-        t5_w_uncond = t5_w_uncond.to(device, dtype=torch.float32)
-        cross_uncond = model.preprocess_text_embeds(qwen_embeds_uncond, t5_ids_uncond, t5_attn_uncond, qwen_attn_uncond)
-        if (
-            use_t5_token_weights
-            and getattr(model, "llm_adapter", None) is not None
-            and cross_uncond.shape[1] == t5_w_uncond.shape[1]
-        ):
-            cross_uncond = cross_uncond * t5_w_uncond.to(cross_uncond.dtype).unsqueeze(-1)
-        if cross_uncond.shape[1] < 512:
-            cross_uncond = F.pad(cross_uncond, (0, 0, 0, 512 - cross_uncond.shape[1]))
-            
-    except Exception as e:
-        logger.error(f"[Debug] Encoding failed: {e}")
-        raise e
-
-    # sigmas（对齐 ComfyUI supported_models.Anima: shift=3.0, multiplier=1.0）
-    lat_h, lat_w = height // 8, width // 8
-    if str(scheduler).lower() != "simple":
-        logger.warning(f"采样 scheduler={scheduler} 未实现，回退 simple")
-    sigmas = _flow_sigmas_simple(steps, shift=3.0, device=device)
-
-    # 初始化噪声（ComfyUI CONST.noise_scaling: x = sigma*noise + (1-sigma)*latent_image；txt2img latent_image=0）
-    x = torch.randn(1, 16, 1, lat_h, lat_w, device=device, dtype=torch.float32) * float(sigmas[0])
-    logger.info(f"[Debug] Latents init: {x.shape}, mean={x.mean().item():.4f}, std={x.std().item():.4f}")
-
-    pad_mask = torch.zeros(1, 1, lat_h, lat_w, device=device, dtype=dtype)
-    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
-
-    def denoise_fn(x_in: torch.Tensor, sigma_in: torch.Tensor) -> torch.Tensor:
-        if not torch.is_tensor(sigma_in):
-            sigma_in = torch.tensor(float(sigma_in), device=x_in.device, dtype=torch.float32)
-        sigma_b = sigma_in.view(1, 1).to(device=x_in.device, dtype=dtype)
-        sigma_5d = sigma_in.view(1, 1, 1, 1, 1).to(device=x_in.device, dtype=torch.float32)
-
-        with torch.autocast(device_type=device_type, dtype=dtype):
-            v_cond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_cond, padding_mask=pad_mask)
-            v_uncond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_uncond, padding_mask=pad_mask)
-            v = v_uncond + cfg_scale * (v_cond - v_uncond)
-
-        if torch.isnan(v).any():
-            raise RuntimeError("v contains NaN during sampling")
-
-        # CONST(flow): denoised x0 = x - sigma * v
-        return x_in - sigma_5d * v.float()
-
-    sampler_name_l = str(sampler_name).lower().strip()
-    logger.info(f"[Debug] Sampler={sampler_name_l}, Scheduler=simple, steps={steps}, cfg={cfg_scale}")
-
-    if sampler_name_l == "er_sde":
-        x = _sample_er_sde_const_x0(denoise_fn, x, sigmas, seed=None, s_noise=1.0, max_stage=3)
-    else:
-        # fallback: 简化 Euler ODE（deterministic），与 flow 兼容
-        for i in range(len(sigmas) - 1):
-            sigma = float(sigmas[i])
-            sigma_next = float(sigmas[i + 1])
-            denoised = denoise_fn(x, sigmas[i])
-            d = (x - denoised) / max(sigma, 1e-6)
-            x = x + d * (sigma_next - sigma)
-
-    # VAE 解码
-    latents = x.to(device=device, dtype=dtype)
-    logger.info(f"[Debug] Final latents: mean={latents.mean().item():.4f}, std={latents.std().item():.4f}")
-    try:
-        images = vae.model.decode(latents, vae.scale)
-        images = images.squeeze(2)  # [B,C,H,W]
-        images = (images.clamp(-1, 1) + 1) / 2
-
-        # 转 PIL
-        img = images[0].permute(1, 2, 0).cpu().float().numpy()
-        img = (img * 255).clip(0, 255).astype(np.uint8)
-
-        model.train()
-        return Image.fromarray(img)
-    except Exception as e:
-        logger.error(f"[Debug] VAE decode failed: {e}")
-        raise e
-
-
-# ============================================================================
-# 训练辅助
-# ============================================================================
-
-def sample_t(
-    bs,
-    device,
-    mode: str = "logit_normal",
-    shift: float = 3.0,
-    mix_low_prob: float = 0.25,
-    mix_extreme_prob: float = 0.0,
-):
-    """采样 Flow Matching 时间步 t ∈ (0, 1)。
-
-    mode:
-      - "logit_normal": 经典 SD3/Anima 偏向中间 t 的分布，shift>1 进一步偏向高噪声端（默认）。
-      - "uniform":      均匀采样 t，对低噪声端（细节）和高噪声端（结构）覆盖更均衡。
-      - "logit_normal_low": logit-normal 但 shift 反向（推 t 偏向低噪声/细节端），适合刻画细节差的训练集。
-      - "extreme_low":  Beta(0.5, 5) 多数 t 在 [0.01, 0.2]；用于 logo/眼/发等需要近清洁 latent 的高频特征。
-      - "mode":         SD3 式 mode-distribution（用 sigma 形式，需要 shift）。
-      - "mixed_uniform_low": 以 uniform 为主体，按 mix_low_prob 混入 logit_normal_low；
-                             若 mix_extreme_prob>0，再混入相应比例的 extreme_low（v5 新增）。
-    """
-    mode = (mode or "logit_normal").lower()
-    if mode == "uniform":
-        return torch.rand(bs, device=device).clamp(1e-4, 1.0 - 1e-4)
-
-    if mode == "extreme_low":
-        # Beta(0.5, 5)：mean≈0.091，多数样本 t<0.2。专为 high-freq 局部特征设计。
-        beta = torch.distributions.Beta(
-            torch.tensor(0.5, device=device),
-            torch.tensor(5.0, device=device),
-        )
-        return beta.sample((bs,)).clamp(1e-4, 1.0 - 1e-4)
-
-    if mode in ("mixed_uniform_low", "uniform_low_mix"):
-        uniform_t = torch.rand(bs, device=device)
-        low_t = sample_t(bs, device, mode="logit_normal_low", shift=shift)
-        p_low = min(max(float(mix_low_prob), 0.0), 1.0)
-        p_extreme = min(max(float(mix_extreme_prob), 0.0), 1.0)
-        # 保证 p_low + p_extreme <= 1.0；超出时按比例缩放
-        if p_low + p_extreme > 1.0:
-            scale = 1.0 / (p_low + p_extreme)
-            p_low *= scale
-            p_extreme *= scale
-        r = torch.rand(bs, device=device)
-        if p_extreme > 0:
-            extreme_t = sample_t(bs, device, mode="extreme_low", shift=shift)
-            # r < p_extreme → extreme；p_extreme ≤ r < p_extreme+p_low → low；其余 → uniform
-            t = torch.where(
-                r < p_extreme,
-                extreme_t,
-                torch.where(r < p_extreme + p_low, low_t, uniform_t),
-            )
-        else:
-            t = torch.where(r < p_low, low_t, uniform_t)
-        return t.clamp(1e-4, 1.0 - 1e-4)
-
-    if mode in ("mixed_uniform_logit", "uniform_logit_mix"):
-        uniform_t = torch.rand(bs, device=device)
-        logit_t = sample_t(bs, device, mode="logit_normal", shift=shift)
-        p = min(max(float(mix_low_prob), 0.0), 1.0)
-        use_logit = (torch.rand(bs, device=device) < p)
-        return torch.where(use_logit, logit_t, uniform_t).clamp(1e-4, 1.0 - 1e-4)
-
-    # 基础 logit-normal
-    u = torch.sigmoid(torch.randn(bs, device=device))
-
-    if mode == "logit_normal_low":
-        # shift 倒数，效果是把 t 推向 0 端（更多“低噪声/细节”样本）
-        s = max(float(shift), 1e-4)
-        u = (u * (1.0 / s)) / (1 + (1.0 / s - 1) * u)
-        return u.clamp(1e-4, 1.0 - 1e-4)
-
-    if mode == "mode":
-        # SD3 mode sampling: 集中在某个 sigma 附近
-        s = float(shift)
-        u = 1 - u - s * (torch.cos(torch.pi * 0.5 * u) ** 2 - 1 + u)
-        return u.clamp(1e-4, 1.0 - 1e-4)
-
-    # 默认 logit_normal + shift
-    s = float(shift)
-    u = (u * s) / (1 + (s - 1) * u)
-    return u.clamp(1e-4, 1.0 - 1e-4)
-
-
-def make_noise(latents, noise_offset: float = 0.0, pyramid_iters: int = 0,
-               pyramid_discount: float = 0.3, random_offset_strength: bool = False,
-               noise_offset_min: float = 0.0):
-    """生成训练用噪声。
-
-    base: standard normal
-    noise_offset: 给每个样本/通道加一个低频偏移，缓解“总是中等亮度”的偏差，对学习明暗对比尤其有效（来自 SDXL 的 noise_offset 思路）。
-    noise_offset_min: random_offset_strength=true 时的随机下限；默认 0 兼容旧行为。
-    pyramid_iters: 叠加多尺度低频噪声，帮助模型快速学习全局光照/构图（参考 multires noise / pyramid noise）。
-    """
-    noise = torch.randn_like(latents)
-
-    if noise_offset and noise_offset > 0:
-        # 形状: (B, C, T, 1, 1) 或 (B, C, 1, 1) — 与 latents 兼容的"低频"扰动
-        leading_shape = list(latents.shape)
-        for ax in range(2, latents.ndim):
-            leading_shape[ax] = 1
-        offset = torch.randn(*leading_shape, device=latents.device, dtype=latents.dtype)
-        scale = float(noise_offset)
-        if random_offset_strength:
-            lo = max(float(noise_offset_min or 0.0), 0.0)
-            hi = max(scale, 0.0)
-            if lo > hi:
-                lo, hi = hi, lo
-            scale = lo + (hi - lo) * float(torch.rand(1, device=latents.device).item())
-        noise = noise + scale * offset
-
-    if pyramid_iters and int(pyramid_iters) > 0:
-        # 简化的 pyramid noise：在多个降采样尺度上叠加噪声，再 upsample 加回原噪声
-        try:
-            import torch.nn.functional as _F
-            spatial_dims = list(latents.shape[-2:])
-            cur = noise.clone()
-            for i in range(int(pyramid_iters)):
-                r = 2 ** (i + 1)
-                small_h = max(spatial_dims[0] // r, 1)
-                small_w = max(spatial_dims[1] // r, 1)
-                # 5D latent: (B, C, T, H, W)；4D 也支持
-                # NOTE: 用 bilinear 而非 nearest，与 Whitaker 原版 pyramid_noise_like 一致；
-                # nearest 会产生块状低频结构，模型把"预测块状偏移"也作为目标的一部分学习，
-                # 导致规则小结构（如扣子、文字、网格）训练后变形。bilinear 提供平滑的 LF 噪声。
-                if latents.ndim == 5:
-                    extra = torch.randn(latents.shape[0], latents.shape[1], latents.shape[2], small_h, small_w,
-                                        device=latents.device, dtype=latents.dtype)
-                    extra = _F.interpolate(extra.flatten(0, 1), size=spatial_dims, mode="bilinear",
-                                           align_corners=False).view(
-                        latents.shape[0], latents.shape[1], latents.shape[2], spatial_dims[0], spatial_dims[1])
-                else:
-                    extra = torch.randn(latents.shape[0], latents.shape[1], small_h, small_w,
-                                        device=latents.device, dtype=latents.dtype)
-                    extra = _F.interpolate(extra, size=spatial_dims, mode="bilinear", align_corners=False)
-                cur = cur + extra * (float(pyramid_discount) ** (i + 1))
-                if min(small_h, small_w) <= 1:
-                    break
-            # ★ v5 修复：先减空间均值再归方差。bilinear 上采样的 coarse 分量天然带 DC 偏置，
-            # 仅做 std 归一会让训练样本带"低频亮度漂移"作为隐藏信号 → 模型学会预测它 →
-            # 推理时给的是标准正态（无漂移）→ 模型仍会补一个 → 输出整体亮/暗偏置被强化。
-            # 这是 Whitaker 原版的正确语义，许多 fork 漏了这一步。
-            # 形状：5D=(B,C,T,H,W) → 在 (T,H,W) 上减均值；4D=(B,C,H,W) → 在 (H,W) 上减。
-            spatial_mean_dims = tuple(range(2, cur.ndim))
-            cur = cur - cur.mean(dim=spatial_mean_dims, keepdim=True)
-            cur = cur / cur.std().clamp(min=1e-6)
-            noise = cur
-        except Exception as _e:
-            logger.warning(f"pyramid_noise 计算失败，回退到标准噪声: {_e}")
-
-    return noise
-
-
-def _huber_delta_for_t(t: torch.Tensor | None, huber_c: float, schedule: str):
-    delta = max(float(huber_c), 1e-8)
-    if t is None:
-        return delta
-
-    schedule = (schedule or "constant").lower()
-    if schedule == "constant":
-        return delta
-
-    t_c = t.float().clamp(1e-4, 1.0 - 1e-4)
-    if schedule == "snr":
-        # High SNR / low-noise steps get a larger quadratic basin; high-noise steps become more L1-like.
-        snr_sqrt = ((1.0 - t_c) / t_c).clamp(0.1, 10.0)
-        return (delta * snr_sqrt).view(-1, *([1] * 4))
-    if schedule == "sigma":
-        return (delta * t_c.clamp(0.1, 1.0)).view(-1, *([1] * 4))
-
-    return delta
-
-
-def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "mse",
-                    huber_c: float = 0.1, huber_schedule: str = "constant",
-                    t: torch.Tensor | None = None) -> torch.Tensor:
-    """Return per-sample loss for tensors shaped (B, C, T, H, W)."""
-    pred_f = pred.float()
-    target_f = target.float()
-    loss_type = (loss_type or "mse").lower()
-
-    if loss_type in ("mse", "l2"):
-        loss_map = F.mse_loss(pred_f, target_f, reduction="none")
-    elif loss_type in ("l1", "mae"):
-        loss_map = F.l1_loss(pred_f, target_f, reduction="none")
-    elif loss_type in ("huber", "smooth_l1"):
-        delta = _huber_delta_for_t(t, huber_c, huber_schedule)
-        err = (pred_f - target_f).abs()
-        if not torch.is_tensor(delta):
-            delta_t = torch.tensor(float(delta), device=err.device, dtype=err.dtype)
-        else:
-            delta_t = delta.to(device=err.device, dtype=err.dtype)
-        if loss_type == "huber":
-            loss_map = torch.where(
-                err < delta_t,
-                0.5 * err.square(),
-                delta_t * (err - 0.5 * delta_t),
-            )
-        else:
-            loss_map = torch.where(
-                err < delta_t,
-                0.5 * err.square() / delta_t,
-                err - 0.5 * delta_t,
-            )
-    else:
-        logger.warning(f"Unknown loss_type={loss_type!r}; falling back to mse")
-        loss_map = F.mse_loss(pred_f, target_f, reduction="none")
-
-    return loss_map.view(loss_map.shape[0], -1).mean(dim=1)
-
-
-def compute_grad_norm(parameters) -> float:
-    total_sq = 0.0
-    for p in parameters:
-        if p.grad is None:
-            continue
-        grad = p.grad.detach()
-        if not torch.isfinite(grad).all():
-            return float("inf")
-        param_norm = grad.float().norm(2).item()
-        total_sq += param_norm * param_norm
-    return total_sq ** 0.5
-
-
-def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: float = 0.0,
-                        weight_cap_ratio: float = 0.0):
-    """根据 scheme 返回每样本的 loss 权重 (B,)。
-
-    Flow Matching CONST 调度下：alpha_t = 1 - t，sigma_t = t；SNR(t) = ((1-t)/t)^2
-
-    scheme:
-      - "none":          全 1 权重
-      - "min_snr":       w = min(gamma / SNR, 1)，下调"几乎无噪声/高 SNR"的简单步
-      - "max_snr_inv":   w = min(SNR / gamma, 1)，下调极高噪声/低 SNR 步（少用）
-      - "logit_normal":  按 logit-normal 概率密度的倒数加权（debias 采样偏置）
-      - "sigma_sqrt":    w = sqrt(sigma) = sqrt(t)，缓解 t→0 处梯度爆炸
-      - "sigma_sqrt_sd3":SD3 论文 Eq.6 原始 σ^-2 权重；max=1000，**仅用于大 batch (>=64)**。
-                         小 batch + Prodigy 会因单样本主导导致 d 估计崩坏（不学习）。
-                         小 batch 想要细节强化请用 "detail_inv_t" 或 "cosmap"。
-      - "detail_inv_t":  w = 1/t，clamp 到 [1, 5]；这是一个温和的细节端强化，配合
-                         weight_cap_ratio (默认 5) 时单 batch 内 max/min 比 ≤ 5×。
-                         小 batch + Prodigy 兼容，是 sigma_sqrt_sd3 的实用替代。
-      - "cosmap":        SD3 cosmap weighting，对中间 t 更友好（max/min ≈ 1.81×）
-
-    weight_cap_ratio: 单个 batch 内最大权重 / 最小权重的硬上限。0=禁用。
-                       建议小 batch 训练设 5-10，避免单样本主导破坏 Prodigy 的 d 估计。
-    """
-    scheme = (scheme or "none").lower()
-    if scheme == "none":
-        return torch.ones_like(t)
-
-    eps = 1e-4
-    t_c = t.clamp(eps, 1 - eps)
-
-    if scheme == "min_snr":
-        if min_snr_gamma <= 0:
-            return torch.ones_like(t)
-        snr = ((1 - t_c) / t_c) ** 2
-        w = torch.minimum(float(min_snr_gamma) / snr, torch.ones_like(t_c))
-    elif scheme == "max_snr_inv":
-        if min_snr_gamma <= 0:
-            return torch.ones_like(t)
-        snr = ((1 - t_c) / t_c) ** 2
-        w = torch.minimum(snr / float(min_snr_gamma), torch.ones_like(t_c))
-    elif scheme == "logit_normal":
-        w = (t_c * (1 - t_c)).clamp(min=eps)
-    elif scheme == "sigma_sqrt":
-        # 【遗留】这是 sqrt(t)，不是 SD3 论文 Eq.6 的 sigma^-2。
-        w = t_c.sqrt()
-    elif scheme == "sigma_sqrt_sd3":
-        # SD3 paper Eq. 6: w(sigma) = sigma^-2
-        # ⚠️ 仅适合大 batch (>=64)。小 batch + Prodigy 会让单样本独占 loss → d 估计崩坏。
-        w = (t_c ** -2).clamp(max=1000.0)
-    elif scheme == "detail_inv_t":
-        # 温和细节端强化：w = 1/t 但 clamp 到 [1, 5]；与小 batch + Prodigy 兼容。
-        w = (1.0 / t_c).clamp(min=1.0, max=5.0)
-    elif scheme == "cosmap":
-        bot = 1 - 2 * t_c + 2 * t_c ** 2
-        w = 2.0 / (math.pi * bot)
-    else:
-        return torch.ones_like(t)
-
-    # batch 内 max/min 比上限：防止单样本主导（破坏 Prodigy d 估计）。
-    if weight_cap_ratio and weight_cap_ratio > 1.0:
-        w_min = w.min().clamp(min=eps)
-        w_max_allowed = w_min * float(weight_cap_ratio)
-        w = w.clamp(max=w_max_allowed)
-
-    return w
-
-
-def collate_fn(batch):
-    """DataLoader collate"""
-    shapes = [tuple(b["pixel_values"].shape) for b in batch]
-    if len(set(shapes)) > 1:
-        # 诊断信息：BucketBatchSampler 应该已按 bucket 分组，出现混合尺寸说明分桶失效
-        details = [
-            f"  - {b.get('image', '?')}: shape={tuple(b['pixel_values'].shape)}"
-            for b in batch
-        ]
-        raise RuntimeError(
-            "[collate_fn] 同一 batch 出现不同尺寸张量，BucketBatchSampler 分桶失效。\n"
-            "Batch 内容:\n" + "\n".join(details)
-        )
-    pixels = torch.stack([b["pixel_values"] for b in batch])
-    captions = [b["caption"] for b in batch]
-    images = [b.get("image", "") for b in batch]
-    return {"pixel_values": pixels, "captions": captions, "images": images}
-
-
-def collate_fn_cached(batch):
-    """DataLoader collate for cached latents"""
-    shapes = [tuple(b["latent"].shape) for b in batch]
-    if len(set(shapes)) > 1:
-        details = [
-            f"  - {b.get('image', '?')}: latent_shape={tuple(b['latent'].shape)}"
-            for b in batch
-        ]
-        raise RuntimeError(
-            "[collate_fn_cached] 同一 batch 出现不同 latent 尺寸，BucketBatchSampler 分桶失效。\n"
-            "Batch 内容:\n" + "\n".join(details)
-        )
-    latents = torch.stack([b["latent"] for b in batch])
-    captions = [b["caption"] for b in batch]
-    images = [b.get("image", "") for b in batch]
-    return {"latents": latents, "captions": captions, "images": images}
+from trainer.text_encode import (
+    _parse_weighted_tag,
+    _build_qwen_text_from_prompt,
+    encode_qwen,
+    tokenize_t5_weighted,
+)
+from trainer.sampling import (
+    _time_snr_shift,
+    _flow_sigmas_simple,
+    _default_noise_sampler,
+    _sample_er_sde_const_x0,
+    sample_image,
+)
+from trainer.objective import (
+    TimestepConfig,
+    NoiseConfig,
+    LossConfig,
+    TrainingObjectiveConfig,
+    build_training_objective_config,
+    sample_t,
+    apply_timestep_schedule_shift,
+    AdaptiveTimestepSampler,
+    make_noise,
+    make_noise_from_config,
+    _huber_delta_for_t,
+    per_sample_loss,
+    per_sample_highfreq_loss,
+    adaptive_timestep_metric_signal,
+    compute_loss_weight,
+    apply_loss_weighting,
+    compute_grad_norm,
+    forward_with_optional_checkpoint,
+)
+from trainer.lora import LoRALayer, LoKrLayer, LoRALinear, LoRAInjector
+from trainer.data import (
+    BucketManager,
+    ImageDataset,
+    RepeatDataset,
+    MergedDataset,
+    BucketBatchSampler,
+    CachedLatentDataset,
+    collate_fn,
+    collate_fn_cached,
+)
+from trainer.checkpoint import (
+    _strip_prefixes,
+    _pick_best_prefix_remap,
+    _load_safetensors_state_dict,
+    resolve_path_best_effort,
+    normalize_resume_paths,
+    _load_weights_best_effort,
+    save_training_state,
+    load_training_state,
+)
+from trainer.models import (
+    find_diffusion_pipe_root,
+    load_module_from_path,
+    ensure_models_namespace,
+    load_anima_model,
+    load_vae,
+    load_text_encoders,
+)
+from trainer.config import (
+    load_yaml_config,
+    apply_yaml_config,
+)
 
 
 # ============================================================================
@@ -2889,10 +274,26 @@ def parse_args():
     p.add_argument("--lr-scheduler-eta-min", type=float, default=0.0, help="cosine/cosine_with_restart: 最小学习率")
     p.add_argument("--weight-decay", type=float, default=0.01, help="AdamW 权重衰减 (L2 正则, 0=禁用)")
     p.add_argument("--grad-clip-max-norm", type=float, default=1.0, help="梯度裁剪最大范数 (0=禁用；ProdigyPlus 推荐设 0)")
-    p.add_argument("--resolution", type=int, default=1024)
+    p.add_argument("--resolution", type=int, default=1024,
+                   help="ARB 分桶的 base 边长（桶围着 base² 面积 ±10% 造）")
+    p.add_argument("--min-bucket-reso", type=int, default=512,
+                   help="ARB 单维下限（小于此的边长不会作为桶候选；默认 512）")
+    p.add_argument("--max-bucket-reso", type=int, default=2048,
+                   help="ARB 单维上限（大于此的边长不会作为桶候选；1024 base 默认 2048，"
+                        "1536 base 想要全 AR=2.0 支持需要 2240+）")
+    p.add_argument("--bucket-reso-steps", type=int, default=64,
+                   help="ARB 桶的边长步长（默认 64；VAE 8× + patch 2× 要求是 16 的倍数，64 安全）")
+    p.add_argument("--bucket-drop-last", action="store_true",
+                   help="ARB 分桶时，每个桶里不足 batch_size 的余数图片是否丢弃。"
+                        "默认 False —— 不丢弃，余数桶产生小 batch，保证每张图每 epoch 1 次曝光。"
+                        "显式传该 flag 恢复旧行为（丢弃残缺桶）。")
+    p.add_argument("--max-img-h", type=int, default=0,
+                   help="RoPE 位置嵌入支持的最大单维（latent 单位 = image / 8）。0=自动从 "
+                        "max_bucket_reso 推算并兜底到 240。preview3 训练在 240 = 120 patches，"
+                        "1536 base 训练需要 >= 272 (image 2176)，建议 288。")
+    p.add_argument("--max-img-w", type=int, default=0, help="同 max_img_h，宽度方向。")
     p.add_argument("--mixed-precision", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--grad-checkpoint", action="store_true", help="启用梯度检查点减少显存")
-    p.add_argument("--xformers", action="store_true", help="启用 xformers memory efficient attention")
     p.add_argument("--max-steps", type=int, default=0, help="最大训练步数 (0=无限制)")
     p.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
 
@@ -2914,6 +315,26 @@ def parse_args():
     p.add_argument("--lora-alpha", type=float, default=32.0)
     p.add_argument("--lora-dropout", type=float, default=0.0)
     p.add_argument("--lokr-factor", type=int, default=8)
+    p.add_argument("--lora-variant", choices=["base", "dora", "tlora"], default="base",
+                   help="Adapter variant. 'dora' enables LyCORIS/ComfyUI-compatible DoRA-LoKr. "
+                        "'tlora' enables timestep-dependent rank mask (arxiv:2507.05964); "
+                        "ComfyUI 推理需 bghira/ComfyUI-T-LoRA。")
+    # T-LoRA 参数（仅 lora_variant=tlora 时生效）
+    p.add_argument("--tlora-rmin-ratio", type=float, default=0.5,
+                   help="T-LoRA r_min 占 r 的比例。默认 0.5（论文推荐）。")
+    p.add_argument("--tlora-alpha", type=float, default=1.0,
+                   help="T-LoRA rank-schedule 幂律指数（alpha=1 即论文线性 schedule）。")
+    p.add_argument("--tlora-init", choices=["ortho", "default"], default="ortho",
+                   help="T-LoRA 初始化：ortho=SVD-based Ortho-LoRA（论文方案）；default=kaiming+zeros（仅 mask）。")
+    p.add_argument("--tlora-lokr-experimental", action="store_true",
+                   help="允许 lora_variant=tlora 与 lora_type=lokr 组合（实验性，论文未覆盖；"
+                        "保存的 checkpoint 在 ComfyUI 中退化为标准 LoKr）。")
+    p.add_argument("--tlora-lokr-ortho-init", action="store_true",
+                   help="LoKr+T-LoRA 时启用 (w2_a, w2_b) 上的 Ortho 初始化（启发式扩展）。")
+    p.add_argument("--dora-export-mode", choices=["native", "diff", "merged_model"], default="native",
+                   help="Export mode: native LoKr + .dora_scale, exact ComfyUI .diff, or full merged transformer safetensors.")
+    p.add_argument("--lora-targets", default=None,
+                   help="逗号分隔的 Linear 模块名片段；默认使用 q/k/v/output_proj 和 mlp.layer1/2。")
     p.add_argument("--lora-exclude-prefixes", default=None,
                    help="逗号分隔，命中前缀的 Linear 不被注入 LoRA/LoKr，例如 'llm_adapter.'。默认空（与 base 一致）")
     p.add_argument("--resume-lora", default="", help="从已有 LoRA 继续训练（safetensors 路径）")
@@ -2959,17 +380,63 @@ def parse_args():
     p.add_argument("--interactive", action="store_true", help="交互模式，提示输入缺失参数")
     p.add_argument("--use-t5-token-weights", action="store_true", default=True)
     p.add_argument("--no-t5-token-weights", dest="use_t5_token_weights", action="store_false")
+    p.add_argument("--flow-shift", type=float, default=3.0, help="logit/timestep shift used by shifted timestep samplers")
+    p.add_argument("--timestep-sampling", default="logit_normal",
+                   choices=["logit_normal", "uniform", "logit_normal_low", "mode", "mixed_uniform_low", "mixed_uniform_logit"],
+                   help="timestep sampling distribution")
     p.add_argument("--timestep-mix-low-prob", type=float, default=0.25, help="mixed_uniform_low 中低噪声样本比例")
+    p.add_argument("--adaptive-timestep", action="store_true",
+                   help="启用保守自适应 timestep：按 per-timestep raw loss 重采样，不改变 loss 权重。")
+    p.add_argument("--adaptive-timestep-metric", choices=["raw", "highfreq", "mixed", "entropy_rate"], default="raw",
+                   help="自适应 timestep 的统计信号：raw / highfreq / mixed / entropy_rate "
+                        "（entropy_rate = InfoNoise 风格 ρ(t)/w(t)，配合 --adaptive-timestep-low-noise-gate 使用）。")
+    p.add_argument("--adaptive-timestep-low-noise-gate", action="store_true",
+                   help="InfoNoise 低噪闸门 g(t) = t^n/(t^n + c^n)；entropy_rate 模式专用。")
+    p.add_argument("--adaptive-timestep-gate-n", type=float, default=3.0,
+                   help="InfoNoise 闸门指数 n（论文默认 3）。")
+    p.add_argument("--adaptive-timestep-gate-c", type=float, default=0.05,
+                   help="InfoNoise 闸门拐点 c（t 远小于 c 时压制采样）。")
+    p.add_argument("--adaptive-timestep-highfreq-weight", type=float, default=0.25,
+                   help="adaptive_timestep_metric=mixed 时的高频 residual 权重。")
+    p.add_argument("--adaptive-timestep-bins", type=int, default=16, help="自适应 timestep loss 统计分桶数")
+    p.add_argument("--adaptive-timestep-ema-decay", type=float, default=0.95, help="自适应 timestep loss EMA 衰减")
+    p.add_argument("--adaptive-timestep-burn-in", type=int, default=160, help="开始重采样前的 warmup step 数")
+    p.add_argument("--adaptive-timestep-min-factor", type=float, default=0.5, help="分桶采样倍率下限")
+    p.add_argument("--adaptive-timestep-max-factor", type=float, default=2.0, help="分桶采样倍率上限")
+    p.add_argument("--adaptive-timestep-base-mix", type=float, default=0.25, help="每个 batch 保留基础采样的比例")
+    p.add_argument("--adaptive-timestep-candidate-mult", type=int, default=8, help="proposal-resampling 候选倍数")
     p.add_argument("--schedule-shift", type=float, default=1.0,
                    help="SD3 式 σ schedule shift（应用于所有 t 在噪声混合前）。1.0=不偏移；"
                         "1024 高分辨率训练 SD3 论文推荐 3.0；与 timestep_sampling 模式无关，对 uniform 也生效。")
     p.add_argument("--loss-type", default="mse", choices=["mse", "l2", "l1", "huber", "smooth_l1"], help="训练损失类型")
     p.add_argument("--huber-c", type=float, default=0.1, help="Huber/SmoothL1 切换阈值")
     p.add_argument("--huber-schedule", default="constant", choices=["constant", "snr", "sigma"], help="Huber 阈值随 timestep 的调度")
+    p.add_argument("--loss-weighting-scheme", default="none",
+                   choices=["none", "min_snr", "max_snr_inv", "logit_normal", "sigma_sqrt", "sigma_sqrt_sd3", "detail_inv_t", "cosmap"],
+                   help="per-sample loss weighting scheme")
+    p.add_argument("--min-snr-gamma", type=float, default=0.0, help="gamma used by min_snr/max_snr_inv weighting")
     p.add_argument("--weight-cap-ratio", type=float, default=5.0,
                    help="loss 加权时单 batch 内 max/min 比上限。0=禁用；推荐 5-10（小 batch + Prodigy）。"
                         "防止 detail_inv_t / sigma_sqrt_sd3 等激进权重让单样本主导 batch loss → 破坏 Prodigy 的 d 估计。")
     p.add_argument("--noise-offset-min", type=float, default=0.0, help="随机 noise_offset 的下限；仅 random_strength=true 时生效")
+
+    p.add_argument("--noise-offset", type=float, default=0.0, help="low-frequency noise offset strength")
+    p.add_argument("--noise-offset-random-strength", action="store_true", help="randomize noise_offset strength per sample")
+    p.add_argument("--pyramid-noise-iterations", type=int, default=0, help="number of multires/pyramid noise levels")
+    p.add_argument("--pyramid-noise-discount", type=float, default=0.3, help="pyramid noise decay per level")
+    p.add_argument("--caption-dropout-rate", type=float, default=0.0, help="drop whole captions with this probability")
+
+    # 风格预设：在 YAML 顶层设 `style_profile: hazy` 或命令行 `--style-profile hazy`
+    # 会按预设覆盖一组相关参数（loss_weighting_scheme / detail_inv_t_* /
+    # timestep_sampling / mix_low_prob / adaptive_*）。详见 trainer/config.py
+    # 的 STYLE_PROFILES。YAML 里显式写的字段优先级 > 预设。
+    p.add_argument("--style-profile", default="",
+                   choices=["", "sharp", "hazy", "balanced"],
+                   help="一行切换画风预设：sharp / hazy / balanced（详见 STYLE_PROFILES）")
+    p.add_argument("--detail-inv-t-min", type=float, default=1.0,
+                   help="detail_inv_t 加权下限（默认 1.0）")
+    p.add_argument("--detail-inv-t-max", type=float, default=5.0,
+                   help="detail_inv_t 加权上限（默认 5.0；hazy 画风可降到 ~3.0）")
 
     return p.parse_args()
 
@@ -3100,6 +567,27 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    # ★ TF32 优化：在 Ampere/Hopper (A100/H100/RTX 30+/40+) GPU 上对 fp32 矩阵乘法
+    # 启用 TensorFloat-32，单乘 ~8× 加速 fp32 路径，bf16 路径不受影响。
+    # 训练里 fp32 残留路径主要在 loss 计算和某些 reduce 上，开 high 是安全的零代价收益。
+    # 旧 GPU（V100、Turing）这些调用是 no-op，不会出错。
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        # 显式开 matmul + cudnn 的 TF32 flag。`high` 已经等价启用 matmul TF32，但
+        # PyTorch 在不同小版本里的默认值会漂移；写出来更稳定。cudnn 那个 flag 对 conv 也生效，
+        # 本训练里基本不走 conv（仅 VAE encode 阶段），不过开着也无害。
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # SDPA 是 PyTorch 2.x 内置的注意力实现，会在 Flash / memory-efficient / math
+        # 三个 backend 中自动选最优。Anima/Cosmos 的 attention 算子通过 F.scaled_dot_product_attention
+        # 调用它，所以这里不需要手动启用 xformers；过往版本 `--xformers` 开关在 Anima 上
+        # 实际上从未生效（钩子名不匹配），已经移除。
+        logger.info("Attention backend: PyTorch SDPA (auto-selects flash/memory-efficient/math)")
+    # 注意：cudnn.benchmark 这里**故意不开启**。
+    # 理由：ARB 分桶导致 batch 之间 conv shape 在多个 bucket 之间切换，
+    # 每个新 shape 都触发 ~1-5 秒的算法 profiling。短训练（几百-几千步）下
+    # profiling 开销难以摊销，可能反而变慢；只有 shape 完全固定且训练很长才推荐开。
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
 
@@ -3162,12 +650,23 @@ def main():
     normalize_resume_paths(args, output_dir)
 
     # 加载模型
+    # 自动确定 max_img_h / max_img_w（RoPE 位置嵌入支持的单维上限）：
+    #   - 用户在 YAML / CLI 显式设了 → 用用户给的
+    #   - 否则按 max_bucket_reso 推算（latent 单位 = image / 8）
+    #   - 历史最小值 240（= 1920 image 单维 = 120 patches）作为兜底
+    # ARB 桶单维最大 = max_bucket_reso；要求 max_img_h >= max_bucket_reso / 8。
+    # 留 8 个 latent 的余量 + 偶数对齐（patch_spatial=2）。
+    _user_max_h = getattr(args, "max_img_h", 0)
+    _user_max_w = getattr(args, "max_img_w", 0)
+    _bucket_max = int(getattr(args, "max_bucket_reso", 2048) or 2048)
+    _auto_max = max(240, ((_bucket_max // 8) + 8 + 1) // 2 * 2)
+    max_img_h = int(_user_max_h) if _user_max_h and int(_user_max_h) > 0 else _auto_max
+    max_img_w = int(_user_max_w) if _user_max_w and int(_user_max_w) > 0 else _auto_max
     logger.info("加载 Transformer...")
-    model = load_anima_model(args.transformer, device, dtype, repo_root)
-
-    # 启用 xformers
-    if args.xformers:
-        enable_xformers(model)
+    model = load_anima_model(
+        args.transformer, device, dtype, repo_root,
+        max_img_h=max_img_h, max_img_w=max_img_w,
+    )
 
     logger.info("加载 VAE...")
     vae = load_vae(args.vae, device, dtype, repo_root)
@@ -3178,7 +677,13 @@ def main():
     )
 
     # 注入 LoRA
-    logger.info(f"注入 {args.lora_type.upper()}...")
+    lora_variant = str(getattr(args, "lora_variant", "base") or "base").lower()
+    dora_export_mode = str(getattr(args, "dora_export_mode", "native") or "native").lower()
+    if lora_variant == "dora" and args.lora_type != "lokr":
+        raise ValueError("lora_variant='dora' requires lora_type='lokr'")
+    # T-LoRA × LoKr 的组合校验交给 LoRAInjector.__init__（带详细错误提示）；
+    # 这里只在标准 LoRA 路径下记录一行 info。
+    logger.info(f"注入 {args.lora_type.upper()} ({lora_variant})...")
     # exclude_prefixes 语义：
     #   - None / 未设置  → 用 DEFAULT_EXCLUDE_PREFIXES（默认排除 llm_adapter.*，与 Anima 官方建议一致）
     #   - 字符串/列表    → 完全替换默认值（例如 [] 表示一个不排除）
@@ -3197,11 +702,24 @@ def main():
     if raw_include_patterns is not None:
         injector_kwargs["include_patterns"] = list(raw_include_patterns)
 
+    raw_targets = getattr(args, "lora_targets", None)
+    if raw_targets is not None:
+        if isinstance(raw_targets, str):
+            raw_targets = [s.strip() for s in raw_targets.split(",") if s.strip()]
+        else:
+            raw_targets = [str(s).strip() for s in raw_targets if str(s).strip()]
+        if raw_targets:
+            injector_kwargs["targets"] = raw_targets
+            logger.info("LoRA targets: %s", ", ".join(raw_targets))
+
     # 模块级 rank/lr 控制
     reg_dims = getattr(args, "lora_reg_dims", None)
+    reg_alphas = getattr(args, "lora_reg_alphas", None)
     reg_lrs = getattr(args, "lora_reg_lrs", None)
     if reg_dims:
         injector_kwargs["reg_dims"] = dict(reg_dims)
+    if reg_alphas:
+        injector_kwargs["reg_alphas"] = dict(reg_alphas)
     if reg_lrs:
         injector_kwargs["reg_lrs"] = dict(reg_lrs)
 
@@ -3214,6 +732,13 @@ def main():
         rank_dropout=float(getattr(args, "rank_dropout", 0.0) or 0.0),
         module_dropout=float(getattr(args, "module_dropout", 0.0) or 0.0),
         loraplus_lr_ratio=float(getattr(args, "loraplus_lr_ratio", 1.0) or 1.0),
+        lora_variant=lora_variant,
+        dora_export_mode=dora_export_mode,
+        tlora_rmin_ratio=float(getattr(args, "tlora_rmin_ratio", 0.5) or 0.5),
+        tlora_alpha=float(getattr(args, "tlora_alpha", 1.0) or 1.0),
+        tlora_init=str(getattr(args, "tlora_init", "ortho") or "ortho"),
+        tlora_lokr_experimental=bool(getattr(args, "tlora_lokr_experimental", False)),
+        tlora_lokr_ortho_init=bool(getattr(args, "tlora_lokr_ortho_init", False)),
         **injector_kwargs,
     )
     injector.inject(model)
@@ -3224,7 +749,44 @@ def main():
         logger.info(f"将从已有 LoRA 继续训练: {args.resume_lora}")
 
     # 数据集
-    bucket_mgr = BucketManager(args.resolution)
+    bucket_min_reso = int(getattr(args, "min_bucket_reso", 512) or 512)
+    bucket_max_reso = int(getattr(args, "max_bucket_reso", 2048) or 2048)
+    bucket_step = int(getattr(args, "bucket_reso_steps", 64) or 64)
+    bucket_mgr = BucketManager(
+        base_reso=args.resolution,
+        min_reso=bucket_min_reso,
+        max_reso=bucket_max_reso,
+        step=bucket_step,
+    )
+    logger.info(
+        "[BucketManager] base=%d, min=%d, max=%d, step=%d, 桶数=%d",
+        args.resolution, bucket_min_reso, bucket_max_reso, bucket_step,
+        len(bucket_mgr.buckets),
+    )
+
+    # 模型 RoPE 能容纳的最大单维（image pixels）= max_img_h * 8。
+    # 在训练第一步崩溃之前，提前 fail-fast：把所有超出 RoPE 容量的桶过滤掉，
+    # 并在控制台 emit 一个清楚的错误说明 —— 否则用户会看到一个看起来像随机崩溃
+    # 的 AssertionError 出现在 forward 里。
+    rope_max_image_dim = max_img_h * 8  # max_img_h 在 latent 单位（已经包含 patch_spatial=2 的余量）
+    bad_buckets = [(bw, bh) for (bw, bh) in bucket_mgr.buckets
+                   if bw > rope_max_image_dim or bh > rope_max_image_dim]
+    if bad_buckets:
+        good = [b for b in bucket_mgr.buckets if b not in bad_buckets]
+        if not good:
+            raise RuntimeError(
+                f"全部 {len(bucket_mgr.buckets)} 个 ARB 桶都超出了模型 RoPE 单维上限 "
+                f"{rope_max_image_dim} image pixels。\n"
+                f"解决方案：提高 max_img_h / max_img_w（latent 单位），或者降低 max_bucket_reso。\n"
+                f"例如 resolution=1536 + AR=2.0 需要 max_img_h >= 272（image 2176），建议 288。"
+            )
+        logger.warning(
+            "[BucketManager] 检测到 %d 个桶超出 RoPE 单维上限 %d image pixels（max_img_h=%d）："
+            "%s ... 已从桶集合中过滤。如需保留这些桶，请提高 YAML 里的 max_img_h / max_img_w。",
+            len(bad_buckets), rope_max_image_dim, max_img_h,
+            ", ".join(f"{w}x{h}" for w, h in bad_buckets[:5]),
+        )
+        bucket_mgr.buckets = good
     base_dataset = ImageDataset(
         args.data_dir, args.resolution, bucket_mgr,
         shuffle_caption=args.shuffle_caption,
@@ -3292,29 +854,38 @@ def main():
         logger.warning("num_workers > 0 在 Windows 上容易崩溃：已强制设为 0（避免多进程 spawn 问题）")
         args.num_workers = 0
 
+    # num_workers>0 时启用 worker 持久化与适度预取，省每 epoch 的 spawn 开销
+    _loader_kwargs = {}
+    if args.num_workers > 0:
+        _loader_kwargs["persistent_workers"] = True
+        _loader_kwargs["prefetch_factor"] = 2
+
+    _bucket_drop_last = bool(getattr(args, "bucket_drop_last", False))
     if use_cached:
         batch_sampler = BucketBatchSampler(
             dataset, batch_size=args.batch_size,
-            drop_last=True, shuffle=True,
+            drop_last=_bucket_drop_last, shuffle=True,
             seed=getattr(args, "seed", 42),
         )
         dataloader = DataLoader(
             dataset, batch_sampler=batch_sampler,
             collate_fn=collate_fn_cached,
             num_workers=args.num_workers,
+            **_loader_kwargs,
         )
     else:
         # Use BucketBatchSampler so same-resolution images are always batched together.
         # Without this, torch.stack fails when ARB produces tensors of different shapes.
         batch_sampler = BucketBatchSampler(
             dataset, batch_size=args.batch_size,
-            drop_last=True, shuffle=True,
+            drop_last=_bucket_drop_last, shuffle=True,
             seed=getattr(args, "seed", 42),
         )
         dataloader = DataLoader(
             dataset, batch_sampler=batch_sampler,
             collate_fn=collate_fn,
             num_workers=args.num_workers,
+            **_loader_kwargs,
         )
 
     # 训练前自检：VAE encode->decode 循环（快速排除 VAE/scale/shape 问题）
@@ -3332,6 +903,20 @@ def main():
     except Exception as e:
         logger.warning(f"VAE roundtrip 自检失败（若 sample 仍是噪点，请优先修这个）: {e}")
 
+    # ── VAE CPU offload（仅在 cache_latents=True 时）────────────────────────
+    # latent 缓存建好后，训练主循环再也不调用 vae.model（取 batch 时直接读 npz）。
+    # 把 VAE 主网络挪到 CPU 上省 1-2GB 显存；sample_image 用到时再 .to(device)。
+    # mean / std 张量小（fp32 16 channels × 2 = 128 bytes 量级），保持在 GPU 上没问题。
+    vae_offloaded_to_cpu = False
+    if use_cached:
+        try:
+            vae.model = vae.model.cpu()
+            torch.cuda.empty_cache()
+            vae_offloaded_to_cpu = True
+            logger.info("VAE 主网络已 offload 到 CPU（cache_latents=True 后训练循环不再使用 VAE）")
+        except Exception as _e:
+            logger.warning(f"VAE CPU offload 失败（忽略，继续训练）: {_e}")
+
     # 优化器
     weight_decay = float(getattr(args, "weight_decay", 0.01) or 0.0)
     opt_type = getattr(args, "optimizer_type", "adamw")
@@ -3343,6 +928,7 @@ def main():
     # 获取参数组（支持 LoRA+、模块级 lr）
     param_groups = injector.get_param_groups(
         weight_decay,
+        base_lr=args.lr,
         loraplus_lr_ratio=float(getattr(args, "loraplus_lr_ratio", 1.0) or 1.0),
     )
 
@@ -3400,66 +986,6 @@ def main():
     trainable_params = []
     for group in optimizer.param_groups:
         trainable_params.extend(group["params"])
-
-    # ★ v5 ⑤ LoRA EMA 初始化
-    # 构造 (name, param) 列表，供 EMA 内部用 id(param) 索引。命名仅用于调试。
-    # 我们直接在 model.named_parameters() 中筛选 requires_grad=True 的参数。
-    named_trainable_params = [
-        (n, p) for n, p in model.named_parameters() if p.requires_grad
-    ]
-    ema_decay = float(getattr(args, "lora_ema_decay", 0.0) or 0.0)
-    lora_ema = None
-    if ema_decay > 0:
-        if ema_decay >= 1.0:
-            logger.warning(f"[ema] decay={ema_decay} >=1，禁用 EMA。合法范围 (0, 1)，推荐 0.999-0.9999。")
-        else:
-            lora_ema = LoRAEmaShadow(named_trainable_params, decay=ema_decay)
-            logger.info(
-                f"[ema] 启用 LoRA EMA，decay={ema_decay} "
-                f"(shadow {len(lora_ema.shadow)} 个张量；采样/保存时自动切换到 EMA 副本)"
-            )
-
-    def _ema_ctx():
-        """采样/保存时把当前 LoRA 权重临时换成 EMA 副本。未启用 EMA 时返回 nullcontext。"""
-        if lora_ema is not None:
-            return lora_ema.applied(named_trainable_params)
-        return nullcontext()
-
-    # ★ v5 ⑦ t-binned LR group：按 t 区间冻结不同模块的梯度
-    # 启用时，需要把每个 LoRA 参数按所属模块名归类，便于按 t_mean 选择性 zero_grad。
-    t_binned_enabled = bool(getattr(args, "t_binned_module_groups", False))
-    param_category = {}  # id(param) -> str: "mlp" / "self_attn" / "cross_attn" / "llm_adapter" / "other"
-    if t_binned_enabled:
-        for module_name, lora_mod in injector.injected.items():
-            # 按 module_name 做粗分类。用 dotted segment 完整匹配避免子串误判
-            # （例如某层名里同时含 "mlp" 与 "cross_attn" 时，子串顺序会决定结果，不稳健）。
-            segs = set(module_name.split("."))
-            if "llm_adapter" in segs or any("llm_adapter" in s for s in segs):
-                cat = "llm_adapter"
-            elif "mlp" in segs or any(s.startswith("mlp") for s in segs):
-                cat = "mlp"
-            elif "cross_attn" in segs or any("cross_attn" in s for s in segs):
-                cat = "cross_attn"
-            elif "self_attn" in segs or any("self_attn" in s for s in segs):
-                cat = "self_attn"
-            else:
-                cat = "other"
-            for p in lora_mod.parameters():
-                if p.requires_grad:
-                    param_category[id(p)] = cat
-        # 诊断：分类后每组参数数量
-        from collections import Counter
-        cat_count = Counter(param_category.values())
-        logger.info(
-            f"[t_binned] 启用 t-binned LR group；模块分类参数数: "
-            f"{dict(cat_count)} "
-            f"(t<0.3 时仅训练 mlp+llm_adapter+other；t>0.6 时仅训练 self_attn+cross_attn+other)"
-        )
-        if int(getattr(args, "grad_accum", 1) or 1) > 1:
-            logger.info(
-                "[t_binned] grad_accum>1 时启用了 pre-backward snapshot 机制，"
-                "确保每个微 batch 的 t 仅作用于自己的贡献。"
-            )
 
     # 计算总步数
     try:
@@ -3568,6 +1094,7 @@ def main():
     
     # Ctrl+C 信号处理：保存状态后退出
     interrupted = False
+    current_epoch = start_epoch
     def signal_handler(sig, frame):
         nonlocal interrupted
         if interrupted:
@@ -3585,18 +1112,15 @@ def main():
                 monitor_data = get_state()
             except Exception:
                 pass
-        with _ema_ctx():  # v5 ⑤
-            save_training_state(state_path, injector, optimizer, current_epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
-            # 同时保存 LoRA 权重
-            lora_path = output_dir / f"{args.output_name}_interrupted_step{global_step}.safetensors"
-            injector.save(lora_path)
+        save_training_state(state_path, injector, optimizer, current_epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
+        # 同时保存 LoRA 权重
+        lora_path = output_dir / f"{args.output_name}_interrupted_step{global_step}.safetensors"
+        injector.save(lora_path, model=model)
         emit(f"已保存！下次使用 --resume-state \"{state_path}\" 继续训练")
         sys.exit(0)
     
     import signal
     signal.signal(signal.SIGINT, signal_handler)
-    
-    current_epoch = start_epoch
     
     # 确保优化器在训练模式
     if hasattr(optimizer, "train"):
@@ -3610,6 +1134,73 @@ def main():
     if not sample_prompts and args.sample_prompt:
         sample_prompts = [args.sample_prompt]
     sample_prompt_idx = 0
+
+    def _sample_with_vae_swap(*args_pos, **kwargs_pos):
+        """sample_image 的薄包装：如果 VAE 被 offload 到 CPU 了，临时搬回 GPU 出图，
+        出完再搬回去，省显存。否则直接透传。"""
+        if vae_offloaded_to_cpu:
+            try:
+                vae.model = vae.model.to(device=device, dtype=dtype)
+                return sample_image(*args_pos, **kwargs_pos)
+            finally:
+                try:
+                    vae.model = vae.model.cpu()
+                    torch.cuda.empty_cache()
+                except Exception as _e:
+                    logger.warning(f"VAE 出图后回 CPU 失败（忽略）: {_e}")
+        return sample_image(*args_pos, **kwargs_pos)
+
+    objective_cfg = build_training_objective_config(args)
+
+    # InfoNoise entropy_rate 模式需要在 .factors() 里除以当前 loss-weighting w(t)。
+    # 构造一个轻量闭包，复用 trainer.objective.compute_loss_weight，参数从 objective_cfg.loss 取。
+    from trainer.objective import compute_loss_weight as _compute_loss_weight
+    _loss_cfg_for_weight = objective_cfg.loss
+
+    def _loss_weight_fn(t_tensor):
+        return _compute_loss_weight(
+            t_tensor.float(),
+            scheme=_loss_cfg_for_weight.weighting_scheme,
+            min_snr_gamma=_loss_cfg_for_weight.min_snr_gamma,
+            weight_cap_ratio=0.0,  # bin-level 估计不需要 batch-level cap
+            detail_inv_t_min=_loss_cfg_for_weight.detail_inv_t_min,
+            detail_inv_t_max=_loss_cfg_for_weight.detail_inv_t_max,
+        )
+
+    adaptive_ts = AdaptiveTimestepSampler(
+        enabled=bool(getattr(args, "adaptive_timestep", False)),
+        bins=int(getattr(args, "adaptive_timestep_bins", 16) or 16),
+        ema_decay=float(getattr(args, "adaptive_timestep_ema_decay", 0.95) or 0.95),
+        burn_in_steps=int(getattr(args, "adaptive_timestep_burn_in", 160) or 0),
+        min_factor=float(getattr(args, "adaptive_timestep_min_factor", 0.5) or 0.5),
+        max_factor=float(getattr(args, "adaptive_timestep_max_factor", 2.0) or 2.0),
+        base_mix=float(getattr(args, "adaptive_timestep_base_mix", 0.25) or 0.0),
+        candidate_mult=int(getattr(args, "adaptive_timestep_candidate_mult", 8) or 8),
+        metric=str(getattr(args, "adaptive_timestep_metric", "raw") or "raw"),
+        highfreq_weight=float(getattr(args, "adaptive_timestep_highfreq_weight", 0.25) or 0.0),
+        low_noise_gate=bool(getattr(args, "adaptive_timestep_low_noise_gate", False)),
+        gate_n=float(getattr(args, "adaptive_timestep_gate_n", 3.0) or 3.0),
+        gate_c=float(getattr(args, "adaptive_timestep_gate_c", 0.05) or 0.05),
+        loss_weight_fn=_loss_weight_fn,
+    )
+    if adaptive_ts.enabled:
+        logger.info("[adaptive_timestep] enabled: %s", adaptive_ts.summary())
+    logger.info(
+        "[objective] timestep=%s flow_shift=%.3f schedule_shift=%.3f mix_low=%.3f "
+        "noise_offset=%.4f pyramid=%d discount=%.3f loss=%s huber=%s/%.3f weight=%s cap=%.3f",
+        objective_cfg.timestep.mode,
+        objective_cfg.timestep.flow_shift,
+        objective_cfg.timestep.schedule_shift,
+        objective_cfg.timestep.mix_low_prob,
+        objective_cfg.noise.offset,
+        objective_cfg.noise.pyramid_iterations,
+        objective_cfg.noise.pyramid_discount,
+        objective_cfg.loss.loss_type,
+        objective_cfg.loss.huber_schedule,
+        objective_cfg.loss.huber_c,
+        objective_cfg.loss.weighting_scheme,
+        objective_cfg.loss.weight_cap_ratio,
+    )
 
     def get_next_sample_prompt():
         """获取下一个采样提示词（轮换）"""
@@ -3638,7 +1229,7 @@ def main():
         for i, prompt in enumerate(sample_prompts[:3]):  # 最多测试 3 个
             if s_seed:
                 torch.manual_seed(s_seed + i)
-            img = sample_image(
+            img = _sample_with_vae_swap(
                 model, vae, qwen_model, qwen_tok, t5_tok,
                 prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
                 negative_prompt=(s_neg or None),
@@ -3646,6 +1237,7 @@ def main():
                 scheduler=s_sched,
                 device=device, dtype=dtype,
                 use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                injector=injector,
             )
             sample_path = sample_dir / f"step_0_baseline_{i}.png"
             img.save(sample_path)
@@ -3665,14 +1257,21 @@ def main():
         optimizer.train()
     model.train()
 
+    # 累积周期状态：当周期内任一 micro-batch 出现 NaN 时置 False。
+    # 旧实现是出 NaN 立即 `zero_grad()` —— 会抹掉同周期内之前已经累计好的梯度，
+    # 接着继续累计剩下的 micro-batch，最后用"半截"梯度调用 optimizer.step()。
+    # 新做法：保留已累计的梯度，但记号本周期"脏了"，到周期边界时整体丢弃这次 step。
+    accum_clean = True
+
     for epoch in range(start_epoch, args.epochs):
         current_epoch = epoch
         if hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_epoch"):
             dataloader.batch_sampler.set_epoch(epoch)
         for batch_idx, batch in enumerate(dataloader):
-            # 在累积周期开始时记录时间
+            # 在累积周期开始时记录时间 + 重置 clean 标志
             if batch_idx % args.grad_accum == 0:
                 step_start_time = time.perf_counter()
+                accum_clean = True
 
             captions = batch["captions"]
 
@@ -3713,139 +1312,52 @@ def main():
                     cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
 
             # Flow Matching：t 采样、噪声生成、目标计算
-            ts_mode = str(getattr(args, "timestep_sampling", "logit_normal") or "logit_normal")
-            f_shift = float(getattr(args, "flow_shift", 3.0) or 3.0)
-            mix_low_prob = float(getattr(args, "timestep_mix_low_prob", 0.25) or 0.0)
-            mix_extreme_prob = float(getattr(args, "timestep_mix_extreme_prob", 0.0) or 0.0)
-            t = sample_t(
+            ts_mode = objective_cfg.timestep.mode
+            f_shift = objective_cfg.timestep.flow_shift
+            mix_low_prob = objective_cfg.timestep.mix_low_prob
+            sched_shift = objective_cfg.timestep.schedule_shift
+            t = adaptive_ts.sample(
                 bs, device, mode=ts_mode, shift=f_shift,
-                mix_low_prob=mix_low_prob, mix_extreme_prob=mix_extreme_prob,
+                mix_low_prob=mix_low_prob, schedule_shift=sched_shift,
+                global_step=global_step,
             )
 
             # SD3 式 σ schedule shift：作用于所有模式的 t（含 uniform / mixed_*），
             # 把噪声混合用的 sigma 整体偏向高噪声端。1.0=禁用，向后兼容。
-            sched_shift = float(getattr(args, "schedule_shift", 1.0) or 1.0)
-            if sched_shift > 0 and abs(sched_shift - 1.0) > 1e-6:
-                t = (t * sched_shift) / (1 + (sched_shift - 1) * t)
-                t = t.clamp(1e-4, 1.0 - 1e-4)
+            t = apply_timestep_schedule_shift(t, sched_shift)
 
             t_exp = t.view(-1, 1, 1, 1, 1)
 
-            noise = make_noise(
-                latents,
-                noise_offset=float(getattr(args, "noise_offset", 0.0) or 0.0),
-                pyramid_iters=int(getattr(args, "pyramid_noise_iterations", 0) or 0),
-                pyramid_discount=float(getattr(args, "pyramid_noise_discount", 0.3) or 0.3),
-                random_offset_strength=bool(getattr(args, "noise_offset_random_strength", False)),
-                noise_offset_min=float(getattr(args, "noise_offset_min", 0.0) or 0.0),
-            )
-
-            # ★ v5 ④ Immiscible noise pairing
-            # batch（或 pool）内做 (latent, noise) 的 Hungarian 配对，把每个 latent 配到
-            # transport cost 最小的 noise。显著降低梯度方差，对小 batch + ProdigyPlus 收益最大。
-            # 注意：必须在 ip_noise_gamma 扰动之前做 pairing，否则随机扰动会让 pairing 不稳定。
-            immiscible_pool = int(getattr(args, "immiscible_pool_size", 0) or 0)
-            if immiscible_pool > 1 and bs > 1:
-                try:
-                    from scipy.optimize import linear_sum_assignment
-                    actual_pool = max(immiscible_pool, bs)
-                    if actual_pool > bs:
-                        # 扩展 pool：再采 (actual_pool - bs) 个噪声，与原 noise 拼起来
-                        extra_shape = list(latents.shape)
-                        extra_shape[0] = actual_pool - bs
-                        extra_latents_proxy = latents[:1].expand(actual_pool - bs, *latents.shape[1:]).contiguous()
-                        extra_noise = make_noise(
-                            extra_latents_proxy,
-                            noise_offset=float(getattr(args, "noise_offset", 0.0) or 0.0),
-                            pyramid_iters=int(getattr(args, "pyramid_noise_iterations", 0) or 0),
-                            pyramid_discount=float(getattr(args, "pyramid_noise_discount", 0.3) or 0.3),
-                            random_offset_strength=bool(getattr(args, "noise_offset_random_strength", False)),
-                            noise_offset_min=float(getattr(args, "noise_offset_min", 0.0) or 0.0),
-                        )
-                        pool_noise = torch.cat([noise, extra_noise], dim=0)
-                    else:
-                        pool_noise = noise
-                    # 用未扰动的 latents 做距离矩阵（fp32, flatten 到 (B, D) / (pool, D)）
-                    L = latents.detach().float().reshape(bs, -1)
-                    P = pool_noise.detach().float().reshape(pool_noise.shape[0], -1)
-                    # cdist 在大维度上较慢；按 sample 做能够避免一次性产生 (bs, pool, D) 张量
-                    dist = torch.cdist(L, P).cpu().numpy()
-                    row_ind, col_ind = linear_sum_assignment(dist)
-                    noise = pool_noise[col_ind]
-                except ImportError:
-                    logger.warning(
-                        "[immiscible] scipy 未安装，无法做 Hungarian 配对；本次回退到随机配对。"
-                        "pip install scipy 即可启用。"
-                    )
-                except Exception as _e:
-                    logger.warning(f"[immiscible] 配对失败，回退到随机配对: {_e}")
-
-            # ★ v5 ③ Input perturbation noise (ip_noise_gamma)
-            # 在 FM 噪声混合之前给 clean latents 加一个小高斯扰动，把每张训练图扩展成
-            # ε-邻域副本，扩大训练分布支持。对 60-100 张小数据集泛化提升最显著。
-            # 注意：target 必须基于扰动后的 latents（target = noise - latents_perturbed），
-            # 否则 v 预测目标和实际 x_t 不一致。
-            ip_gamma = float(getattr(args, "ip_noise_gamma", 0.0) or 0.0)
-            if ip_gamma > 0:
-                latents = latents + ip_gamma * torch.randn_like(latents)
+            noise = make_noise_from_config(latents, objective_cfg.noise)
 
             noisy = (1 - t_exp) * latents + t_exp * noise
             target = noise - latents
 
             # 前向
             pad_mask = torch.zeros(bs, 1, latents.shape[-2], latents.shape[-1], device=device, dtype=dtype)
-            with torch.autocast("cuda", dtype=dtype):
-                pred = forward_with_optional_checkpoint(
-                    model, noisy, t.view(-1, 1), cross, pad_mask,
-                    use_checkpoint=args.grad_checkpoint
-                )
-                # ★ 损失始终 fp32 计算（per-sample，便于按 t 加权）
-                per_sample = per_sample_loss(
-                    pred,
-                    target,
-                    loss_type=str(getattr(args, "loss_type", "mse") or "mse"),
-                    huber_c=float(getattr(args, "huber_c", 0.1) or 0.1),
-                    huber_schedule=str(getattr(args, "huber_schedule", "constant") or "constant"),
-                    t=t.float(),
-                )
-
-                w_scheme = str(getattr(args, "loss_weighting_scheme", "none") or "none")
-                if w_scheme != "none":
-                    w = compute_loss_weight(
-                        t.float(),
-                        scheme=w_scheme,
-                        min_snr_gamma=float(getattr(args, "min_snr_gamma", 0.0) or 0.0),
-                        weight_cap_ratio=float(getattr(args, "weight_cap_ratio", 0.0) or 0.0),
+            # T-LoRA: 把当前 batch 的 timestep 写到每个注入的 LoRA adapter，让其在 forward
+            # 内按 r(t) 应用 rank mask；其它 variant 该调用是空操作。完成后 reset 避免
+            # 跨 step 残留（采样 / eval / 其它前向不应受影响）。
+            injector.set_current_t(t.float().detach())
+            try:
+                with torch.autocast("cuda", dtype=dtype):
+                    pred = forward_with_optional_checkpoint(
+                        model, noisy, t.view(-1, 1), cross, pad_mask,
+                        use_checkpoint=args.grad_checkpoint
                     )
-                    # 归一到均值 1，避免间接改变 LR
-                    w = w / w.mean().clamp(min=1e-6)
-                    loss = (per_sample * w).mean()
-                else:
-                    loss = per_sample.mean()
+                    # ★ 损失始终 fp32 计算（per-sample，便于按 t 加权）
+                    per_sample = per_sample_loss(
+                        pred,
+                        target,
+                        loss_type=objective_cfg.loss.loss_type,
+                        huber_c=objective_cfg.loss.huber_c,
+                        huber_schedule=objective_cfg.loss.huber_schedule,
+                        t=t.float(),
+                    )
 
-                # ★ v5 ⑥ High-frequency loss term
-                # 主 loss 之外加一项 high-pass 残差 loss，直接放大眼睛/头发/logo
-                # 这类高频信号的梯度；不依赖区域定位，对画师构图偏好完全中立。
-                hf_w = float(getattr(args, "highfreq_loss_weight", 0.0) or 0.0)
-                if hf_w > 0:
-                    def _spatial_highpass(x):
-                        # 仅在空间维 (H, W) 做 box-blur，得到 high-pass = x - blur
-                        if x.ndim == 5:
-                            b, c, tt, h, w_ = x.shape
-                            x2 = x.reshape(b * c * tt, 1, h, w_)
-                            blur = F.avg_pool2d(x2, kernel_size=5, stride=1, padding=2)
-                            return (x2 - blur).reshape(b, c, tt, h, w_)
-                        elif x.ndim == 4:
-                            b, c, h, w_ = x.shape
-                            x2 = x.reshape(b * c, 1, h, w_)
-                            blur = F.avg_pool2d(x2, kernel_size=5, stride=1, padding=2)
-                            return (x2 - blur).reshape(b, c, h, w_)
-                        else:
-                            return x  # 不支持的维度直接跳过
-                    pred_hf = _spatial_highpass(pred.float())
-                    target_hf = _spatial_highpass(target.float())
-                    hf_loss = (pred_hf - target_hf).square().mean()
-                    loss = loss + hf_w * hf_loss
+                    loss = apply_loss_weighting(per_sample, t, objective_cfg.loss)
+            finally:
+                injector.set_current_t(None)
 
             # ★ 守护 1：forward 结果 NaN/Inf 检查
             debug_n = int(getattr(args, "debug_first_batches", 0) or 0)
@@ -3878,12 +1390,12 @@ def main():
                         f_shift,
                         sched_shift,
                         mix_low_prob,
-                        float(getattr(args, "noise_offset", 0.0) or 0.0),
-                        float(getattr(args, "noise_offset_min", 0.0) or 0.0),
-                        int(getattr(args, "pyramid_noise_iterations", 0) or 0),
-                        str(getattr(args, "loss_type", "mse") or "mse"),
-                        float(getattr(args, "huber_c", 0.1) or 0.1),
-                        str(getattr(args, "loss_weighting_scheme", "none") or "none"),
+                        objective_cfg.noise.offset,
+                        objective_cfg.noise.offset_min,
+                        objective_cfg.noise.pyramid_iterations,
+                        objective_cfg.loss.loss_type,
+                        objective_cfg.loss.huber_c,
+                        objective_cfg.loss.weighting_scheme,
                         float(getattr(args, "caption_dropout_rate", 0.0) or 0.0),
                         float(getattr(args, "tag_dropout", 0.0) or 0.0),
                         float(getattr(args, "lora_dropout", 0.0) or 0.0),
@@ -3900,58 +1412,33 @@ def main():
                     f"pred stats: min={pred.float().min().item():.3e} "
                     f"max={pred.float().max().item():.3e}"
                 )
-                optimizer.zero_grad(set_to_none=True)
+                # 不要 zero_grad！保留同周期内其他 micro-batch 的梯度，整周期边界统一丢弃。
+                accum_clean = False
                 continue
 
-            # ★ v5 ⑦ t-binned LR group：按 t 区间冻结部分模块的梯度
-            # 替代 detail_inv_t × 5×：用"显式 module-level 冻结"避免低 t 梯度污染
-            # ProdigyPlus 的 d 估计。
-            #   t < 0.3 (细节端)：仅更新 mlp + llm_adapter + other（含 norm/bias 等）
-            #   t > 0.6 (构图端)：仅更新 self_attn + cross_attn + other
-            #   0.3 ≤ t ≤ 0.6 (过渡端)：全部更新
-            # 建议同时把 loss_weighting_scheme 设为 "none"，避免和它叠加。
-            #
-            # ★ grad_accum 安全的实现：在 backward 之前 snapshot 被 skip 类别的当前 grad
-            # （即"已累积到这里的合法贡献"），backward 之后把这些类别的 grad 恢复到 snapshot
-            # 值——这等于"把本微 batch 的贡献从被 skip 类别中减掉"。这样：
-            #   - grad_accum=1: snapshot 是 None/0，恢复后 grad=0 → 等同直接 zero_()。
-            #   - grad_accum>1: 前几个微 batch 累积的合法部分被保留，本微 batch 被禁的类别不污染。
-            t_binned_skip_cats = set()
-            t_binned_snapshots = {}
-            if t_binned_enabled and param_category:
-                t_mean = float(t.float().mean().detach())
-                if t_mean < 0.3:
-                    t_binned_skip_cats = {"self_attn", "cross_attn"}
-                elif t_mean > 0.6:
-                    t_binned_skip_cats = {"mlp"}
-                if t_binned_skip_cats:
-                    for p in trainable_params:
-                        cat = param_category.get(id(p))
-                        if cat in t_binned_skip_cats:
-                            # 若 p.grad 已存在（accumulation 中段），克隆；否则记 None 表示"原本就没有"
-                            t_binned_snapshots[id(p)] = (
-                                p.grad.detach().clone() if p.grad is not None else None
-                            )
-
+            if adaptive_ts.enabled:
+                adaptive_signal = adaptive_timestep_metric_signal(
+                    per_sample,
+                    pred,
+                    target,
+                    metric=adaptive_ts.metric,
+                    highfreq_weight=adaptive_ts.highfreq_weight,
+                )
+                adaptive_ts.update(t.float(), adaptive_signal)
             loss_to_backward = loss / args.grad_accum
             loss_to_backward.backward()
 
-            # backward 之后立刻恢复 skip 类别的 grad（撤销本微 batch 对它们的贡献）
-            if t_binned_snapshots:
-                for p in trainable_params:
-                    if id(p) not in t_binned_snapshots:
-                        continue
-                    snap = t_binned_snapshots[id(p)]
-                    if snap is None:
-                        # 原本没 grad → 抹除本次新增的 grad
-                        if p.grad is not None:
-                            p.grad = None
-                    else:
-                        p.grad.copy_(snap)
-                t_binned_snapshots.clear()
-
             if (batch_idx + 1) % args.grad_accum == 0:
-                # ★ 守护 2：梯度 NaN/Inf 检查
+                # ★ 守护 1：周期内有 micro-batch NaN/Inf loss → 整周期作废，不做 step
+                if not accum_clean:
+                    logger.warning(
+                        f"[step {global_step}] Accumulation cycle contained a non-finite "
+                        f"micro-batch loss; discarding the entire cycle's gradients."
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                # ★ 守护 2：梯度 NaN/Inf 检查（即使 loss 全 finite，反向也可能出 NaN）
                 bad_grad = False
                 for p in trainable_params:
                     if p.grad is not None and not torch.isfinite(p.grad).all():
@@ -4001,10 +1488,6 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-                # ★ v5 ⑤ EMA update（在 optimizer.step() 之后）
-                if lora_ema is not None:
-                    lora_ema.update(named_trainable_params)
-
                 # ★ 守护 3：优化器状态污染检测（Prodigy 内部 d 变 NaN 会连锁崩溃）
                 if opt_type == "prodigyplus" and global_step % 50 == 0:
                     try:
@@ -4041,6 +1524,8 @@ def main():
                         )
                 else:
                     lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else 0.0
+                if adaptive_ts.enabled and global_step % 50 == 0:
+                    logger.info("[step %d] adaptive_timestep %s", global_step, adaptive_ts.summary())
                 
                 # 更新训练监控面板
                 if monitor_server:
@@ -4083,16 +1568,16 @@ def main():
                     s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
                     s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
                     s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
-                    with _ema_ctx():  # v5 ⑤ 切换到 LoRA EMA 副本（如启用）
-                        img = sample_image(
-                            model, vae, qwen_model, qwen_tok, t5_tok,
-                            prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
-                            negative_prompt=(s_neg or None),
-                            sampler_name=s_sampler,
-                            scheduler=s_sched,
-                            device=device, dtype=dtype,
-                            use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
-                        )
+                    img = _sample_with_vae_swap(
+                        model, vae, qwen_model, qwen_tok, t5_tok,
+                        prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
+                        negative_prompt=(s_neg or None),
+                        sampler_name=s_sampler,
+                        scheduler=s_sched,
+                        device=device, dtype=dtype,
+                        use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                        injector=injector,
+                    )
                     sample_path = sample_dir / f"step_{global_step}.png"
                     img.save(sample_path)
                     emit(f"采样保存: step_{global_step}.png")
@@ -4109,8 +1594,7 @@ def main():
                 if save_every_steps > 0 and global_step % save_every_steps == 0:
                     if hasattr(optimizer, "eval"): optimizer.eval()
                     lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
-                    with _ema_ctx():  # v5 ⑤
-                        injector.save(lora_path)
+                    injector.save(lora_path, model=model)
                     emit(f"Saved LoRA: {lora_path}")
                     if hasattr(optimizer, "train"): optimizer.train()
 
@@ -4127,14 +1611,10 @@ def main():
                             monitor_data = get_state()
                         except Exception:
                             pass
-                    # 注意：training_state 包含 optimizer state（含 SF z），故 LoRA 权重和 LoRA
-                    # checkpoint 都用 EMA 视图保存，断点续训依然能恢复（resume 时不会从 LoRA
-                    # checkpoint 加载训练态，只用作起点；optimizer state 单独恢复）。
-                    with _ema_ctx():  # v5 ⑤
-                        save_training_state(state_path, injector, optimizer, epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
-                        # 同时保存 LoRA 权重
-                        lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
-                        injector.save(lora_path)
+                    save_training_state(state_path, injector, optimizer, epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
+                    # 同时保存 LoRA 权重
+                    lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
+                    injector.save(lora_path, model=model)
                     if hasattr(optimizer, "train"): optimizer.train()
 
                 # 检查 max_steps
@@ -4148,8 +1628,7 @@ def main():
             if args.save_every > 0 and current_epoch % args.save_every == 0:
                 if hasattr(optimizer, "eval"): optimizer.eval()
                 save_path = output_dir / f"{args.output_name}_epoch{current_epoch}.safetensors"
-                with _ema_ctx():  # v5 ⑤
-                    injector.save(save_path)
+                injector.save(save_path, model=model)
                 emit(f"Saved LoRA: {save_path}")
                 if hasattr(optimizer, "train"): optimizer.train()
 
@@ -4167,16 +1646,16 @@ def main():
                 s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
                 s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
                 s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
-                with _ema_ctx():  # v5 ⑤
-                    img = sample_image(
-                        model, vae, qwen_model, qwen_tok, t5_tok,
-                        prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
-                        negative_prompt=(s_neg or None),
-                        sampler_name=s_sampler,
-                        scheduler=s_sched,
-                        device=device, dtype=dtype,
-                        use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
-                    )
+                img = _sample_with_vae_swap(
+                    model, vae, qwen_model, qwen_tok, t5_tok,
+                    prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
+                    negative_prompt=(s_neg or None),
+                    sampler_name=s_sampler,
+                    scheduler=s_sched,
+                    device=device, dtype=dtype,
+                    use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                    injector=injector,
+                )
                 sample_path = sample_dir / f"epoch_{current_epoch}.png"
                 img.save(sample_path)
                 emit(f"采样保存: epoch_{current_epoch}.png")
@@ -4197,8 +1676,7 @@ def main():
     # 最终保存
     if hasattr(optimizer, "eval"): optimizer.eval()
     final_path = output_dir / f"{args.output_name}.safetensors"
-    with _ema_ctx():  # v5 ⑤
-        injector.save(final_path)
+    injector.save(final_path, model=model)
 
     # 清理进度显示
     if live:

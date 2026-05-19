@@ -53,8 +53,10 @@ echo " "
 # 后台运行训练，并将输出重定向到日志
 echo "正在后台启动 Anima 训练脚本..."
 
-# 使用 nohup 将进程挂起在后台
-nohup "$PYTHON_BIN" "$TRAIN_SCRIPT" --config="$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
+# 注：PYTHONUNBUFFERED=1 + python -u 强制 stdout/stderr 无缓冲。
+# 否则被 nohup 重定向到文件后 Python 走块缓冲，tail -f 会卡好几分钟才出新行。
+nohup env PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u "$TRAIN_SCRIPT" --config="$CONFIG_FILE" \
+    > "$LOG_FILE" 2>&1 &
 TRAIN_PID=$!
 
 echo "训练任务已成功提交至后台运行 (PID: $TRAIN_PID)。"

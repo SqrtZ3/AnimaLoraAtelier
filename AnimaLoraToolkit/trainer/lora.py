@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import math
-import random as _py_random
 import re
 
 import torch
@@ -22,11 +21,16 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-# ★ 在 LoRA forward 的 module_dropout 决策中代替 torch.rand(1).item()。
-# torch 在 GPU 上生成单元素再 .item() 会触发设备同步，对 200+ LoRA 层每步 200+ 次同步
-# 是可观的隐性开销。module_dropout 仅决定"跳过该层与否"，是 boolean 控制流，与梯度无关，
-# 用 Python 标准 random（CPU rng）数学上完全等价、且不触发设备同步。
-_py_random_call = _py_random.random
+# ★ module_dropout 决策必须用 torch.rand 而非 Python random:
+# torch.utils.checkpoint(use_reentrant=False) 在 backward recompute forward 时
+# 会自动 fork + restore torch 的 rng state，让 forward 和 recompute 走完全相同的
+# 分支；Python random 模块的 state **不被** checkpoint 保护，recompute 时返回不同
+# 值会让 forward 选 "return zeros" 而 recompute 选 "正常计算"，autograd 图保存的
+# tensor 与 recompute 的对不上 → CheckpointError。
+#
+# 至于 GPU 同步：torch.rand(1) 默认 device=cpu（且 generator 默认是 cpu 的），不
+# 触发 GPU↔CPU 同步；.item() 在 CPU tensor 上是纯内存读取。曾经有一版改成
+# random.random() 想"省同步"是误判，且破坏了 checkpoint 的确定性。
 
 
 # ============================================================================
@@ -155,11 +159,10 @@ class LoRALayer(torch.nn.Module):
 
     def forward(self, x):
         # Module dropout: 整个模块以 p 概率跳过（训练时）
-        # ★ 旧实现 torch.rand(1).item() 触发 GPU↔CPU 同步；对 200+ LoRA 层每步 200+ 次同步。
-        # 用 Python random.random()（CPU rng）省掉同步开销；module_dropout 是 boolean 决策，
-        # 不参与梯度，使用 CPU rng 对训练结果无差异。
+        # 用 torch.rand(1).item()：默认 CPU device 不触发 GPU 同步，且 rng state 被
+        # torch.utils.checkpoint 自动 fork+restore，recompute 时返回同一值，分支一致。
         if self.training and self.module_dropout > 0:
-            if _py_random_call() < self.module_dropout:
+            if torch.rand(1).item() < self.module_dropout:
                 return torch.zeros(*x.shape[:-1], self.lora_up.out_features,
                                    device=x.device, dtype=x.dtype)
         x_drop = self.dropout(x)
@@ -325,9 +328,10 @@ class LoKrLayer(torch.nn.Module):
 
     def forward(self, x):
         # Module dropout: 整个模块以 p 概率跳过（训练时）
-        # 用 CPU rng（详见 LoRALayer.forward 同名注释）
+        # 用 torch.rand（详见 LoRALayer.forward 同名注释）：CPU rng，无设备同步，且
+        # 被 grad checkpoint 保护，recompute 与原 forward 走同一分支。
         if self.training and self.module_dropout > 0:
-            if _py_random_call() < self.module_dropout:
+            if torch.rand(1).item() < self.module_dropout:
                 return torch.zeros(*x.shape[:-1], self.out_features,
                                    device=x.device, dtype=x.dtype)
 
@@ -487,8 +491,10 @@ class LoRALinear(torch.nn.Module):
         if self.use_dora:
             adapter = self.adapter
             if self.training and adapter.module_dropout > 0:
-                # 用 CPU rng 省 GPU↔CPU 同步
-                if _py_random_call() < adapter.module_dropout:
+                # 用 torch.rand(1).item()（CPU device 默认）：既不触发 GPU 同步，
+                # 又被 grad checkpoint 自动保护，recompute 一致。旧实现
+                # torch.rand(1, device=x.device).item() 才会触发 GPU 同步，已去掉。
+                if torch.rand(1).item() < adapter.module_dropout:
                     return self.original(x)
 
             delta = adapter.delta_weight(apply_rank_dropout=True).to(device=self.original.weight.device)

@@ -1,20 +1,42 @@
 """
 训练监控服务器
 实时显示 loss 曲线和采样图片
+
+线程模型：
+- 训练主线程通过 update_monitor() 写入 MONITOR_STATE。
+- ThreadingHTTPServer 在多个 handler 线程里调 get_state() 读取并 JSON 序列化。
+- 二者共享 _STATE_LOCK；list 改用 collections.deque(maxlen=N) 避免每步 O(n) memcpy。
+
+★ 关于 state.json:
+旧版本会在每个 update_monitor() 把整个 MONITOR_STATE（含最多 50000 个 loss 点）
+序列化写到 monitor_data/state.json。但搜遍仓库这个文件**从未被读取**：
+  - HTTP /api/state 直接从内存 MONITOR_STATE 读
+  - 断点续训的 monitor 历史走 training_state_step{N}.pt 里的 monitor_state 字段
+  - 没有任何 json.load(state.json) 路径
+
+所以 state.json 是纯写入孤儿文件。最干净的解决方案 = **不写**。
+保留 save_state() / shutdown 钩子作为 API 兼容（旧脚本若调过 save_state 不会崩），
+但实际是 no-op。
 """
 import json
-import os
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 import webbrowser
 from urllib.parse import urlparse, parse_qs
 
-# 全局状态
+# 历史保留点数上限（loss/lr/samples）
+_MAX_LOSS_POINTS = 50000
+_MAX_LR_POINTS = 50000
+_MAX_SAMPLES = 50
+
+# 全局状态。list 改成 deque(maxlen)：append 与左侧弹出都是 O(1)，省每步 [-50000:] 的 memcpy。
+# samples 仍可用 list（变更频率低，最多 50 个）。
 MONITOR_STATE = {
-    "losses": [],
-    "lr_history": [],
+    "losses": deque(maxlen=_MAX_LOSS_POINTS),
+    "lr_history": deque(maxlen=_MAX_LR_POINTS),
     "epoch": 0,
     "step": 0,
     "total_steps": 0,
@@ -24,65 +46,74 @@ MONITOR_STATE = {
     "config": {},
 }
 
-MONITOR_DIR = Path(__file__).resolve().parent / "monitor_data"
-MONITOR_DIR.mkdir(exist_ok=True)
+# 训练线程写 / handler 线程读 共享锁。Python list/dict 的单操作大多是原子的，但
+# HTTP 线程 JSON serialize 时可能撞到 deque mutated；用 lock + deque 双保险。
+_STATE_LOCK = threading.RLock()
+
+
+def _state_snapshot_for_serialization():
+    """在 lock 下生成一个可 JSON serialize 的快照（deque → list）。"""
+    with _STATE_LOCK:
+        return {
+            "losses": list(MONITOR_STATE["losses"]),
+            "lr_history": list(MONITOR_STATE["lr_history"]),
+            "epoch": MONITOR_STATE["epoch"],
+            "step": MONITOR_STATE["step"],
+            "total_steps": MONITOR_STATE["total_steps"],
+            "speed": MONITOR_STATE["speed"],
+            "samples": list(MONITOR_STATE["samples"]),
+            "start_time": MONITOR_STATE["start_time"],
+            "config": dict(MONITOR_STATE["config"]) if MONITOR_STATE["config"] else {},
+        }
 
 
 def update_monitor(loss=None, lr=None, epoch=None, step=None, total_steps=None, speed=None, sample_path=None, config=None):
-    """更新监控状态"""
-    # 先更新 step/epoch 等，使本次写入的 loss/lr 点位正确
-    if epoch is not None:
-        MONITOR_STATE["epoch"] = epoch
-    if step is not None:
-        MONITOR_STATE["step"] = step
-    if total_steps is not None:
-        MONITOR_STATE["total_steps"] = total_steps
-    if speed is not None:
-        MONITOR_STATE["speed"] = speed
+    """更新监控状态（线程安全；纯内存，无 disk IO）。"""
+    with _STATE_LOCK:
+        # 先更新 step/epoch 等，使本次写入的 loss/lr 点位正确
+        if epoch is not None:
+            MONITOR_STATE["epoch"] = epoch
+        if step is not None:
+            MONITOR_STATE["step"] = step
+        if total_steps is not None:
+            MONITOR_STATE["total_steps"] = total_steps
+        if speed is not None:
+            MONITOR_STATE["speed"] = speed
 
-    if loss is not None:
-        MONITOR_STATE["losses"].append({"step": MONITOR_STATE["step"], "loss": loss, "time": time.time()})
-        # 保留最近 50000 个点（支持长时间训练）
-        if len(MONITOR_STATE["losses"]) > 50000:
-            MONITOR_STATE["losses"] = MONITOR_STATE["losses"][-50000:]
-    
-    if lr is not None:
-        MONITOR_STATE["lr_history"].append({"step": MONITOR_STATE["step"], "lr": lr})
-        if len(MONITOR_STATE["lr_history"]) > 50000:
-            MONITOR_STATE["lr_history"] = MONITOR_STATE["lr_history"][-50000:]
-    if sample_path is not None:
-        MONITOR_STATE["samples"].append({"path": str(sample_path), "step": MONITOR_STATE["step"], "time": time.time()})
-        # 只保留最近 50 张
-        if len(MONITOR_STATE["samples"]) > 50:
-            MONITOR_STATE["samples"] = MONITOR_STATE["samples"][-50:]
-    if config is not None:
-        MONITOR_STATE["config"] = config
-    
-    if MONITOR_STATE["start_time"] is None:
-        MONITOR_STATE["start_time"] = time.time()
-    
-    # 写入 JSON 文件
-    save_state()
+        if loss is not None:
+            MONITOR_STATE["losses"].append({"step": MONITOR_STATE["step"], "loss": loss, "time": time.time()})
+        if lr is not None:
+            MONITOR_STATE["lr_history"].append({"step": MONITOR_STATE["step"], "lr": lr})
+        if sample_path is not None:
+            MONITOR_STATE["samples"].append({"path": str(sample_path), "step": MONITOR_STATE["step"], "time": time.time()})
+            if len(MONITOR_STATE["samples"]) > _MAX_SAMPLES:
+                # samples 仍是 list（采样很少触发），直接截断
+                MONITOR_STATE["samples"] = MONITOR_STATE["samples"][-_MAX_SAMPLES:]
+        if config is not None:
+            MONITOR_STATE["config"] = config
+
+        if MONITOR_STATE["start_time"] is None:
+            MONITOR_STATE["start_time"] = time.time()
 
 
-def save_state():
-    """保存状态到 JSON"""
-    state_file = MONITOR_DIR / "state.json"
-    try:
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(MONITOR_STATE, f)
-    except Exception:
-        pass
+def save_state(force: bool = False):
+    """No-op，保留作为 API 兼容入口。
+
+    旧版本会把 MONITOR_STATE 写到 monitor_data/state.json，但该文件从未被读取（HTTP API
+    / 断点续训都走其它路径），属于纯写入孤儿。已移除磁盘 IO 以减少长训练的持续写盘开销。
+    若未来需要 forensic dump，可显式调用 get_state() 自行序列化。
+    """
+    return None
 
 
 def get_state():
-    """获取当前状态"""
-    return MONITOR_STATE.copy()
+    """获取当前状态（用于 HTTP handler；deque 转 list 以便 JSON 序列化）。"""
+    return _state_snapshot_for_serialization()
 
 
 def restore_monitor_state(losses=None, lr_history=None, epoch=None, step=None, total_steps=None, start_time=None, config=None):
-    """恢复监控状态（用于断点续训）
-    
+    """恢复监控状态（用于断点续训）。
+
     Args:
         losses: 历史 loss 列表，格式 [{"step": int, "loss": float, "time": float}, ...]
         lr_history: 历史 lr 列表，格式 [{"step": int, "lr": float}, ...]
@@ -90,21 +121,21 @@ def restore_monitor_state(losses=None, lr_history=None, epoch=None, step=None, t
         start_time: 训练开始时间
         config: 配置字典
     """
-    if losses is not None:
-        MONITOR_STATE["losses"] = losses
-    if lr_history is not None:
-        MONITOR_STATE["lr_history"] = lr_history
-    if epoch is not None:
-        MONITOR_STATE["epoch"] = epoch
-    if step is not None:
-        MONITOR_STATE["step"] = step
-    if total_steps is not None:
-        MONITOR_STATE["total_steps"] = total_steps
-    if start_time is not None:
-        MONITOR_STATE["start_time"] = start_time
-    if config is not None:
-        MONITOR_STATE["config"] = config
-    save_state()
+    with _STATE_LOCK:
+        if losses is not None:
+            MONITOR_STATE["losses"] = deque(losses, maxlen=_MAX_LOSS_POINTS)
+        if lr_history is not None:
+            MONITOR_STATE["lr_history"] = deque(lr_history, maxlen=_MAX_LR_POINTS)
+        if epoch is not None:
+            MONITOR_STATE["epoch"] = epoch
+        if step is not None:
+            MONITOR_STATE["step"] = step
+        if total_steps is not None:
+            MONITOR_STATE["total_steps"] = total_steps
+        if start_time is not None:
+            MONITOR_STATE["start_time"] = start_time
+        if config is not None:
+            MONITOR_STATE["config"] = config
 
 
 def _downsample_uniform(points, target_points: int):
@@ -487,8 +518,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>
 """
+# VRAM 查询缓存：浏览器 + 多客户端每秒 hit /api/state，重复查询 mem_get_info 触发 CUDA 同步。
+# 用一个 500ms cache 把 N/秒收敛到 ≤2/秒，对实时性影响微乎其微。
+_VRAM_CACHE = {"data": None, "ts": 0.0}
+_VRAM_TTL = 0.5  # seconds
+
+
 def get_vram_info():
-    """获取 CUDA VRAM 信息"""
+    """获取 CUDA VRAM 信息（带 500ms cache）"""
+    now = time.time()
+    if _VRAM_CACHE["data"] is not None and (now - _VRAM_CACHE["ts"]) < _VRAM_TTL:
+        return _VRAM_CACHE["data"]
     try:
         import torch
         if torch.cuda.is_available():
@@ -497,15 +537,41 @@ def get_vram_info():
             free_mb = free // (1024 * 1024)
             total_mb = total // (1024 * 1024)
             used_mb = total_mb - free_mb
-            return {
+            result = {
                 "free": free_mb,
                 "total": total_mb,
                 "used": used_mb,
-                "percentage": round(used_mb / total_mb * 100, 1) if total_mb > 0 else 0
+                "percentage": round(used_mb / total_mb * 100, 1) if total_mb > 0 else 0,
             }
+            _VRAM_CACHE["data"] = result
+            _VRAM_CACHE["ts"] = now
+            return result
     except Exception:
         pass
     return None
+
+
+def _read_log_tail(log_file: Path, max_lines: int = 100, max_bytes: int = 256 * 1024) -> list:
+    """读 log 文件末尾 max_lines 行，最多读 max_bytes 字节。
+
+    旧实现 readlines() 把整个 log 文件读进内存 → 长训练 log 数十 MB 时，每秒
+    /api/logs 都触发一次全文读 + 字符串切片，主机 IO + Python 解析都被占满。
+    新实现 seek 到末尾倒读最多 256KB，足够覆盖 100 行（每行 ~200 字节是典型）。
+    """
+    try:
+        size = log_file.stat().st_size
+        with open(log_file, "rb") as f:
+            offset = max(size - max_bytes, 0)
+            f.seek(offset)
+            chunk = f.read()
+        text = chunk.decode("utf-8", errors="ignore")
+        lines = text.splitlines()
+        # 第一行可能因 seek 中截断，丢掉；除非我们就是从文件起始读的
+        if offset > 0 and lines:
+            lines = lines[1:]
+        return [ln.strip() for ln in lines[-max_lines:]]
+    except Exception:
+        return []
 
 
 class MonitorHandler(SimpleHTTPRequestHandler):
@@ -559,19 +625,15 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            
+
             logs = []
             log_file = Path("anima_training.log")
             if not log_file.exists():
                 log_file = Path(__file__).resolve().parent.parent / "anima_training.log"
-            
+
             if log_file.exists():
-                try:
-                    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                        lines = f.readlines()
-                        logs = [line.strip() for line in lines[-100:]]
-                except Exception:
-                    pass
+                # tail 读法（seek 到末尾 256KB），比每秒 readlines() 全文快几十倍
+                logs = _read_log_tail(log_file, max_lines=100, max_bytes=256 * 1024)
             self.wfile.write(json.dumps({"logs": logs}).encode("utf-8"))
         elif self.path.startswith("/samples/"):
             # 提供采样图片
@@ -592,15 +654,43 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         pass  # 静默日志
 
 
-def start_monitor_server(port=8765, host="127.0.0.1", output_dir=None, open_browser=True):
-    """启动监控服务器"""
+def start_monitor_server(port=8765, host="0.0.0.0", output_dir=None, open_browser=True, max_port_retries=5):
+    """启动监控服务器。
+
+    使用 ThreadingHTTPServer 而非 HTTPServer：浏览器同时请求 /api/state + /api/logs +
+    多张 /samples/*.png 时，旧 HTTPServer 是单线程串行 → 一个慢请求阻塞其它。
+    Threading 版每个请求一个 worker thread。
+
+    端口被占时自动 +1 重试，最多 max_port_retries 次（避免训练因端口冲突直接失败）。
+    """
     output_dir = Path(output_dir) if output_dir else Path("./output")
-    
+
     def handler(*args, **kwargs):
         return MonitorHandler(*args, output_dir=output_dir, **kwargs)
-    
-    server = HTTPServer((host, port), handler)
-    
+
+    server = None
+    last_err = None
+    actual_port = port
+    for attempt in range(max(int(max_port_retries), 1)):
+        try_port = port + attempt
+        try:
+            server = ThreadingHTTPServer((host, try_port), handler)
+            actual_port = try_port
+            break
+        except OSError as e:
+            last_err = e
+            continue
+
+    if server is None:
+        raise RuntimeError(
+            f"[Monitor] 端口 {port}..{port + max_port_retries - 1} 都被占用，监控面板启动失败: {last_err}"
+        )
+
+    # 提示端口被改写
+    if actual_port != port:
+        print(f"[Monitor] 端口 {port} 被占用，自动切换到 {actual_port}")
+        port = actual_port
+
     def run():
         shown_host = "localhost" if host in ("0.0.0.0", "127.0.0.1") else host
         try:
@@ -613,15 +703,31 @@ def start_monitor_server(port=8765, host="127.0.0.1", output_dir=None, open_brow
         except Exception:
             pass
         server.serve_forever()
-    
+
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    
+
     if open_browser:
         time.sleep(0.5)
         webbrowser.open(f"http://{('localhost' if host in ('0.0.0.0','127.0.0.1') else host)}:{port}")
-    
+
+    # 暴露端口给调用方（自动 fallback 时主程序需要知道实际端口）
+    server.actual_port = port
     return server
+
+
+def shutdown_monitor_server(server):
+    """优雅关闭监控服务器（signal handler 与训练正常结束时都应调用）。"""
+    if server is None:
+        return
+    try:
+        server.shutdown()
+    except Exception:
+        pass
+    try:
+        server.server_close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

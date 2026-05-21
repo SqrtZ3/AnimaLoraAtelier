@@ -252,35 +252,43 @@ def save_training_state(path, injector, optimizer, epoch, global_step,
 
 
 def load_training_state(path, injector, optimizer, scheduler=None):
-    """加载训练状态，返回 (epoch, global_step, loss_history, monitor_state)"""
+    """加载训练状态，返回 (epoch, global_step, loss_history, monitor_state)。
+
+    ★ 旧实现这里有一份独立的 "拷贝 lora_w1/w2_a/w2_b" 逻辑，与 `LoRAInjector.load()`
+    几乎完全重复。任何对 LoRA 存盘格式的修改（如 T-LoRA q/p_layer 命名、DoRA scale 维度）
+    都要在两处同步改。这里改为：写一个临时 safetensors-like 接口给 injector.load_state_dict
+    复用注入器自己的 loader，单一来源避免漂移。
+    """
     logger.info(f"加载训练状态: {path}")
     state = torch.load(path, map_location="cpu", weights_only=False)
 
-    # 加载 LoRA 权重
+    # 委托给 injector.load_state_dict_from_mapping —— 这是新加的 in-memory 加载入口，
+    # 与 .safetensors 文件加载共享同一份 key 解析逻辑。
     lora_sd = state["lora_state_dict"]
-    for name, lora in injector.injected.items():
-        base = "lora_unet_" + name.replace(".", "_")
-        if injector.use_lokr:
-            w1_key = f"{base}.lokr_w1"
-            w2a_key = f"{base}.lokr_w2_a"
-            w2b_key = f"{base}.lokr_w2_b"
-            dora_key = f"{base}.dora_scale"
-            w2_old_key = f"{base}.lokr_w2"
-            if w1_key in lora_sd and w2a_key in lora_sd and w2b_key in lora_sd:
-                lora.adapter.lokr_w1.data.copy_(lora_sd[w1_key])
-                lora.adapter.lokr_w2_a.data.copy_(lora_sd[w2a_key])
-                lora.adapter.lokr_w2_b.data.copy_(lora_sd[w2b_key])
-                if getattr(lora, "use_dora", False) and dora_key in lora_sd:
-                    dora_scale = lora_sd[dora_key].reshape(-1)
-                    lora.dora_scale.data.copy_(dora_scale.to(device=lora.dora_scale.device, dtype=lora.dora_scale.dtype))
-            elif w1_key in lora_sd and w2_old_key in lora_sd:
-                logger.warning(f"跳过旧格式 lokr_w2 全矩阵层: {name}（需重新训练）")
-        else:
-            down_key = f"{base}.lora_down.weight"
-            up_key = f"{base}.lora_up.weight"
-            if down_key in lora_sd and up_key in lora_sd:
-                lora.adapter.lora_down.weight.data.copy_(lora_sd[down_key])
-                lora.adapter.lora_up.weight.data.copy_(lora_sd[up_key])
+    if hasattr(injector, "load_state_dict_from_mapping"):
+        injector.load_state_dict_from_mapping(lora_sd)
+    else:
+        # 极旧的 injector 版本兜底（不应该走到这里）
+        for name, lora in injector.injected.items():
+            base = "lora_unet_" + name.replace(".", "_")
+            if injector.use_lokr:
+                w1_key = f"{base}.lokr_w1"
+                w2a_key = f"{base}.lokr_w2_a"
+                w2b_key = f"{base}.lokr_w2_b"
+                dora_key = f"{base}.dora_scale"
+                if w1_key in lora_sd and w2a_key in lora_sd and w2b_key in lora_sd:
+                    lora.adapter.lokr_w1.data.copy_(lora_sd[w1_key])
+                    lora.adapter.lokr_w2_a.data.copy_(lora_sd[w2a_key])
+                    lora.adapter.lokr_w2_b.data.copy_(lora_sd[w2b_key])
+                    if getattr(lora, "use_dora", False) and dora_key in lora_sd:
+                        dora_scale = lora_sd[dora_key].reshape(-1)
+                        lora.dora_scale.data.copy_(dora_scale.to(device=lora.dora_scale.device, dtype=lora.dora_scale.dtype))
+            else:
+                down_key = f"{base}.lora_down.weight"
+                up_key = f"{base}.lora_up.weight"
+                if down_key in lora_sd and up_key in lora_sd:
+                    lora.adapter.lora_down.weight.data.copy_(lora_sd[down_key])
+                    lora.adapter.lora_up.weight.data.copy_(lora_sd[up_key])
 
     # 加载优化器状态
     optimizer.load_state_dict(state["optimizer_state_dict"])

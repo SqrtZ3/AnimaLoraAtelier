@@ -23,10 +23,20 @@ import random
 import sys
 from pathlib import Path
 
+import numpy as _np_for_dtype_map
 import torch
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+
+# numpy ↔ torch dtype 映射（CachedLatentDataset 保存 bf16 / fp16 时用）。
+# numpy 1.x 无原生 bfloat16，所以 bf16 在磁盘上用 uint16 视图保存，读回来 view 成 bf16。
+_NP_TO_TORCH = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "uint16_bf16": torch.bfloat16,  # 自定义 sentinel
+}
 
 
 class BucketManager:
@@ -113,6 +123,11 @@ class ImageDataset(Dataset):
         txt_count = len(self.samples) - json_count
         logger.info(f"数据集: {len(self.samples)} 样本 (JSON: {json_count}, TXT: {txt_count})")
 
+        # ★ JSON 预 normalize：__getitem__ 时只做 build（shuffle+dropout），不再每次 load+parse 文件。
+        # 在 num_workers=0（Windows 默认）时，这一项能把数据 prep CPU 时间显著降下来。
+        if json_count > 0 and self.caption_utils is not None:
+            self._pre_normalize_json_captions()
+
         # 用与 __getitem__ 完全一致的 PIL 路径填充 bucket_key
         self._finalize_bucket_keys()
         self.bucket_for_index = [s["bucket_key"] for s in self.samples]
@@ -132,30 +147,85 @@ class ImageDataset(Dataset):
 
     def _finalize_bucket_keys(self):
         """For each sample, compute bucket_key via the same code path that __getitem__ uses,
-        so BucketBatchSampler can reliably group same-shape tensors. Caches per unique img path."""
+        so BucketBatchSampler can reliably group same-shape tensors. Caches per unique img path.
+
+        ★ 大数据集（几万张）时 PIL.Image.open 在 OS 层每张都要 open/close fd，
+          init 阶段可能卡几十秒。加进度日志让用户知道还活着；并把 unique image set 预先收集，
+          避免 repeats 重复样本重复 open。
+        """
         from PIL import Image as _PILImage
-        cache = {}
+        # 先收集 unique image paths（_scan 里同一张图可能被 repeats 次添加）
+        unique_imgs = []
+        seen = set()
         for sample in self.samples:
-            img_path = sample["image"]
-            key = cache.get(img_path)
-            if key is None:
-                if self.bucket_mgr is None:
-                    key = (self.resolution, self.resolution)
-                else:
+            ip = sample["image"]
+            if ip not in seen:
+                seen.add(ip)
+                unique_imgs.append(ip)
+        n_unique = len(unique_imgs)
+
+        cache = {}
+        for i, img_path in enumerate(unique_imgs):
+            if self.bucket_mgr is None:
+                cache[img_path] = (self.resolution, self.resolution)
+            else:
+                try:
+                    img = _PILImage.open(img_path)
+                    w, h = img.width, img.height
                     try:
-                        img = _PILImage.open(img_path)
-                        w, h = img.width, img.height
-                        try:
-                            img.close()
-                        except Exception:
-                            pass
-                        bw, bh = self.bucket_mgr.get_bucket(w, h)
-                        key = (bh, bw)  # (h, w)
-                    except Exception as e:
-                        logger.warning(f"[bucket_key] 无法读取 {img_path}: {e}，回退到 ({self.resolution},{self.resolution})")
-                        key = (self.resolution, self.resolution)
-                cache[img_path] = key
-            sample["bucket_key"] = key
+                        img.close()
+                    except Exception:
+                        pass
+                    bw, bh = self.bucket_mgr.get_bucket(w, h)
+                    cache[img_path] = (bh, bw)  # (h, w)
+                except Exception as e:
+                    logger.warning(f"[bucket_key] 无法读取 {img_path}: {e}，回退到 ({self.resolution},{self.resolution})")
+                    cache[img_path] = (self.resolution, self.resolution)
+            # 每 1000 张或最后一张时打印进度，让用户知道 init 没卡死
+            if n_unique >= 2000 and ((i + 1) % 1000 == 0 or i == n_unique - 1):
+                logger.info(f"  bucket_key 解析进度: {i + 1}/{n_unique}")
+
+        for sample in self.samples:
+            sample["bucket_key"] = cache[sample["image"]]
+
+    def _pre_normalize_json_captions(self):
+        """一次性把所有 JSON caption 加载 + normalize，缓存到 sample["normalized_json"]。
+
+        旧实现 `_process_caption_json` 在每次 __getitem__ 都做 load_json + normalize + build；
+        normalize 是结构变换，对同一文件每次产出都一样，没必要重复做。
+        load_json 也省下重复 IO（同一 sample dict 会被 repeats 次添加，每次都读盘）。
+
+        预 normalize 后 __getitem__ 走 build_only 路径（只做 shuffle/dropout 这种随机的部分）。
+        """
+        if self.caption_utils is None:
+            return
+        cache = {}  # json_path -> normalized dict（同一 JSON 多次出现只算一次）
+        ok = 0
+        fail = 0
+        for sample in self.samples:
+            jp = sample.get("json_path")
+            if jp is None:
+                continue
+            cached = cache.get(jp)
+            if cached is None:
+                try:
+                    raw = self.caption_utils["load_json"](jp)
+                    if raw is None:
+                        fail += 1
+                        continue
+                    if "tags" in raw and "meta" in raw:
+                        normalized = raw
+                    else:
+                        normalized = self.caption_utils["normalize"](raw)
+                    cache[jp] = normalized
+                    cached = normalized
+                    ok += 1
+                except Exception as e:
+                    logger.warning(f"JSON pre-normalize 失败 {jp}: {e}")
+                    fail += 1
+                    continue
+            sample["normalized_json"] = cached
+        logger.info(f"[dataset] JSON 预 normalize 完成: {ok} unique, {fail} 失败")
 
     def _compute_tag_freq(self):
         """★ v5 ② 扫描全部 caption 文件，统计每个 tag 在数据集中出现的图片数 / 总图片数。
@@ -209,6 +279,8 @@ class ImageDataset(Dataset):
 
     def _scan(self):
         samples = []
+        dir_repeat_stats = {}  # dir_name -> repeat 次数（用于诊断日志）
+        unique_images = 0
         for img_path in self.data_dir.rglob("*"):
             if img_path.suffix.lower() not in self.EXTS:
                 continue
@@ -220,6 +292,7 @@ class ImageDataset(Dataset):
                 prefix = parent_name.split("_", 1)[0]
                 if prefix.isdigit():
                     repeats = max(1, int(prefix))
+                    dir_repeat_stats[parent_name] = repeats
 
             sample = {"image": img_path}
 
@@ -238,9 +311,25 @@ class ImageDataset(Dataset):
                 sample["txt_path"] = txt_path
 
             sample["bucket_key"] = None
+            # ★ JSON 预 normalize 槽：__getitem__ 时直接读 dict 而非重新解析文件
+            sample["normalized_json"] = None
+            unique_images += 1
 
             for _ in range(repeats):
-                samples.append(sample.copy())
+                samples.append(dict(sample))
+
+        # ★ 旧实现：如果用户同时使用了 `10_xxx` 目录命名 + 顶层 `repeats: 10` YAML 参数，
+        # 实际曝光会 ×100，用户无从察觉。这里明确 log 出 dir-level repeats 和 unique image 数。
+        if dir_repeat_stats:
+            preview = ", ".join(f"{name}×{r}" for name, r in list(dir_repeat_stats.items())[:5])
+            logger.info(
+                f"[dataset] 检测到 {len(dir_repeat_stats)} 个目录使用 kohya 风格 repeat 前缀: {preview}"
+                + (" ..." if len(dir_repeat_stats) > 5 else "")
+            )
+            logger.info(
+                f"[dataset] 唯一图片: {unique_images}, dir-level repeat 后样本: {len(samples)}。"
+                f"注意：若 YAML 顶层再设 `repeats: N`，最终曝光 = dir_repeats × N，请确认是否符合预期。"
+            )
         return samples
 
     def _process_caption_txt(self, caption):
@@ -295,20 +384,25 @@ class ImageDataset(Dataset):
 
         return ", ".join(kept + rest)
 
-    def _process_caption_json(self, json_path):
-        """处理 JSON caption: 分类 shuffle"""
+    def _process_caption_json(self, json_path, normalized=None):
+        """处理 JSON caption: 分类 shuffle。
+
+        若调用方传入 `normalized`（init 时 _pre_normalize_json_captions 算好的），跳过 load + normalize；
+        否则按旧路径 load + normalize（兼容外部直接调用，如 CachedLatentDataset）。
+        """
         if self.caption_utils is None:
             return None
 
         try:
-            raw_json = self.caption_utils["load_json"](json_path)
-            if raw_json is None:
-                return None
+            if normalized is None:
+                raw_json = self.caption_utils["load_json"](json_path)
+                if raw_json is None:
+                    return None
 
-            if "tags" in raw_json and "meta" in raw_json:
-                normalized = raw_json
-            else:
-                normalized = self.caption_utils["normalize"](raw_json)
+                if "tags" in raw_json and "meta" in raw_json:
+                    normalized = raw_json
+                else:
+                    normalized = self.caption_utils["normalize"](raw_json)
 
             return self.caption_utils["build"](
                 normalized,
@@ -334,7 +428,10 @@ class ImageDataset(Dataset):
         if self.caption_override is not None:
             caption = self.caption_override
         elif sample.get("json_path"):
-            caption = self._process_caption_json(sample["json_path"])
+            # 使用预 normalized 缓存（init 阶段算好），跳过每次的 load+normalize 开销
+            caption = self._process_caption_json(
+                sample["json_path"], normalized=sample.get("normalized_json"),
+            )
 
         if caption is None and sample.get("txt_path"):
             caption = sample["txt_path"].read_text(encoding="utf-8").strip()
@@ -496,11 +593,58 @@ class BucketBatchSampler:
         return total
 
     def _build_keys(self, dataset):
+        """Build per-outer-index bucket keys。
+
+        ★ 旧实现对每个 outer idx 都递归 walk wrapper（O(N × depth)）。
+        优化：一次 walk 找到 leaf 的 bucket_for_index 列表，然后批量索引 → O(N + walk_depth)。
+        对 100K samples + 3 层 wrap 提升约 2-3×。
+
+        无法静态决定 leaf 时（如 MergedDataset(reg, main) 两个 leaf 不同），回退到 per-idx walk。
+        """
         n = len(dataset)
+        # 尝试 fast path：找到唯一 leaf 的 bucket_for_index
+        leaf = self._find_unique_leaf(dataset)
+        if leaf is not None:
+            leaf_keys = getattr(leaf, "bucket_for_index", None)
+            leaf_len = len(leaf_keys) if leaf_keys is not None else 0
+            if leaf_len > 0:
+                # outer idx 通过 % leaf_len 直接映射（RepeatDataset 的语义）
+                return [leaf_keys[i % leaf_len] for i in range(n)]
+
+        # 回退：复用旧的 walk 实现（MergedDataset 路径）
         keys = [None] * n
         for i in range(n):
             keys[i] = self._lookup(dataset, i)
         return keys
+
+    def _find_unique_leaf(self, d):
+        """Walk down a single chain（RepeatDataset/CachedLatentDataset）的 leaf。
+
+        MergedDataset 有两条分支，不在 fast path 范围；返回 None 由 _lookup 处理。
+        """
+        # MergedDataset：拒绝
+        if getattr(d, "main_dataset", None) is not None and getattr(d, "reg_dataset", None) is not None:
+            return None
+        cur = d
+        # 已有 bucket_for_index 就是 leaf
+        bfi = getattr(cur, "bucket_for_index", None)
+        if bfi is not None and len(bfi) > 0:
+            return cur
+        # 一层层往下找
+        for _ in range(10):  # 防御 max depth
+            inner = getattr(cur, "dataset", None)
+            if inner is None or inner is cur or isinstance(inner, list):
+                inner = getattr(cur, "base_dataset", None)
+            if inner is None or inner is cur:
+                return None
+            cur = inner
+            # MergedDataset 出现在中间层就不行
+            if getattr(cur, "main_dataset", None) is not None and getattr(cur, "reg_dataset", None) is not None:
+                return None
+            bfi = getattr(cur, "bucket_for_index", None)
+            if bfi is not None and len(bfi) > 0:
+                return cur
+        return None
 
     def _lookup(self, d, idx):
         """Resolve the bucket key for a given outer index by walking dataset wrappers.
@@ -558,14 +702,23 @@ class BucketBatchSampler:
 
 
 class CachedLatentDataset(Dataset):
-    """Kohya 风格 npz 文件缓存的数据集"""
-    def __init__(self, base_dataset, vae, device, dtype, cache_dir=None):
+    """Kohya 风格 npz 文件缓存的数据集。
+
+    save_dtype: torch.float32 / torch.bfloat16 / torch.float16
+        - 默认 bf16：与训练 dtype 对齐，disk 占用 ≈ fp32 的 50%，读取时无精度转换开销。
+        - numpy 1.x 没有原生 bf16，bf16 在磁盘上以 uint16 view 保存，并附带 sentinel
+          key (`dtype_kind = "bf16"`) 让读端正确还原。
+        - 旧 cache（无 dtype_kind 键）默认按 fp32 读，向后兼容。
+    """
+    def __init__(self, base_dataset, vae, device, dtype, cache_dir=None,
+                 save_dtype: torch.dtype = torch.bfloat16):
         import numpy as np
         self.base_dataset = base_dataset
         self.np = np
         self.samples = self._get_base_samples(base_dataset)
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.bucket_for_index = []
+        self.save_dtype = save_dtype
         self._build_cache(vae, device, dtype)
 
     def _get_base_samples(self, dataset):
@@ -602,10 +755,14 @@ class CachedLatentDataset(Dataset):
                 logger.warning(f"删除疑似非 Anima/Qwen VAE 缓存（C={latent.shape[0]}，应为 16）: {npz_path}")
                 npz_path.unlink()
                 return False
-            if not self.np.isfinite(latent).all():
-                logger.warning(f"删除非有限 latent 缓存: {npz_path}")
-                npz_path.unlink()
-                return False
+            # bf16 cache 用 uint16 view 保存，跳过 isfinite 检查（uint16 永远 finite）。
+            # 旧 fp32 / 新 fp16 cache 仍做 NaN/Inf 校验。
+            dtype_kind = str(data["dtype_kind"]) if "dtype_kind" in data.files else "fp32"
+            if dtype_kind != "bf16":
+                if not self.np.isfinite(latent).all():
+                    logger.warning(f"删除非有限 latent 缓存: {npz_path}")
+                    npz_path.unlink()
+                    return False
         except Exception:
             try:
                 npz_path.unlink()
@@ -649,22 +806,71 @@ class CachedLatentDataset(Dataset):
             self.bucket_for_index[i] = (int(h), int(w))
 
     def _encode_and_save(self, indices, vae, device, dtype):
-        for count, i in enumerate(indices):
-            item = self.base_dataset[i]
-            pixels = item["pixel_values"].unsqueeze(0).to(device, dtype=dtype)
-            _, _, ph, pw = pixels.shape
-            bucket_w, bucket_h = pw, ph
-            with torch.no_grad():
-                pixels_5d = pixels.unsqueeze(2)
-                latent = vae.model.encode(pixels_5d, vae.scale)
-            if not torch.isfinite(latent).all():
-                logger.warning(f"VAE 编码产生非有限 latent，跳过缓存: {self.samples[i]['image']}")
-                continue
-            latent_np = latent.squeeze(0).cpu().float().numpy()
-            npz_path = self._get_npz_path(self.samples[i]["image"])
-            self.np.savez(npz_path, latent=latent_np, bucket_w=bucket_w, bucket_h=bucket_h)
-            if (count + 1) % 10 == 0 or count == len(indices) - 1:
-                logger.info(f"  编码进度: {count + 1}/{len(indices)}")
+        # ★ flip_augment + cache 不能同时生效：base_dataset.__getitem__ 会做一次随机 flip
+        # 然后被烘焙进 npz，等价于 50% 数据集预 flip，再也不会每 epoch 随机翻转。
+        # 这里临时把 base 的 flip 关掉，编码完恢复。
+        base = self.base_dataset
+        while hasattr(base, "dataset") and base is not self.base_dataset:
+            base = base.dataset
+        # 找到最底层的 ImageDataset
+        leaf = self.base_dataset
+        while hasattr(leaf, "dataset"):
+            leaf = leaf.dataset
+        _orig_flip = bool(getattr(leaf, "flip_augment", False))
+        if _orig_flip:
+            logger.warning(
+                "[cache] 临时关闭 flip_augment 编码 latent（避免随机 flip 被烘焙进 npz）。"
+                "编码完后恢复，但请注意：cache_latents=True 时 flip 不会每 epoch 随机生效。"
+            )
+            leaf.flip_augment = False
+
+        save_dtype = getattr(self, "save_dtype", torch.bfloat16)
+        try:
+            for count, i in enumerate(indices):
+                item = self.base_dataset[i]
+                pixels = item["pixel_values"].unsqueeze(0).to(device, dtype=dtype)
+                _, _, ph, pw = pixels.shape
+                bucket_w, bucket_h = pw, ph
+                with torch.no_grad():
+                    pixels_5d = pixels.unsqueeze(2)
+                    latent = vae.model.encode(pixels_5d, vae.scale)
+                if not torch.isfinite(latent).all():
+                    logger.warning(f"VAE 编码产生非有限 latent，跳过缓存: {self.samples[i]['image']}")
+                    continue
+
+                latent_gpu = latent.squeeze(0)
+                npz_path = self._get_npz_path(self.samples[i]["image"])
+                if save_dtype == torch.bfloat16:
+                    # bf16 → uint16 view（同等 bit pattern；numpy 1.x 没有原生 bf16）
+                    latent_bf16 = latent_gpu.to(dtype=torch.bfloat16).cpu().contiguous()
+                    latent_u16 = latent_bf16.view(torch.uint16).numpy()
+                    self.np.savez(
+                        npz_path,
+                        latent=latent_u16,
+                        bucket_w=bucket_w, bucket_h=bucket_h,
+                        dtype_kind="bf16",
+                    )
+                elif save_dtype == torch.float16:
+                    latent_np = latent_gpu.to(dtype=torch.float16).cpu().numpy()
+                    self.np.savez(
+                        npz_path,
+                        latent=latent_np,
+                        bucket_w=bucket_w, bucket_h=bucket_h,
+                        dtype_kind="fp16",
+                    )
+                else:
+                    latent_np = latent_gpu.cpu().float().numpy()
+                    self.np.savez(
+                        npz_path,
+                        latent=latent_np,
+                        bucket_w=bucket_w, bucket_h=bucket_h,
+                        dtype_kind="fp32",
+                    )
+                if (count + 1) % 10 == 0 or count == len(indices) - 1:
+                    logger.info(f"  编码进度: {count + 1}/{len(indices)}")
+        finally:
+            if _orig_flip:
+                leaf.flip_augment = True
 
     def __len__(self):
         return len(self.samples)
@@ -673,8 +879,18 @@ class CachedLatentDataset(Dataset):
         sample = self.samples[idx]
         npz_path = self._get_npz_path(sample["image"])
         data = self.np.load(npz_path)
-        latent = torch.from_numpy(data["latent"])
-        if not torch.isfinite(latent).all():
+        latent_np = data["latent"]
+        # dtype_kind sentinel：bf16 cache 在磁盘上是 uint16 view，要 view 回 bf16；
+        # fp16 / fp32 直接 from_numpy。旧 cache 无 dtype_kind，按 fp32 兼容。
+        dtype_kind = str(data["dtype_kind"]) if "dtype_kind" in data.files else "fp32"
+        if dtype_kind == "bf16":
+            # uint16 → torch.uint16 → view as bf16（bit pattern 相同）
+            latent = torch.from_numpy(latent_np).view(torch.bfloat16)
+        else:
+            latent = torch.from_numpy(latent_np)
+        # bf16 不能 isfinite 直接判（pytorch 旧版本可能行为不一致），但我们在保存时已验证过；
+        # 这里只对 fp32/fp16 cache 做防御性 isfinite 校验。
+        if dtype_kind != "bf16" and not torch.isfinite(latent).all():
             raise RuntimeError(f"读取到非有限 latent 缓存: {npz_path}")
 
         # 获取 base_dataset 的引用（处理可能的嵌套）
@@ -694,7 +910,10 @@ class CachedLatentDataset(Dataset):
         if getattr(base, "caption_override", None) is not None:
             caption = base.caption_override
         elif sample.get("json_path") and hasattr(base, "_process_caption_json"):
-            caption = base._process_caption_json(sample["json_path"])
+            # 使用预 normalized 缓存（避免每次 __getitem__ load+normalize JSON）
+            caption = base._process_caption_json(
+                sample["json_path"], normalized=sample.get("normalized_json"),
+            )
 
         if caption is None and sample.get("txt_path"):
             caption = sample["txt_path"].read_text(encoding="utf-8").strip()

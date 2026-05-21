@@ -618,6 +618,34 @@ def compute_grad_norm(parameters) -> float:
     return float(total.item())
 
 
+_BLOCK_ACCEPTS_PAD_MASK_CACHE: "dict[int, bool]" = {}
+
+
+def _block_accepts_padding_mask(block) -> bool:
+    """Detect once per (block class, model instance) 是否接受 padding_mask kwarg。
+
+    旧实现每个 block 每步 forward 都 try/except TypeError 兜底 —— 对 36 blocks ×
+    几千 steps = 几十万次 try/except，虽然单次开销小，但累积非零。
+
+    用 class id 做 cache key（同一模型类的所有 block 行为一致）。
+    """
+    key = id(type(block))
+    cached = _BLOCK_ACCEPTS_PAD_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    import inspect
+    try:
+        sig = inspect.signature(block.forward)
+        accepts = ("padding_mask" in sig.parameters) or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+    except (TypeError, ValueError):
+        # 无法 introspect（C++ binding 等）时保守地试一次 + 兜底
+        accepts = True
+    _BLOCK_ACCEPTS_PAD_MASK_CACHE[key] = bool(accepts)
+    return bool(accepts)
+
+
 def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_mask, use_checkpoint=False):
     """带可选梯度检查点的前向传播（per-block checkpoint 策略）。
 
@@ -628,8 +656,10 @@ def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_m
 
     本实现回退到 per-block checkpoint：每个 transformer block 单独 checkpoint，峰值激活
     ≈ 1 × (单 block 激活)。同时把 `padding_mask` 显式透传给每个 block —— 这是上一版整体
-    checkpoint 当初引入的本意（旧 per-block 实现漏传了 padding_mask）。block 不接受该 kwarg
-    时 try/except 兜底，行为与不传一致。
+    checkpoint 当初引入的本意（旧 per-block 实现漏传了 padding_mask）。
+
+    ★ block 是否接受 padding_mask kwarg 用 inspect 一次性 introspect 并 cache，
+       不再每个 forward 都 try/except TypeError。
     """
     if not use_checkpoint:
         return model(latents, timesteps, cross, padding_mask=padding_mask)
@@ -650,10 +680,12 @@ def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_m
     }
 
     for block in model.blocks:
-        def custom_forward(x, blk=block):
-            try:
+        accepts_pad = _block_accepts_padding_mask(block)
+        if accepts_pad:
+            def custom_forward(x, blk=block):
                 return blk(x, t_embedding, cross, padding_mask=padding_mask, **block_kwargs)
-            except TypeError:
+        else:
+            def custom_forward(x, blk=block):
                 return blk(x, t_embedding, cross, **block_kwargs)
         x_B_T_H_W_D = checkpoint(custom_forward, x_B_T_H_W_D, use_reentrant=False)
 

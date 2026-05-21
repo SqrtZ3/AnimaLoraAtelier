@@ -308,6 +308,15 @@ def parse_args():
     p.add_argument("--tag-dropout", type=float, default=0.0, help="Tag dropout 概率 (0-1)")
     p.add_argument("--no-prefer-json", action="store_true", help="禁用 JSON 优先模式")
     p.add_argument("--cache-latents", action="store_true", help="缓存 VAE latent 加速训练")
+    p.add_argument("--cache-latents-dtype", choices=["fp32", "bf16", "fp16"], default="bf16",
+                   help="latent 缓存 dtype。默认 bf16 与训练 dtype 对齐，disk 占用减半，"
+                        "且省去训练取数时的 fp32→bf16 转换开销。fp32 仅在需要最高精度时用。")
+    p.add_argument("--baseline-sample-count", type=int, default=3,
+                   help="step 0 基线采样的提示词数量（最多取 sample_prompts 前 N 个）")
+    p.add_argument("--dataloader-pin-memory", action="store_true", default=True,
+                   help="DataLoader pin_memory=True，配合 .to(device, non_blocking=True) 让 H2D 拷贝与计算 overlap。"
+                        "Windows 上某些场景可能引起问题，可用 --no-dataloader-pin-memory 关闭。")
+    p.add_argument("--no-dataloader-pin-memory", dest="dataloader_pin_memory", action="store_false")
 
     # LoRA 参数
     p.add_argument("--lora-type", choices=["lora", "lokr"], default="lokr")
@@ -522,7 +531,14 @@ def prompt_for_args(args):
     args.lora_alpha = _ask_float("LoRA alpha", args.lora_alpha)
     args.loss_curve_steps = _ask_int("Loss 曲线步数 (0=禁用)", args.loss_curve_steps)
     args.auto_install = _ask_bool("自动安装缺失依赖?", args.auto_install)
-    args.save_every_epoch = _ask_bool("每个 epoch 保存?", args.save_every_epoch)
+    # ★ 旧实现 `args.save_every_epoch` 这个属性根本不存在（argparse 里只有 save_every: int）
+    # 任何用户跑 --interactive 都会 AttributeError 崩溃。把它映射到 save_every（0=禁用, 1=每 epoch）。
+    _save_each_epoch_default = bool(getattr(args, "save_every", 0))
+    if _ask_bool("每个 epoch 保存?", _save_each_epoch_default):
+        if not args.save_every:
+            args.save_every = 1
+    else:
+        args.save_every = 0
     args.mixed_precision = _ask_str("混合精度 (bf16/fp32)", args.mixed_precision)
     return args
 
@@ -587,6 +603,14 @@ def main():
     # 理由：ARB 分桶导致 batch 之间 conv shape 在多个 bucket 之间切换，
     # 每个新 shape 都触发 ~1-5 秒的算法 profiling。短训练（几百-几千步）下
     # profiling 开销难以摊销，可能反而变慢；只有 shape 完全固定且训练很长才推荐开。
+
+    # ★ Allocator 提示：训练循环里 ARB 多 bucket 会触发频繁的 cudaMalloc/Free。
+    # 设置 expandable_segments=True 让 PyTorch caching allocator 用增长式 segment 而非
+    # 每个新 shape 都开新 block；减少 OOM 风险 + 降低分配延迟。
+    # 仅在用户没显式设过 PYTORCH_CUDA_ALLOC_CONF 时设置。
+    if torch.cuda.is_available() and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        logger.info("Allocator: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (ARB 多 bucket 友好)")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
@@ -676,6 +700,27 @@ def main():
         args.qwen, args.t5_tokenizer, device, dtype
     )
 
+    # ★ Text encode cache：caption 在训练中是否会变？
+    # - shuffle_caption / tag_dropout / caption_dropout_rate / freq_balanced_dropout 任一开启
+    #   → caption 每次都不一样，cache 命中率几乎 0，纯浪费内存。
+    # - 都关闭 → caption 完全静态，cache 命中率接近 100%，可省 Qwen forward + T5 tokenize 的 overhead。
+    _caption_is_static = (
+        not bool(getattr(args, "shuffle_caption", False))
+        and float(getattr(args, "tag_dropout", 0.0) or 0.0) <= 0
+        and float(getattr(args, "caption_dropout_rate", 0.0) or 0.0) <= 0
+        and float(getattr(args, "freq_balanced_dropout_strength", 0.0) or 0.0) <= 0
+    )
+    try:
+        from trainer.text_encode import set_text_encode_cache_enabled, reset_text_encode_cache
+        reset_text_encode_cache()
+        set_text_encode_cache_enabled(_caption_is_static)
+        if _caption_is_static:
+            logger.info("[text-encode] caption 静态（无 shuffle / dropout），启用编码 LRU cache（命中即跳过 Qwen forward）")
+        else:
+            logger.info("[text-encode] caption 启用了 shuffle / dropout，禁用编码 cache（命中率会很低）")
+    except Exception as _e:
+        logger.warning(f"[text-encode] cache toggle 失败（忽略）: {_e}")
+
     # 注入 LoRA
     lora_variant = str(getattr(args, "lora_variant", "base") or "base").lower()
     dora_export_mode = str(getattr(args, "dora_export_mode", "native") or "native").lower()
@@ -739,6 +784,7 @@ def main():
         tlora_init=str(getattr(args, "tlora_init", "ortho") or "ortho"),
         tlora_lokr_experimental=bool(getattr(args, "tlora_lokr_experimental", False)),
         tlora_lokr_ortho_init=bool(getattr(args, "tlora_lokr_ortho_init", False)),
+        tlora_skip_lambda_layer=bool(getattr(args, "tlora_skip_lambda_layer", True)),
         **injector_kwargs,
     )
     injector.inject(model)
@@ -838,9 +884,16 @@ def main():
             "若想保持 cache_latents 的速度，请关闭 flip_augment。"
         )
     if use_cached:
-        dataset = CachedLatentDataset(dataset, vae, device, dtype)
+        # cache_latents_dtype 让 npz 保存为 bf16/fp16 而非 fp32：
+        #  - disk 占用 ≈ 一半（5120×5120×16ch 的 5D latent，一张 1024² 图约 0.6MB(fp32) → 0.3MB(bf16)）
+        #  - 训练取数时 from_numpy(...).to(dtype=bf16) 跳过精度转换
+        # fp32 = 旧默认（最高精度但 disk/读盘成本翻倍）；bf16 = 新默认（与训练 dtype 对齐）。
+        _cache_dtype_str = str(getattr(args, "cache_latents_dtype", "bf16") or "bf16").lower()
+        _cache_dtype_map = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+        _cache_save_dtype = _cache_dtype_map.get(_cache_dtype_str, torch.bfloat16)
+        dataset = CachedLatentDataset(dataset, vae, device, dtype, save_dtype=_cache_save_dtype)
     if reg_dataset is not None and use_cached:
-        reg_dataset = CachedLatentDataset(reg_dataset, vae, device, dtype)
+        reg_dataset = CachedLatentDataset(reg_dataset, vae, device, dtype, save_dtype=_cache_save_dtype)
 
     # repeat 放在缓存之后
     if args.repeats > 1:
@@ -859,6 +912,10 @@ def main():
     if args.num_workers > 0:
         _loader_kwargs["persistent_workers"] = True
         _loader_kwargs["prefetch_factor"] = 2
+    # ★ pin_memory + non_blocking 让 H2D 拷贝与下个 batch 计算 overlap。
+    # 仅在 CUDA 可用时启用；Windows 上 num_workers=0 通常仍能受益（pinned host 内存自身有用）。
+    if torch.cuda.is_available() and bool(getattr(args, "dataloader_pin_memory", True)):
+        _loader_kwargs["pin_memory"] = True
 
     _bucket_drop_last = bool(getattr(args, "bucket_drop_last", False))
     if use_cached:
@@ -1117,8 +1174,16 @@ def main():
         lora_path = output_dir / f"{args.output_name}_interrupted_step{global_step}.safetensors"
         injector.save(lora_path, model=model)
         emit(f"已保存！下次使用 --resume-state \"{state_path}\" 继续训练")
+        # ★ 优雅关闭监控 server。旧实现直接 sys.exit(0)，daemon thread 立刻被强杀，
+        # 但 server socket 未 server_close() → Windows 下下次启动撞 "Address already in use"。
+        if monitor_server is not None:
+            try:
+                from train_monitor import shutdown_monitor_server
+                shutdown_monitor_server(monitor_server)
+            except Exception:
+                pass
         sys.exit(0)
-    
+
     import signal
     signal.signal(signal.SIGINT, signal_handler)
     
@@ -1226,7 +1291,8 @@ def main():
         s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
         s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
         s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
-        for i, prompt in enumerate(sample_prompts[:3]):  # 最多测试 3 个
+        _baseline_n = max(int(getattr(args, "baseline_sample_count", 3) or 3), 1)
+        for i, prompt in enumerate(sample_prompts[:_baseline_n]):
             if s_seed:
                 torch.manual_seed(s_seed + i)
             img = _sample_with_vae_swap(
@@ -1263,6 +1329,10 @@ def main():
     # 新做法：保留已累计的梯度，但记号本周期"脏了"，到周期边界时整体丢弃这次 step。
     accum_clean = True
 
+    # pad_mask 复用缓存：key=(B, 1, H_lat, W_lat) → tensor
+    # ARB 多 bucket 时大概会有 5-20 个 unique shape，cache 几 KB 内存换掉每步的 cudaMalloc。
+    _pad_mask_cache: dict = {}
+
     for epoch in range(start_epoch, args.epochs):
         current_epoch = epoch
         if hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_epoch"):
@@ -1280,11 +1350,13 @@ def main():
             if cap_drop_p > 0:
                 captions = ["" if random.random() < cap_drop_p else c for c in captions]
 
-            # 获取 latents（缓存模式或实时编码）
+            # 获取 latents（缓存模式或实时编码）。
+            # ★ 用 non_blocking=True 配合 DataLoader pin_memory，让 H2D 拷贝与下个 batch overlap。
+            _non_blk = bool(_loader_kwargs.get("pin_memory", False))
             if use_cached:
-                latents = batch["latents"].to(device, dtype=dtype)
+                latents = batch["latents"].to(device, dtype=dtype, non_blocking=_non_blk)
             else:
-                pixels = batch["pixel_values"].to(device, dtype=dtype)
+                pixels = batch["pixel_values"].to(device, dtype=dtype, non_blocking=_non_blk)
                 with torch.no_grad():
                     pixels_5d = pixels.unsqueeze(2)
                     # VAE 权重已是 bf16；与 _build_cache / roundtrip 自检保持一致，
@@ -1334,30 +1406,39 @@ def main():
             target = noise - latents
 
             # 前向
-            pad_mask = torch.zeros(bs, 1, latents.shape[-2], latents.shape[-1], device=device, dtype=dtype)
+            # ★ pad_mask 是全零张量，每步都 zeros 分配 → ARB 多 bucket 时
+            # 频繁触发 cudaMalloc/cudaFree。改成 by-shape cache，相同 shape 复用同一张量
+            # （forward 内不修改它，只是把它当 attention mask 的占位）。
+            _pad_key = (int(bs), 1, int(latents.shape[-2]), int(latents.shape[-1]))
+            pad_mask = _pad_mask_cache.get(_pad_key)
+            if pad_mask is None or pad_mask.device != latents.device or pad_mask.dtype != dtype:
+                pad_mask = torch.zeros(*_pad_key, device=device, dtype=dtype)
+                _pad_mask_cache[_pad_key] = pad_mask
             # T-LoRA: 把当前 batch 的 timestep 写到每个注入的 LoRA adapter，让其在 forward
             # 内按 r(t) 应用 rank mask；其它 variant 该调用是空操作。完成后 reset 避免
             # 跨 step 残留（采样 / eval / 其它前向不应受影响）。
             injector.set_current_t(t.float().detach())
-            try:
-                with torch.autocast("cuda", dtype=dtype):
-                    pred = forward_with_optional_checkpoint(
-                        model, noisy, t.view(-1, 1), cross, pad_mask,
-                        use_checkpoint=args.grad_checkpoint
-                    )
-                    # ★ 损失始终 fp32 计算（per-sample，便于按 t 加权）
-                    per_sample = per_sample_loss(
-                        pred,
-                        target,
-                        loss_type=objective_cfg.loss.loss_type,
-                        huber_c=objective_cfg.loss.huber_c,
-                        huber_schedule=objective_cfg.loss.huber_schedule,
-                        t=t.float(),
-                    )
+            # ★ T-LoRA: current_t 必须存活到 backward 之后。原本在这里 finally reset
+            # 是错的：grad checkpoint 在 backward 时会 recompute forward，那一刻 current_t
+            # 必须和原 forward 完全一致，否则 LoRALayer 的 _apply_tlora_mask / ortho 补偿
+            # 分支会变，autograd 图保存的张量数对不上（torch.utils.checkpoint.CheckpointError）。
+            # reset 已移到 backward 之后，以及 NaN-loss continue 路径之前。
+            with torch.autocast("cuda", dtype=dtype):
+                pred = forward_with_optional_checkpoint(
+                    model, noisy, t.view(-1, 1), cross, pad_mask,
+                    use_checkpoint=args.grad_checkpoint
+                )
+                # ★ 损失始终 fp32 计算（per-sample，便于按 t 加权）
+                per_sample = per_sample_loss(
+                    pred,
+                    target,
+                    loss_type=objective_cfg.loss.loss_type,
+                    huber_c=objective_cfg.loss.huber_c,
+                    huber_schedule=objective_cfg.loss.huber_schedule,
+                    t=t.float(),
+                )
 
-                    loss = apply_loss_weighting(per_sample, t, objective_cfg.loss)
-            finally:
-                injector.set_current_t(None)
+                loss = apply_loss_weighting(per_sample, t, objective_cfg.loss)
 
             # ★ 守护 1：forward 结果 NaN/Inf 检查
             debug_n = int(getattr(args, "debug_first_batches", 0) or 0)
@@ -1414,6 +1495,11 @@ def main():
                 )
                 # 不要 zero_grad！保留同周期内其他 micro-batch 的梯度，整周期边界统一丢弃。
                 accum_clean = False
+                injector.set_current_t(None)  # T-LoRA: 本 micro-batch 跳过 backward，立即 reset
+                # ★ 显式释放本 micro-batch 的 forward autograd 图。否则同周期内
+                # 后续 micro-batch 的图会累积（pred / per_sample / loss 都还被 closure 引用），
+                # 持续 NaN 时显存会迅速被这些"死图"占满 → OOM。
+                del loss, per_sample, pred, target, noisy, cross
                 continue
 
             if adaptive_ts.enabled:
@@ -1427,6 +1513,9 @@ def main():
                 adaptive_ts.update(t.float(), adaptive_signal)
             loss_to_backward = loss / args.grad_accum
             loss_to_backward.backward()
+            # T-LoRA: backward 完成后才能 reset，否则 grad checkpoint recompute 会看到
+            # current_t=None，与原 forward 走的分支不一致 → CheckpointError
+            injector.set_current_t(None)
 
             if (batch_idx + 1) % args.grad_accum == 0:
                 # ★ 守护 1：周期内有 micro-batch NaN/Inf loss → 整周期作废，不做 step
@@ -1691,6 +1780,14 @@ def main():
 
     emit(f"Saved final LoRA: {final_path}")
     logger.info("训练完成!")
+
+    # ★ 优雅关闭监控 server，让端口在训练结束后立即被释放（否则连续重启会撞端口）。
+    if monitor_server is not None:
+        try:
+            from train_monitor import shutdown_monitor_server
+            shutdown_monitor_server(monitor_server)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -246,13 +246,31 @@ def load_vae(vae_path, device, dtype, repo_root):
 
 
 def load_text_encoders(qwen_path, t5_tokenizer_path, device, dtype):
-    """加载文本编码器"""
+    """加载文本编码器。
+
+    ★ 加 `low_cpu_mem_usage=True` 与 `device_map={"": device}` 避免双倍 RAM：
+       旧实现先把权重 load 到 CPU 再 `.to(device)` 拷一份到 VRAM；Qwen3-0.6B ~1.2GB
+       会让 CPU RAM 额外占用 1.2GB（在 32GB 服务器上不算大问题，但云上小机型 / 多 LoRA
+       并行训练时会撞 OOM）。新写法直接 in-place 加载到目标 device。
+       老版本 transformers 不支持 `device_map` 参数的情形：catch + fallback 旧路径。
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer, T5Tokenizer
 
     qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_path, trust_remote_code=True)
-    qwen_model = AutoModelForCausalLM.from_pretrained(
-        qwen_path, torch_dtype=dtype, trust_remote_code=True
-    ).to(device).eval().requires_grad_(False)
+
+    try:
+        qwen_model = AutoModelForCausalLM.from_pretrained(
+            qwen_path,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            device_map={"": str(device)},
+        ).eval().requires_grad_(False)
+    except (TypeError, ValueError, ImportError) as e:
+        logger.warning(f"Qwen 加载 device_map 路径失败 ({e})，回退到 .to(device)（CPU RAM 会临时翻倍）")
+        qwen_model = AutoModelForCausalLM.from_pretrained(
+            qwen_path, torch_dtype=dtype, trust_remote_code=True
+        ).to(device).eval().requires_grad_(False)
 
     if t5_tokenizer_path and Path(t5_tokenizer_path).exists():
         t5_tokenizer = T5Tokenizer.from_pretrained(t5_tokenizer_path)

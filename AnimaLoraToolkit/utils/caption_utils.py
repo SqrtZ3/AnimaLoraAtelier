@@ -35,7 +35,13 @@ def normalize_caption_json(raw_json: dict) -> dict:
     ai_output = raw_json if is_simplified else raw_json.get("ai_output", {})
     
     # 【Bug修复核心】兼容 character 是字符串的情况
-    character_info = raw_json.get("character", "")
+    # ★ 新增：嵌套 JSON 格式下，character 可能在 fixed.character 而非顶层。
+    # 旧实现只读 raw_json.get("character", "") → 嵌套格式且 character 在 fixed 节点时永远空。
+    character_info = raw_json.get("character", None)
+    if character_info is None and not is_simplified:
+        character_info = fixed.get("character", "")
+    if character_info is None:
+        character_info = ""
     if isinstance(character_info, str):
         character_name = character_info
     else:

@@ -174,131 +174,147 @@ def sample_image(
         negative_prompt: 负面提示词，默认使用标准负面提示词
         sampler_name: 采样器（推荐：er_sde）
         scheduler: 调度器（推荐：simple）
+
+    ★ model.train()/eval() 状态用 try/finally 守护：
+       旧实现是函数体内 model.eval() 进入、return 前 model.train() 退出。但若中途抛错
+       （NaN/Inf、VAE decode 失败、模型分支跳错），return 永不到达，模型留在 eval 模式 →
+       继续训练时 dropout 等被禁用，训练曲线静默偏移。
     """
     import numpy as np
     from PIL import Image
+    # 记录原 mode（model.training 为 True/False），用于 finally 恢复
+    _orig_training = bool(model.training)
     model.eval()
 
     logger.info(f"[Debug] Sampling start. Prompt: {prompt[:50]}...")
 
-    # Check VAE scale
-    if isinstance(vae.scale, list) and len(vae.scale) == 2:
-        m, s = vae.scale
-        logger.info(f"[Debug] VAE scale: mean_shape={m.shape}, std_inv_shape={s.shape}")
-        logger.info(f"[Debug] VAE scale values: mean={m.mean().item():.4f}, std_inv={s.mean().item():.4f}")
-
-    # 默认负面提示词 (参考 Anima Prompt Guide)
-    if negative_prompt is None:
-        negative_prompt = "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, bad anatomy, bad hands, bad feet, missing fingers, extra fingers, text, watermark, logo, signature, username, artist name, copyright name"
-
-    # 文本编码
     try:
-        # 有条件 (positive prompt)
-        qwen_text = _build_qwen_text_from_prompt(prompt)
-        qwen_embeds, qwen_attn = encode_qwen(qwen_model, qwen_tokenizer, [qwen_text], device)
-        logger.info(f"[Debug] Qwen embeds: {qwen_embeds.shape}, mean={qwen_embeds.mean().item():.4f}")
+        # Check VAE scale
+        if isinstance(vae.scale, list) and len(vae.scale) == 2:
+            m, s = vae.scale
+            logger.info(f"[Debug] VAE scale: mean_shape={m.shape}, std_inv_shape={s.shape}")
+            logger.info(f"[Debug] VAE scale values: mean={m.mean().item():.4f}, std_inv={s.mean().item():.4f}")
 
-        t5_ids, t5_attn, t5_w = tokenize_t5_weighted(t5_tokenizer, [prompt], max_length=512)
-        t5_ids = t5_ids.to(device)
-        t5_attn = t5_attn.to(device)
-        t5_w = t5_w.to(device, dtype=torch.float32)
-        cross_cond = model.preprocess_text_embeds(qwen_embeds, t5_ids, t5_attn, qwen_attn)
-        if (
-            use_t5_token_weights
-            and getattr(model, "llm_adapter", None) is not None
-            and cross_cond.shape[1] == t5_w.shape[1]
-        ):
-            cross_cond = cross_cond * t5_w.to(cross_cond.dtype).unsqueeze(-1)
-        if cross_cond.shape[1] < 512:
-            cross_cond = F.pad(cross_cond, (0, 0, 0, 512 - cross_cond.shape[1]))
+        # 默认负面提示词 (参考 Anima Prompt Guide)
+        if negative_prompt is None:
+            negative_prompt = (
+                "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, "
+                "bad anatomy, bad hands, bad feet, missing fingers, extra fingers, text, watermark, "
+                "logo, signature, username, artist name, copyright name"
+            )
 
-        # 无条件/负面提示词 (negative prompt)
-        qwen_text_uncond = _build_qwen_text_from_prompt(negative_prompt)
-        qwen_embeds_uncond, qwen_attn_uncond = encode_qwen(qwen_model, qwen_tokenizer, [qwen_text_uncond], device)
-        t5_ids_uncond, t5_attn_uncond, t5_w_uncond = tokenize_t5_weighted(t5_tokenizer, [negative_prompt], max_length=512)
-        t5_ids_uncond = t5_ids_uncond.to(device)
-        t5_attn_uncond = t5_attn_uncond.to(device)
-        t5_w_uncond = t5_w_uncond.to(device, dtype=torch.float32)
-        cross_uncond = model.preprocess_text_embeds(qwen_embeds_uncond, t5_ids_uncond, t5_attn_uncond, qwen_attn_uncond)
-        if (
-            use_t5_token_weights
-            and getattr(model, "llm_adapter", None) is not None
-            and cross_uncond.shape[1] == t5_w_uncond.shape[1]
-        ):
-            cross_uncond = cross_uncond * t5_w_uncond.to(cross_uncond.dtype).unsqueeze(-1)
-        if cross_uncond.shape[1] < 512:
-            cross_uncond = F.pad(cross_uncond, (0, 0, 0, 512 - cross_uncond.shape[1]))
-
-    except Exception as e:
-        logger.error(f"[Debug] Encoding failed: {e}")
-        raise e
-
-    # sigmas（对齐 ComfyUI supported_models.Anima: shift=3.0, multiplier=1.0）
-    lat_h, lat_w = height // 8, width // 8
-    if str(scheduler).lower() != "simple":
-        logger.warning(f"采样 scheduler={scheduler} 未实现，回退 simple")
-    sigmas = _flow_sigmas_simple(steps, shift=3.0, device=device)
-
-    # 初始化噪声（ComfyUI CONST.noise_scaling: x = sigma*noise + (1-sigma)*latent_image；txt2img latent_image=0）
-    x = torch.randn(1, 16, 1, lat_h, lat_w, device=device, dtype=torch.float32) * float(sigmas[0])
-    logger.info(f"[Debug] Latents init: {x.shape}, mean={x.mean().item():.4f}, std={x.std().item():.4f}")
-
-    pad_mask = torch.zeros(1, 1, lat_h, lat_w, device=device, dtype=dtype)
-    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
-
-    def denoise_fn(x_in: torch.Tensor, sigma_in: torch.Tensor) -> torch.Tensor:
-        if not torch.is_tensor(sigma_in):
-            sigma_in = torch.tensor(float(sigma_in), device=x_in.device, dtype=torch.float32)
-        sigma_b = sigma_in.view(1, 1).to(device=x_in.device, dtype=dtype)
-        sigma_5d = sigma_in.view(1, 1, 1, 1, 1).to(device=x_in.device, dtype=torch.float32)
-
-        # T-LoRA：把当前 σ 写到 LoRA adapter（B=1 here）。其它 variant 自动跳过。
-        # 在 try/finally 内确保即便 forward 抛错也能 reset，避免污染后续 step。
-        if injector is not None:
-            injector.set_current_t(sigma_in.view(-1).to(device=x_in.device, dtype=torch.float32))
+        # 文本编码
         try:
-            with torch.autocast(device_type=device_type, dtype=dtype):
-                v_cond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_cond, padding_mask=pad_mask)
-                v_uncond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_uncond, padding_mask=pad_mask)
-                v = v_uncond + cfg_scale * (v_cond - v_uncond)
-        finally:
+            # 有条件 (positive prompt)
+            qwen_text = _build_qwen_text_from_prompt(prompt)
+            qwen_embeds, qwen_attn = encode_qwen(qwen_model, qwen_tokenizer, [qwen_text], device)
+            logger.info(f"[Debug] Qwen embeds: {qwen_embeds.shape}, mean={qwen_embeds.mean().item():.4f}")
+
+            t5_ids, t5_attn, t5_w = tokenize_t5_weighted(t5_tokenizer, [prompt], max_length=512)
+            t5_ids = t5_ids.to(device)
+            t5_attn = t5_attn.to(device)
+            t5_w = t5_w.to(device, dtype=torch.float32)
+            cross_cond = model.preprocess_text_embeds(qwen_embeds, t5_ids, t5_attn, qwen_attn)
+            if (
+                use_t5_token_weights
+                and getattr(model, "llm_adapter", None) is not None
+                and cross_cond.shape[1] == t5_w.shape[1]
+            ):
+                cross_cond = cross_cond * t5_w.to(cross_cond.dtype).unsqueeze(-1)
+            if cross_cond.shape[1] < 512:
+                cross_cond = F.pad(cross_cond, (0, 0, 0, 512 - cross_cond.shape[1]))
+
+            # 无条件/负面提示词 (negative prompt)
+            qwen_text_uncond = _build_qwen_text_from_prompt(negative_prompt)
+            qwen_embeds_uncond, qwen_attn_uncond = encode_qwen(qwen_model, qwen_tokenizer, [qwen_text_uncond], device)
+            t5_ids_uncond, t5_attn_uncond, t5_w_uncond = tokenize_t5_weighted(t5_tokenizer, [negative_prompt], max_length=512)
+            t5_ids_uncond = t5_ids_uncond.to(device)
+            t5_attn_uncond = t5_attn_uncond.to(device)
+            t5_w_uncond = t5_w_uncond.to(device, dtype=torch.float32)
+            cross_uncond = model.preprocess_text_embeds(qwen_embeds_uncond, t5_ids_uncond, t5_attn_uncond, qwen_attn_uncond)
+            if (
+                use_t5_token_weights
+                and getattr(model, "llm_adapter", None) is not None
+                and cross_uncond.shape[1] == t5_w_uncond.shape[1]
+            ):
+                cross_uncond = cross_uncond * t5_w_uncond.to(cross_uncond.dtype).unsqueeze(-1)
+            if cross_uncond.shape[1] < 512:
+                cross_uncond = F.pad(cross_uncond, (0, 0, 0, 512 - cross_uncond.shape[1]))
+
+        except Exception as e:
+            logger.error(f"[Debug] Encoding failed: {e}")
+            raise
+
+        # sigmas（对齐 ComfyUI supported_models.Anima: shift=3.0, multiplier=1.0）
+        lat_h, lat_w = height // 8, width // 8
+        if str(scheduler).lower() != "simple":
+            logger.warning(f"采样 scheduler={scheduler} 未实现，回退 simple")
+        sigmas = _flow_sigmas_simple(steps, shift=3.0, device=device)
+
+        # 初始化噪声（ComfyUI CONST.noise_scaling: x = sigma*noise + (1-sigma)*latent_image；txt2img latent_image=0）
+        x = torch.randn(1, 16, 1, lat_h, lat_w, device=device, dtype=torch.float32) * float(sigmas[0])
+        logger.info(f"[Debug] Latents init: {x.shape}, mean={x.mean().item():.4f}, std={x.std().item():.4f}")
+
+        pad_mask = torch.zeros(1, 1, lat_h, lat_w, device=device, dtype=dtype)
+        device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+
+        def denoise_fn(x_in: torch.Tensor, sigma_in: torch.Tensor) -> torch.Tensor:
+            if not torch.is_tensor(sigma_in):
+                sigma_in = torch.tensor(float(sigma_in), device=x_in.device, dtype=torch.float32)
+            sigma_b = sigma_in.view(1, 1).to(device=x_in.device, dtype=dtype)
+            sigma_5d = sigma_in.view(1, 1, 1, 1, 1).to(device=x_in.device, dtype=torch.float32)
+
+            # T-LoRA：把当前 σ 写到 LoRA adapter（B=1 here）。其它 variant 自动跳过。
+            # 在 try/finally 内确保即便 forward 抛错也能 reset，避免污染后续 step。
             if injector is not None:
-                injector.set_current_t(None)
+                injector.set_current_t(sigma_in.view(-1).to(device=x_in.device, dtype=torch.float32))
+            try:
+                with torch.autocast(device_type=device_type, dtype=dtype):
+                    v_cond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_cond, padding_mask=pad_mask)
+                    v_uncond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_uncond, padding_mask=pad_mask)
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+            finally:
+                if injector is not None:
+                    injector.set_current_t(None)
 
-        if torch.isnan(v).any():
-            raise RuntimeError("v contains NaN during sampling")
+            if torch.isnan(v).any():
+                raise RuntimeError("v contains NaN during sampling")
 
-        # CONST(flow): denoised x0 = x - sigma * v
-        return x_in - sigma_5d * v.float()
+            # CONST(flow): denoised x0 = x - sigma * v
+            return x_in - sigma_5d * v.float()
 
-    sampler_name_l = str(sampler_name).lower().strip()
-    logger.info(f"[Debug] Sampler={sampler_name_l}, Scheduler=simple, steps={steps}, cfg={cfg_scale}")
+        sampler_name_l = str(sampler_name).lower().strip()
+        logger.info(f"[Debug] Sampler={sampler_name_l}, Scheduler=simple, steps={steps}, cfg={cfg_scale}")
 
-    if sampler_name_l == "er_sde":
-        x = _sample_er_sde_const_x0(denoise_fn, x, sigmas, seed=None, s_noise=1.0, max_stage=3)
-    else:
-        # fallback: 简化 Euler ODE（deterministic），与 flow 兼容
-        for i in range(len(sigmas) - 1):
-            sigma = float(sigmas[i])
-            sigma_next = float(sigmas[i + 1])
-            denoised = denoise_fn(x, sigmas[i])
-            d = (x - denoised) / max(sigma, 1e-6)
-            x = x + d * (sigma_next - sigma)
+        if sampler_name_l == "er_sde":
+            x = _sample_er_sde_const_x0(denoise_fn, x, sigmas, seed=None, s_noise=1.0, max_stage=3)
+        else:
+            # fallback: 简化 Euler ODE（deterministic），与 flow 兼容
+            for i in range(len(sigmas) - 1):
+                sigma = float(sigmas[i])
+                sigma_next = float(sigmas[i + 1])
+                denoised = denoise_fn(x, sigmas[i])
+                d = (x - denoised) / max(sigma, 1e-6)
+                x = x + d * (sigma_next - sigma)
 
-    # VAE 解码
-    latents = x.to(device=device, dtype=dtype)
-    logger.info(f"[Debug] Final latents: mean={latents.mean().item():.4f}, std={latents.std().item():.4f}")
-    try:
-        images = vae.model.decode(latents, vae.scale)
-        images = images.squeeze(2)  # [B,C,H,W]
-        images = (images.clamp(-1, 1) + 1) / 2
+        # VAE 解码
+        latents = x.to(device=device, dtype=dtype)
+        logger.info(f"[Debug] Final latents: mean={latents.mean().item():.4f}, std={latents.std().item():.4f}")
+        try:
+            images = vae.model.decode(latents, vae.scale)
+            images = images.squeeze(2)  # [B,C,H,W]
+            images = (images.clamp(-1, 1) + 1) / 2
 
-        # 转 PIL
-        img = images[0].permute(1, 2, 0).cpu().float().numpy()
-        img = (img * 255).clip(0, 255).astype(np.uint8)
-
-        model.train()
-        return Image.fromarray(img)
-    except Exception as e:
-        logger.error(f"[Debug] VAE decode failed: {e}")
-        raise e
+            # 转 PIL
+            img = images[0].permute(1, 2, 0).cpu().float().numpy()
+            img = (img * 255).clip(0, 255).astype(np.uint8)
+            return Image.fromarray(img)
+        except Exception as e:
+            logger.error(f"[Debug] VAE decode failed: {e}")
+            raise
+    finally:
+        # 不论是否抛错都恢复 model train/eval 模式（修了旧实现"中途抛错 → 模型留在 eval"的 bug）。
+        if _orig_training:
+            model.train()
+        else:
+            model.eval()

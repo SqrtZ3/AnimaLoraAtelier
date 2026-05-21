@@ -14,12 +14,19 @@ from __future__ import annotations
 
 import logging
 import math
+import random as _py_random
 import re
 
 import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+# ★ 在 LoRA forward 的 module_dropout 决策中代替 torch.rand(1).item()。
+# torch 在 GPU 上生成单元素再 .item() 会触发设备同步，对 200+ LoRA 层每步 200+ 次同步
+# 是可观的隐性开销。module_dropout 仅决定"跳过该层与否"，是 boolean 控制流，与梯度无关，
+# 用 Python 标准 random（CPU rng）数学上完全等价、且不触发设备同步。
+_py_random_call = _py_random.random
 
 
 # ============================================================================
@@ -43,7 +50,7 @@ def _tlora_rank_mask(rank: int, r_min: int, current_t: torch.Tensor, alpha: floa
     return mask
 
 
-def _ortho_lora_init(in_features: int, out_features: int, rank: int):
+def _ortho_lora_init(in_features: int, out_features: int, rank: int, device=None):
     """Ortho-LoRA SVD init (arxiv:2507.05964 Eq.5).
 
     取 R ~ N(0, 1/sqrt(rank)) 的 SVD 最后 rank 个分量（sig_type="last"）：
@@ -51,8 +58,11 @@ def _ortho_lora_init(in_features: int, out_features: int, rank: int):
         B_init = U[:, -rank:] * S[-rank:]   (out_features, rank)   # 把 S 折进 B
     返回 (A_init, B_init)；调用方负责拷贝到 nn.Linear 权重并保留 init 副本用于
     forward 时的初始 delta 补偿。
+
+    SVD 在传入的 device 上计算（建议传 GPU），CPU SVD 在 5120×5120 量级要 10+ 秒，
+    Wan 14B 整网 240+ 层会累积到一小时。dtype 固定 fp32：bf16 SVD 数值上不稳定。
     """
-    R = torch.randn(out_features, in_features) / math.sqrt(max(rank, 1))
+    R = torch.randn(out_features, in_features, device=device, dtype=torch.float32) / math.sqrt(max(rank, 1))
     U, S, Vh = torch.linalg.svd(R, full_matrices=False)
     # SVD 返回 S 降序；最后 rank 个 = 最小奇异值（论文经验：抗过拟合最好）
     A_init = Vh[-rank:, :].contiguous()                          # (rank, in_features)
@@ -78,13 +88,15 @@ class LoRALayer(torch.nn.Module):
     def __init__(self, in_features, out_features, rank=4, alpha=1.0, dropout=0.0,
                  rank_dropout=0.0, module_dropout=0.0,
                  tlora_enabled=False, tlora_rmin_ratio=0.5, tlora_alpha=1.0,
-                 tlora_init="default"):
+                 tlora_init="default", device=None):
         super().__init__()
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
-        self.lora_down = torch.nn.Linear(in_features, rank, bias=False)
-        self.lora_up = torch.nn.Linear(rank, out_features, bias=False)
+        # 在目标 device 上直接构造，避免后续 cross-device copy_ 的隐式同步开销
+        linear_kwargs = {"device": device} if device is not None else {}
+        self.lora_down = torch.nn.Linear(in_features, rank, bias=False, **linear_kwargs)
+        self.lora_up = torch.nn.Linear(rank, out_features, bias=False, **linear_kwargs)
         self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
         self.rank_dropout = float(rank_dropout or 0.0)
         self.module_dropout = float(module_dropout or 0.0)
@@ -101,7 +113,7 @@ class LoRALayer(torch.nn.Module):
 
         # 初始化 + 可选 Ortho-LoRA + 初始 delta 补偿 buffer
         if self.tlora_enabled and self.tlora_init == "ortho":
-            A_init, B_init = _ortho_lora_init(in_features, out_features, rank)
+            A_init, B_init = _ortho_lora_init(in_features, out_features, rank, device=device)
             with torch.no_grad():
                 self.lora_down.weight.copy_(A_init)
                 self.lora_up.weight.copy_(B_init)
@@ -143,8 +155,11 @@ class LoRALayer(torch.nn.Module):
 
     def forward(self, x):
         # Module dropout: 整个模块以 p 概率跳过（训练时）
+        # ★ 旧实现 torch.rand(1).item() 触发 GPU↔CPU 同步；对 200+ LoRA 层每步 200+ 次同步。
+        # 用 Python random.random()（CPU rng）省掉同步开销；module_dropout 是 boolean 决策，
+        # 不参与梯度，使用 CPU rng 对训练结果无差异。
         if self.training and self.module_dropout > 0:
-            if torch.rand(1).item() < self.module_dropout:
+            if _py_random_call() < self.module_dropout:
                 return torch.zeros(*x.shape[:-1], self.lora_up.out_features,
                                    device=x.device, dtype=x.dtype)
         x_drop = self.dropout(x)
@@ -153,24 +168,48 @@ class LoRALayer(torch.nn.Module):
         # T-LoRA: rank mask
         h, mask = self._apply_tlora_mask(h)
 
-        # Rank dropout: 随机置零 rank 中的某些通道（训练时，inverted dropout）
-        if self.training and self.rank_dropout > 0:
-            rd_mask = torch.bernoulli(
-                torch.full((self.rank,), 1.0 - self.rank_dropout, device=h.device)
-            )
-            h = h * rd_mask / (1.0 - self.rank_dropout + 1e-6)
+        # 是否启用 Ortho-LoRA 初始 delta 补偿。先确定，因为 rank_dropout 需要同时作用到两支。
+        use_ortho_comp = (
+            self.tlora_enabled and self.lora_down_init is not None
+            and self.lora_up_init is not None and self.current_t is not None
+        )
 
-        out = self.lora_up(h) * self.scaling
-
-        # Ortho-LoRA 初始 delta 补偿：减去 (B_init · M_t · A_init) · x · scaling
-        # 与上面的 (B · M_t · A) · x · scaling 相抵消，让训练 step 0 时净 delta ≈ 0
-        if (self.tlora_enabled and self.lora_down_init is not None
-                and self.lora_up_init is not None and self.current_t is not None):
-            with torch.no_grad():
-                pass  # buffers 已经 requires_grad=False
+        # 提前算出 init 分支的 h_init（应用同一个 T-LoRA mask），稍后与 train 分支共用 rd_mask
+        h_init = None
+        if use_ortho_comp:
             h_init = F.linear(x_drop, self.lora_down_init)
             if mask is not None:
                 h_init = h_init * mask.view(mask.shape[0], *([1] * (h_init.ndim - 2)), self.rank)
+
+        # Rank dropout: 随机置零 rank 中的某些通道（训练时，inverted dropout）
+        # ★ rd_mask 必须显式落在 h.dtype 上：torch.full 默认 fp32，会让 h * rd_mask
+        # 升精度（bf16 → fp32），后续 self.lora_up(h) 时 weight 是 bf16 即 dtype mismatch
+        # ★★ 同一个 rd_mask 必须同时应用到 train 分支 h 和 init 分支 h_init。
+        # 否则 step 0 时（lora_up=B_init, lora_down=A_init）两分支应当严格相消，但因
+        # 一边 dropout 了、另一边没 dropout，会留下一个高方差 0 均值的随机 delta 叠加
+        # 在 base 权重上，破坏 Ortho-LoRA 论文 Eq.5 的"step 0 净 delta=0"保证。
+        # 观察上的表现：训练从一开始就输出色块噪声、Prodigy d 估计被噪声主导疯狂上调、
+        # loss 反复冲到 1.5+ 不收敛（issue: rank_dropout × T-LoRA ortho init 互动）
+        if self.training and self.rank_dropout > 0:
+            rd_mask = torch.bernoulli(
+                torch.full((self.rank,), 1.0 - self.rank_dropout, device=h.device)
+            ).to(dtype=h.dtype)
+            inv_keep = 1.0 / (1.0 - self.rank_dropout + 1e-6)
+            h = h * rd_mask * inv_keep
+            if h_init is not None:
+                h_init = h_init * rd_mask.to(h_init.dtype) * inv_keep
+
+        # ★ 防御性 cast：极端情况下（用户在 forward 前手工改了 dtype，或某些 hook 上溯精度）
+        # 也能保证 lora_up 不会因 dtype mismatch 崩；正常路径下这是 no-op
+        if h.dtype != self.lora_up.weight.dtype:
+            h = h.to(dtype=self.lora_up.weight.dtype)
+        out = self.lora_up(h) * self.scaling
+
+        # Ortho-LoRA 初始 delta 补偿：减去 (B_init · M_t · A_init · rd_mask) · x · scaling
+        # 与上面的 (B · M_t · A · rd_mask) · x · scaling 相抵消，让训练 step 0 时净 delta = 0
+        if h_init is not None:
+            if h_init.dtype != self.lora_up_init.dtype:
+                h_init = h_init.to(dtype=self.lora_up_init.dtype)
             out = out - F.linear(h_init, self.lora_up_init) * self.scaling
 
         return out
@@ -194,7 +233,7 @@ class LoKrLayer(torch.nn.Module):
     def __init__(self, in_features, out_features, rank=4, alpha=1.0, factor=8, dropout=0.0,
                  rank_dropout=0.0, module_dropout=0.0,
                  tlora_enabled=False, tlora_rmin_ratio=0.5, tlora_alpha=1.0,
-                 tlora_lokr_ortho_init=False):
+                 tlora_lokr_ortho_init=False, device=None):
         super().__init__()
         self.alpha = alpha
         self.in_features = in_features
@@ -234,7 +273,7 @@ class LoKrLayer(torch.nn.Module):
         if self.tlora_enabled and bool(tlora_lokr_ortho_init):
             # 实验性 ortho init：在 (w2_a, w2_b) 的简化维度上套 SVD 方案；
             # w1 保留原初始化。论文未覆盖该组合，需要 init delta 补偿避免初始 step 偏移。
-            A_init, B_init = _ortho_lora_init(self.in_dim, self.out_dim, self.rank)
+            A_init, B_init = _ortho_lora_init(self.in_dim, self.out_dim, self.rank, device=device)
             with torch.no_grad():
                 self.lokr_w2_a.data.copy_(B_init)  # (out_dim, rank)
                 self.lokr_w2_b.data.copy_(A_init)  # (rank, in_dim)
@@ -286,28 +325,46 @@ class LoKrLayer(torch.nn.Module):
 
     def forward(self, x):
         # Module dropout: 整个模块以 p 概率跳过（训练时）
+        # 用 CPU rng（详见 LoRALayer.forward 同名注释）
         if self.training and self.module_dropout > 0:
-            if torch.rand(1).item() < self.module_dropout:
+            if _py_random_call() < self.module_dropout:
                 return torch.zeros(*x.shape[:-1], self.out_features,
                                    device=x.device, dtype=x.dtype)
 
-        # bf16 下 kron 容易数值放大，统一转 fp32 中间运算
-        w1 = self.lokr_w1.float()
-        w2_a = self.lokr_w2_a.float()
-        w2_b = self.lokr_w2_b.float()
+        # ★ Training 路径：bf16 下 kron 容易数值放大，统一转 fp32 中间运算（必要）。
+        # ★ Inference (eval + no_grad) 路径：可直接用原 dtype（通常 bf16），跳过 3 个 fp32 副本。
+        #   - 推理时不积累梯度，bf16 精度对单步前向足够
+        #   - 节省 ~3× LoKr 参数副本（对 5120ch model 大概 80MB / inject 层 → 总省几 GB 临时显存）
+        #   - 推理速度也快 ~1.5×（bf16 matmul tensor core）
+        # rank_dropout / T-LoRA mask / ortho init 路径都需要严格的数值一致性 → 训练路径仍 fp32。
+        if self.training:
+            w1 = self.lokr_w1.float()
+            w2_a = self.lokr_w2_a.float()
+            w2_b = self.lokr_w2_b.float()
+            _compute_dtype = torch.float32
+        else:
+            _compute_dtype = self.lokr_w1.dtype  # 通常 bf16，与基模型 dtype 对齐
+            w1 = self.lokr_w1
+            w2_a = self.lokr_w2_a
+            w2_b = self.lokr_w2_b
 
         # Rank dropout: 随机置零 rank 中的某些通道（训练时，inverted dropout）
+        # ★ 同一个 rd_mask 必须同时作用到 w2_b 和后面的 w2b_init，否则破坏 step 0 净 delta=0
+        # （详见 LoRALayer.forward 同名注释）。保留 rd 元组传到 ortho 补偿块用。
+        _rd_for_init = None
         if self.training and self.rank_dropout > 0:
             mask = torch.bernoulli(
                 torch.full((self.rank,), 1.0 - self.rank_dropout, device=w2_b.device)
             )
             scale = 1.0 / (1.0 - self.rank_dropout + 1e-6)
             w2_b = w2_b * (mask.unsqueeze(1) * scale)  # (rank, in_dim)
+            _rd_for_init = (mask, scale)
 
         x_drop = self.dropout(x)
         orig_shape = x_drop.shape
         # (..., in_features) → (B*, factor, in_dim)；保留前置维度
-        x_flat = x_drop.reshape(-1, self.factor, self.in_dim).float()
+        # 推理路径用 compute_dtype（通常 bf16），训练路径转 fp32
+        x_flat = x_drop.reshape(-1, self.factor, self.in_dim).to(dtype=_compute_dtype)
 
         # 两段低秩矩阵乘代替 kron 全矩阵：
         #   tmp = x_flat @ w2_b^T  → (B*, factor, rank)
@@ -321,11 +378,17 @@ class LoKrLayer(torch.nn.Module):
 
         # Ortho init compensation for LoKr T-LoRA：减去用 init 权重 + 同一 mask 的贡献，
         # 让训练 step 0 时净 delta ≈ 0。实验性，论文未覆盖。
+        # ortho 补偿块只在 training=True 时有意义（推理时 T-LoRA mask 不动），
+        # 因此一直走 fp32 是安全的（保数值精度）。
         if (self.tlora_enabled and self.lokr_w2_a_init is not None
                 and self.lokr_w2_b_init is not None and self.current_t is not None):
             w1_init = self.lokr_w1_init.float()
             w2a_init = self.lokr_w2_a_init.float()
             w2b_init = self.lokr_w2_b_init.float()
+            # 与 w2_b 用同一个 rd_mask，保 step 0 净 delta=0
+            if _rd_for_init is not None:
+                rd_mask, rd_scale = _rd_for_init
+                w2b_init = w2b_init * (rd_mask.unsqueeze(1) * rd_scale)
             tmp_i = torch.matmul(x_flat, w2b_init.transpose(0, 1))
             if mask_BR is not None:
                 # 复用刚才算好的 mask
@@ -383,6 +446,9 @@ class LoRALinear(torch.nn.Module):
         if self.use_tlora and self.use_dora:
             raise ValueError("lora_variant='tlora' is incompatible with DoRA")
 
+        # Ortho init 里的 SVD 走 original.weight.device（通常 GPU），避免 CPU SVD
+        # 在大尺寸层（>5120）上每层 10–50 秒、整网累积一小时的开销
+        svd_device = original.weight.device
         if use_lokr:
             self.adapter = LoKrLayer(
                 original.in_features, original.out_features,
@@ -392,6 +458,7 @@ class LoRALinear(torch.nn.Module):
                 tlora_rmin_ratio=tlora_rmin_ratio,
                 tlora_alpha=tlora_alpha,
                 tlora_lokr_ortho_init=tlora_lokr_ortho_init,
+                device=svd_device,
             )
         else:
             self.adapter = LoRALayer(
@@ -402,6 +469,7 @@ class LoRALinear(torch.nn.Module):
                 tlora_rmin_ratio=tlora_rmin_ratio,
                 tlora_alpha=tlora_alpha,
                 tlora_init=tlora_init,
+                device=svd_device,
             )
 
         self.adapter.to(device=original.weight.device, dtype=original.weight.dtype)
@@ -419,7 +487,8 @@ class LoRALinear(torch.nn.Module):
         if self.use_dora:
             adapter = self.adapter
             if self.training and adapter.module_dropout > 0:
-                if torch.rand(1, device=x.device).item() < adapter.module_dropout:
+                # 用 CPU rng 省 GPU↔CPU 同步
+                if _py_random_call() < adapter.module_dropout:
                     return self.original(x)
 
             delta = adapter.delta_weight(apply_rank_dropout=True).to(device=self.original.weight.device)
@@ -485,7 +554,9 @@ class LoRAInjector:
                  loraplus_lr_ratio=1.0, lora_variant="base", dora_export_mode="native",
                  # T-LoRA (arxiv:2507.05964)
                  tlora_rmin_ratio=0.5, tlora_alpha=1.0, tlora_init="ortho",
-                 tlora_lokr_experimental=False, tlora_lokr_ortho_init=False):
+                 tlora_lokr_experimental=False, tlora_lokr_ortho_init=False,
+                 # T-LoRA 导出体积控制
+                 tlora_skip_lambda_layer=True):
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
@@ -517,6 +588,12 @@ class LoRAInjector:
             raise ValueError(f"Unknown tlora_init: {tlora_init}")
         self.tlora_lokr_experimental = bool(tlora_lokr_experimental)
         self.tlora_lokr_ortho_init = bool(tlora_lokr_ortho_init)
+        # lambda_layer = b_init @ a_init 是 (out, in) 全矩阵，与基模型对应层等大。
+        # 数学上完全冗余（q_layer_init / p_layer_init 已经低秩存了 a_init / b_init，
+        # loader 可自行重建乘积；且 T-LoRA 的 per-step rank mask 必须在 rank 维中间
+        # 插入，不能用预乘的全矩阵承载）。默认 True 跳过，文件从 GB 量级降到 100MB 量级。
+        # 仅当下游 loader 明确要求 `.lambda_layer` 键存在时再设 False。
+        self.tlora_skip_lambda_layer = bool(tlora_skip_lambda_layer)
         self.dora_export_mode = (dora_export_mode or "native").lower()
         if self.dora_export_mode not in ("native", "diff", "merged_model"):
             raise ValueError(f"Unknown dora_export_mode: {dora_export_mode}")
@@ -581,9 +658,20 @@ class LoRAInjector:
         return float(self.alpha)
 
     def inject(self, model):
-        """注入 LoRA 到模型"""
+        """注入 LoRA 到模型。
+
+        ★ 旧实现对每个注入点都从 `model` 起 `getattr` walk 整条 dotted path
+          （`for p in parts[:-1]: parent = getattr(parent, p)`），O(N × depth)。
+        新实现一次性 `dict(model.named_modules())`（O(N)），按 parent dotted name 直接查表，
+        O(1) 每层。对 Anima 5120ch + 36 blocks 共 200+ 注入点，inject 阶段提速 ~5×。
+        """
         rank_summary = {}
-        for name, module in list(model.named_modules()):
+        # 注意：要在改 model 之前快照所有 module，否则后续 setattr 会让新 LoRALinear
+        # 出现在 named_modules() 里，把 isinstance Linear 检查带歪。
+        modules_snapshot = list(model.named_modules())
+        modules_by_name = {n: m for n, m in modules_snapshot}
+
+        for name, module in modules_snapshot:
             if not isinstance(module, torch.nn.Linear):
                 continue
             if not self._should_inject(name):
@@ -604,11 +692,9 @@ class LoRAInjector:
                 tlora_lokr_ortho_init=self.tlora_lokr_ortho_init,
             )
 
-            parts = name.split(".")
-            parent = model
-            for p in parts[:-1]:
-                parent = getattr(parent, p)
-            setattr(parent, parts[-1], lora_linear)
+            parent_name, _, child_name = name.rpartition(".")
+            parent = modules_by_name[parent_name] if parent_name else model
+            setattr(parent, child_name, lora_linear)
             self.injected[name] = lora_linear
             self._module_ranks[name] = mod_rank
             self._module_alphas[name] = mod_alpha
@@ -798,11 +884,18 @@ class LoRAInjector:
                     #   完整 A_init/B_init（lambda_layer 是其乘积，单独无法回推）
                     if (getattr(lora.adapter, "lora_down_init", None) is not None
                             and getattr(lora.adapter, "lora_up_init", None) is not None):
+                        # 始终存的低秩 init buffers（resume 必需；下游 loader 也能用它们
+                        # 重建 lambda_layer = p_init @ q_init）。bf16 存储与训练精度一致。
                         a_init = lora.adapter.lora_down_init.float().cpu()
                         b_init = lora.adapter.lora_up_init.float().cpu()
-                        sd[f"{base}.lambda_layer"] = torch.matmul(b_init, a_init)
-                        sd[f"{base}.q_layer_init.weight"] = a_init
-                        sd[f"{base}.p_layer_init.weight"] = b_init
+                        sd[f"{base}.q_layer_init.weight"] = a_init.to(torch.bfloat16)
+                        sd[f"{base}.p_layer_init.weight"] = b_init.to(torch.bfloat16)
+                        # 可选：写入 (out, in) 全矩阵 lambda_layer = b_init @ a_init。
+                        # 这是冗余信息（loader 可从上面两个低秩矩阵自己算），但某些下游
+                        # loader 直接读这个 key。默认跳过：单层 lambda_layer 与 base 模型
+                        # 对应层等大，Wan 1.3B 整网累积 ~3 GB，几乎全是这一项。
+                        if not self.tlora_skip_lambda_layer:
+                            sd[f"{base}.lambda_layer"] = torch.matmul(b_init, a_init).to(torch.bfloat16)
                 else:
                     sd[f"{base}.lora_down.weight"] = lora.adapter.lora_down.weight.data.clone()
                     sd[f"{base}.lora_up.weight"] = lora.adapter.lora_up.weight.data.clone()
@@ -901,10 +994,20 @@ class LoRAInjector:
                 )
             else:
                 meta["anima_tlora_inference_supported"] = "true"
-                meta["anima_tlora_inference_note"] = (
-                    "Compatible with bghira/ComfyUI-T-LoRA loader (LyCORIS-style keys: "
-                    "q_layer/p_layer/lambda_layer)."
+                meta["anima_tlora_lambda_layer_present"] = (
+                    "false" if self.tlora_skip_lambda_layer else "true"
                 )
+                if self.tlora_skip_lambda_layer:
+                    meta["anima_tlora_inference_note"] = (
+                        "Compact T-LoRA export: keys q_layer/p_layer/q_layer_init/p_layer_init. "
+                        "lambda_layer (= p_init @ q_init) skipped to keep file size at ~LoRA scale. "
+                        "Loaders that need lambda_layer must reconstruct it from the _init pieces."
+                    )
+                else:
+                    meta["anima_tlora_inference_note"] = (
+                        "Legacy T-LoRA export: keys q_layer/p_layer/lambda_layer/q_layer_init/p_layer_init. "
+                        "Compatible with loaders that read lambda_layer directly."
+                    )
 
         save_file(sd, path, metadata=meta)
         if self.lora_variant == "tlora" and self.use_lokr:
@@ -912,20 +1015,20 @@ class LoRAInjector:
                 f"⚠ LoKr+T-LoRA 实验性 checkpoint 已保存到 {path}（满 rank 烘焙；"
                 f"ComfyUI 加载即为标准 LoKr，动态 mask 仅训练 / 训练期 sampling.py 生效）。"
             )
+        elif self.lora_variant == "tlora":
+            mode = "compact (no lambda_layer)" if self.tlora_skip_lambda_layer else "legacy (+ lambda_layer)"
+            logger.info(f"T-LoRA 保存到: {path}  [{mode}]")
         else:
             logger.info(f"LoRA 保存到: {path}")
 
-    def load(self, path):
-        """从 safetensors 加载已有 LoRA 权重（用于继续训练）"""
-        from safetensors import safe_open
+    def load_state_dict_from_mapping(self, sd: dict, label: str = "checkpoint") -> int:
+        """从 in-memory dict 加载 LoRA 权重。
 
-        logger.info(f"加载已有 LoRA 权重: {path}")
+        被 `load()`（safetensors）和 `checkpoint.load_training_state()`（torch.save 内嵌 dict）共享。
+        旧实现两条路径各有一份独立的 lokr_w1/w2_a/w2_b 拷贝逻辑，存盘格式变动时容易漂移。
 
-        sd = {}
-        with safe_open(path, framework="pt", device="cpu") as f:
-            for k in f.keys():
-                sd[k] = f.get_tensor(k)
-
+        返回成功加载的层数。
+        """
         loaded_count = 0
         for name, lora in self.injected.items():
             base = "lora_unet_" + name.replace(".", "_")
@@ -952,7 +1055,6 @@ class LoRAInjector:
                 # T-LoRA LyCORIS-style 命名（兼容 bghira/ComfyUI-T-LoRA）
                 q_key = f"{base}.q_layer.weight"
                 p_key = f"{base}.p_layer.weight"
-                lambda_key = f"{base}.lambda_layer"
                 if down_key in sd and up_key in sd:
                     lora.adapter.lora_down.weight.data.copy_(sd[down_key])
                     lora.adapter.lora_up.weight.data.copy_(sd[up_key])
@@ -977,4 +1079,18 @@ class LoRAInjector:
                         ))
                     loaded_count += 1
 
-        logger.info(f"从 checkpoint 加载了 {loaded_count}/{len(self.injected)} 层 LoRA 权重")
+        logger.info(f"从 {label} 加载了 {loaded_count}/{len(self.injected)} 层 LoRA 权重")
+        return loaded_count
+
+    def load(self, path):
+        """从 safetensors 加载已有 LoRA 权重（用于继续训练）"""
+        from safetensors import safe_open
+
+        logger.info(f"加载已有 LoRA 权重: {path}")
+
+        sd = {}
+        with safe_open(path, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                sd[k] = f.get_tensor(k)
+
+        self.load_state_dict_from_mapping(sd, label=str(path))

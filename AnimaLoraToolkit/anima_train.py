@@ -212,6 +212,13 @@ from trainer.objective import (
     forward_with_optional_checkpoint,
 )
 from trainer.lora import LoRALayer, LoKrLayer, LoRALinear, LoRAInjector
+from trainer.aux_losses import (
+    build_aux_loss_config,
+    recover_x0_from_velocity,
+    spectral_loss,
+    PerceptualLossModule,
+    summary_aux_loss_config,
+)
 from trainer.data import (
     BucketManager,
     ImageDataset,
@@ -446,6 +453,34 @@ def parse_args():
                    help="detail_inv_t 加权下限（默认 1.0）")
     p.add_argument("--detail-inv-t-max", type=float, default=5.0,
                    help="detail_inv_t 加权上限（默认 5.0；hazy 画风可降到 ~3.0）")
+
+    # ── 辅助 loss：Spectral Regularization（arxiv:2603.02447）────────────────
+    # FFT 振幅匹配 + 可选 Haar wavelet 系数匹配；纯 tensor 运算，零额外模型。
+    p.add_argument("--aux-spectral-enabled", action="store_true",
+                   help="启用 spectral regularization（在 latent space 上对 x₀_pred / x₀_target 做 FFT 振幅 L1 匹配）")
+    p.add_argument("--aux-spectral-lambda", type=float, default=0.05,
+                   help="spectral FFT 振幅 loss 的权重；推荐 0.02-0.1")
+    p.add_argument("--aux-spectral-use-wavelet", action="store_true",
+                   help="额外开启 Haar wavelet 系数 L1（多尺度结构匹配）")
+    p.add_argument("--aux-spectral-wavelet-lambda", type=float, default=0.05,
+                   help="wavelet loss 在 spectral 总和中的相对权重")
+    p.add_argument("--aux-spectral-t-gate", type=float, default=0.7,
+                   help="仅在 t < t_gate 时启用 spectral loss（高 t 区间 x₀_pred 不准，频域无意义）")
+    # ── 辅助 loss：Perceptual（arxiv:2602.02493 PixelGen）──────────────────────
+    # 通过 VAE decode → pixel → VGG16(LPIPS) + DINOv2-B 计算感知相似度。
+    p.add_argument("--aux-perceptual-enabled", action="store_true",
+                   help="启用 perceptual loss（LPIPS + DINOv2-B，VAE 解码到 pixel space）")
+    p.add_argument("--aux-perceptual-lambda-lpips", type=float, default=0.1,
+                   help="LPIPS 权重；PixelGen 论文经典值 0.1")
+    p.add_argument("--aux-perceptual-lambda-dino", type=float, default=0.01,
+                   help="DINOv2 cosine 距离权重；PixelGen 论文经典值 0.01；0=不加载 DINO")
+    p.add_argument("--aux-perceptual-t-gate", type=float, default=0.7,
+                   help="仅在 t < t_gate 时启用 perceptual loss")
+    p.add_argument("--aux-perceptual-lpips-net", default="vgg",
+                   choices=["vgg", "alex", "squeeze"],
+                   help="LPIPS 主干网络；vgg 对纹理最敏感，alex 最快，squeeze 最轻量")
+    p.add_argument("--aux-perceptual-dino-local-path", default="",
+                   help="本地 DINOv2 权重路径（.pth/.safetensors 或 dinov2 仓库目录）；空=走 torch.hub 自动下载")
 
     return p.parse_args()
 
@@ -964,8 +999,11 @@ def main():
     # latent 缓存建好后，训练主循环再也不调用 vae.model（取 batch 时直接读 npz）。
     # 把 VAE 主网络挪到 CPU 上省 1-2GB 显存；sample_image 用到时再 .to(device)。
     # mean / std 张量小（fp32 16 channels × 2 = 128 bytes 量级），保持在 GPU 上没问题。
+    # ★ 例外：若启用了 perceptual loss，训练主循环每步都要 vae.model.decode，offload
+    #   到 CPU 会让每步都 swap，巨慢。这种情况下 VAE 必须常驻 GPU。
+    aux_cfg = build_aux_loss_config(args)
     vae_offloaded_to_cpu = False
-    if use_cached:
+    if use_cached and not aux_cfg.needs_vae_decoder:
         try:
             vae.model = vae.model.cpu()
             torch.cuda.empty_cache()
@@ -973,6 +1011,37 @@ def main():
             logger.info("VAE 主网络已 offload 到 CPU（cache_latents=True 后训练循环不再使用 VAE）")
         except Exception as _e:
             logger.warning(f"VAE CPU offload 失败（忽略，继续训练）: {_e}")
+    elif use_cached and aux_cfg.needs_vae_decoder:
+        logger.info(
+            "Perceptual loss enabled → VAE 保留在 GPU 上（训练循环每步要 decode；CPU↔GPU swap 太贵）"
+        )
+
+    # ── 辅助 loss 模块（Spectral / Perceptual）────────────────────────────────
+    # Spectral 是无状态 fn，按 cfg 调用即可；Perceptual 要预加载 LPIPS + DINO，做成 Module。
+    perceptual_module = None
+    if aux_cfg.perceptual_enabled:
+        try:
+            perceptual_module = PerceptualLossModule(
+                vae_wrapper=vae,
+                cfg=aux_cfg,
+                device=device,
+                compute_dtype=dtype,
+            )
+            perceptual_module.eval()
+            logger.info("PerceptualLossModule 构建完成: %s", summary_aux_loss_config(aux_cfg))
+        except Exception as e:
+            import dataclasses
+            logger.error(
+                "PerceptualLossModule 构建失败，自动禁用 perceptual loss（如缺少依赖请运行 `pip install lpips`）：%s",
+                e,
+            )
+            # 把 perceptual 标记关掉，spectral 不受影响
+            aux_cfg = dataclasses.replace(aux_cfg, perceptual_enabled=False)
+            # ★ 同步禁用 args，否则下面 build_training_objective_config(args).aux 仍会带着
+            #    perceptual_enabled=True，训练循环会再次进入 perceptual 分支但 module=None。
+            args.aux_perceptual_enabled = False
+    elif aux_cfg.spectral_enabled:
+        logger.info("辅助 loss 配置: %s", summary_aux_loss_config(aux_cfg))
 
     # 优化器
     weight_decay = float(getattr(args, "weight_decay", 0.01) or 0.0)
@@ -1440,6 +1509,33 @@ def main():
 
                 loss = apply_loss_weighting(per_sample, t, objective_cfg.loss)
 
+            # ── 辅助 loss（Spectral / Perceptual）─────────────────────────────
+            # 在 autocast 块之外计算：
+            #   - spectral_loss 内部强制 fp32（FFT 数值稳定性）
+            #   - perceptual_module 内部自己管 autocast（VAE decode + LPIPS/DINO 都用 bf16）
+            # 顺序：x₀ 恢复 → spectral（不需要模型） → perceptual（需要 VAE decode）
+            # x0_pred / x0_target / aux_total 在 None 兜底下声明，便于 NaN 路径统一 del
+            x0_pred = None
+            x0_target = None
+            aux_total = None
+            if objective_cfg.aux.any_enabled:
+                # x₀_pred = noisy - t·velocity_pred，强制 fp32 避免 bf16 精度损失
+                x0_pred = recover_x0_from_velocity(noisy, t, pred)
+                x0_target = latents.float()
+
+                # 明确 fp32 计算 aux_total，最后才 cast 回 loss dtype（fp32）
+                aux_total = torch.zeros((), device=loss.device, dtype=torch.float32)
+                if objective_cfg.aux.spectral_enabled:
+                    l_spec = spectral_loss(x0_pred, x0_target, t, objective_cfg.aux)
+                    aux_total = aux_total + float(objective_cfg.aux.spectral_lambda) * l_spec
+
+                if objective_cfg.aux.perceptual_enabled and perceptual_module is not None:
+                    # PerceptualLossModule 已把 λ_lpips / λ_dino 写在 forward 内部
+                    l_perc = perceptual_module(x0_pred, x0_target, t)
+                    aux_total = aux_total + l_perc
+
+                loss = loss + aux_total.to(loss.dtype)
+
             # ★ 守护 1：forward 结果 NaN/Inf 检查
             debug_n = int(getattr(args, "debug_first_batches", 0) or 0)
             if debug_n > 0 and global_step < debug_n:
@@ -1499,7 +1595,15 @@ def main():
                 # ★ 显式释放本 micro-batch 的 forward autograd 图。否则同周期内
                 # 后续 micro-batch 的图会累积（pred / per_sample / loss 都还被 closure 引用），
                 # 持续 NaN 时显存会迅速被这些"死图"占满 → OOM。
+                # x0_pred / x0_target / aux_total 在 aux loss 启用时持有 pred / noisy 的
+                # autograd 图引用，必须一并 del 才能让 GC 真正回收。
                 del loss, per_sample, pred, target, noisy, cross
+                if x0_pred is not None:
+                    del x0_pred
+                if x0_target is not None:
+                    del x0_target
+                if aux_total is not None:
+                    del aux_total
                 continue
 
             if adaptive_ts.enabled:

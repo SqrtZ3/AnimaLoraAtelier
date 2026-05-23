@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
+
+from .aux_losses import AuxLossConfig, build_aux_loss_config
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,8 @@ class TrainingObjectiveConfig:
     timestep: TimestepConfig
     noise: NoiseConfig
     loss: LossConfig
+    # ★ 辅助 loss（Spectral / Perceptual）；默认全关 → 完全 no-op 向后兼容
+    aux: AuxLossConfig = field(default_factory=AuxLossConfig)
 
 
 def build_training_objective_config(args) -> TrainingObjectiveConfig:
@@ -91,6 +95,7 @@ def build_training_objective_config(args) -> TrainingObjectiveConfig:
             detail_inv_t_min=float(getattr(args, "detail_inv_t_min", 1.0) or 1.0),
             detail_inv_t_max=float(getattr(args, "detail_inv_t_max", 5.0) or 5.0),
         ),
+        aux=build_aux_loss_config(args),
     )
 
 

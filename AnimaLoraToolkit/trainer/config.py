@@ -188,6 +188,18 @@ YAML_TO_ARGS = {
     # detail_inv_t 权重的可调上下限（默认 [1, 5]）
     "detail_inv_t_min": "detail_inv_t_min",
     "detail_inv_t_max": "detail_inv_t_max",
+    # ── 辅助 loss（Spectral + Perceptual），详见 trainer/aux_losses.py ──
+    "aux_spectral_enabled": "aux_spectral_enabled",
+    "aux_spectral_lambda": "aux_spectral_lambda",
+    "aux_spectral_use_wavelet": "aux_spectral_use_wavelet",
+    "aux_spectral_wavelet_lambda": "aux_spectral_wavelet_lambda",
+    "aux_spectral_t_gate": "aux_spectral_t_gate",
+    "aux_perceptual_enabled": "aux_perceptual_enabled",
+    "aux_perceptual_lambda_lpips": "aux_perceptual_lambda_lpips",
+    "aux_perceptual_lambda_dino": "aux_perceptual_lambda_dino",
+    "aux_perceptual_t_gate": "aux_perceptual_t_gate",
+    "aux_perceptual_lpips_net": "aux_perceptual_lpips_net",
+    "aux_perceptual_dino_local_path": "aux_perceptual_dino_local_path",
 }
 
 
@@ -318,6 +330,18 @@ DEFAULTS = {
     "style_profile": "",
     "detail_inv_t_min": 1.0,
     "detail_inv_t_max": 5.0,
+    # 辅助 loss 默认全关，配合 build_aux_loss_config 在 enabled=False 时彻底 no-op
+    "aux_spectral_enabled": False,
+    "aux_spectral_lambda": 0.05,
+    "aux_spectral_use_wavelet": False,
+    "aux_spectral_wavelet_lambda": 0.05,
+    "aux_spectral_t_gate": 0.7,
+    "aux_perceptual_enabled": False,
+    "aux_perceptual_lambda_lpips": 0.1,
+    "aux_perceptual_lambda_dino": 0.01,
+    "aux_perceptual_t_gate": 0.7,
+    "aux_perceptual_lpips_net": "vgg",
+    "aux_perceptual_dino_local_path": "",
 }
 
 

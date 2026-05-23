@@ -1537,24 +1537,33 @@ def main():
             if objective_cfg.aux.any_enabled:
                 # Early t-gate：若 batch 内所有样本的 t 都 >= 最大 gate，
                 # 跳过 x₀ recovery（~1.5GB fp32 分配）和全部 aux forward。
+                # 若只有部分样本命中 gate，则只恢复这些样本的 x₀，避免高 t 样本
+                # 参与 latent FFT / VAE decode / LPIPS / DINO 的重路径。
                 _aux = objective_cfg.aux
                 _max_gate = max(
                     _aux.spectral_t_gate if _aux.spectral_enabled else 0.0,
                     _aux.perceptual_t_gate if _aux.perceptual_enabled else 0.0,
                 )
-                _any_below_gate = (t.float() < _max_gate).any().item()
+                _aux_active = t.float() < _max_gate
+                _any_below_gate = _aux_active.any().item()
 
                 if _any_below_gate:
-                    x0_pred = recover_x0_from_velocity(noisy, t, pred)
-                    x0_target = latents.float()
+                    _aux_idx = _aux_active.nonzero(as_tuple=False).flatten()
+                    x0_pred = recover_x0_from_velocity(
+                        noisy.index_select(0, _aux_idx),
+                        t.index_select(0, _aux_idx),
+                        pred.index_select(0, _aux_idx),
+                    )
+                    x0_target = latents.index_select(0, _aux_idx).float()
+                    t_aux = t.index_select(0, _aux_idx)
 
                     aux_total = torch.zeros((), device=loss.device, dtype=torch.float32)
                     if _aux.spectral_enabled:
-                        l_spec = spectral_loss(x0_pred, x0_target, t, _aux)
+                        l_spec = spectral_loss(x0_pred, x0_target, t_aux, _aux)
                         aux_total = aux_total + float(_aux.spectral_lambda) * l_spec
 
                     if _aux.perceptual_enabled and perceptual_module is not None:
-                        l_perc = perceptual_module(x0_pred, x0_target, t)
+                        l_perc = perceptual_module(x0_pred, x0_target, t_aux)
                         aux_total = aux_total + l_perc
 
                     loss = loss + aux_total.to(loss.dtype)

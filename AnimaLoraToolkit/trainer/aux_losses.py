@@ -183,12 +183,13 @@ def spectral_loss(x0_pred: torch.Tensor, x0_target: torch.Tensor,
         return x0_pred.new_zeros((), dtype=torch.float32)
 
     # gating mask：(B,) 0/1，只保留 t < gate 的样本
-    mask = (t.float() < float(cfg.spectral_t_gate)).float()
-    if mask.sum() == 0:
+    active = t.float() < float(cfg.spectral_t_gate)
+    if not bool(active.any()):
         return x0_pred.new_zeros((), dtype=torch.float32)
 
-    pred_f = x0_pred.float()
-    target_f = x0_target.float()
+    active_idx = active.nonzero(as_tuple=False).flatten()
+    pred_f = x0_pred.index_select(0, active_idx).float()
+    target_f = x0_target.index_select(0, active_idx).float()
 
     # 2D FFT 在最后两个空间维（H, W）；4D/5D 都适用
     fft_pred = torch.fft.fft2(pred_f, dim=(-2, -1), norm="ortho")
@@ -210,8 +211,7 @@ def spectral_loss(x0_pred: torch.Tensor, x0_target: torch.Tensor,
         w_per_sample = w_diff.view(w_diff.shape[0], -1).mean(dim=1)
         total = total + float(cfg.spectral_wavelet_lambda) * w_per_sample
 
-    # mask 加权求平均（只对参与样本归一）
-    return (total * mask).sum() / mask.sum().clamp(min=1.0)
+    return total.mean()
 
 
 # ============================================================================
@@ -478,14 +478,21 @@ class PerceptualLossModule(torch.nn.Module):
         if not self.cfg.perceptual_enabled:
             return x0_pred.new_zeros((), dtype=torch.float32)
 
-        mask = (t.float() < float(self.cfg.perceptual_t_gate)).float()
-        if mask.sum() == 0:
+        active = t.float() < float(self.cfg.perceptual_t_gate)
+        if not bool(active.any()):
             return x0_pred.new_zeros((), dtype=torch.float32)
+
+        # PixelGen-style noise gating should save compute, not only zero out loss.
+        # Slice to active samples before VAE decode / LPIPS / DINO so high-noise
+        # samples do not pay the perceptual path cost.
+        active_idx = active.nonzero(as_tuple=False).flatten()
+        x0_pred_active = x0_pred.index_select(0, active_idx)
+        x0_target_active = x0_target.index_select(0, active_idx)
 
         if self.cfg.perceptual_use_checkpoint and torch.is_grad_enabled():
             from torch.utils.checkpoint import checkpoint
 
-            B = x0_pred.shape[0]
+            B = x0_pred_active.shape[0]
 
             # ★ 预计算 target：VAE decode + LPIPS downsample + DINO features。
             # 全部在 no_grad 下逐样本跑（避免 batched VAE decode 峰值显存），
@@ -493,7 +500,7 @@ class PerceptualLossModule(torch.nn.Module):
             pre_target = []
             with torch.no_grad():
                 for i in range(B):
-                    pt_i = self._decode_to_pixel(x0_target[i:i + 1], with_grad=False)
+                    pt_i = self._decode_to_pixel(x0_target_active[i:i + 1], with_grad=False)
                     pt_lp_i = self._lpips_downsample(pt_i)
                     dino_feat_i = None
                     if self.use_dino:
@@ -505,7 +512,7 @@ class PerceptualLossModule(torch.nn.Module):
 
             per_sample_list = []
             for i in range(B):
-                x0p_i = x0_pred[i:i + 1]
+                x0p_i = x0_pred_active[i:i + 1]
                 pt_lp_i, dino_feat_i = pre_target[i]
 
                 def _heavy_i(x, _pt_lp=pt_lp_i, _dino_feat=dino_feat_i):
@@ -516,9 +523,9 @@ class PerceptualLossModule(torch.nn.Module):
 
             per_sample = torch.cat(per_sample_list, dim=0)
         else:
-            per_sample = self._compute_per_sample(x0_pred, x0_target)
+            per_sample = self._compute_per_sample(x0_pred_active, x0_target_active)
 
-        return (per_sample * mask).sum() / mask.sum().clamp(min=1.0)
+        return per_sample.mean()
 
 
 # ============================================================================

@@ -485,6 +485,15 @@ def parse_args():
                    help="本地 perceptual 模型缓存目录（设为 TORCH_HOME）；LPIPS-VGG 与 DINOv2 都从这里读，无需联网。"
                         "目录结构：<cache_dir>/hub/checkpoints/{vgg16-*.pth,dinov2_vitb14_pretrain.pth} + "
                         "<cache_dir>/hub/facebookresearch_dinov2_main/（DINOv2 仓库代码）")
+    p.add_argument("--aux-perceptual-use-checkpoint", action="store_true", default=True,
+                   help="把 VAE decode + LPIPS + DINO 这条 forward 用 torch.utils.checkpoint 包起来，"
+                        "backward 重放一次以释放激活。1024 训练强烈建议开（默认 True）。")
+    p.add_argument("--aux-perceptual-no-checkpoint", dest="aux_perceptual_use_checkpoint",
+                   action="store_false",
+                   help="禁用 perceptual 路径的 checkpoint（仅供调试/显存富余时用）")
+    p.add_argument("--aux-perceptual-lpips-size", type=int, default=0,
+                   help="LPIPS 之前对 pixel 下采样的目标边长。0=用原分辨率（默认）；512 让显存减半；"
+                        "256 再减半，对 1024 训练几乎无质量损失")
 
     return p.parse_args()
 
@@ -1031,7 +1040,10 @@ def main():
                 device=device,
                 compute_dtype=dtype,
             )
-            perceptual_module.eval()
+            # ★ 不能在这里 .eval()：会递归把 wrapper.training 设 False，
+            #   而 PerceptualLossModule.forward 的 checkpoint 分支条件之一是
+            #   self.training=True（已在 aux_losses.py 里去掉了，但稳妥起见这里也不调）。
+            #   sub-modules (lpips_fn / dino) 在 __init__ 里已被独立 .eval()，无需父级再调。
             logger.info("PerceptualLossModule 构建完成: %s", summary_aux_loss_config(aux_cfg))
         except Exception as e:
             import dataclasses

@@ -201,6 +201,8 @@ YAML_TO_ARGS = {
     "aux_perceptual_lpips_net": "aux_perceptual_lpips_net",
     "aux_perceptual_dino_local_path": "aux_perceptual_dino_local_path",
     "aux_perceptual_cache_dir": "aux_perceptual_cache_dir",
+    "aux_perceptual_use_checkpoint": "aux_perceptual_use_checkpoint",
+    "aux_perceptual_lpips_size": "aux_perceptual_lpips_size",
 }
 
 
@@ -344,6 +346,8 @@ DEFAULTS = {
     "aux_perceptual_lpips_net": "vgg",
     "aux_perceptual_dino_local_path": "",
     "aux_perceptual_cache_dir": "",
+    "aux_perceptual_use_checkpoint": True,
+    "aux_perceptual_lpips_size": 0,
 }
 
 

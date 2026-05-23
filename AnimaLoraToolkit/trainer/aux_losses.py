@@ -61,6 +61,16 @@ class AuxLossConfig:
     #                 <cache_dir>/hub/facebookresearch_dinov2_main/ (DINOv2 仓库代码)
     #   设了这个后，torch.hub.load 和 torchvision.models.vgg16 都从这里加载，无需联网。
     perceptual_cache_dir: str = ""
+    # ★ 把 VAE decode + LPIPS-VGG + DINOv2 这条 forward 用 torch.utils.checkpoint 包起来。
+    #   原因：这三个模型都没启用 PyTorch 梯度检查点，激活会一直活到 backward。
+    #   1024 分辨率 batch=4 时 VAE decoder + VGG 累计激活可达 15-25 GB，会拖爆 96GB 显存。
+    #   开启后 backward 会重放一次这段 forward（compute 翻倍），但显存降到几 GB。
+    #   除非你显存非常富裕想榨速度，强烈建议保持 True。
+    perceptual_use_checkpoint: bool = True
+    # ★ LPIPS 计算前的 pixel 下采样目标边长。0 = 不下采样（用原分辨率）。
+    #   1024 训练时建议设 512（显存减半）或 256（再减半）；LPIPS-VGG 在 256-512 仍能可靠
+    #   捕获纹理/细节相似度，对 1024 原图的差异不明显。
+    perceptual_lpips_size: int = 0
 
     @property
     def any_enabled(self) -> bool:
@@ -86,6 +96,8 @@ def build_aux_loss_config(args) -> AuxLossConfig:
         perceptual_lpips_net=str(getattr(args, "aux_perceptual_lpips_net", "vgg") or "vgg"),
         perceptual_dino_local_path=str(getattr(args, "aux_perceptual_dino_local_path", "") or ""),
         perceptual_cache_dir=str(getattr(args, "aux_perceptual_cache_dir", "") or ""),
+        perceptual_use_checkpoint=bool(getattr(args, "aux_perceptual_use_checkpoint", True)),
+        perceptual_lpips_size=int(getattr(args, "aux_perceptual_lpips_size", 0) or 0),
     )
 
 
@@ -282,14 +294,20 @@ class PerceptualLossModule(torch.nn.Module):
             logger.info("DINOv2 已跳过（perceptual_lambda_dino=0）")
 
         # ImageNet 归一化常量（用于 DINO 输入）
+        # ★ 必须在 device 上构造，否则与 GPU 上的 pixels 做减除会因 device 不匹配崩。
+        #   register_buffer 不直接接 device 参数，所以在 tensor 构造时就指定。
         self.register_buffer(
             "dino_mean",
-            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1),
         )
         self.register_buffer(
             "dino_std",
-            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1),
         )
+
+        # ★ 防御性：把整个 wrapper 移到 device，确保任何未来新增的 buffer/parameter
+        #   也都在 GPU 上（lpips_fn / dino 已经各自 .to(device) 过，重复调用是 no-op）。
+        self.to(device)
 
     @staticmethod
     def _load_dino(local_path: str, device):
@@ -369,23 +387,29 @@ class PerceptualLossModule(torch.nn.Module):
         # 保持 compute_dtype；LPIPS/DINO 内部自己 autocast
         return pixels.clamp(-1.0, 1.0)
 
-    def forward(self, x0_pred: torch.Tensor, x0_target: torch.Tensor,
-                t: torch.Tensor) -> torch.Tensor:
-        """计算 λ_lpips * LPIPS + λ_dino * (1 - cos_sim_DINO)，对 t < t_gate 样本做平均。"""
-        if not self.cfg.perceptual_enabled:
-            return x0_pred.new_zeros((), dtype=torch.float32)
+    def _compute_per_sample(self, x0_pred: torch.Tensor, x0_target: torch.Tensor) -> torch.Tensor:
+        """完整的 per-sample perceptual loss 计算（VAE decode + LPIPS + DINO）。
 
-        mask = (t.float() < float(self.cfg.perceptual_t_gate)).float()
-        if mask.sum() == 0:
-            return x0_pred.new_zeros((), dtype=torch.float32)
-
+        这个函数被 forward() 直接调用或包进 checkpoint 调用。把"重计算"集中在这里，
+        backward 时若启用 checkpoint，整段会被 PyTorch 重放一次以释放激活内存。
+        """
         # 解码到 pixel space（保持 compute_dtype，下游 LPIPS/DINO 在 bf16 下跑）
         pixels_pred = self._decode_to_pixel(x0_pred, with_grad=True)
         pixels_target = self._decode_to_pixel(x0_target, with_grad=False)
 
+        # ---- 可选：下采样到 perceptual_lpips_size，进一步省显存 ----
+        if self.cfg.perceptual_lpips_size > 0:
+            tgt = int(self.cfg.perceptual_lpips_size)
+            # 只 LPIPS 用下采样后的像素；DINO 在下面自己 resize 到 224，与此无关
+            pixels_pred_lp = F.interpolate(pixels_pred, size=tgt, mode="bilinear", align_corners=False)
+            pixels_target_lp = F.interpolate(pixels_target, size=tgt, mode="bilinear", align_corners=False)
+        else:
+            pixels_pred_lp = pixels_pred
+            pixels_target_lp = pixels_target
+
         # ---- LPIPS（在 bf16 autocast 内跑 VGG，速度 ~2× 且省显存）----
         with torch.autocast("cuda", dtype=self.compute_dtype):
-            l_lpips = self.lpips_fn(pixels_pred, pixels_target)
+            l_lpips = self.lpips_fn(pixels_pred_lp, pixels_target_lp)
         # 返回 (B, 1, 1, 1)，规范成 (B,)，再 upcast 到 fp32 与主 loss 同 dtype
         l_lpips = l_lpips.view(l_lpips.shape[0]).float()
         per_sample = float(self.cfg.perceptual_lambda_lpips) * l_lpips
@@ -395,8 +419,10 @@ class PerceptualLossModule(torch.nn.Module):
             # [-1, 1] → [0, 1] → ImageNet normalize → resize to 224
             # mean/std buffers 是 fp32，与 pixels 做减除会上抬到 fp32；这里我们想保持 bf16，
             # 所以把 mean/std 转成 pixels 的 dtype
-            mean = self.dino_mean.to(dtype=pixels_pred.dtype)
-            std = self.dino_std.to(dtype=pixels_pred.dtype)
+            # 防御性：同时对齐 dtype 与 device（buffer 应已在 device 上，但万一被外部
+            # 代码搬走过——例如某些 CPU-offload 工具——这里强制对齐避免 runtime 崩）。
+            mean = self.dino_mean.to(dtype=pixels_pred.dtype, device=pixels_pred.device)
+            std = self.dino_std.to(dtype=pixels_pred.dtype, device=pixels_pred.device)
             p_pred = ((pixels_pred + 1.0) * 0.5).clamp(0.0, 1.0)
             p_target = ((pixels_target + 1.0) * 0.5).clamp(0.0, 1.0)
             p_pred = (p_pred - mean) / std
@@ -413,6 +439,56 @@ class PerceptualLossModule(torch.nn.Module):
             cos = F.cosine_similarity(feat_pred.float(), feat_target.float(), dim=-1)  # (B, N)
             l_dino = (1.0 - cos).mean(dim=-1)  # (B,)
             per_sample = per_sample + float(self.cfg.perceptual_lambda_dino) * l_dino
+
+        return per_sample  # (B,) per-sample loss
+
+    def forward(self, x0_pred: torch.Tensor, x0_target: torch.Tensor,
+                t: torch.Tensor) -> torch.Tensor:
+        """计算 λ_lpips * LPIPS + λ_dino * (1 - cos_sim_DINO)，对 t < t_gate 样本做平均。
+
+        ★ 显存控制：若 cfg.perceptual_use_checkpoint=True（默认），整个 VAE+VGG+DINO
+          forward 会被 torch.utils.checkpoint 包起来 —— backward 时重放一次以释放
+          forward 激活。这与主模型 per-block checkpoint 是对称的设计，否则 1024 训练
+          时 perceptual 路径的激活会撑爆 96GB 显存。
+        """
+        if not self.cfg.perceptual_enabled:
+            return x0_pred.new_zeros((), dtype=torch.float32)
+
+        mask = (t.float() < float(self.cfg.perceptual_t_gate)).float()
+        if mask.sum() == 0:
+            return x0_pred.new_zeros((), dtype=torch.float32)
+
+        if self.cfg.perceptual_use_checkpoint and torch.is_grad_enabled():
+            # ★ Per-sample micro-batching + 每样本独立 checkpoint：
+            #   WAN VAE 是视频 VAE，每个 conv3d 对时间维 T 做 causal padding，
+            #   单帧 (T=1) 会被撑到 T~5，整个 decoder 累计激活 ~5× 图像 VAE。
+            #   1024 batch=4 时直接 batched decode 激活 60+ GB → OOM。
+            #
+            #   解法：把 batch 拆成单样本，每个样本独立走一次 checkpoint。
+            #   forward peak = 1 样本 (而非 B 样本) 的 VAE 激活；
+            #   backward 同样按样本逐个 replay，峰值激活仅 1/B。
+            #   代价：VAE forward 慢 ~2-3×（GPU 利用率下降）。
+            from torch.utils.checkpoint import checkpoint
+
+            B = x0_pred.shape[0]
+            per_sample_list = []
+            for i in range(B):
+                # i:i+1 切片保留 batch 维（VAE/LPIPS/DINO 都假定 4D/5D 输入）
+                x0p_i = x0_pred[i:i + 1]
+                x0t_i = x0_target[i:i + 1]
+
+                # 每个样本独立 checkpoint：闭包以默认参数形式捕获 x0t_i，
+                # 避免 late-binding 陷阱（所有闭包看见同一 i 的 bug）
+                def _heavy_i(x, _x0t=x0t_i):
+                    return self._compute_per_sample(x, _x0t)
+
+                l_i = checkpoint(_heavy_i, x0p_i, use_reentrant=False)
+                per_sample_list.append(l_i)
+
+            per_sample = torch.cat(per_sample_list, dim=0)  # (B,)
+        else:
+            # eval / no-grad 路径：batched 直跑，无内存压力
+            per_sample = self._compute_per_sample(x0_pred, x0_target)
 
         return (per_sample * mask).sum() / mask.sum().clamp(min=1.0)
 

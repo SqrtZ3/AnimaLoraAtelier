@@ -21,6 +21,13 @@
 
 本仓库额外提供 `LICENSE-APACHE` 以便分发 Apache-2.0 许可文本。
 
+## SOAP Optimizer (MIT)
+
+- **来源**：`nikhilvyas/SOAP` official implementation
+- **许可**：MIT（许可文本已保留在派生文件头部）
+- **涉及文件**：
+  - `utils/soap_optimizer.py`
+
 ## Alibaba Wan2.1 VAE（请再次确认上游许可）
 
 - **来源**：`Wan-Video/Wan2.1` 的 VAE 实现（与 `wan/modules/vae.py` 对应）

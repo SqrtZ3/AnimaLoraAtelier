@@ -16,6 +16,7 @@ Optimizer Utils Module - 优化器创建（修复版）
 - adamw8bit (bitsandbytes) - 内存高效
 - adamw    - 标准 PyTorch AdamW，后备选项
 - prodigyplus (prodigyplus) - 自适应学习率 + Schedule-Free
+- soap     - Shampoo/Adam 矩阵预条件优化器
 """
 
 from __future__ import annotations
@@ -29,6 +30,11 @@ from torch import nn
 from torch.optim import AdamW, Optimizer
 
 logger = logging.getLogger(__name__)
+
+try:
+    from .soap_optimizer import SOAP
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from soap_optimizer import SOAP  # type: ignore
 
 # -------- 可选依赖 --------
 try:
@@ -136,10 +142,25 @@ def create_optimizer(
             params=params, lr=learning_rate, betas=betas,
             weight_decay=weight_decay, eps=eps, **kwargs,
         )
+    if optimizer_type == "soap":
+        if "lr" in kwargs:
+            learning_rate = kwargs.pop("lr")
+        if "betas" in kwargs:
+            betas = tuple(kwargs.pop("betas"))
+        elif betas == (0.9, 0.999):
+            betas = (0.95, 0.95)
+        if "weight_decay" in kwargs:
+            weight_decay = kwargs.pop("weight_decay")
+        if "eps" in kwargs:
+            eps = kwargs.pop("eps")
+        return create_soap_optimizer(
+            params=params, lr=learning_rate, betas=betas,
+            weight_decay=weight_decay, eps=eps, **kwargs,
+        )
 
     raise ValueError(
         f"Unknown optimizer type: {optimizer_type}. "
-        f"Choose from: adamw8bit, adamw, prodigyplus"
+        f"Choose from: adamw8bit, adamw, prodigyplus, soap"
     )
 
 
@@ -196,6 +217,57 @@ def create_8bit_adamw(
     return bnb.optim.AdamW8bit(
         param_list, lr=lr, betas=betas, eps=eps,
         weight_decay=weight_decay, min_8bit_size=min_8bit_size,
+    )
+
+
+# =============================================================================
+# SOAP
+# =============================================================================
+
+def create_soap_optimizer(
+    params: ParamInput,
+    lr: float,
+    betas: tuple = (0.95, 0.95),
+    weight_decay: float = 0.01,
+    eps: float = 1e-8,
+    **kwargs,
+) -> Optimizer:
+    valid_keys = {
+        "shampoo_beta",
+        "precondition_frequency",
+        "max_precond_dim",
+        "merge_dims",
+        "precondition_1d",
+        "normalize_grads",
+        "data_format",
+        "correct_bias",
+    }
+    soap_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+    ignored = [k for k in kwargs if k not in valid_keys]
+    if ignored:
+        logger.warning(f"[SOAP] Ignored unsupported params: {ignored}")
+
+    param_list = params if _is_param_groups(params) else list(params)
+    logger.info(
+        "Creating SOAP optimizer "
+        "(lr=%s, betas=%s, wd=%s, eps=%s, precondition_frequency=%s, "
+        "max_precond_dim=%s, precondition_1d=%s, merge_dims=%s)",
+        lr,
+        betas,
+        weight_decay,
+        eps,
+        soap_kwargs.get("precondition_frequency", 10),
+        soap_kwargs.get("max_precond_dim", 10000),
+        soap_kwargs.get("precondition_1d", False),
+        soap_kwargs.get("merge_dims", False),
+    )
+    return SOAP(
+        param_list,
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
+        eps=eps,
+        **soap_kwargs,
     )
 
 

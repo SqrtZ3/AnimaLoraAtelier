@@ -197,7 +197,7 @@ num_workers: 0
 # Optimizer 选择与 ProdigyPlusScheduleFree 全参数
 # ============================================================================
 
-# "prodigyplus" / "adamw" / "adamw8bit"。
+# "prodigyplus" / "adamw" / "adamw8bit" / "soap"。
 optimizer_type: "prodigyplus"
 
 # 旧字段兼容：仅当 optimizer_args 未给 d0/use_stableadamw 时作为兜底。
@@ -305,6 +305,30 @@ optimizer_args:
   # use_focus：大步长噪声处理实验项。与 factored、Adam-atan2(eps:null) 不兼容。
   # 若要试：factored=false 且 eps=1e-8。
   use_focus: false
+
+# ── SOAP 参考配置（optimizer_type: "soap" 时使用）────────────────────────
+# SOAP = Shampoo preconditioner + Adam in Shampoo eigenbasis。它不自动估计全局 LR，
+# 因此更适合当前这种 timestep / aux loss / loss weighting 都很实验性的训练环境：
+# 宏观步长仍由 learning_rate + scheduler 控制，优化器只负责矩阵方向预条件。
+#
+# 推荐首跑：
+# optimizer_type: "soap"
+# learning_rate: 2.0e-5
+# lr_scheduler: "cosine"
+# lr_scheduler_eta_min: 2.0e-6
+# grad_clip_max_norm: 1.0
+# loraplus_lr_ratio: 1.0
+# optimizer_args:
+#   betas: [0.95, 0.95]          # Adam 动量与二阶矩；SOAP 论文常用较低 beta2
+#   shampoo_beta: -1             # -1 表示复用 beta2
+#   eps: 1.0e-8
+#   weight_decay: 0.01
+#   precondition_frequency: 10   # 每 N 步更新一次 eigenbasis；越小越贵但反应快
+#   max_precond_dim: 512         # 首跑安全值；稳定但偏弱时再试 1024
+#   precondition_1d: false       # DoRA scale 等 1D 参数退化为 Adam-like 更新
+#   normalize_grads: false       # true 会抹掉部分 loss 权重幅度信息，首跑关闭
+#   correct_bias: true
+#   merge_dims: false            # LoKr 矩阵保持原形状，不合并维度
 
 # ============================================================================
 # Flow Matching / timestep / 噪声增强 / loss 权重

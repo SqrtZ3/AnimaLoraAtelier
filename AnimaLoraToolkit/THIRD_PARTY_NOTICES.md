@@ -28,6 +28,24 @@
 - **涉及文件**：
   - `utils/soap_optimizer.py`
 
+## ADOPT Optimizer (MIT)
+
+- **来源**：`iShohei220/adopt` official implementation
+- **论文**：Taniguchi et al., "ADOPT: Modified Adam Can Converge with Any β2
+  with the Optimal Rate", NeurIPS 2024 — arXiv:2411.02853
+- **许可**：MIT（许可文本已保留在派生文件头部）
+- **涉及文件**：
+  - `utils/adopt_optimizer.py`
+
+## Lion Optimizer (Apache-2.0) + Cautious variant (MIT)
+
+- **Lion 来源**：Chen et al., "Symbolic Discovery of Optimization Algorithms",
+  NeurIPS 2023 — arXiv:2302.06675。Google Research，Apache License 2.0。
+- **Cautious 来源**：Liang et al., "Cautious Optimizers: Improving Training
+  with One Line of Code", arXiv:2411.16085；参考实现 `kyleliang919/C-Optim`，MIT。
+- **涉及文件**：
+  - `utils/lion_optimizer.py`（Lion 类，`cautious=True` 即 C-Lion）
+
 ## Alibaba Wan2.1 VAE（请再次确认上游许可）
 
 - **来源**：`Wan-Video/Wan2.1` 的 VAE 实现（与 `wan/modules/vae.py` 对应）

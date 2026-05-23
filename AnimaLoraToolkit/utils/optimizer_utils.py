@@ -17,6 +17,9 @@ Optimizer Utils Module - 优化器创建（修复版）
 - adamw    - 标准 PyTorch AdamW，后备选项
 - prodigyplus (prodigyplus) - 自适应学习率 + Schedule-Free
 - soap     - Shampoo/Adam 矩阵预条件优化器
+- adopt    - ADOPT（NeurIPS 2024），diffusion 等无界梯度噪声下收敛保证的 Adam 变种
+- lion     - Lion（NeurIPS 2023），sign-based 极简优化器
+- clion    - Cautious Lion，Lion + 一行 mask（arxiv 2411.16085）
 """
 
 from __future__ import annotations
@@ -35,6 +38,16 @@ try:
     from .soap_optimizer import SOAP
 except ImportError:  # pragma: no cover - fallback for direct script execution
     from soap_optimizer import SOAP  # type: ignore
+
+try:
+    from .adopt_optimizer import ADOPT
+except ImportError:  # pragma: no cover
+    from adopt_optimizer import ADOPT  # type: ignore
+
+try:
+    from .lion_optimizer import Lion
+except ImportError:  # pragma: no cover
+    from lion_optimizer import Lion  # type: ignore
 
 # -------- 可选依赖 --------
 try:
@@ -157,10 +170,43 @@ def create_optimizer(
             params=params, lr=learning_rate, betas=betas,
             weight_decay=weight_decay, eps=eps, **kwargs,
         )
+    if optimizer_type == "adopt":
+        if "lr" in kwargs:
+            learning_rate = kwargs.pop("lr")
+        if "betas" in kwargs:
+            betas = tuple(kwargs.pop("betas"))
+        elif betas == (0.9, 0.999):
+            # ADOPT recommends a larger β2 (the whole point is β2 robustness).
+            betas = (0.9, 0.9999)
+        if "weight_decay" in kwargs:
+            weight_decay = kwargs.pop("weight_decay")
+        if "eps" in kwargs:
+            eps = kwargs.pop("eps")
+        return create_adopt_optimizer(
+            params=params, lr=learning_rate, betas=betas,
+            weight_decay=weight_decay, eps=eps, **kwargs,
+        )
+    if optimizer_type in {"lion", "clion"}:
+        if "lr" in kwargs:
+            learning_rate = kwargs.pop("lr")
+        if "betas" in kwargs:
+            betas = tuple(kwargs.pop("betas"))
+        elif betas == (0.9, 0.999):
+            betas = (0.9, 0.99)
+        if "weight_decay" in kwargs:
+            weight_decay = kwargs.pop("weight_decay")
+        kwargs.pop("eps", None)  # Lion has no eps; silently drop if passed.
+        # `clion` is just lion + cautious=True; explicit kwargs win.
+        if optimizer_type == "clion":
+            kwargs.setdefault("cautious", True)
+        return create_lion_optimizer(
+            params=params, lr=learning_rate, betas=betas,
+            weight_decay=weight_decay, **kwargs,
+        )
 
     raise ValueError(
         f"Unknown optimizer type: {optimizer_type}. "
-        f"Choose from: adamw8bit, adamw, prodigyplus, soap"
+        f"Choose from: adamw8bit, adamw, prodigyplus, soap, adopt, lion, clion"
     )
 
 
@@ -268,6 +314,79 @@ def create_soap_optimizer(
         weight_decay=weight_decay,
         eps=eps,
         **soap_kwargs,
+    )
+
+
+# =============================================================================
+# ADOPT
+# =============================================================================
+
+def create_adopt_optimizer(
+    params: ParamInput,
+    lr: float,
+    betas: tuple = (0.9, 0.9999),
+    weight_decay: float = 0.0,
+    eps: float = 1e-6,
+    **kwargs,
+) -> Optimizer:
+    valid_keys = {"decoupled", "use_clip", "clip_exponent"}
+    adopt_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+    ignored = [k for k in kwargs if k not in valid_keys]
+    if ignored:
+        logger.warning(f"[ADOPT] Ignored unsupported params: {ignored}")
+
+    param_list = params if _is_param_groups(params) else list(params)
+    logger.info(
+        "Creating ADOPT optimizer "
+        "(lr=%s, betas=%s, wd=%s, eps=%s, decoupled=%s, use_clip=%s, clip_exponent=%s)",
+        lr,
+        betas,
+        weight_decay,
+        eps,
+        adopt_kwargs.get("decoupled", True),
+        adopt_kwargs.get("use_clip", True),
+        adopt_kwargs.get("clip_exponent", 0.25),
+    )
+    return ADOPT(
+        param_list,
+        lr=lr,
+        betas=betas,
+        eps=eps,
+        weight_decay=weight_decay,
+        **adopt_kwargs,
+    )
+
+
+# =============================================================================
+# Lion / C-Lion
+# =============================================================================
+
+def create_lion_optimizer(
+    params: ParamInput,
+    lr: float,
+    betas: tuple = (0.9, 0.99),
+    weight_decay: float = 0.0,
+    **kwargs,
+) -> Optimizer:
+    valid_keys = {"cautious"}
+    lion_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+    ignored = [k for k in kwargs if k not in valid_keys]
+    if ignored:
+        logger.warning(f"[Lion] Ignored unsupported params: {ignored}")
+
+    param_list = params if _is_param_groups(params) else list(params)
+    cautious = bool(lion_kwargs.get("cautious", False))
+    label = "C-Lion (cautious)" if cautious else "Lion"
+    logger.info(
+        "Creating %s optimizer (lr=%s, betas=%s, wd=%s)",
+        label, lr, betas, weight_decay,
+    )
+    return Lion(
+        param_list,
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
+        **lion_kwargs,
     )
 
 

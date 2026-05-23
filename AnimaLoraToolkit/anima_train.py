@@ -481,6 +481,10 @@ def parse_args():
                    help="LPIPS 主干网络；vgg 对纹理最敏感，alex 最快，squeeze 最轻量")
     p.add_argument("--aux-perceptual-dino-local-path", default="",
                    help="本地 DINOv2 权重路径（.pth/.safetensors 或 dinov2 仓库目录）；空=走 torch.hub 自动下载")
+    p.add_argument("--aux-perceptual-cache-dir", default="",
+                   help="本地 perceptual 模型缓存目录（设为 TORCH_HOME）；LPIPS-VGG 与 DINOv2 都从这里读，无需联网。"
+                        "目录结构：<cache_dir>/hub/checkpoints/{vgg16-*.pth,dinov2_vitb14_pretrain.pth} + "
+                        "<cache_dir>/hub/facebookresearch_dinov2_main/（DINOv2 仓库代码）")
 
     return p.parse_args()
 

@@ -200,6 +200,7 @@ YAML_TO_ARGS = {
     "aux_perceptual_t_gate": "aux_perceptual_t_gate",
     "aux_perceptual_lpips_net": "aux_perceptual_lpips_net",
     "aux_perceptual_dino_local_path": "aux_perceptual_dino_local_path",
+    "aux_perceptual_cache_dir": "aux_perceptual_cache_dir",
 }
 
 
@@ -342,6 +343,7 @@ DEFAULTS = {
     "aux_perceptual_t_gate": 0.7,
     "aux_perceptual_lpips_net": "vgg",
     "aux_perceptual_dino_local_path": "",
+    "aux_perceptual_cache_dir": "",
 }
 
 

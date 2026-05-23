@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,6 +56,11 @@ class AuxLossConfig:
     perceptual_t_gate: float = 0.7
     perceptual_lpips_net: str = "vgg"
     perceptual_dino_local_path: str = ""
+    # ★ 给 LPIPS 内部 VGG / DINOv2 都重定向到这个本地目录（设为 TORCH_HOME）。
+    #   目录结构必须是：<cache_dir>/hub/checkpoints/{vgg16-*.pth, dinov2_vitb14_pretrain.pth}
+    #                 <cache_dir>/hub/facebookresearch_dinov2_main/ (DINOv2 仓库代码)
+    #   设了这个后，torch.hub.load 和 torchvision.models.vgg16 都从这里加载，无需联网。
+    perceptual_cache_dir: str = ""
 
     @property
     def any_enabled(self) -> bool:
@@ -79,6 +85,7 @@ def build_aux_loss_config(args) -> AuxLossConfig:
         perceptual_t_gate=float(getattr(args, "aux_perceptual_t_gate", 0.7) or 0.7),
         perceptual_lpips_net=str(getattr(args, "aux_perceptual_lpips_net", "vgg") or "vgg"),
         perceptual_dino_local_path=str(getattr(args, "aux_perceptual_dino_local_path", "") or ""),
+        perceptual_cache_dir=str(getattr(args, "aux_perceptual_cache_dir", "") or ""),
     )
 
 
@@ -216,6 +223,28 @@ class PerceptualLossModule(torch.nn.Module):
         self.vae_wrapper = vae_wrapper  # 拿 .model 和 .scale，不作为子 module（避免被参数注册）
         self.compute_dtype = compute_dtype
         self.device = device
+
+        # ★★★ 关键：在加载任何模型之前设置 TORCH_HOME ★★★
+        # torch.hub.load (DINOv2 仓库代码 + 权重) 与 torchvision.models.vgg16 (LPIPS 内部)
+        # 都从 ${TORCH_HOME}/hub/ 读取。设了这个就能完全离线运行。
+        # 必须在 import lpips（构造 LPIPS 实例）和 torch.hub.load 之前。
+        if cfg.perceptual_cache_dir:
+            cache_dir = Path(cfg.perceptual_cache_dir).resolve()
+            if not cache_dir.exists():
+                raise FileNotFoundError(
+                    f"aux_perceptual_cache_dir 不存在: {cache_dir}\n"
+                    f"请先创建 {cache_dir}/hub/checkpoints/ 并把权重文件搬进去（详见 README 或 train_my.yaml 注释）"
+                )
+            os.environ["TORCH_HOME"] = str(cache_dir)
+            logger.info("TORCH_HOME 已设为本地缓存目录: %s", cache_dir)
+            # 顺便提示一下用户文件确实在那
+            ckpt_dir = cache_dir / "hub" / "checkpoints"
+            if ckpt_dir.exists():
+                files = sorted(ckpt_dir.glob("*.pth"))
+                logger.info("  发现 %d 个本地权重文件: %s",
+                            len(files), [f.name for f in files])
+            else:
+                logger.warning("  ⚠ %s 不存在，加载时仍会尝试联网下载", ckpt_dir)
 
         # ★ VAE 主网络在我们这里只做 forward，不应该有梯度（不在优化器参数组里也不会更新，
         #    但 backward 时若 requires_grad=True 会无谓累积梯度占显存）。

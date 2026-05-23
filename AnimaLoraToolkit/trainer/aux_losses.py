@@ -387,60 +387,80 @@ class PerceptualLossModule(torch.nn.Module):
         # 保持 compute_dtype；LPIPS/DINO 内部自己 autocast
         return pixels.clamp(-1.0, 1.0)
 
+    def _dino_pixels(self, pixels: torch.Tensor, pixels_lp: torch.Tensor | None) -> torch.Tensor:
+        """[-1,1] pixels → ImageNet-normalized, resize 到 224 供 DINOv2。
+
+        当 perceptual_lpips_size >= 224 且 pixels_lp 可用时，从已经下采样的版本
+        resize（512→224 vs 1024→224，interpolate 计算量和内存均降到 1/4）。
+        """
+        src = pixels_lp if (pixels_lp is not None and self.cfg.perceptual_lpips_size >= 224) else pixels
+        mean = self.dino_mean.to(dtype=src.dtype, device=src.device)
+        std = self.dino_std.to(dtype=src.dtype, device=src.device)
+        p = ((src + 1.0) * 0.5).clamp(0.0, 1.0)
+        p = (p - mean) / std
+        return F.interpolate(p, size=224, mode="bilinear", align_corners=False)
+
+    def _lpips_downsample(self, pixels: torch.Tensor) -> torch.Tensor:
+        if self.cfg.perceptual_lpips_size > 0:
+            return F.interpolate(pixels, size=int(self.cfg.perceptual_lpips_size),
+                                 mode="bilinear", align_corners=False)
+        return pixels
+
     def _compute_per_sample(self, x0_pred: torch.Tensor, x0_target: torch.Tensor) -> torch.Tensor:
         """完整的 per-sample perceptual loss 计算（VAE decode + LPIPS + DINO）。
 
-        这个函数被 forward() 直接调用或包进 checkpoint 调用。把"重计算"集中在这里，
-        backward 时若启用 checkpoint，整段会被 PyTorch 重放一次以释放激活内存。
+        用于 eval / no-grad 路径（无 checkpoint），直接 batched 跑。
         """
-        # 解码到 pixel space（保持 compute_dtype，下游 LPIPS/DINO 在 bf16 下跑）
         pixels_pred = self._decode_to_pixel(x0_pred, with_grad=True)
         pixels_target = self._decode_to_pixel(x0_target, with_grad=False)
 
-        # ---- 可选：下采样到 perceptual_lpips_size，进一步省显存 ----
-        if self.cfg.perceptual_lpips_size > 0:
-            tgt = int(self.cfg.perceptual_lpips_size)
-            # 只 LPIPS 用下采样后的像素；DINO 在下面自己 resize 到 224，与此无关
-            pixels_pred_lp = F.interpolate(pixels_pred, size=tgt, mode="bilinear", align_corners=False)
-            pixels_target_lp = F.interpolate(pixels_target, size=tgt, mode="bilinear", align_corners=False)
-        else:
-            pixels_pred_lp = pixels_pred
-            pixels_target_lp = pixels_target
+        pixels_pred_lp = self._lpips_downsample(pixels_pred)
+        pixels_target_lp = self._lpips_downsample(pixels_target)
 
-        # ---- LPIPS（在 bf16 autocast 内跑 VGG，速度 ~2× 且省显存）----
         with torch.autocast("cuda", dtype=self.compute_dtype):
             l_lpips = self.lpips_fn(pixels_pred_lp, pixels_target_lp)
-        # 返回 (B, 1, 1, 1)，规范成 (B,)，再 upcast 到 fp32 与主 loss 同 dtype
         l_lpips = l_lpips.view(l_lpips.shape[0]).float()
         per_sample = float(self.cfg.perceptual_lambda_lpips) * l_lpips
 
-        # ---- DINOv2 cosine similarity ----
         if self.use_dino:
-            # [-1, 1] → [0, 1] → ImageNet normalize → resize to 224
-            # mean/std buffers 是 fp32，与 pixels 做减除会上抬到 fp32；这里我们想保持 bf16，
-            # 所以把 mean/std 转成 pixels 的 dtype
-            # 防御性：同时对齐 dtype 与 device（buffer 应已在 device 上，但万一被外部
-            # 代码搬走过——例如某些 CPU-offload 工具——这里强制对齐避免 runtime 崩）。
-            mean = self.dino_mean.to(dtype=pixels_pred.dtype, device=pixels_pred.device)
-            std = self.dino_std.to(dtype=pixels_pred.dtype, device=pixels_pred.device)
-            p_pred = ((pixels_pred + 1.0) * 0.5).clamp(0.0, 1.0)
-            p_target = ((pixels_target + 1.0) * 0.5).clamp(0.0, 1.0)
-            p_pred = (p_pred - mean) / std
-            p_target = (p_target - mean) / std
-            p_pred = F.interpolate(p_pred, size=224, mode="bilinear", align_corners=False)
-            p_target = F.interpolate(p_target, size=224, mode="bilinear", align_corners=False)
-
+            p_pred = self._dino_pixels(pixels_pred, pixels_pred_lp)
+            p_target = self._dino_pixels(pixels_target, pixels_target_lp)
             with torch.autocast("cuda", dtype=self.compute_dtype):
                 feat_pred = self.dino.forward_features(p_pred)["x_norm_patchtokens"]
                 with torch.no_grad():
                     feat_target = self.dino.forward_features(p_target)["x_norm_patchtokens"]
-
-            # cosine similarity 在 fp32 上做（数值更稳）；patch 维度平均
-            cos = F.cosine_similarity(feat_pred.float(), feat_target.float(), dim=-1)  # (B, N)
-            l_dino = (1.0 - cos).mean(dim=-1)  # (B,)
+            cos = F.cosine_similarity(feat_pred.float(), feat_target.float(), dim=-1)
+            l_dino = (1.0 - cos).mean(dim=-1)
             per_sample = per_sample + float(self.cfg.perceptual_lambda_dino) * l_dino
 
-        return per_sample  # (B,) per-sample loss
+        return per_sample
+
+    def _compute_pred_against_target(self, x0_pred: torch.Tensor,
+                                     pixels_target_lp: torch.Tensor,
+                                     dino_feat_target: torch.Tensor | None) -> torch.Tensor:
+        """Checkpoint 优化路径：仅对 pred 做 VAE decode + VGG + DINO。
+
+        Target 的 pixels 和 DINO features 在 checkpoint 边界外预计算完毕，
+        通过闭包传入。backward replay 时这些 no_grad 张量直接复用，不再重跑
+        VAE decode + DINO forward on target（每 step 省 B 次 VAE + B 次 DINO）。
+        """
+        pixels_pred = self._decode_to_pixel(x0_pred, with_grad=True)
+        pixels_pred_lp = self._lpips_downsample(pixels_pred)
+
+        with torch.autocast("cuda", dtype=self.compute_dtype):
+            l_lpips = self.lpips_fn(pixels_pred_lp, pixels_target_lp)
+        l_lpips = l_lpips.view(l_lpips.shape[0]).float()
+        per_sample = float(self.cfg.perceptual_lambda_lpips) * l_lpips
+
+        if self.use_dino and dino_feat_target is not None:
+            p_pred = self._dino_pixels(pixels_pred, pixels_pred_lp)
+            with torch.autocast("cuda", dtype=self.compute_dtype):
+                feat_pred = self.dino.forward_features(p_pred)["x_norm_patchtokens"]
+            cos = F.cosine_similarity(feat_pred.float(), dino_feat_target.float(), dim=-1)
+            l_dino = (1.0 - cos).mean(dim=-1)
+            per_sample = per_sample + float(self.cfg.perceptual_lambda_dino) * l_dino
+
+        return per_sample
 
     def forward(self, x0_pred: torch.Tensor, x0_target: torch.Tensor,
                 t: torch.Tensor) -> torch.Tensor:
@@ -450,6 +470,10 @@ class PerceptualLossModule(torch.nn.Module):
           forward 会被 torch.utils.checkpoint 包起来 —— backward 时重放一次以释放
           forward 激活。这与主模型 per-block checkpoint 是对称的设计，否则 1024 训练
           时 perceptual 路径的激活会撑爆 96GB 显存。
+
+        ★ 优化：target 的 VAE decode + DINO features 在 checkpoint 边界外一次性预计算。
+          checkpoint 内仅对 pred 做 forward（backward replay 不再冗余重跑 target）。
+          batch=4 时每 step 省 4 次 VAE decode + 4 次 DINO forward。
         """
         if not self.cfg.perceptual_enabled:
             return x0_pred.new_zeros((), dtype=torch.float32)
@@ -459,35 +483,39 @@ class PerceptualLossModule(torch.nn.Module):
             return x0_pred.new_zeros((), dtype=torch.float32)
 
         if self.cfg.perceptual_use_checkpoint and torch.is_grad_enabled():
-            # ★ Per-sample micro-batching + 每样本独立 checkpoint：
-            #   WAN VAE 是视频 VAE，每个 conv3d 对时间维 T 做 causal padding，
-            #   单帧 (T=1) 会被撑到 T~5，整个 decoder 累计激活 ~5× 图像 VAE。
-            #   1024 batch=4 时直接 batched decode 激活 60+ GB → OOM。
-            #
-            #   解法：把 batch 拆成单样本，每个样本独立走一次 checkpoint。
-            #   forward peak = 1 样本 (而非 B 样本) 的 VAE 激活；
-            #   backward 同样按样本逐个 replay，峰值激活仅 1/B。
-            #   代价：VAE forward 慢 ~2-3×（GPU 利用率下降）。
             from torch.utils.checkpoint import checkpoint
 
             B = x0_pred.shape[0]
+
+            # ★ 预计算 target：VAE decode + LPIPS downsample + DINO features。
+            # 全部在 no_grad 下逐样本跑（避免 batched VAE decode 峰值显存），
+            # 结果通过闭包传入 checkpoint 内部，backward replay 直接复用。
+            pre_target = []
+            with torch.no_grad():
+                for i in range(B):
+                    pt_i = self._decode_to_pixel(x0_target[i:i + 1], with_grad=False)
+                    pt_lp_i = self._lpips_downsample(pt_i)
+                    dino_feat_i = None
+                    if self.use_dino:
+                        p_t = self._dino_pixels(pt_i, pt_lp_i)
+                        with torch.autocast("cuda", dtype=self.compute_dtype):
+                            dino_feat_i = self.dino.forward_features(p_t)["x_norm_patchtokens"]
+                    pre_target.append((pt_lp_i, dino_feat_i))
+                    del pt_i  # 释放原始分辨率 target pixels
+
             per_sample_list = []
             for i in range(B):
-                # i:i+1 切片保留 batch 维（VAE/LPIPS/DINO 都假定 4D/5D 输入）
                 x0p_i = x0_pred[i:i + 1]
-                x0t_i = x0_target[i:i + 1]
+                pt_lp_i, dino_feat_i = pre_target[i]
 
-                # 每个样本独立 checkpoint：闭包以默认参数形式捕获 x0t_i，
-                # 避免 late-binding 陷阱（所有闭包看见同一 i 的 bug）
-                def _heavy_i(x, _x0t=x0t_i):
-                    return self._compute_per_sample(x, _x0t)
+                def _heavy_i(x, _pt_lp=pt_lp_i, _dino_feat=dino_feat_i):
+                    return self._compute_pred_against_target(x, _pt_lp, _dino_feat)
 
                 l_i = checkpoint(_heavy_i, x0p_i, use_reentrant=False)
                 per_sample_list.append(l_i)
 
-            per_sample = torch.cat(per_sample_list, dim=0)  # (B,)
+            per_sample = torch.cat(per_sample_list, dim=0)
         else:
-            # eval / no-grad 路径：batched 直跑，无内存压力
             per_sample = self._compute_per_sample(x0_pred, x0_target)
 
         return (per_sample * mask).sum() / mask.sum().clamp(min=1.0)

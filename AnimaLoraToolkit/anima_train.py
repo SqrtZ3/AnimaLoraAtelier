@@ -1529,28 +1529,35 @@ def main():
             # 在 autocast 块之外计算：
             #   - spectral_loss 内部强制 fp32（FFT 数值稳定性）
             #   - perceptual_module 内部自己管 autocast（VAE decode + LPIPS/DINO 都用 bf16）
-            # 顺序：x₀ 恢复 → spectral（不需要模型） → perceptual（需要 VAE decode）
+            # 顺序：先检查 t-gate → x₀ 恢复 → spectral → perceptual
             # x0_pred / x0_target / aux_total 在 None 兜底下声明，便于 NaN 路径统一 del
             x0_pred = None
             x0_target = None
             aux_total = None
             if objective_cfg.aux.any_enabled:
-                # x₀_pred = noisy - t·velocity_pred，强制 fp32 避免 bf16 精度损失
-                x0_pred = recover_x0_from_velocity(noisy, t, pred)
-                x0_target = latents.float()
+                # Early t-gate：若 batch 内所有样本的 t 都 >= 最大 gate，
+                # 跳过 x₀ recovery（~1.5GB fp32 分配）和全部 aux forward。
+                _aux = objective_cfg.aux
+                _max_gate = max(
+                    _aux.spectral_t_gate if _aux.spectral_enabled else 0.0,
+                    _aux.perceptual_t_gate if _aux.perceptual_enabled else 0.0,
+                )
+                _any_below_gate = (t.float() < _max_gate).any().item()
 
-                # 明确 fp32 计算 aux_total，最后才 cast 回 loss dtype（fp32）
-                aux_total = torch.zeros((), device=loss.device, dtype=torch.float32)
-                if objective_cfg.aux.spectral_enabled:
-                    l_spec = spectral_loss(x0_pred, x0_target, t, objective_cfg.aux)
-                    aux_total = aux_total + float(objective_cfg.aux.spectral_lambda) * l_spec
+                if _any_below_gate:
+                    x0_pred = recover_x0_from_velocity(noisy, t, pred)
+                    x0_target = latents.float()
 
-                if objective_cfg.aux.perceptual_enabled and perceptual_module is not None:
-                    # PerceptualLossModule 已把 λ_lpips / λ_dino 写在 forward 内部
-                    l_perc = perceptual_module(x0_pred, x0_target, t)
-                    aux_total = aux_total + l_perc
+                    aux_total = torch.zeros((), device=loss.device, dtype=torch.float32)
+                    if _aux.spectral_enabled:
+                        l_spec = spectral_loss(x0_pred, x0_target, t, _aux)
+                        aux_total = aux_total + float(_aux.spectral_lambda) * l_spec
 
-                loss = loss + aux_total.to(loss.dtype)
+                    if _aux.perceptual_enabled and perceptual_module is not None:
+                        l_perc = perceptual_module(x0_pred, x0_target, t)
+                        aux_total = aux_total + l_perc
+
+                    loss = loss + aux_total.to(loss.dtype)
 
             # ★ 守护 1：forward 结果 NaN/Inf 检查
             debug_n = int(getattr(args, "debug_first_batches", 0) or 0)

@@ -19,7 +19,7 @@ GPU=0                   # CUDA GPU 编号（多卡机器上改为 1、2…）
 KEEP_FREE=4096          # 目标保留空闲显存（MiB）；该值以下才会停止抢占
 HARD_MIN_FREE=768      # 强制释放触发线（MiB）；空闲低于此值立即让出一块
                         # 留空（""）则自动取 KEEP_FREE / 2
-MAX_RESERVE=60000           # 本进程最多占用的显存（MiB）；0 表示不限
+MAX_RESERVE=76000           # 本进程最多占用的显存（MiB）；0 表示不限
 BLOCK=512               # 稳态分配/释放的粒度（MiB）
 STARTUP_BLOCK=2048      # 启动阶段快速抢占的粒度（MiB）
 RELEASE_POLICY=hard-only  # 释放策略：hard-only（只在触发硬性下限时释放）

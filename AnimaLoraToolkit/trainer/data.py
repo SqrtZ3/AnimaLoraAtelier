@@ -23,11 +23,22 @@ import random
 import sys
 from pathlib import Path
 
-import numpy as _np_for_dtype_map
 import torch
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+
+def compute_sample_accumulation_steps(dataset_size: int, epochs: int,
+                                      effective_batch_size: int) -> int:
+    """Return optimizer steps when flushing one final partial sample window.
+
+    This helper is intentionally sample-count based: it does not care how many
+    ARB buckets or micro-batches the DataLoader produces.
+    """
+    total_samples = max(0, int(dataset_size)) * max(0, int(epochs))
+    eff_bs = max(1, int(effective_batch_size))
+    return (total_samples + eff_bs - 1) // eff_bs
 
 
 # numpy ↔ torch dtype 映射（CachedLatentDataset 保存 bf16 / fp16 时用）。
@@ -533,13 +544,18 @@ class BucketBatchSampler:
     for every outer index to look up the underlying ImageDataset / CachedLatentDataset's
     bucket_for_index. This avoids any indirection bugs in pre-built bucket_for_index lists.
     """
-    def __init__(self, dataset, batch_size, drop_last=False, shuffle=True, seed=42):
+    def __init__(self, dataset, batch_size, drop_last=False, shuffle=True, seed=42,
+                 effective_batch_size=0):
         self.dataset = dataset
         self.batch_size = int(batch_size)
+        self.effective_batch_size = int(effective_batch_size or 0)
+        if self.effective_batch_size <= 0:
+            self.effective_batch_size = 0
         self.drop_last = bool(drop_last)
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.epoch = 0
+        self.accumulation_offset = 0
         self._bucket_keys = self._build_keys(dataset)
 
         unique = set(self._bucket_keys)
@@ -574,23 +590,69 @@ class BucketBatchSampler:
                 "其中 %d 个桶会产生 1 个小于 batch_size=%d 的余数 batch。",
                 len(self._bucket_keys), _small_batches, _bs,
             )
+        if self.effective_batch_size:
+            logger.info(
+                "[BucketBatchSampler] sample-window accumulation enabled: "
+                "effective_batch_size=%d, native batch_size<=%d.",
+                self.effective_batch_size, self.batch_size,
+            )
 
         # 预计算 per-bucket 批数（drop_last 在每个桶内独立生效）。
         # 旧实现 `n // bs` 在多桶 + drop_last 时会高估批数，进而把 cosine 调度器的 T_max 设错。
         self._total_batches = self._compute_total_batches()
 
     def _compute_total_batches(self):
-        from collections import Counter
-        counts = Counter(tuple(k) if k is not None else (0, 0) for k in self._bucket_keys)
-        bs = self.batch_size
         total = 0
-        if self.drop_last:
-            for n in counts.values():
-                total += n // bs
-        else:
-            for n in counts.values():
-                total += (n + bs - 1) // bs
+        pending = self.accumulation_offset
+        for batch in self._native_batches():
+            split_batches, pending = self._split_for_accumulation_window(batch, pending)
+            total += len(split_batches)
         return total
+
+    def _native_batches(self):
+        rng = random.Random(self.seed + self.epoch)
+        bucket_to_indices = {}
+        for idx, key in enumerate(self._bucket_keys):
+            if key is None:
+                key = (0, 0)
+            bucket_to_indices.setdefault(tuple(key), []).append(idx)
+
+        buckets = list(bucket_to_indices.keys())
+        if self.shuffle:
+            rng.shuffle(buckets)
+        for bucket in buckets:
+            indices = bucket_to_indices[bucket]
+            if self.shuffle:
+                rng.shuffle(indices)
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                yield batch
+
+    def _split_for_accumulation_window(self, batch, pending):
+        """Split a same-bucket native batch before forward to hit sample windows.
+
+        The returned sub-batches preserve order and contain each input index
+        exactly once. If `effective_batch_size` is disabled, the original batch
+        is returned unchanged.
+        """
+        if not self.effective_batch_size:
+            return [batch], pending
+
+        eff = self.effective_batch_size
+        pending = int(pending) % eff
+        parts = []
+        pos = 0
+        while pos < len(batch):
+            remaining = eff - pending
+            take = min(len(batch) - pos, remaining)
+            parts.append(batch[pos:pos + take])
+            pos += take
+            pending += take
+            if pending == eff:
+                pending = 0
+        return parts, pending
 
     def _build_keys(self, dataset):
         """Build per-outer-index bucket keys。
@@ -676,29 +738,23 @@ class BucketBatchSampler:
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
 
+    def set_accumulation_offset(self, pending_samples):
+        if self.effective_batch_size:
+            self.accumulation_offset = int(pending_samples) % self.effective_batch_size
+        else:
+            self.accumulation_offset = 0
+
     def __len__(self):
+        if self.effective_batch_size:
+            return self._compute_total_batches()
         return self._total_batches
 
     def __iter__(self):
-        rng = random.Random(self.seed + self.epoch)
-        bucket_to_indices = {}
-        for idx, key in enumerate(self._bucket_keys):
-            if key is None:
-                key = (0, 0)
-            bucket_to_indices.setdefault(tuple(key), []).append(idx)
-
-        buckets = list(bucket_to_indices.keys())
-        if self.shuffle:
-            rng.shuffle(buckets)
-        for bucket in buckets:
-            indices = bucket_to_indices[bucket]
-            if self.shuffle:
-                rng.shuffle(indices)
-            for i in range(0, len(indices), self.batch_size):
-                batch = indices[i:i + self.batch_size]
-                if len(batch) < self.batch_size and self.drop_last:
-                    continue
-                yield batch
+        pending = self.accumulation_offset
+        for batch in self._native_batches():
+            split_batches, pending = self._split_for_accumulation_window(batch, pending)
+            for split_batch in split_batches:
+                yield split_batch
 
 
 class CachedLatentDataset(Dataset):

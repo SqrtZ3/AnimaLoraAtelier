@@ -155,7 +155,13 @@ max_steps: 0
 # 单步 batch。调大梯度更稳、Prodigy 估计更稳，但吃显存；batch 1 时建议 grad_accum 补足。
 batch_size: 4
 
+# 按真实图片数做精确累积。0=关闭，使用 grad_accum；>0 时 DataLoader 会在窗口边界
+# 拆分同桶 micro-batch，确保每个 optimizer.step() 来自该数量的图片均值梯度。
+# 适合 Lion/C-Lion 在分辨率桶很碎、小 batch 很多时稳定方向；不会丢图、补图或二次裁切。
+effective_batch_size: 0
+
 # 梯度累积。有效 batch=batch_size*grad_accum；调大会变稳但响应变慢。
+# 当 effective_batch_size > 0 时会被忽略。
 grad_accum: 1
 
 # 对 ProdigyPlus 必须保持 1.0；实际步长由 d/d0/d_coef 自适应。

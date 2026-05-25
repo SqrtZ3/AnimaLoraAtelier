@@ -179,13 +179,23 @@ def spectral_loss(x0_pred: torch.Tensor, x0_target: torch.Tensor,
     t-gate：仅 t < cfg.spectral_t_gate 的样本参与；其它样本对 batch loss 贡献为 0。
     返回标量（已按有效样本数归一）。
     """
-    if not cfg.spectral_enabled:
-        return x0_pred.new_zeros((), dtype=torch.float32)
-
-    # gating mask：(B,) 0/1，只保留 t < gate 的样本
+    per_sample = spectral_loss_per_sample(x0_pred, x0_target, t, cfg)
     active = t.float() < float(cfg.spectral_t_gate)
     if not bool(active.any()):
         return x0_pred.new_zeros((), dtype=torch.float32)
+    return per_sample.index_select(0, active.nonzero(as_tuple=False).flatten()).mean()
+
+
+def spectral_loss_per_sample(x0_pred: torch.Tensor, x0_target: torch.Tensor,
+                             t: torch.Tensor, cfg: AuxLossConfig) -> torch.Tensor:
+    """Return per-sample spectral loss, with inactive t-gated samples as zero."""
+    out = x0_pred.new_zeros((x0_pred.shape[0],), dtype=torch.float32)
+    if not cfg.spectral_enabled:
+        return out
+
+    active = t.float() < float(cfg.spectral_t_gate)
+    if not bool(active.any()):
+        return out
 
     active_idx = active.nonzero(as_tuple=False).flatten()
     pred_f = x0_pred.index_select(0, active_idx).float()
@@ -211,7 +221,8 @@ def spectral_loss(x0_pred: torch.Tensor, x0_target: torch.Tensor,
         w_per_sample = w_diff.view(w_diff.shape[0], -1).mean(dim=1)
         total = total + float(cfg.spectral_wavelet_lambda) * w_per_sample
 
-    return total.mean()
+    out.index_copy_(0, active_idx, total)
+    return out
 
 
 # ============================================================================
@@ -475,12 +486,22 @@ class PerceptualLossModule(torch.nn.Module):
           checkpoint 内仅对 pred 做 forward（backward replay 不再冗余重跑 target）。
           batch=4 时每 step 省 4 次 VAE decode + 4 次 DINO forward。
         """
-        if not self.cfg.perceptual_enabled:
-            return x0_pred.new_zeros((), dtype=torch.float32)
-
+        per_sample = self.forward_per_sample(x0_pred, x0_target, t)
         active = t.float() < float(self.cfg.perceptual_t_gate)
         if not bool(active.any()):
             return x0_pred.new_zeros((), dtype=torch.float32)
+        return per_sample.index_select(0, active.nonzero(as_tuple=False).flatten()).mean()
+
+    def forward_per_sample(self, x0_pred: torch.Tensor, x0_target: torch.Tensor,
+                           t: torch.Tensor) -> torch.Tensor:
+        """Return per-sample perceptual loss, with inactive t-gated samples as zero."""
+        out = x0_pred.new_zeros((x0_pred.shape[0],), dtype=torch.float32)
+        if not self.cfg.perceptual_enabled:
+            return out
+
+        active = t.float() < float(self.cfg.perceptual_t_gate)
+        if not bool(active.any()):
+            return out
 
         # PixelGen-style noise gating should save compute, not only zero out loss.
         # Slice to active samples before VAE decode / LPIPS / DINO so high-noise
@@ -525,7 +546,8 @@ class PerceptualLossModule(torch.nn.Module):
         else:
             per_sample = self._compute_per_sample(x0_pred_active, x0_target_active)
 
-        return per_sample.mean()
+        out.index_copy_(0, active_idx, per_sample.float())
+        return out
 
 
 # ============================================================================

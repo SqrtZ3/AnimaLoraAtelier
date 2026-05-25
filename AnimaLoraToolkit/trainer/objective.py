@@ -600,6 +600,31 @@ def apply_loss_weighting(per_sample: torch.Tensor, t: torch.Tensor, cfg: LossCon
     return (per_sample * w).mean()
 
 
+def apply_loss_weighting_per_sample(per_sample: torch.Tensor, t: torch.Tensor,
+                                    cfg: LossConfig,
+                                    normalize_weights: bool = False) -> torch.Tensor:
+    """Return weighted per-sample losses without reducing across the batch.
+
+    The regular training path keeps the historical per-micro-batch weight
+    normalization in ``apply_loss_weighting``. Sample-window accumulation needs
+    raw per-sample values so ARB micro-batch boundaries do not renormalize the
+    timestep weights independently.
+    """
+    if cfg.weighting_scheme == "none":
+        return per_sample
+    w = compute_loss_weight(
+        t.float(),
+        scheme=cfg.weighting_scheme,
+        min_snr_gamma=cfg.min_snr_gamma,
+        weight_cap_ratio=cfg.weight_cap_ratio,
+        detail_inv_t_min=cfg.detail_inv_t_min,
+        detail_inv_t_max=cfg.detail_inv_t_max,
+    )
+    if normalize_weights:
+        w = w / w.mean().clamp(min=1e-6)
+    return per_sample * w
+
+
 # ============================================================================
 # Grad norm + forward helpers
 # ============================================================================

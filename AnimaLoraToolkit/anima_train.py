@@ -208,6 +208,7 @@ from trainer.objective import (
     adaptive_timestep_metric_signal,
     compute_loss_weight,
     apply_loss_weighting,
+    apply_loss_weighting_per_sample,
     compute_grad_norm,
     forward_with_optional_checkpoint,
 )
@@ -216,6 +217,7 @@ from trainer.aux_losses import (
     build_aux_loss_config,
     recover_x0_from_velocity,
     spectral_loss,
+    spectral_loss_per_sample,
     PerceptualLossModule,
     summary_aux_loss_config,
 )
@@ -226,6 +228,7 @@ from trainer.data import (
     MergedDataset,
     BucketBatchSampler,
     CachedLatentDataset,
+    compute_sample_accumulation_steps,
     collate_fn,
     collate_fn_cached,
 )
@@ -273,6 +276,8 @@ def parse_args():
     # 训练参数
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--effective-batch-size", type=int, default=0,
+                   help="按真实图片数累积到该数量后再 optimizer.step()。0=使用旧的 grad_accum 逻辑。")
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr-scheduler", default="none", choices=["none", "cosine", "cosine_with_restart"], help="学习率调度器")
@@ -966,11 +971,28 @@ def main():
         _loader_kwargs["pin_memory"] = True
 
     _bucket_drop_last = bool(getattr(args, "bucket_drop_last", False))
+    _effective_batch_size = int(getattr(args, "effective_batch_size", 0) or 0)
+    if _effective_batch_size > 0:
+        if _bucket_drop_last:
+            logger.warning(
+                "effective_batch_size 已启用，建议保持 bucket_drop_last=false；"
+                "当前仍会先按 bucket_drop_last 丢弃不满 batch_size 的桶余数。"
+            )
+        if int(getattr(args, "grad_accum", 1) or 1) != 1:
+            logger.warning(
+                "effective_batch_size=%d 会接管梯度累积；grad_accum=%d 将被忽略。",
+                _effective_batch_size, int(getattr(args, "grad_accum", 1) or 1),
+            )
+        logger.info(
+            "Sample-window accumulation: native batch_size<=%d, effective_batch_size=%d",
+            int(args.batch_size), _effective_batch_size,
+        )
     if use_cached:
         batch_sampler = BucketBatchSampler(
             dataset, batch_size=args.batch_size,
             drop_last=_bucket_drop_last, shuffle=True,
             seed=getattr(args, "seed", 42),
+            effective_batch_size=_effective_batch_size,
         )
         dataloader = DataLoader(
             dataset, batch_sampler=batch_sampler,
@@ -985,6 +1007,7 @@ def main():
             dataset, batch_size=args.batch_size,
             drop_last=_bucket_drop_last, shuffle=True,
             seed=getattr(args, "seed", 42),
+            effective_batch_size=_effective_batch_size,
         )
         dataloader = DataLoader(
             dataset, batch_sampler=batch_sampler,
@@ -1130,13 +1153,28 @@ def main():
         trainable_params.extend(group["params"])
 
     # 计算总步数
+    sample_accum_enabled = int(getattr(args, "effective_batch_size", 0) or 0) > 0
+    effective_batch_size = int(getattr(args, "effective_batch_size", 0) or 0)
     try:
-        steps_per_epoch = len(dataloader) // args.grad_accum
+        if sample_accum_enabled:
+            steps_per_epoch = compute_sample_accumulation_steps(
+                dataset_size=len(dataset),
+                epochs=1,
+                effective_batch_size=effective_batch_size,
+            )
+        else:
+            steps_per_epoch = len(dataloader) // args.grad_accum
     except Exception:
         steps_per_epoch = None
 
     if args.max_steps and args.max_steps > 0:
         total_steps = args.max_steps
+    elif sample_accum_enabled:
+        total_steps = compute_sample_accumulation_steps(
+            dataset_size=len(dataset),
+            epochs=args.epochs,
+            effective_batch_size=effective_batch_size,
+        )
     elif steps_per_epoch is not None:
         total_steps = steps_per_epoch * args.epochs
     else:
@@ -1413,6 +1451,9 @@ def main():
     # 接着继续累计剩下的 micro-batch，最后用"半截"梯度调用 optimizer.step()。
     # 新做法：保留已累计的梯度，但记号本周期"脏了"，到周期边界时整体丢弃这次 step。
     accum_clean = True
+    sample_accum_pending = 0
+    sample_accum_loss_sum = None
+    step_start_time = time.perf_counter()
 
     # pad_mask 复用缓存：key=(B, 1, H_lat, W_lat) → tensor
     # ARB 多 bucket 时大概会有 5-20 个 unique shape，cache 几 KB 内存换掉每步的 cudaMalloc。
@@ -1422,9 +1463,16 @@ def main():
         current_epoch = epoch
         if hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_epoch"):
             dataloader.batch_sampler.set_epoch(epoch)
+        if sample_accum_enabled and hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_accumulation_offset"):
+            dataloader.batch_sampler.set_accumulation_offset(sample_accum_pending)
         for batch_idx, batch in enumerate(dataloader):
             # 在累积周期开始时记录时间 + 重置 clean 标志
-            if batch_idx % args.grad_accum == 0:
+            if sample_accum_enabled:
+                if sample_accum_pending == 0:
+                    step_start_time = time.perf_counter()
+                    sample_accum_loss_sum = None
+                    accum_clean = True
+            elif batch_idx % args.grad_accum == 0:
                 step_start_time = time.perf_counter()
                 accum_clean = True
 
@@ -1523,7 +1571,14 @@ def main():
                     t=t.float(),
                 )
 
-                loss = apply_loss_weighting(per_sample, t, objective_cfg.loss)
+                if sample_accum_enabled:
+                    main_loss_per_sample = apply_loss_weighting_per_sample(
+                        per_sample, t, objective_cfg.loss, normalize_weights=False
+                    )
+                    loss = main_loss_per_sample.sum() / float(effective_batch_size)
+                else:
+                    main_loss_per_sample = None
+                    loss = apply_loss_weighting(per_sample, t, objective_cfg.loss)
 
             # ── 辅助 loss（Spectral / Perceptual）─────────────────────────────
             # 在 autocast 块之外计算：
@@ -1559,12 +1614,23 @@ def main():
 
                     aux_total = torch.zeros((), device=loss.device, dtype=torch.float32)
                     if _aux.spectral_enabled:
-                        l_spec = spectral_loss(x0_pred, x0_target, t_aux, _aux)
-                        aux_total = aux_total + float(_aux.spectral_lambda) * l_spec
+                        if sample_accum_enabled:
+                            l_spec_vec = spectral_loss_per_sample(x0_pred, x0_target, t_aux, _aux)
+                            aux_total = aux_total + (
+                                float(_aux.spectral_lambda) * l_spec_vec.sum()
+                                / float(effective_batch_size)
+                            )
+                        else:
+                            l_spec = spectral_loss(x0_pred, x0_target, t_aux, _aux)
+                            aux_total = aux_total + float(_aux.spectral_lambda) * l_spec
 
                     if _aux.perceptual_enabled and perceptual_module is not None:
-                        l_perc = perceptual_module(x0_pred, x0_target, t_aux)
-                        aux_total = aux_total + l_perc
+                        if sample_accum_enabled:
+                            l_perc_vec = perceptual_module.forward_per_sample(x0_pred, x0_target, t_aux)
+                            aux_total = aux_total + l_perc_vec.sum() / float(effective_batch_size)
+                        else:
+                            l_perc = perceptual_module(x0_pred, x0_target, t_aux)
+                            aux_total = aux_total + l_perc
 
                     loss = loss + aux_total.to(loss.dtype)
 
@@ -1623,6 +1689,17 @@ def main():
                 )
                 # 不要 zero_grad！保留同周期内其他 micro-batch 的梯度，整周期边界统一丢弃。
                 accum_clean = False
+                if sample_accum_enabled:
+                    sample_accum_pending += int(bs)
+                    if sample_accum_pending >= effective_batch_size:
+                        logger.warning(
+                            f"[step {global_step}] Sample accumulation window contained a "
+                            f"non-finite micro-batch loss; discarding the entire window."
+                        )
+                        optimizer.zero_grad(set_to_none=True)
+                        sample_accum_pending = 0
+                        sample_accum_loss_sum = None
+                        accum_clean = True
                 injector.set_current_t(None)  # T-LoRA: 本 micro-batch 跳过 backward，立即 reset
                 # ★ 显式释放本 micro-batch 的 forward autograd 图。否则同周期内
                 # 后续 micro-batch 的图会累积（pred / per_sample / loss 都还被 closure 引用），
@@ -1630,6 +1707,8 @@ def main():
                 # x0_pred / x0_target / aux_total 在 aux loss 启用时持有 pred / noisy 的
                 # autograd 图引用，必须一并 del 才能让 GC 真正回收。
                 del loss, per_sample, pred, target, noisy, cross
+                if sample_accum_enabled and main_loss_per_sample is not None:
+                    del main_loss_per_sample
                 if x0_pred is not None:
                     del x0_pred
                 if x0_target is not None:
@@ -1647,13 +1726,34 @@ def main():
                     highfreq_weight=adaptive_ts.highfreq_weight,
                 )
                 adaptive_ts.update(t.float(), adaptive_signal)
-            loss_to_backward = loss / args.grad_accum
+            if sample_accum_enabled:
+                loss_to_backward = loss
+                sample_accum_pending += int(bs)
+                _loss_for_log = (
+                    main_loss_per_sample.detach().float().sum()
+                    if main_loss_per_sample is not None
+                    else loss.detach().float() * float(effective_batch_size)
+                )
+                sample_accum_loss_sum = (
+                    _loss_for_log if sample_accum_loss_sum is None
+                    else sample_accum_loss_sum + _loss_for_log
+                )
+                step_boundary = sample_accum_pending >= effective_batch_size
+            else:
+                loss_to_backward = loss / args.grad_accum
+                step_boundary = (batch_idx + 1) % args.grad_accum == 0
             loss_to_backward.backward()
             # T-LoRA: backward 完成后才能 reset，否则 grad checkpoint recompute 会看到
             # current_t=None，与原 forward 走的分支不一致 → CheckpointError
             injector.set_current_t(None)
 
-            if (batch_idx + 1) % args.grad_accum == 0:
+            if step_boundary:
+                if sample_accum_enabled and sample_accum_pending != effective_batch_size:
+                    raise RuntimeError(
+                        f"Sample accumulation boundary mismatch: pending={sample_accum_pending}, "
+                        f"effective_batch_size={effective_batch_size}. "
+                        "BucketBatchSampler should split micro-batches before crossing the window."
+                    )
                 # ★ 守护 1：周期内有 micro-batch NaN/Inf loss → 整周期作废，不做 step
                 if not accum_clean:
                     logger.warning(
@@ -1661,6 +1761,9 @@ def main():
                         f"micro-batch loss; discarding the entire cycle's gradients."
                     )
                     optimizer.zero_grad(set_to_none=True)
+                    if sample_accum_enabled:
+                        sample_accum_pending = 0
+                        sample_accum_loss_sum = None
                     continue
 
                 # ★ 守护 2：梯度 NaN/Inf 检查（即使 loss 全 finite，反向也可能出 NaN）
@@ -1675,6 +1778,9 @@ def main():
                     suffix = f" batch_images=[{preview}]" if preview else ""
                     logger.warning(f"[step {global_step}] Non-finite gradient, skipping update.{suffix}")
                     optimizer.zero_grad(set_to_none=True)
+                    if sample_accum_enabled:
+                        sample_accum_pending = 0
+                        sample_accum_loss_sum = None
                     continue
 
                 # 梯度裁剪：grad_clip > 0 时启用，==0 表示用户显式关闭（推荐对 ProdigyPlus）。
@@ -1727,7 +1833,15 @@ def main():
                         pass
 
                 # 记录 loss 历史（环形缓冲：始终保留最近 N 步）
-                loss_val = float(loss.item() * args.grad_accum)
+                if sample_accum_enabled:
+                    loss_val = (
+                        float(sample_accum_loss_sum.detach().cpu()) / max(1, sample_accum_pending)
+                        if sample_accum_loss_sum is not None else 0.0
+                    )
+                    sample_accum_pending = 0
+                    sample_accum_loss_sum = None
+                else:
+                    loss_val = float(loss.item() * args.grad_accum)
                 if args.loss_curve_steps and args.loss_curve_steps > 0:
                     loss_history.append(loss_val)
                     if len(loss_history) > args.loss_curve_steps:
@@ -1846,6 +1960,16 @@ def main():
                 if args.max_steps and global_step >= args.max_steps:
                     break
 
+        if sample_accum_enabled and sample_accum_pending > 0 and args.max_steps and global_step >= args.max_steps:
+            logger.info(
+                "max_steps reached; discarding %d pending samples in the unfinished accumulation window.",
+                sample_accum_pending,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            sample_accum_pending = 0
+            sample_accum_loss_sum = None
+            accum_clean = True
+
         # epoch 结束后的操作
         current_epoch = epoch + 1
         if not args.max_steps or global_step < args.max_steps:
@@ -1897,6 +2021,47 @@ def main():
         # 检查 max_steps
         if args.max_steps and global_step >= args.max_steps:
             break
+
+    if sample_accum_enabled and sample_accum_pending > 0:
+        if accum_clean:
+            logger.info(
+                "Flushing final partial sample window: %d/%d samples.",
+                sample_accum_pending, effective_batch_size,
+            )
+            # 复用常规 step 路径的核心保护逻辑，避免最后几张图只 backward 不更新。
+            bad_grad = False
+            for p in trainable_params:
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    bad_grad = True
+                    break
+            if bad_grad:
+                logger.warning("[final flush] Non-finite gradient, skipping final partial update.")
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                loss_val = (
+                    float(sample_accum_loss_sum.detach().cpu()) / max(1, sample_accum_pending)
+                    if sample_accum_loss_sum is not None else 0.0
+                )
+                if args.loss_curve_steps and args.loss_curve_steps > 0:
+                    loss_history.append(loss_val)
+                    if len(loss_history) > args.loss_curve_steps:
+                        del loss_history[: len(loss_history) - args.loss_curve_steps]
+        else:
+            logger.warning(
+                "[final flush] Accumulation window contained a non-finite micro-batch; "
+                "discarding %d pending samples.",
+                sample_accum_pending,
+            )
+            optimizer.zero_grad(set_to_none=True)
+        sample_accum_pending = 0
+        sample_accum_loss_sum = None
 
     # 最终保存
     if hasattr(optimizer, "eval"): optimizer.eval()

@@ -39,6 +39,8 @@ MONITOR_STATE = {
     "lr_history": deque(maxlen=_MAX_LR_POINTS),
     "epoch": 0,
     "step": 0,
+    "ref_step": 0.0,
+    "samples_seen": 0,
     "total_steps": 0,
     "speed": 0.0,
     "samples": [],
@@ -59,6 +61,8 @@ def _state_snapshot_for_serialization():
             "lr_history": list(MONITOR_STATE["lr_history"]),
             "epoch": MONITOR_STATE["epoch"],
             "step": MONITOR_STATE["step"],
+            "ref_step": MONITOR_STATE.get("ref_step", 0.0),
+            "samples_seen": MONITOR_STATE.get("samples_seen", 0),
             "total_steps": MONITOR_STATE["total_steps"],
             "speed": MONITOR_STATE["speed"],
             "samples": list(MONITOR_STATE["samples"]),
@@ -67,7 +71,10 @@ def _state_snapshot_for_serialization():
         }
 
 
-def update_monitor(loss=None, lr=None, epoch=None, step=None, total_steps=None, speed=None, sample_path=None, config=None):
+def update_monitor(
+    loss=None, lr=None, epoch=None, step=None, total_steps=None, speed=None,
+    sample_path=None, config=None, ref_step=None, samples_seen=None,
+):
     """更新监控状态（线程安全；纯内存，无 disk IO）。"""
     with _STATE_LOCK:
         # 先更新 step/epoch 等，使本次写入的 loss/lr 点位正确
@@ -75,6 +82,10 @@ def update_monitor(loss=None, lr=None, epoch=None, step=None, total_steps=None, 
             MONITOR_STATE["epoch"] = epoch
         if step is not None:
             MONITOR_STATE["step"] = step
+        if ref_step is not None:
+            MONITOR_STATE["ref_step"] = ref_step
+        if samples_seen is not None:
+            MONITOR_STATE["samples_seen"] = samples_seen
         if total_steps is not None:
             MONITOR_STATE["total_steps"] = total_steps
         if speed is not None:
@@ -111,13 +122,17 @@ def get_state():
     return _state_snapshot_for_serialization()
 
 
-def restore_monitor_state(losses=None, lr_history=None, epoch=None, step=None, total_steps=None, start_time=None, config=None):
+def restore_monitor_state(
+    losses=None, lr_history=None, epoch=None, step=None, total_steps=None,
+    start_time=None, config=None, ref_step=None, samples_seen=None,
+):
     """恢复监控状态（用于断点续训）。
 
     Args:
         losses: 历史 loss 列表，格式 [{"step": int, "loss": float, "time": float}, ...]
         lr_history: 历史 lr 列表，格式 [{"step": int, "lr": float}, ...]
         epoch, step, total_steps: 训练进度
+        ref_step, samples_seen: reference step 与已提交样本数（可选）
         start_time: 训练开始时间
         config: 配置字典
     """
@@ -130,6 +145,10 @@ def restore_monitor_state(losses=None, lr_history=None, epoch=None, step=None, t
             MONITOR_STATE["epoch"] = epoch
         if step is not None:
             MONITOR_STATE["step"] = step
+        if ref_step is not None:
+            MONITOR_STATE["ref_step"] = ref_step
+        if samples_seen is not None:
+            MONITOR_STATE["samples_seen"] = samples_seen
         if total_steps is not None:
             MONITOR_STATE["total_steps"] = total_steps
         if start_time is not None:
@@ -197,7 +216,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             align-items: center;
             gap: 8px;
         }
-        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 15px; }
         .stat-item {
             background: rgba(0,212,255,0.1);
             border-radius: 12px;
@@ -286,6 +305,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="stat-item">
                 <div class="stat-value" id="step">-</div>
                 <div class="stat-label">Step</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="ref-step">-</div>
+                <div class="stat-label">Ref Step</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="samples-seen">-</div>
+                <div class="stat-label">Samples</div>
             </div>
             <div class="stat-item">
                 <div class="stat-value" id="loss">-</div>
@@ -427,6 +454,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 // 更新统计
                 document.getElementById('epoch').textContent = data.epoch || 0;
                 document.getElementById('step').textContent = data.step || 0;
+                document.getElementById('ref-step').textContent = data.ref_step ? Number(data.ref_step).toFixed(1) : '-';
+                document.getElementById('samples-seen').textContent = data.samples_seen || 0;
                 document.getElementById('speed').textContent = (data.speed || 0).toFixed(2);
                 
                 // Loss

@@ -230,13 +230,16 @@ def _load_weights_best_effort(model: torch.nn.Module, sd: dict, label: str) -> d
 # ============================================================================
 
 def save_training_state(path, injector, optimizer, epoch, global_step,
-                        loss_history=None, rng_state=None, monitor_state=None, scheduler=None):
+                        loss_history=None, rng_state=None, monitor_state=None,
+                        scheduler=None, samples_seen=None, reference_state=None):
     """保存完整训练状态，支持断点续训"""
     state = {
         "lora_state_dict": injector.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
         "global_step": global_step,
+        "samples_seen": samples_seen,
+        "reference_state": reference_state,
         "loss_history": loss_history or [],
         "rng_state": {
             "torch": torch.get_rng_state(),
@@ -252,7 +255,7 @@ def save_training_state(path, injector, optimizer, epoch, global_step,
 
 
 def load_training_state(path, injector, optimizer, scheduler=None):
-    """加载训练状态，返回 (epoch, global_step, loss_history, monitor_state)。
+    """加载训练状态，返回 (epoch, global_step, loss_history, monitor_state, samples_seen, reference_state)。
 
     ★ 旧实现这里有一份独立的 "拷贝 lora_w1/w2_a/w2_b" 逻辑，与 `LoRAInjector.load()`
     几乎完全重复。任何对 LoRA 存盘格式的修改（如 T-LoRA q/p_layer 命名、DoRA scale 维度）
@@ -316,4 +319,6 @@ def load_training_state(path, injector, optimizer, scheduler=None):
     monitor_state = state.get("monitor_state", None)  # 恢复监控数据
 
     logger.info(f"训练状态已恢复: epoch={epoch}, step={global_step}")
-    return epoch, global_step, loss_history, monitor_state
+    samples_seen = state.get("samples_seen")
+    reference_state = state.get("reference_state")
+    return epoch, global_step, loss_history, monitor_state, samples_seen, reference_state

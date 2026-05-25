@@ -545,17 +545,21 @@ class BucketBatchSampler:
     bucket_for_index. This avoids any indirection bugs in pre-built bucket_for_index lists.
     """
     def __init__(self, dataset, batch_size, drop_last=False, shuffle=True, seed=42,
-                 effective_batch_size=0):
+                 effective_batch_size=0, reference_batch_size=0):
         self.dataset = dataset
         self.batch_size = int(batch_size)
         self.effective_batch_size = int(effective_batch_size or 0)
         if self.effective_batch_size <= 0:
             self.effective_batch_size = 0
+        self.reference_batch_size = int(reference_batch_size or 0)
+        if self.reference_batch_size <= 0:
+            self.reference_batch_size = 0
         self.drop_last = bool(drop_last)
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.epoch = 0
         self.accumulation_offset = 0
+        self._reference_counts_for_epoch = []
         self._bucket_keys = self._build_keys(dataset)
 
         unique = set(self._bucket_keys)
@@ -595,6 +599,12 @@ class BucketBatchSampler:
                 "[BucketBatchSampler] sample-window accumulation enabled: "
                 "effective_batch_size=%d, native batch_size<=%d.",
                 self.effective_batch_size, self.batch_size,
+            )
+        if self.reference_batch_size:
+            logger.info(
+                "[BucketBatchSampler] reference progress enabled: "
+                "reference_batch_size=%d.",
+                self.reference_batch_size,
             )
 
         # 预计算 per-bucket 批数（drop_last 在每个桶内独立生效）。
@@ -653,6 +663,43 @@ class BucketBatchSampler:
             if pending == eff:
                 pending = 0
         return parts, pending
+
+    def _reference_boundaries_for_bucket(self, bucket_len):
+        if not self.reference_batch_size:
+            return []
+        ref_bs = self.reference_batch_size
+        full = bucket_len // ref_bs
+        boundaries = [ref_bs * i for i in range(1, full + 1)]
+        if not self.drop_last and bucket_len % ref_bs:
+            boundaries.append(bucket_len)
+        return boundaries
+
+    def _native_batches_with_reference_boundaries(self):
+        rng = random.Random(self.seed + self.epoch)
+        bucket_to_indices = {}
+        for idx, key in enumerate(self._bucket_keys):
+            if key is None:
+                key = (0, 0)
+            bucket_to_indices.setdefault(tuple(key), []).append(idx)
+
+        buckets = list(bucket_to_indices.keys())
+        if self.shuffle:
+            rng.shuffle(buckets)
+        for bucket in buckets:
+            indices = bucket_to_indices[bucket]
+            if self.shuffle:
+                rng.shuffle(indices)
+            reference_boundaries = self._reference_boundaries_for_bucket(len(indices))
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                local_boundaries = [
+                    boundary - i
+                    for boundary in reference_boundaries
+                    if i < boundary <= i + len(batch)
+                ]
+                yield batch, local_boundaries
 
     def _build_keys(self, dataset):
         """Build per-outer-index bucket keys。
@@ -744,6 +791,12 @@ class BucketBatchSampler:
         else:
             self.accumulation_offset = 0
 
+    def reference_batches_for_batch_index(self, batch_idx):
+        try:
+            return int(self._reference_counts_for_epoch[int(batch_idx)])
+        except (IndexError, TypeError, ValueError):
+            return 0
+
     def __len__(self):
         if self.effective_batch_size:
             return self._compute_total_batches()
@@ -751,9 +804,18 @@ class BucketBatchSampler:
 
     def __iter__(self):
         pending = self.accumulation_offset
-        for batch in self._native_batches():
+        self._reference_counts_for_epoch = []
+        for batch, reference_boundaries in self._native_batches_with_reference_boundaries():
             split_batches, pending = self._split_for_accumulation_window(batch, pending)
+            split_start = 0
             for split_batch in split_batches:
+                split_end = split_start + len(split_batch)
+                reference_count = sum(
+                    1 for boundary in reference_boundaries
+                    if split_start < boundary <= split_end
+                )
+                self._reference_counts_for_epoch.append(reference_count)
+                split_start = split_end
                 yield split_batch
 
 

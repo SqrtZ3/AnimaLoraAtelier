@@ -65,6 +65,14 @@ prefer_json: true
 # 缓存 VAE latent。开启后训练更快；首次编码耗时。开启 flip_augment 时本补丁会翻转 latent。
 cache_latents: true
 
+# Keep VAE resident on GPU after latent caching. This costs VRAM but avoids CPU/GPU swaps when
+# in-training sampling is frequent.
+keep_vae_on_gpu: false
+
+# When VAE is offloaded, clear PyTorch's CUDA cache after sampling. Set false to keep allocator
+# warm if frequent sampling causes the next training step to re-allocate from scratch.
+empty_cache_after_sample: true
+
 # ============================================================================
 # LoRA / LoKr
 # ============================================================================
@@ -159,6 +167,15 @@ batch_size: 4
 # 拆分同桶 micro-batch，确保每个 optimizer.step() 来自该数量的图片均值梯度。
 # 适合 Lion/C-Lion 在分辨率桶很碎、小 batch 很多时稳定方向；不会丢图、补图或二次裁切。
 effective_batch_size: 0
+
+# Legacy reference batch for old experiments. This simulates the old BucketBatchSampler with the
+# reference batch size and counts old optimizer steps from completed old bucket batches.
+# Set to the old native batch, e.g. 4, when effective_batch_size is much larger and you still
+# want sampling/saving intervals expressed in old-step experience.
+reference_batch_size: 0
+
+# Old grad_accum used by reference step simulation. Keep 1 if the old training used native batch=4.
+reference_grad_accum: 1
 
 # 梯度累积。有效 batch=batch_size*grad_accum；调大会变稳但响应变慢。
 # 当 effective_batch_size > 0 时会被忽略。
@@ -446,6 +463,9 @@ save_every: 0
 # 每 N optimizer step 保存 LoRA。建议与 sample_steps 对齐，方便选 checkpoint。
 save_every_steps: 100
 
+# Save every N ref_step instead of optimizer step. Requires reference_batch_size > 0.
+save_every_reference_steps: 0
+
 # 每 N step 保存完整训练状态。可断点续训，但文件更大。
 save_state_every: 500
 
@@ -464,6 +484,10 @@ sample_every: 0
 
 # 每 N step 采样。过小会拖慢训练；40-200 适合观察小数据集过拟合点。
 sample_steps: 100
+
+# Sample every N ref_step instead of optimizer step. Requires reference_batch_size > 0.
+# For frequent sampling, consider keep_vae_on_gpu=true and empty_cache_after_sample=false.
+sample_reference_steps: 0
 
 # 单 prompt 采样。若 sample_prompts 非空，通常会轮换多 prompt。
 sample_prompt: "newest, safe, 1girl, masterpiece, best quality"

@@ -92,6 +92,28 @@ class SampleAccumulationSamplerTests(unittest.TestCase):
         flat = [i for batch in sampler for i in batch]
         self.assertEqual(sorted(flat), list(range(len(dataset))))
 
+    def test_reference_progress_counts_old_bucket_batches_not_sample_division(self):
+        dataset = _BucketOnlyDataset([6, 6])
+        sampler = BucketBatchSampler(
+            dataset,
+            batch_size=48,
+            effective_batch_size=12,
+            reference_batch_size=4,
+            drop_last=False,
+            shuffle=False,
+        )
+
+        batches = list(iter(sampler))
+        reference_counts = [
+            sampler.reference_batches_for_batch_index(i)
+            for i in range(len(batches))
+        ]
+
+        self.assertEqual([len(batch) for batch in batches], [6, 6])
+        self.assertEqual(reference_counts, [2, 2])
+        self.assertEqual(sum(reference_counts), 4)
+        self.assertNotEqual(sum(reference_counts), len(dataset) // 4)
+
     def test_counts_optimizer_steps_across_epochs_with_one_final_flush(self):
         self.assertEqual(
             compute_sample_accumulation_steps(

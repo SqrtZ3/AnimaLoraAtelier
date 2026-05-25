@@ -232,6 +232,10 @@ from trainer.data import (
     collate_fn,
     collate_fn_cached,
 )
+from trainer.progress import (
+    ReferenceStepTracker,
+    reference_interval_crossed,
+)
 from trainer.checkpoint import (
     _strip_prefixes,
     _pick_best_prefix_remap,
@@ -278,6 +282,10 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--effective-batch-size", type=int, default=0,
                    help="按真实图片数累积到该数量后再 optimizer.step()。0=使用旧的 grad_accum 逻辑。")
+    p.add_argument("--reference-batch-size", type=int, default=0,
+                   help="用旧 batch size 模拟分桶 batch，换算旧 optimizer step。0=禁用 reference step。")
+    p.add_argument("--reference-grad-accum", type=int, default=1,
+                   help="reference step 使用的旧 grad_accum。默认 1。")
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr-scheduler", default="none", choices=["none", "cosine", "cosine_with_restart"], help="学习率调度器")
@@ -363,6 +371,8 @@ def parse_args():
     # 采样参数
     p.add_argument("--sample-every", type=int, default=0, help="每 N 个 epoch 采样一次 (0=禁用)")
     p.add_argument("--sample-steps", type=int, default=0, help="每 N 个 step 采样一次 (0=禁用)")
+    p.add_argument("--sample-reference-steps", type=int, default=0,
+                   help="每 N 个 reference step 采样一次。reference step 按旧 batch/grad_accum 分桶模拟。0=禁用")
     p.add_argument("--sample-prompt", default="1girl, masterpiece", help="采样提示词")
     p.add_argument("--sample-cfg-scale", type=float, default=4.0, help="采样 CFG（设为 1 表示不做 CFG，仅用正面条件）")
     p.add_argument("--sample-negative-prompt", default="", help="采样负面提示词（留空使用默认负面）")
@@ -375,6 +385,9 @@ def parse_args():
 
     # 保存参数
     p.add_argument("--save-every", type=int, default=0, help="每 N 个 epoch 保存 (0=仅结束时)")
+    p.add_argument("--save-every-steps", type=int, default=0, help="每 N 个 optimizer step 保存 LoRA (0=禁用)")
+    p.add_argument("--save-every-reference-steps", type=int, default=0,
+                   help="每 N 个 reference step 保存 LoRA。reference step 按旧 batch/grad_accum 分桶模拟。0=禁用")
     p.add_argument("--save-state-every", type=int, default=0, help="每 N 步保存完整训练状态（可断点续训）")
     p.add_argument("--resume-state", default="", help="从训练状态恢复（.pt 文件路径）")
     p.add_argument("--seed", type=int, default=42)
@@ -390,6 +403,12 @@ def parse_args():
     p.add_argument("--log-every", type=int, default=10, help="日志输出间隔")
     p.add_argument("--debug-first-batches", type=int, default=0, help="记录前 N 个优化步的张量统计，用于对齐 loss 标尺")
     p.add_argument("--grad-norm-log-every", type=int, default=0, help="每 N 个优化步记录梯度范数和裁切状态 (0=禁用)")
+    p.add_argument("--keep-vae-on-gpu", action="store_true",
+                   help="cache_latents=True 后仍让 VAE 留在 GPU，适合频繁采样，避免反复搬运。")
+    p.add_argument("--empty-cache-after-sample", action="store_true", default=True,
+                   help="VAE 采样后 offload 回 CPU 时调用 torch.cuda.empty_cache()。默认开启。")
+    p.add_argument("--no-empty-cache-after-sample", dest="empty_cache_after_sample", action="store_false",
+                   help="VAE 采样后不清空 CUDA allocator cache，适合频繁采样。")
 
     # 优化器设置
     p.add_argument("--optimizer-type", default="adamw", choices=["adamw", "adamw8bit", "prodigyplus", "soap", "adopt", "lion", "clion"], help="优化器类型")
@@ -692,6 +711,15 @@ def main():
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
                 "grad_accum": args.grad_accum,
+                "effective_batch_size": getattr(args, "effective_batch_size", 0),
+                "reference_batch_size": getattr(args, "reference_batch_size", 0),
+                "reference_grad_accum": getattr(args, "reference_grad_accum", 1),
+                "sample_steps": getattr(args, "sample_steps", 0),
+                "sample_reference_steps": getattr(args, "sample_reference_steps", 0),
+                "save_every_steps": getattr(args, "save_every_steps", 0),
+                "save_every_reference_steps": getattr(args, "save_every_reference_steps", 0),
+                "keep_vae_on_gpu": getattr(args, "keep_vae_on_gpu", False),
+                "empty_cache_after_sample": getattr(args, "empty_cache_after_sample", True),
                 "lr": args.lr,
                 "resolution": args.resolution,
                 "data_dir": str(args.data_dir),
@@ -972,6 +1000,7 @@ def main():
 
     _bucket_drop_last = bool(getattr(args, "bucket_drop_last", False))
     _effective_batch_size = int(getattr(args, "effective_batch_size", 0) or 0)
+    _reference_batch_size = int(getattr(args, "reference_batch_size", 0) or 0)
     if _effective_batch_size > 0:
         if _bucket_drop_last:
             logger.warning(
@@ -993,6 +1022,7 @@ def main():
             drop_last=_bucket_drop_last, shuffle=True,
             seed=getattr(args, "seed", 42),
             effective_batch_size=_effective_batch_size,
+            reference_batch_size=_reference_batch_size,
         )
         dataloader = DataLoader(
             dataset, batch_sampler=batch_sampler,
@@ -1008,6 +1038,7 @@ def main():
             drop_last=_bucket_drop_last, shuffle=True,
             seed=getattr(args, "seed", 42),
             effective_batch_size=_effective_batch_size,
+            reference_batch_size=_reference_batch_size,
         )
         dataloader = DataLoader(
             dataset, batch_sampler=batch_sampler,
@@ -1039,7 +1070,10 @@ def main():
     #   到 CPU 会让每步都 swap，巨慢。这种情况下 VAE 必须常驻 GPU。
     aux_cfg = build_aux_loss_config(args)
     vae_offloaded_to_cpu = False
-    if use_cached and not aux_cfg.needs_vae_decoder:
+    keep_vae_on_gpu = bool(getattr(args, "keep_vae_on_gpu", False))
+    if use_cached and keep_vae_on_gpu:
+        logger.info("VAE kept on GPU (keep_vae_on_gpu=True); frequent sampling will not reload VAE.")
+    elif use_cached and not aux_cfg.needs_vae_decoder:
         try:
             vae.model = vae.model.cpu()
             torch.cuda.empty_cache()
@@ -1249,24 +1283,53 @@ def main():
     # 训练循环
     global_step = 0
     start_epoch = 0
+    samples_seen = 0
+    reference_batch_size = int(getattr(args, "reference_batch_size", 0) or 0)
+    reference_grad_accum = max(1, int(getattr(args, "reference_grad_accum", 1) or 1))
+    reference_tracker = ReferenceStepTracker(grad_accum=reference_grad_accum)
     
     # 从训练状态恢复（断点续训）
     if getattr(args, "resume_state", "") and Path(args.resume_state).exists():
-        start_epoch, global_step, loss_history, saved_monitor_state = load_training_state(
+        (
+            start_epoch,
+            global_step,
+            loss_history,
+            saved_monitor_state,
+            saved_samples_seen,
+            saved_reference_state,
+        ) = load_training_state(
             args.resume_state, injector, optimizer, scheduler
         )
+        if saved_samples_seen is not None:
+            samples_seen = int(saved_samples_seen)
+        elif sample_accum_enabled:
+            samples_seen = int(global_step) * int(effective_batch_size)
+        else:
+            samples_seen = int(global_step) * int(args.batch_size) * int(args.grad_accum)
+        if isinstance(saved_reference_state, dict):
+            reference_tracker.step = int(saved_reference_state.get("step", 0) or 0)
+            reference_tracker.grad_batches_pending = int(saved_reference_state.get("grad_batches_pending", 0) or 0)
+            reference_tracker.grad_accum = int(saved_reference_state.get("grad_accum", reference_grad_accum) or reference_grad_accum)
         emit(f"从断点恢复训练: epoch={start_epoch}, step={global_step}")
         
         # 恢复监控面板的历史数据（loss 曲线等）
         if monitor_server and saved_monitor_state:
             try:
                 from train_monitor import restore_monitor_state
+                monitor_samples_seen = saved_monitor_state.get("samples_seen")
+                if monitor_samples_seen is None:
+                    monitor_samples_seen = samples_seen
+                monitor_ref_step = saved_monitor_state.get("ref_step")
+                if monitor_ref_step is None:
+                    monitor_ref_step = reference_tracker.step
                 restore_monitor_state(
                     losses=saved_monitor_state.get("losses"),
                     lr_history=saved_monitor_state.get("lr_history"),
                     epoch=start_epoch,
                     step=global_step,
                     total_steps=total_steps,
+                    ref_step=monitor_ref_step,
+                    samples_seen=monitor_samples_seen,
                 )
                 emit(f"监控面板历史数据已恢复: {len(saved_monitor_state.get('losses', []))} 个 loss 点")
             except Exception as e:
@@ -1292,7 +1355,16 @@ def main():
                 monitor_data = get_state()
             except Exception:
                 pass
-        save_training_state(state_path, injector, optimizer, current_epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
+        save_training_state(
+            state_path, injector, optimizer, current_epoch, global_step,
+            loss_history, monitor_state=monitor_data, scheduler=scheduler,
+            samples_seen=samples_seen,
+            reference_state={
+                "step": reference_tracker.step,
+                "grad_batches_pending": reference_tracker.grad_batches_pending,
+                "grad_accum": reference_tracker.grad_accum,
+            },
+        )
         # 同时保存 LoRA 权重
         lora_path = output_dir / f"{args.output_name}_interrupted_step{global_step}.safetensors"
         injector.save(lora_path, model=model)
@@ -1333,7 +1405,8 @@ def main():
             finally:
                 try:
                     vae.model = vae.model.cpu()
-                    torch.cuda.empty_cache()
+                    if bool(getattr(args, "empty_cache_after_sample", True)):
+                        torch.cuda.empty_cache()
                 except Exception as _e:
                     logger.warning(f"VAE 出图后回 CPU 失败（忽略）: {_e}")
         return sample_image(*args_pos, **kwargs_pos)
@@ -1399,9 +1472,60 @@ def main():
         sample_prompt_idx += 1
         return prompt
 
+    def run_sample_checkpoint(label, filename_stem):
+        prompt = get_next_sample_prompt()
+        prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
+        emit(f"采样中 ({label}): {prompt_short}")
+        model.eval()
+        if hasattr(optimizer, "eval"):
+            optimizer.eval()
+        s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
+        s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
+        s_cfg = float(getattr(args, "sample_cfg_scale", 4.0) or 4.0)
+        s_neg = str(getattr(args, "sample_negative_prompt", "") or "")
+        s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
+        s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
+        s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
+        img = _sample_with_vae_swap(
+            model, vae, qwen_model, qwen_tok, t5_tok,
+            prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
+            negative_prompt=(s_neg or None),
+            sampler_name=s_sampler,
+            scheduler=s_sched,
+            device=device, dtype=dtype,
+            use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+            injector=injector,
+        )
+        sample_path = sample_dir / f"{filename_stem}.png"
+        img.save(sample_path)
+        emit(f"采样保存: {sample_path.name}")
+        if monitor_server:
+            try:
+                update_monitor(sample_path=sample_path)
+            except Exception:
+                pass
+        if hasattr(optimizer, "train"):
+            optimizer.train()
+        model.train()
+        return sample_path
+
+    def save_lora_checkpoint(filename_stem):
+        if hasattr(optimizer, "eval"):
+            optimizer.eval()
+        lora_path = output_dir / f"{args.output_name}_{filename_stem}.safetensors"
+        injector.save(lora_path, model=model)
+        emit(f"Saved LoRA: {lora_path}")
+        if hasattr(optimizer, "train"):
+            optimizer.train()
+        return lora_path
+
     # Step 0 初始采样（基线效果，测试所有提示词）
     # 只在新训练时执行（global_step == 0），resume 时跳过
-    sampling_enabled = args.sample_steps > 0 or args.sample_every > 0
+    sampling_enabled = (
+        args.sample_steps > 0
+        or args.sample_every > 0
+        or int(getattr(args, "sample_reference_steps", 0) or 0) > 0
+    )
     if global_step == 0 and sampling_enabled:
         emit("采样中 (step 0, 基线)...")
         model.eval()
@@ -1453,6 +1577,8 @@ def main():
     accum_clean = True
     sample_accum_pending = 0
     sample_accum_loss_sum = None
+    legacy_accum_samples = 0
+    pending_reference_batches = 0
     step_start_time = time.perf_counter()
 
     # pad_mask 复用缓存：key=(B, 1, H_lat, W_lat) → tensor
@@ -1471,10 +1597,16 @@ def main():
                 if sample_accum_pending == 0:
                     step_start_time = time.perf_counter()
                     sample_accum_loss_sum = None
+                    pending_reference_batches = 0
                     accum_clean = True
             elif batch_idx % args.grad_accum == 0:
                 step_start_time = time.perf_counter()
+                pending_reference_batches = 0
                 accum_clean = True
+            batch_reference_batches = 0
+            if hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "reference_batches_for_batch_index"):
+                batch_reference_batches = dataloader.batch_sampler.reference_batches_for_batch_index(batch_idx)
+            pending_reference_batches += int(batch_reference_batches)
 
             captions = batch["captions"]
 
@@ -1699,6 +1831,7 @@ def main():
                         optimizer.zero_grad(set_to_none=True)
                         sample_accum_pending = 0
                         sample_accum_loss_sum = None
+                        pending_reference_batches = 0
                         accum_clean = True
                 injector.set_current_t(None)  # T-LoRA: 本 micro-batch 跳过 backward，立即 reset
                 # ★ 显式释放本 micro-batch 的 forward autograd 图。否则同周期内
@@ -1741,6 +1874,7 @@ def main():
                 step_boundary = sample_accum_pending >= effective_batch_size
             else:
                 loss_to_backward = loss / args.grad_accum
+                legacy_accum_samples += int(bs)
                 step_boundary = (batch_idx + 1) % args.grad_accum == 0
             loss_to_backward.backward()
             # T-LoRA: backward 完成后才能 reset，否则 grad checkpoint recompute 会看到
@@ -1764,6 +1898,9 @@ def main():
                     if sample_accum_enabled:
                         sample_accum_pending = 0
                         sample_accum_loss_sum = None
+                    else:
+                        legacy_accum_samples = 0
+                    pending_reference_batches = 0
                     continue
 
                 # ★ 守护 2：梯度 NaN/Inf 检查（即使 loss 全 finite，反向也可能出 NaN）
@@ -1781,6 +1918,9 @@ def main():
                     if sample_accum_enabled:
                         sample_accum_pending = 0
                         sample_accum_loss_sum = None
+                    else:
+                        legacy_accum_samples = 0
+                    pending_reference_batches = 0
                     continue
 
                 # 梯度裁剪：grad_clip > 0 时启用，==0 表示用户显式关闭（推荐对 ProdigyPlus）。
@@ -1833,6 +1973,7 @@ def main():
                         pass
 
                 # 记录 loss 历史（环形缓冲：始终保留最近 N 步）
+                committed_samples = int(effective_batch_size) if sample_accum_enabled else int(legacy_accum_samples)
                 if sample_accum_enabled:
                     loss_val = (
                         float(sample_accum_loss_sum.detach().cpu()) / max(1, sample_accum_pending)
@@ -1842,6 +1983,22 @@ def main():
                     sample_accum_loss_sum = None
                 else:
                     loss_val = float(loss.item() * args.grad_accum)
+                    legacy_accum_samples = 0
+                samples_seen += max(0, committed_samples)
+                previous_ref_step, ref_step = reference_tracker.commit_batches(pending_reference_batches)
+                pending_reference_batches = 0
+                sample_reference_steps = int(getattr(args, "sample_reference_steps", 0) or 0)
+                save_reference_steps = int(getattr(args, "save_every_reference_steps", 0) or 0)
+                sample_by_ref = reference_interval_crossed(
+                    previous_ref_step,
+                    ref_step,
+                    sample_reference_steps,
+                )
+                save_by_ref = reference_interval_crossed(
+                    previous_ref_step,
+                    ref_step,
+                    save_reference_steps,
+                )
                 if args.loss_curve_steps and args.loss_curve_steps > 0:
                     loss_history.append(loss_val)
                     if len(loss_history) > args.loss_curve_steps:
@@ -1871,16 +2028,18 @@ def main():
                     try:
                         update_monitor(
                             loss=loss_val, lr=lr, epoch=epoch+1, step=global_step,
-                            total_steps=total_steps, speed=speed_ema or 0
+                            total_steps=total_steps, speed=speed_ema or 0,
+                            ref_step=ref_step, samples_seen=samples_seen,
                         )
                     except Exception:
                         pass
                 dt_step = now - step_start_time
                 steps_per_sec = (1.0 / dt_step) if dt_step > 0 else 0.0
                 speed_ema = steps_per_sec if speed_ema is None else (0.9 * speed_ema + 0.1 * steps_per_sec)
+                ref_desc = f" ref={ref_step:.1f}" if reference_batch_size > 0 else ""
 
                 if use_rich:
-                    desc = f"epoch {epoch+1}/{args.epochs} step {global_step}/{total_steps or '?'}"
+                    desc = f"epoch {epoch+1}/{args.epochs} step {global_step}/{total_steps or '?'}{ref_desc}"
                     progress.update(task_id, advance=1, description=desc,
                                     loss=loss_val, lr=float(lr), speed=float(speed_ema or 0))
                     if live and args.loss_curve_steps > 0 and not args.no_live_curve:
@@ -1889,53 +2048,26 @@ def main():
                             from rich.console import Group
                             live.update(Group(progress, panel))
                 elif use_plain:
-                    print(f"epoch {epoch+1}/{args.epochs} step {global_step} loss={loss_val:.6f} lr={lr:.2e} speed={speed_ema:.2f} it/s", end="\r", flush=True)
+                    print(f"epoch {epoch+1}/{args.epochs} step {global_step}{ref_desc} loss={loss_val:.6f} lr={lr:.2e} speed={speed_ema:.2f} it/s", end="\r", flush=True)
                 elif args.log_every and global_step % args.log_every == 0:
-                    print(f"epoch={epoch} step={global_step} loss={loss_val:.6f} lr={lr:.2e} speed={steps_per_sec:.2f} it/s")
+                    print(f"epoch={epoch} step={global_step}{ref_desc} loss={loss_val:.6f} lr={lr:.2e} speed={steps_per_sec:.2f} it/s")
 
-                # 按 step 采样（轮换提示词）
+                # Sample/checkpoint by optimizer step or by old-batch-equivalent reference step.
                 if args.sample_steps > 0 and global_step % args.sample_steps == 0:
-                    prompt = get_next_sample_prompt()
-                    prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
-                    emit(f"采样中 (step {global_step}): {prompt_short}")
-                    model.eval()
-                    if hasattr(optimizer, "eval"): optimizer.eval()
-                    s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
-                    s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
-                    s_cfg = float(getattr(args, "sample_cfg_scale", 4.0) or 4.0)
-                    s_neg = str(getattr(args, "sample_negative_prompt", "") or "")
-                    s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
-                    s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
-                    s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
-                    img = _sample_with_vae_swap(
-                        model, vae, qwen_model, qwen_tok, t5_tok,
-                        prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
-                        negative_prompt=(s_neg or None),
-                        sampler_name=s_sampler,
-                        scheduler=s_sched,
-                        device=device, dtype=dtype,
-                        use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
-                        injector=injector,
+                    run_sample_checkpoint(f"step {global_step}", f"step_{global_step}")
+                elif sample_by_ref:
+                    ref_tag = int(ref_step)
+                    run_sample_checkpoint(
+                        f"ref_step {ref_step:.1f} (step {global_step})",
+                        f"refstep_{ref_tag}_step_{global_step}",
                     )
-                    sample_path = sample_dir / f"step_{global_step}.png"
-                    img.save(sample_path)
-                    emit(f"采样保存: step_{global_step}.png")
-                    if monitor_server:
-                        try:
-                            update_monitor(sample_path=sample_path)
-                        except Exception:
-                            pass
-                    if hasattr(optimizer, "train"): optimizer.train()
-                    model.train()
 
-                # 定期保存 LoRA 权重（按 step）
                 save_every_steps = getattr(args, "save_every_steps", 0)
                 if save_every_steps > 0 and global_step % save_every_steps == 0:
-                    if hasattr(optimizer, "eval"): optimizer.eval()
-                    lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
-                    injector.save(lora_path, model=model)
-                    emit(f"Saved LoRA: {lora_path}")
-                    if hasattr(optimizer, "train"): optimizer.train()
+                    save_lora_checkpoint(f"step{global_step}")
+                elif save_by_ref:
+                    ref_tag = int(ref_step)
+                    save_lora_checkpoint(f"refstep{ref_tag}_step{global_step}")
 
                 # 定期保存训练状态（断点续训）
                 save_state_every = getattr(args, "save_state_every", 0)
@@ -1950,7 +2082,16 @@ def main():
                             monitor_data = get_state()
                         except Exception:
                             pass
-                    save_training_state(state_path, injector, optimizer, epoch, global_step, loss_history, monitor_state=monitor_data, scheduler=scheduler)
+                    save_training_state(
+                        state_path, injector, optimizer, epoch, global_step,
+                        loss_history, monitor_state=monitor_data, scheduler=scheduler,
+                        samples_seen=samples_seen,
+                        reference_state={
+                            "step": reference_tracker.step,
+                            "grad_batches_pending": reference_tracker.grad_batches_pending,
+                            "grad_accum": reference_tracker.grad_accum,
+                        },
+                    )
                     # 同时保存 LoRA 权重
                     lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
                     injector.save(lora_path, model=model)
@@ -1968,6 +2109,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             sample_accum_pending = 0
             sample_accum_loss_sum = None
+            pending_reference_batches = 0
             accum_clean = True
 
         # epoch 结束后的操作
@@ -1975,48 +2117,11 @@ def main():
         if not args.max_steps or global_step < args.max_steps:
             # 保存 checkpoint
             if args.save_every > 0 and current_epoch % args.save_every == 0:
-                if hasattr(optimizer, "eval"): optimizer.eval()
-                save_path = output_dir / f"{args.output_name}_epoch{current_epoch}.safetensors"
-                injector.save(save_path, model=model)
-                emit(f"Saved LoRA: {save_path}")
-                if hasattr(optimizer, "train"): optimizer.train()
+                save_lora_checkpoint(f"epoch{current_epoch}")
 
             # 采样（轮换提示词）
             if args.sample_every > 0 and current_epoch % args.sample_every == 0:
-                prompt = get_next_sample_prompt()
-                prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
-                emit(f"采样中 (epoch {current_epoch}): {prompt_short}")
-                model.eval()
-                if hasattr(optimizer, "eval"): optimizer.eval()
-                s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
-                s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
-                s_cfg = float(getattr(args, "sample_cfg_scale", 4.0) or 4.0)
-                s_neg = str(getattr(args, "sample_negative_prompt", "") or "")
-                s_steps = int(getattr(args, "sample_infer_steps", 25) or 25)
-                s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
-                s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
-                img = _sample_with_vae_swap(
-                    model, vae, qwen_model, qwen_tok, t5_tok,
-                    prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
-                    negative_prompt=(s_neg or None),
-                    sampler_name=s_sampler,
-                    scheduler=s_sched,
-                    device=device, dtype=dtype,
-                    use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
-                    injector=injector,
-                )
-                sample_path = sample_dir / f"epoch_{current_epoch}.png"
-                img.save(sample_path)
-                emit(f"采样保存: epoch_{current_epoch}.png")
-                if hasattr(optimizer, "train"): optimizer.train()
-                model.train()
-                
-                # 更新监控面板
-                if monitor_server:
-                    try:
-                        update_monitor(sample_path=sample_path)
-                    except Exception:
-                        pass
+                run_sample_checkpoint(f"epoch {current_epoch}", f"epoch_{current_epoch}")
 
         # 检查 max_steps
         if args.max_steps and global_step >= args.max_steps:
@@ -2024,6 +2129,7 @@ def main():
 
     if sample_accum_enabled and sample_accum_pending > 0:
         if accum_clean:
+            flushed_samples = sample_accum_pending
             logger.info(
                 "Flushing final partial sample window: %d/%d samples.",
                 sample_accum_pending, effective_batch_size,
@@ -2045,6 +2151,9 @@ def main():
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                samples_seen += max(0, int(flushed_samples))
+                reference_tracker.commit_batches(pending_reference_batches)
+                pending_reference_batches = 0
                 loss_val = (
                     float(sample_accum_loss_sum.detach().cpu()) / max(1, sample_accum_pending)
                     if sample_accum_loss_sum is not None else 0.0
@@ -2060,6 +2169,7 @@ def main():
                 sample_accum_pending,
             )
             optimizer.zero_grad(set_to_none=True)
+            pending_reference_batches = 0
         sample_accum_pending = 0
         sample_accum_loss_sum = None
 

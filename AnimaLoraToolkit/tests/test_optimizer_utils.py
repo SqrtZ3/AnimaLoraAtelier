@@ -12,6 +12,26 @@ sys.path.insert(0, str(ROOT))
 from utils.optimizer_utils import create_optimizer
 
 
+class AdamWOptimizerFactoryTests(unittest.TestCase):
+    def test_adamw_accepts_yaml_string_optimizer_args(self):
+        param = torch.nn.Parameter(torch.randn(2, 2))
+        optimizer = create_optimizer(
+            "adamw",
+            [param],
+            learning_rate=1.0e-4,
+            lr="3e-4",
+            betas=["0.9", "0.99"],
+            weight_decay="0.03",
+            eps="1e-8",
+        )
+
+        self.assertEqual(type(optimizer).__name__, "AdamW")
+        self.assertEqual(optimizer.param_groups[0]["lr"], 3.0e-4)
+        self.assertEqual(optimizer.param_groups[0]["betas"], (0.9, 0.99))
+        self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.03)
+        self.assertEqual(optimizer.param_groups[0]["eps"], 1.0e-8)
+
+
 class SoapOptimizerFactoryTests(unittest.TestCase):
     def test_create_soap_preserves_param_group_lr_and_weight_decay(self):
         matrix = torch.nn.Parameter(torch.randn(4, 3))
@@ -198,6 +218,45 @@ class LionOptimizerFactoryTests(unittest.TestCase):
         )
         self.assertEqual(type(optimizer).__name__, "Lion")
         self.assertTrue(optimizer.param_groups[0]["cautious"])
+
+    def test_clion_accepts_yaml_string_lr_override(self):
+        param = torch.nn.Parameter(torch.randn(4, 4))
+        optimizer = create_optimizer(
+            "clion",
+            [param],
+            learning_rate=1.0e-4,
+            lr="3e-4",
+            weight_decay=0.03,
+        )
+
+        self.assertEqual(type(optimizer).__name__, "Lion")
+        self.assertEqual(optimizer.param_groups[0]["lr"], 3.0e-4)
+        self.assertTrue(optimizer.param_groups[0]["cautious"])
+
+    def test_lion_accepts_yaml_string_param_group_lr(self):
+        matrix = torch.nn.Parameter(torch.randn(4, 3))
+        vector = torch.nn.Parameter(torch.randn(4))
+        groups = [
+            {
+                "params": [matrix],
+                "lr": "3e-4",
+                "weight_decay": "0.03",
+                "betas": ["0.9", "0.99"],
+            },
+            {"params": [vector], "lr": "8e-5", "weight_decay": 0.0},
+        ]
+
+        optimizer = create_optimizer(
+            "lion",
+            groups,
+            learning_rate=1.0e-4,
+        )
+
+        self.assertEqual(type(optimizer).__name__, "Lion")
+        self.assertEqual(optimizer.param_groups[0]["lr"], 3.0e-4)
+        self.assertEqual(optimizer.param_groups[1]["lr"], 8.0e-5)
+        self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.03)
+        self.assertEqual(optimizer.param_groups[0]["betas"], (0.9, 0.99))
 
     def test_lion_step_updates_param_with_finite_values(self):
         param = torch.nn.Parameter(torch.tensor([[1.0, -2.0], [0.5, 3.0]]))

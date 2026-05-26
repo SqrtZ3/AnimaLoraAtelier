@@ -54,6 +54,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def summarize_bad_gradients(named_parameters, limit=8):
+    summaries = []
+    for name, p in named_parameters:
+        grad = p.grad
+        if grad is None:
+            continue
+        finite = torch.isfinite(grad)
+        if bool(finite.all()):
+            continue
+        with torch.no_grad():
+            nan_count = int(torch.isnan(grad).sum().item())
+            posinf_count = int(torch.isposinf(grad).sum().item())
+            neginf_count = int(torch.isneginf(grad).sum().item())
+            finite_vals = grad.detach().float()[finite]
+            finite_abs_max = (
+                float(finite_vals.abs().max().item()) if finite_vals.numel() > 0 else float("nan")
+            )
+        summaries.append(
+            f"{name}: shape={tuple(grad.shape)} nan={nan_count} "
+            f"+inf={posinf_count} -inf={neginf_count} finite_abs_max={finite_abs_max:.3e}"
+        )
+        if len(summaries) >= int(limit):
+            break
+    return summaries
+
+
 # ============================================================================
 # 依赖检测
 # ============================================================================
@@ -1185,6 +1211,7 @@ def main():
     trainable_params = []
     for group in optimizer.param_groups:
         trainable_params.extend(group["params"])
+    trainable_named_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
 
     # 计算总步数
     sample_accum_enabled = int(getattr(args, "effective_batch_size", 0) or 0) > 0
@@ -1914,6 +1941,8 @@ def main():
                     preview = ", ".join(str(p) for p in batch_images[:4] if p)
                     suffix = f" batch_images=[{preview}]" if preview else ""
                     logger.warning(f"[step {global_step}] Non-finite gradient, skipping update.{suffix}")
+                    for detail in summarize_bad_gradients(trainable_named_params):
+                        logger.warning("[step %s] bad grad %s", global_step, detail)
                     optimizer.zero_grad(set_to_none=True)
                     if sample_accum_enabled:
                         sample_accum_pending = 0
@@ -2142,6 +2171,8 @@ def main():
                     break
             if bad_grad:
                 logger.warning("[final flush] Non-finite gradient, skipping final partial update.")
+                for detail in summarize_bad_gradients(trainable_named_params):
+                    logger.warning("[final flush] bad grad %s", detail)
                 optimizer.zero_grad(set_to_none=True)
             else:
                 if grad_clip > 0:

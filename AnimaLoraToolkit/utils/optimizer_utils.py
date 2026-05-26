@@ -111,6 +111,42 @@ def _filter_kwargs_by_signature(cls_or_fn, kwargs: Dict[str, Any]) -> Dict[str, 
     return filtered
 
 
+def _coerce_float(value: Any, name: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid numeric value for {name}: {value!r}") from exc
+
+
+def _coerce_betas(value: Any) -> tuple:
+    try:
+        beta1, beta2 = value
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid betas value: {value!r}") from exc
+    return (_coerce_float(beta1, "betas[0]"), _coerce_float(beta2, "betas[1]"))
+
+
+def _normalize_param_groups_numeric_values(params: ParamInput) -> ParamInput:
+    if not _is_param_groups(params):
+        return params
+
+    normalized = []
+    for group in params:
+        fixed = dict(group)
+        if "lr" in fixed:
+            fixed["lr"] = _coerce_float(fixed["lr"], "param_group.lr")
+        if "weight_decay" in fixed:
+            fixed["weight_decay"] = _coerce_float(
+                fixed["weight_decay"], "param_group.weight_decay"
+            )
+        if "eps" in fixed and fixed["eps"] is not None:
+            fixed["eps"] = _coerce_float(fixed["eps"], "param_group.eps")
+        if "betas" in fixed:
+            fixed["betas"] = _coerce_betas(fixed["betas"])
+        normalized.append(fixed)
+    return normalized
+
+
 # =============================================================================
 # 工厂入口
 # =============================================================================
@@ -129,13 +165,38 @@ def create_optimizer(
     `params` 既可以是参数迭代器，也可以是 param_groups（[{'params':..., 'weight_decay':...}]）。
     """
     optimizer_type = optimizer_type.lower()
+    params = _normalize_param_groups_numeric_values(params)
+    learning_rate = _coerce_float(learning_rate, "learning_rate")
+    betas = _coerce_betas(betas)
+    weight_decay = _coerce_float(weight_decay, "weight_decay")
+    eps = _coerce_float(eps, "eps") if eps is not None else None
 
     if optimizer_type == "adamw8bit":
+        if "lr" in kwargs:
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
+        if "betas" in kwargs:
+            betas = _coerce_betas(kwargs.pop("betas"))
+        if "weight_decay" in kwargs:
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
+        if "eps" in kwargs:
+            eps = _coerce_float(kwargs.pop("eps"), "optimizer_args.eps")
         return create_8bit_adamw(
             params=params, lr=learning_rate, betas=betas,
             weight_decay=weight_decay, eps=eps, **kwargs,
         )
     if optimizer_type == "adamw":
+        if "lr" in kwargs:
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
+        if "betas" in kwargs:
+            betas = _coerce_betas(kwargs.pop("betas"))
+        if "weight_decay" in kwargs:
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
+        if "eps" in kwargs:
+            eps = _coerce_float(kwargs.pop("eps"), "optimizer_args.eps")
         return create_standard_adamw(
             params=params, lr=learning_rate, betas=betas,
             weight_decay=weight_decay, eps=eps, **kwargs,
@@ -144,57 +205,70 @@ def create_optimizer(
         # `optimizer_args` may contain constructor-level keys. Pop them here so
         # YAML passthrough works without sending duplicate lr/betas/wd/eps.
         if "lr" in kwargs:
-            learning_rate = kwargs.pop("lr")
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
         if "betas" in kwargs:
-            betas = tuple(kwargs.pop("betas"))
+            betas = _coerce_betas(kwargs.pop("betas"))
         if "weight_decay" in kwargs:
-            weight_decay = kwargs.pop("weight_decay")
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
         if "eps" in kwargs:
-            eps = kwargs.pop("eps")
+            eps_value = kwargs.pop("eps")
+            eps = (
+                _coerce_float(eps_value, "optimizer_args.eps")
+                if eps_value is not None
+                else None
+            )
         return create_prodigyplus_optimizer(
             params=params, lr=learning_rate, betas=betas,
             weight_decay=weight_decay, eps=eps, **kwargs,
         )
     if optimizer_type == "soap":
         if "lr" in kwargs:
-            learning_rate = kwargs.pop("lr")
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
         if "betas" in kwargs:
-            betas = tuple(kwargs.pop("betas"))
+            betas = _coerce_betas(kwargs.pop("betas"))
         elif betas == (0.9, 0.999):
             betas = (0.95, 0.95)
         if "weight_decay" in kwargs:
-            weight_decay = kwargs.pop("weight_decay")
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
         if "eps" in kwargs:
-            eps = kwargs.pop("eps")
+            eps = _coerce_float(kwargs.pop("eps"), "optimizer_args.eps")
         return create_soap_optimizer(
             params=params, lr=learning_rate, betas=betas,
             weight_decay=weight_decay, eps=eps, **kwargs,
         )
     if optimizer_type == "adopt":
         if "lr" in kwargs:
-            learning_rate = kwargs.pop("lr")
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
         if "betas" in kwargs:
-            betas = tuple(kwargs.pop("betas"))
+            betas = _coerce_betas(kwargs.pop("betas"))
         elif betas == (0.9, 0.999):
             # ADOPT recommends a larger β2 (the whole point is β2 robustness).
             betas = (0.9, 0.9999)
         if "weight_decay" in kwargs:
-            weight_decay = kwargs.pop("weight_decay")
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
         if "eps" in kwargs:
-            eps = kwargs.pop("eps")
+            eps = _coerce_float(kwargs.pop("eps"), "optimizer_args.eps")
         return create_adopt_optimizer(
             params=params, lr=learning_rate, betas=betas,
             weight_decay=weight_decay, eps=eps, **kwargs,
         )
     if optimizer_type in {"lion", "clion"}:
         if "lr" in kwargs:
-            learning_rate = kwargs.pop("lr")
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
         if "betas" in kwargs:
-            betas = tuple(kwargs.pop("betas"))
+            betas = _coerce_betas(kwargs.pop("betas"))
         elif betas == (0.9, 0.999):
             betas = (0.9, 0.99)
         if "weight_decay" in kwargs:
-            weight_decay = kwargs.pop("weight_decay")
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
         kwargs.pop("eps", None)  # Lion has no eps; silently drop if passed.
         # `clion` is just lion + cautious=True; explicit kwargs win.
         if optimizer_type == "clion":

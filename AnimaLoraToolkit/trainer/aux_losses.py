@@ -30,6 +30,11 @@ import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+_SPECTRAL_AMP_EPS = 1e-12
+
+
+def _complex_abs_stable(x: torch.Tensor) -> torch.Tensor:
+    return (x.real.square() + x.imag.square() + _SPECTRAL_AMP_EPS).sqrt()
 
 
 # ============================================================================
@@ -207,8 +212,9 @@ def spectral_loss_per_sample(x0_pred: torch.Tensor, x0_target: torch.Tensor,
     with torch.no_grad():
         fft_target = torch.fft.fft2(target_f, dim=(-2, -1), norm="ortho")
 
-    # L1 on amplitude spectrum
-    amp_diff = (fft_pred.abs() - fft_target.abs()).abs()
+    # L1 on amplitude spectrum. A tiny epsilon avoids NaN gradients at zero
+    # complex amplitude while leaving nonzero amplitudes effectively unchanged.
+    amp_diff = (_complex_abs_stable(fft_pred) - _complex_abs_stable(fft_target)).abs()
     fft_per_sample = amp_diff.view(amp_diff.shape[0], -1).mean(dim=1)
 
     total = fft_per_sample

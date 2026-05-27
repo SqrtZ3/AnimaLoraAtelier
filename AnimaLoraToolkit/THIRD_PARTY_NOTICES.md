@@ -46,6 +46,15 @@
 - **涉及文件**：
   - `utils/lion_optimizer.py`（Lion 类，`cautious=True` 即 C-Lion）
 
+## EmoSens Optimizer (Apache-2.0)
+
+- **来源**：`muooon/EmoSens` official implementation
+- **许可**：Apache-2.0
+- **涉及文件**：
+  - `utils/emosens_optimizer.py`
+- **本地改动**：移除了上游 ECC/backward monkey patch，改为训练循环显式注入聚合 loss；
+  optimizer state 使用 fp32，以适配本项目的 bf16 LoRA/LoKr 训练。
+
 ## Alibaba Wan2.1 VAE（请再次确认上游许可）
 
 - **来源**：`Wan-Video/Wan2.1` 的 VAE 实现（与 `wan/modules/vae.py` 对应）

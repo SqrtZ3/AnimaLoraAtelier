@@ -437,7 +437,7 @@ def parse_args():
                    help="VAE 采样后不清空 CUDA allocator cache，适合频繁采样。")
 
     # 优化器设置
-    p.add_argument("--optimizer-type", default="adamw", choices=["adamw", "adamw8bit", "prodigyplus", "soap", "adopt", "lion", "clion"], help="优化器类型")
+    p.add_argument("--optimizer-type", default="adamw", choices=["adamw", "adamw8bit", "prodigyplus", "soap", "adopt", "lion", "clion", "emosens"], help="优化器类型")
     p.add_argument("--prodigyplus-d0", type=float, default=1e-6, help="ProdigyPlus 初始 d 估计值")
     p.add_argument("--prodigyplus-use-stableadamw", action="store_true", default=True, help="ProdigyPlus 是否使用 StableAdamW")
 
@@ -1144,11 +1144,16 @@ def main():
 
     # 优化器
     weight_decay = float(getattr(args, "weight_decay", 0.01) or 0.0)
-    opt_type = getattr(args, "optimizer_type", "adamw")
+    opt_type = str(getattr(args, "optimizer_type", "adamw") or "adamw").lower()
     
     # 针对 ProdigyPlus 的学习率建议
     if opt_type == "prodigyplus" and args.lr != 1.0:
         logger.warning(f"检测到正在使用 ProdigyPlus 优化器，但学习率为 {args.lr}。建议将学习率设为 1.0 以获得最佳自适应效果。")
+    if opt_type == "emosens" and args.lr > 0.3:
+        logger.warning(
+            "检测到 EmoSens lr=%s。DiT LoRA 建议先从 0.1 起步；过高的 lr_scope 可能让 emoPulse 上限过大。",
+            args.lr,
+        )
 
     # 获取参数组（支持 LoRA+、模块级 lr）
     param_groups = injector.get_param_groups(
@@ -1256,6 +1261,9 @@ def main():
             lr_sched = "none"
         elif not sf_enabled and lr_sched == "none":
             logger.warning("ProdigyPlus 关闭 Schedule-Free 时建议配 cosine 调度器，否则后期没有 LR 衰减")
+    if opt_type == "emosens" and lr_sched != "none":
+        logger.warning("EmoSens 内部会根据 loss 序列动态写入学习率，已将外部 lr_scheduler 设为 none")
+        lr_sched = "none"
     
     if lr_sched == "cosine":
         eta_min = float(getattr(args, "lr_scheduler_eta_min", 0.0) or 0.0)
@@ -1982,6 +1990,15 @@ def main():
 
 
 
+                if hasattr(optimizer, "set_loss"):
+                    if sample_accum_enabled:
+                        optimizer_loss_val = (
+                            float(sample_accum_loss_sum.detach().cpu()) / max(1, sample_accum_pending)
+                            if sample_accum_loss_sum is not None else 0.0
+                        )
+                    else:
+                        optimizer_loss_val = float(loss.item() * args.grad_accum)
+                    optimizer.set_loss(optimizer_loss_val)
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
@@ -2177,6 +2194,12 @@ def main():
             else:
                 if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
+                if hasattr(optimizer, "set_loss"):
+                    optimizer_loss_val = (
+                        float(sample_accum_loss_sum.detach().cpu()) / max(1, sample_accum_pending)
+                        if sample_accum_loss_sum is not None else 0.0
+                    )
+                    optimizer.set_loss(optimizer_loss_val)
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()

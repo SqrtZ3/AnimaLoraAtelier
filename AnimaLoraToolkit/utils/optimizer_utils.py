@@ -20,6 +20,7 @@ Optimizer Utils Module - 优化器创建（修复版）
 - adopt    - ADOPT（NeurIPS 2024），diffusion 等无界梯度噪声下收敛保证的 Adam 变种
 - lion     - Lion（NeurIPS 2023），sign-based 极简优化器
 - clion    - Cautious Lion，Lion + 一行 mask（arxiv 2411.16085）
+- emosens  - EmoSens，loss 序列驱动的动态 LR Adam-style 优化器
 """
 
 from __future__ import annotations
@@ -48,6 +49,11 @@ try:
     from .lion_optimizer import Lion
 except ImportError:  # pragma: no cover
     from lion_optimizer import Lion  # type: ignore
+
+try:
+    from .emosens_optimizer import EmoSens
+except ImportError:  # pragma: no cover
+    from emosens_optimizer import EmoSens  # type: ignore
 
 # -------- 可选依赖 --------
 try:
@@ -277,10 +283,27 @@ def create_optimizer(
             params=params, lr=learning_rate, betas=betas,
             weight_decay=weight_decay, **kwargs,
         )
+    if optimizer_type == "emosens":
+        if "lr" in kwargs:
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
+        if "betas" in kwargs:
+            betas = _coerce_betas(kwargs.pop("betas"))
+        elif betas == (0.9, 0.999):
+            betas = (0.9, 0.995)
+        if "weight_decay" in kwargs:
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
+        if "eps" in kwargs:
+            eps = _coerce_float(kwargs.pop("eps"), "optimizer_args.eps")
+        return create_emosens_optimizer(
+            params=params, lr=learning_rate, betas=betas,
+            weight_decay=weight_decay, eps=eps, **kwargs,
+        )
 
     raise ValueError(
         f"Unknown optimizer type: {optimizer_type}. "
-        f"Choose from: adamw8bit, adamw, prodigyplus, soap, adopt, lion, clion"
+        f"Choose from: adamw8bit, adamw, prodigyplus, soap, adopt, lion, clion, emosens"
     )
 
 
@@ -465,6 +488,46 @@ def create_lion_optimizer(
 
 
 # =============================================================================
+# EmoSens
+# =============================================================================
+
+def create_emosens_optimizer(
+    params: ParamInput,
+    lr: float = 0.1,
+    betas: tuple = (0.9, 0.995),
+    weight_decay: float = 0.0,
+    eps: float = 1e-8,
+    **kwargs,
+) -> Optimizer:
+    valid_keys = {"stopcoef", "use_shadow", "notify"}
+    emosens_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+    ignored = [k for k in kwargs if k not in valid_keys]
+    if ignored:
+        logger.warning(f"[EmoSens] Ignored unsupported params: {ignored}")
+
+    param_list = params if _is_param_groups(params) else list(params)
+    logger.info(
+        "Creating EmoSens optimizer "
+        "(lr_scope=%s, betas=%s, wd=%s, eps=%s, stopcoef=%s, use_shadow=%s, notify=%s)",
+        lr,
+        betas,
+        weight_decay,
+        eps,
+        emosens_kwargs.get("stopcoef", 0.04),
+        emosens_kwargs.get("use_shadow", False),
+        emosens_kwargs.get("notify", False),
+    )
+    return EmoSens(
+        param_list,
+        lr=lr,
+        betas=betas,
+        eps=eps,
+        weight_decay=weight_decay,
+        **emosens_kwargs,
+    )
+
+
+# =============================================================================
 # ProdigyPlus (Schedule-Free)
 # =============================================================================
 
@@ -589,11 +652,14 @@ def get_optimizer_info(optimizer: Optimizer) -> Dict[str, Any]:
             total += p.numel()
     info["total_trainable_params"] = total
 
-    # ProdigyPlus 特有
+    # Optimizer-specific telemetry
     pg0 = optimizer.param_groups[0]
     for key in ("d", "d0", "d_coef", "effective_lr", "k"):
         if key in pg0:
             info[key] = pg0[key]
+    for key in ("emoScope", "dNR_hist", "noise_est", "d_est", "c_est", "stop_base", "should_stop"):
+        if hasattr(optimizer, key):
+            info[key] = getattr(optimizer, key)
 
     return info
 

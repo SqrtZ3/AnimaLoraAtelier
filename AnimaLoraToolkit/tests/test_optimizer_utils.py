@@ -324,5 +324,100 @@ class LionOptimizerFactoryTests(unittest.TestCase):
         self.assertNotIn("eps", optimizer.param_groups[0])
 
 
+class EmoSensOptimizerFactoryTests(unittest.TestCase):
+    def test_create_emosens_preserves_param_group_lr_and_weight_decay(self):
+        matrix = torch.nn.Parameter(torch.randn(4, 3))
+        vector = torch.nn.Parameter(torch.randn(4))
+        groups = [
+            {"params": [matrix], "lr": "0.1", "weight_decay": "0.0"},
+            {"params": [vector], "lr": "0.03", "weight_decay": "0.0"},
+        ]
+
+        optimizer = create_optimizer(
+            "emosens",
+            groups,
+            learning_rate=0.1,
+            betas=["0.9", "0.995"],
+            eps="1e-8",
+            weight_decay=0.0,
+            notify=False,
+        )
+
+        self.assertEqual(type(optimizer).__name__, "EmoSens")
+        self.assertEqual(optimizer.param_groups[0]["lr"], 0.1)
+        self.assertEqual(optimizer.param_groups[1]["lr"], 0.03)
+        self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.0)
+        self.assertEqual(optimizer.param_groups[0]["betas"], (0.9, 0.995))
+
+    def test_emosens_step_uses_explicit_loss_and_updates_param(self):
+        param = torch.nn.Parameter(torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.float32))
+        optimizer = create_optimizer(
+            "emosens",
+            [param],
+            learning_rate=0.1,
+            weight_decay=0.0,
+            notify=False,
+        )
+
+        before = param.detach().clone()
+        loss = param.float().square().sum()
+        loss.backward()
+        optimizer.set_loss(float(loss.detach()))
+        returned_loss = optimizer.step()
+
+        state = optimizer.state[param]
+        self.assertIsNone(returned_loss)
+        self.assertFalse(torch.equal(before, param.detach()))
+        self.assertTrue(torch.isfinite(param.detach()).all())
+        self.assertEqual(state["exp_avg"].dtype, torch.float32)
+        self.assertEqual(state["exp_avg_sq"].dtype, torch.float32)
+        self.assertIn("emo_internal", optimizer.state_dict())
+
+    def test_emosens_keeps_bf16_parameter_state_fp32(self):
+        param = torch.nn.Parameter(torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.bfloat16))
+        optimizer = create_optimizer(
+            "emosens",
+            [param],
+            learning_rate=0.1,
+            weight_decay=0.0,
+            notify=False,
+        )
+
+        loss = param.float().square().sum()
+        loss.backward()
+        optimizer.set_loss(float(loss.detach()))
+        optimizer.step()
+
+        state = optimizer.state[param]
+        self.assertTrue(torch.isfinite(param.detach()).all())
+        self.assertEqual(state["exp_avg"].dtype, torch.float32)
+        self.assertEqual(state["exp_avg_sq"].dtype, torch.float32)
+
+    def test_emosens_dynamic_lr_preserves_param_group_lr_ratio(self):
+        base = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+        boosted = torch.nn.Parameter(torch.tensor([0.5, 3.0]))
+        optimizer = create_optimizer(
+            "emosens",
+            [
+                {"params": [base], "lr": 0.1, "weight_decay": 0.0},
+                {"params": [boosted], "lr": 0.2, "weight_decay": 0.0},
+            ],
+            learning_rate=0.1,
+            weight_decay=0.0,
+            notify=False,
+        )
+
+        loss = base.square().sum() + boosted.square().sum()
+        loss.backward()
+        optimizer.set_loss(float(loss.detach()))
+        optimizer.step()
+
+        self.assertAlmostEqual(
+            optimizer.param_groups[1]["lr"] / optimizer.param_groups[0]["lr"],
+            2.0,
+            places=6,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

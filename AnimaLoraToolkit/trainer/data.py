@@ -17,8 +17,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import importlib.util
 import logging
+import math
 import random
 import sys
 from pathlib import Path
@@ -27,6 +29,100 @@ import torch
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class NativeFitImagePlan:
+    source_width: int
+    source_height: int
+    width: int
+    height: int
+    align_unit: int
+    token_count: int
+    token_h: int
+    token_w: int
+    was_padded: bool
+    was_resized: bool = False
+    was_cropped: bool = False
+
+
+def _ceil_to_multiple(value: int, multiple: int) -> int:
+    value = max(1, int(value))
+    multiple = max(1, int(multiple))
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _floor_to_multiple(value: int, multiple: int) -> int:
+    value = max(1, int(value))
+    multiple = max(1, int(multiple))
+    return max(multiple, (value // multiple) * multiple)
+
+
+def plan_native_fit_image(
+    width: int,
+    height: int,
+    *,
+    max_tokens: int = 65536,
+    patch_size: int = 2,
+    vae_downsample: int = 8,
+    align_mode: str = "pad",
+    over_budget_strategy: str = "fail",
+) -> NativeFitImagePlan:
+    """Plan native-first FiT sizing without implicit resize/crop.
+
+    The returned size is the pixel size that will be handed to the VAE. The
+    default mode pads up to the VAE+patch granularity so every source pixel is
+    preserved and padded tokens can be masked later.
+    """
+    source_w = int(width)
+    source_h = int(height)
+    if source_w <= 0 or source_h <= 0:
+        raise ValueError(f"image dimensions must be positive, got {source_w}x{source_h}")
+
+    patch = max(1, int(patch_size))
+    down = max(1, int(vae_downsample))
+    align_unit = patch * down
+    align_mode = (align_mode or "pad").lower()
+    if align_mode == "pad" or align_mode == "ceil":
+        planned_w = _ceil_to_multiple(source_w, align_unit)
+        planned_h = _ceil_to_multiple(source_h, align_unit)
+    elif align_mode == "floor":
+        planned_w = _floor_to_multiple(source_w, align_unit)
+        planned_h = _floor_to_multiple(source_h, align_unit)
+    else:
+        raise ValueError(f"unknown fit_align_mode={align_mode!r}; expected pad, ceil, or floor")
+
+    token_w = planned_w // align_unit
+    token_h = planned_h // align_unit
+    token_count = token_w * token_h
+    max_tokens = max(1, int(max_tokens))
+    strategy = (over_budget_strategy or "fail").lower()
+    if token_count > max_tokens:
+        if strategy in ("fail", "skip"):
+            raise ValueError(
+                f"image {source_w}x{source_h} produces {token_count} FiT tokens, "
+                f"which exceeds fit_max_tokens={max_tokens}. "
+                "Increase fit_max_tokens or explicitly set fit_over_budget_strategy."
+            )
+        raise NotImplementedError(
+            f"image {source_w}x{source_h} produces {token_count} FiT tokens, "
+            f"above fit_max_tokens={max_tokens}; fit_over_budget_strategy={strategy!r} "
+            "is reserved but not implemented yet in native-first FiT mode."
+        )
+
+    return NativeFitImagePlan(
+        source_width=source_w,
+        source_height=source_h,
+        width=planned_w,
+        height=planned_h,
+        align_unit=align_unit,
+        token_count=token_count,
+        token_h=token_h,
+        token_w=token_w,
+        was_padded=(planned_w != source_w or planned_h != source_h),
+        was_resized=False,
+        was_cropped=False,
+    )
 
 
 def compute_sample_accumulation_steps(dataset_size: int, epochs: int,
@@ -52,32 +148,177 @@ _NP_TO_TORCH = {
 
 class BucketManager:
     """ARB 分桶管理"""
-    def __init__(self, base_reso=1024, min_reso=512, max_reso=2048, step=64):
-        self.base_reso = base_reso
-        self.buckets = self._generate(min_reso, max_reso, step, base_reso)
+    def __init__(self, base_reso=1024, min_reso=512, max_reso=2048, step=64,
+                 base_resos=None, min_base_reso=0, max_base_reso=0,
+                 base_reso_step=256, no_upscale=False, max_upscale=0.0):
+        self.base_reso = int(base_reso)
+        self.base_resos = self._normalize_base_resos(
+            base_reso, base_resos, min_base_reso, max_base_reso,
+            base_reso_step, min_reso
+        )
+        self.no_upscale = bool(no_upscale)
+        self.max_upscale = float(max_upscale or 0.0)
+        self.buckets = self._generate(min_reso, max_reso, step, self.base_resos)
 
-    def _generate(self, min_r, max_r, step, base):
+    @staticmethod
+    def _normalize_base_resos(base_reso, base_resos, min_base_reso=0,
+                              max_base_reso=0, base_reso_step=256,
+                              min_reso=512):
+        if base_resos is None or base_resos == "":
+            values = []
+        elif isinstance(base_resos, str):
+            values = [v.strip() for v in base_resos.split(",")]
+        else:
+            values = list(base_resos)
+
+        out = []
+        for value in values:
+            if value is None or value == "":
+                continue
+            ivalue = int(value)
+            if ivalue <= 0:
+                continue
+            out.append(ivalue)
+        if out:
+            return sorted(set(out))
+
+        max_base = int(max_base_reso or 0)
+        if max_base > 0:
+            min_base = int(min_base_reso or 0) or int(min_reso or base_reso)
+            step = max(1, int(base_reso_step or 256))
+            if min_base > max_base:
+                min_base, max_base = max_base, min_base
+            generated = list(range(min_base, max_base + 1, step))
+            if not generated or generated[-1] != max_base:
+                generated.append(max_base)
+            return sorted(set(v for v in generated if v > 0))
+
+        return [int(base_reso)]
+
+    def _generate(self, min_r, max_r, step, bases):
         buckets = []
-        base_area = base * base
-        for w in range(min_r, max_r + 1, step):
-            for h in range(min_r, max_r + 1, step):
-                if abs(w * h - base_area) / base_area > 0.1:
-                    continue
-                if max(w / h, h / w) > 2.0:
-                    continue
-                buckets.append((w, h))
-        return buckets
+        seen = set()
+        for base in bases:
+            base_area = base * base
+            for w in range(min_r, max_r + 1, step):
+                for h in range(min_r, max_r + 1, step):
+                    if abs(w * h - base_area) / base_area > 0.1:
+                        continue
+                    if max(w / h, h / w) > 2.0:
+                        continue
+                    bucket = (w, h)
+                    if bucket in seen:
+                        continue
+                    seen.add(bucket)
+                    buckets.append(bucket)
+        return sorted(buckets, key=lambda b: (b[0] * b[1], b[0], b[1]))
+
+    def _bucket_allowed_for_image(self, bw, bh, w, h):
+        scale = max(bw / max(1, w), bh / max(1, h))
+        if self.no_upscale and scale > 1.0:
+            return False
+        if self.max_upscale > 0 and scale > self.max_upscale:
+            return False
+        return True
+
+    def _score_bucket(self, bw, bh, w, h):
+        aspect_diff = abs((w / h) - (bw / bh))
+        scale = max(bw / max(1, w), bh / max(1, h))
+        scale_diff = abs(math.log(max(scale, 1e-8)))
+        area_diff = abs((bw * bh) - (w * h)) / max(1, w * h)
+        return (aspect_diff, scale_diff, area_diff)
 
     def get_bucket(self, w, h):
-        aspect = w / h
         best = (self.base_reso, self.base_reso)
-        best_diff = float("inf")
-        for bw, bh in self.buckets:
-            diff = abs(aspect - bw / bh)
-            if diff < best_diff:
-                best_diff = diff
+        best_score = None
+        candidates = [
+            (bw, bh) for (bw, bh) in self.buckets
+            if self._bucket_allowed_for_image(bw, bh, w, h)
+        ]
+        if not candidates:
+            candidates = self.buckets
+        for bw, bh in candidates:
+            score = self._score_bucket(bw, bh, w, h)
+            if best_score is None or score < best_score:
+                best_score = score
                 best = (bw, bh)
         return best
+
+
+def _format_size(size):
+    h, w = int(size[0]), int(size[1])
+    return f"{w}x{h}"
+
+
+def _downscale_ratio(source_size, bucket_key):
+    source_h, source_w = source_size
+    bucket_h, bucket_w = bucket_key
+    return max(
+        float(source_w) / max(1, float(bucket_w)),
+        float(source_h) / max(1, float(bucket_h)),
+    )
+
+
+def format_bucket_report(samples, limit=12, label="dataset"):
+    """Return a compact text report of source sizes and bucket assignments."""
+    from collections import Counter
+
+    rows = []
+    for sample in samples:
+        bucket_key = sample.get("bucket_key")
+        source_size = sample.get("source_size")
+        if not bucket_key or not source_size:
+            continue
+        rows.append((sample.get("image"), source_size, bucket_key))
+
+    if not rows:
+        return f"[BucketReport:{label}] no bucketed samples"
+
+    bucket_counts = Counter(bucket_key for _, _, bucket_key in rows)
+    source_bins = Counter()
+    downscales = []
+    for image, source_size, bucket_key in rows:
+        longest = max(int(source_size[0]), int(source_size[1]))
+        if longest < 768:
+            source_bins["<768"] += 1
+        elif longest < 1024:
+            source_bins["768-1023"] += 1
+        elif longest < 1536:
+            source_bins["1024-1535"] += 1
+        elif longest < 2048:
+            source_bins["1536-2047"] += 1
+        elif longest < 3072:
+            source_bins["2048-3071"] += 1
+        else:
+            source_bins[">=3072"] += 1
+        ratio = _downscale_ratio(source_size, bucket_key)
+        if ratio > 1.0:
+            downscales.append((ratio, image, source_size, bucket_key))
+
+    bucket_preview = ", ".join(
+        f"{_format_size(bucket)}={count}"
+        for bucket, count in bucket_counts.most_common(limit)
+    )
+    bin_order = ["<768", "768-1023", "1024-1535", "1536-2047", "2048-3071", ">=3072"]
+    bin_preview = ", ".join(
+        f"{name}={source_bins[name]}" for name in bin_order if source_bins[name]
+    )
+    downscales.sort(reverse=True, key=lambda row: row[0])
+    downscale_preview = []
+    for ratio, image, source_size, bucket_key in downscales[:limit]:
+        name = Path(image).name if image is not None else "?"
+        downscale_preview.append(
+            f"{name}: {_format_size(source_size)} -> {_format_size(bucket_key)} ({ratio:.2f}x)"
+        )
+
+    lines = [
+        f"[BucketReport:{label}] samples={len(rows)}, buckets={len(bucket_counts)}",
+        f"  assigned buckets: {bucket_preview}",
+        f"  source size bins: {bin_preview or 'none'}",
+    ]
+    if downscale_preview:
+        lines.append("  largest downscales: " + "; ".join(downscale_preview))
+    return "\n".join(lines)
 
 
 class ImageDataset(Dataset):
@@ -87,7 +328,11 @@ class ImageDataset(Dataset):
     def __init__(self, data_dir, resolution=1024, bucket_mgr=None,
                  shuffle_caption=False, keep_tokens=0, flip_augment=False,
                  tag_dropout=0.0, prefer_json=True, caption_override=None,
-                 freq_balanced_dropout_strength=0.0):
+                 freq_balanced_dropout_strength=0.0,
+                 fit_packed=False, fit_max_tokens=65536,
+                 fit_warn_tokens=16384, fit_min_tokens=16,
+                 fit_patch_size=2, fit_vae_downsample=8,
+                 fit_over_budget_strategy="fail", fit_align_mode="pad"):
         self.data_dir = Path(data_dir)
         self.resolution = resolution
         self.bucket_mgr = bucket_mgr
@@ -97,6 +342,14 @@ class ImageDataset(Dataset):
         self.tag_dropout = tag_dropout
         self.prefer_json = prefer_json
         self.caption_override = caption_override  # 正则集：统一 caption，如 "1girl, solo"
+        self.fit_packed = bool(fit_packed)
+        self.fit_max_tokens = int(fit_max_tokens or 65536)
+        self.fit_warn_tokens = int(fit_warn_tokens or 0)
+        self.fit_min_tokens = int(fit_min_tokens or 0)
+        self.fit_patch_size = int(fit_patch_size or 2)
+        self.fit_vae_downsample = int(fit_vae_downsample or 8)
+        self.fit_over_budget_strategy = str(fit_over_budget_strategy or "fail").lower()
+        self.fit_align_mode = str(fit_align_mode or "pad").lower()
         # ★ v5 ② frequency-balanced tag dropout
         # 0 = 关闭；>0 启用。在数据集 init 时统计 tag 频率，对在数据集中过度共现的 tag 额外提高 dropout
         # 概率，强迫模型把"风格"与"高频共现 tag"解耦。完全数据驱动，自动适配任何画师。
@@ -142,6 +395,7 @@ class ImageDataset(Dataset):
         # 用与 __getitem__ 完全一致的 PIL 路径填充 bucket_key
         self._finalize_bucket_keys()
         self.bucket_for_index = [s["bucket_key"] for s in self.samples]
+        self.token_count_for_index = [int(s.get("token_count", 0) or 0) for s in self.samples]
         # 诊断：统计 bucket 分布
         from collections import Counter
         dist = Counter(self.bucket_for_index)
@@ -177,8 +431,50 @@ class ImageDataset(Dataset):
 
         cache = {}
         for i, img_path in enumerate(unique_imgs):
-            if self.bucket_mgr is None:
-                cache[img_path] = (self.resolution, self.resolution)
+            if self.fit_packed:
+                try:
+                    img = _PILImage.open(img_path)
+                    w, h = img.width, img.height
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+                    plan = plan_native_fit_image(
+                        w,
+                        h,
+                        max_tokens=self.fit_max_tokens,
+                        patch_size=self.fit_patch_size,
+                        vae_downsample=self.fit_vae_downsample,
+                        align_mode=self.fit_align_mode,
+                        over_budget_strategy=self.fit_over_budget_strategy,
+                    )
+                    cache[img_path] = ((plan.height, plan.width), (h, w), plan)
+                    if self.fit_warn_tokens > 0 and plan.token_count > self.fit_warn_tokens:
+                        logger.warning(
+                            "[FiT] %s -> %dx%d, tokens=%d exceeds fit_warn_tokens=%d",
+                            img_path,
+                            plan.width,
+                            plan.height,
+                            plan.token_count,
+                            self.fit_warn_tokens,
+                        )
+                    if self.fit_min_tokens > 0 and plan.token_count < self.fit_min_tokens:
+                        logger.warning(
+                            "[FiT] %s -> %dx%d, tokens=%d below fit_min_tokens=%d",
+                            img_path,
+                            plan.width,
+                            plan.height,
+                            plan.token_count,
+                            self.fit_min_tokens,
+                        )
+                except Exception as e:
+                    logger.warning(f"[FiT] 无法读取 {img_path}: {e}")
+                    if self.fit_over_budget_strategy == "skip":
+                        cache[img_path] = None
+                    else:
+                        raise
+            elif self.bucket_mgr is None:
+                cache[img_path] = ((self.resolution, self.resolution), (self.resolution, self.resolution), None)
             else:
                 try:
                     img = _PILImage.open(img_path)
@@ -188,16 +484,30 @@ class ImageDataset(Dataset):
                     except Exception:
                         pass
                     bw, bh = self.bucket_mgr.get_bucket(w, h)
-                    cache[img_path] = (bh, bw)  # (h, w)
+                    cache[img_path] = ((bh, bw), (h, w), None)  # (bucket h,w), (source h,w), fit plan
                 except Exception as e:
                     logger.warning(f"[bucket_key] 无法读取 {img_path}: {e}，回退到 ({self.resolution},{self.resolution})")
-                    cache[img_path] = (self.resolution, self.resolution)
+                    cache[img_path] = ((self.resolution, self.resolution), (0, 0), None)
             # 每 1000 张或最后一张时打印进度，让用户知道 init 没卡死
             if n_unique >= 2000 and ((i + 1) % 1000 == 0 or i == n_unique - 1):
                 logger.info(f"  bucket_key 解析进度: {i + 1}/{n_unique}")
 
+        if self.fit_packed:
+            before = len(self.samples)
+            self.samples = [sample for sample in self.samples if cache.get(sample["image"]) is not None]
+            skipped = before - len(self.samples)
+            if skipped:
+                logger.warning("[FiT] skipped %d samples due to fit_over_budget_strategy=skip", skipped)
+
         for sample in self.samples:
-            sample["bucket_key"] = cache[sample["image"]]
+            bucket_key, source_size, fit_plan = cache[sample["image"]]
+            sample["bucket_key"] = bucket_key
+            sample["source_size"] = source_size
+            sample["fit_plan"] = fit_plan
+            sample["token_count"] = int(fit_plan.token_count) if fit_plan is not None else 0
+
+    def bucket_report(self, limit=12, label="dataset"):
+        return format_bucket_report(self.samples, limit=limit, label=label)
 
     def _pre_normalize_json_captions(self):
         """一次性把所有 JSON caption 加载 + normalize，缓存到 sample["normalized_json"]。
@@ -451,6 +761,34 @@ class ImageDataset(Dataset):
         if caption is None:
             caption = ""
 
+        if self.fit_packed:
+            plan = sample.get("fit_plan")
+            if plan is None:
+                raise RuntimeError(f"missing FiT image plan for {sample['image']}")
+
+            if self.flip_augment and random.random() > 0.5:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+            if self.fit_align_mode == "floor":
+                img = img.crop((0, 0, min(img.width, plan.width), min(img.height, plan.height)))
+            padded = Image.new("RGB", (plan.width, plan.height), (127, 127, 127))
+            padded.paste(img, (0, 0))
+
+            arr = np.array(padded).astype(np.float32) / 127.5 - 1.0
+            tensor = torch.from_numpy(arr).permute(2, 0, 1)
+            mask = torch.zeros((1, plan.height, plan.width), dtype=torch.float32)
+            valid_h = min(plan.source_height, plan.height)
+            valid_w = min(plan.source_width, plan.width)
+            mask[:, :valid_h, :valid_w] = 1.0
+            return {
+                "pixel_values": tensor,
+                "pixel_mask": mask,
+                "caption": caption,
+                "image": str(sample["image"]),
+                "token_count": int(plan.token_count),
+                "fit_plan": plan,
+            }
+
         # ARB 分桶
         if self.bucket_mgr:
             tw, th = self.bucket_mgr.get_bucket(img.width, img.height)
@@ -482,6 +820,9 @@ class RepeatDataset(Dataset):
     def __init__(self, dataset, repeats=1):
         self.dataset = dataset
         self.repeats = max(1, int(repeats))
+        counts = getattr(dataset, "token_count_for_index", None)
+        if counts:
+            self.token_count_for_index = [int(counts[i % len(counts)]) for i in range(len(self))]
 
     def __len__(self):
         return len(self.dataset) * self.repeats
@@ -499,6 +840,7 @@ class MergedDataset(Dataset):
         self._reg_len = len(reg_dataset)
 
         self.bucket_for_index = self._build_bucket_for_index()
+        self.token_count_for_index = self._build_token_count_for_index()
 
     def _get_cached_dataset(self, d):
         bfi = getattr(d, "bucket_for_index", None)
@@ -527,6 +869,24 @@ class MergedDataset(Dataset):
         else:
             buckets.extend([(0, 0)] * self._reg_len)
         return buckets
+
+    def _build_token_count_for_index(self):
+        counts = []
+        main_counts = getattr(self.main_dataset, "token_count_for_index", None)
+        if main_counts:
+            main_base_len = len(main_counts)
+            for idx in range(self._main_len):
+                counts.append(int(main_counts[idx % main_base_len]))
+        else:
+            counts.extend([0] * self._main_len)
+        reg_counts = getattr(self.reg_dataset, "token_count_for_index", None)
+        if reg_counts:
+            reg_base_len = len(reg_counts)
+            for idx in range(self._reg_len):
+                counts.append(int(reg_counts[idx % reg_base_len]))
+        else:
+            counts.extend([0] * self._reg_len)
+        return counts
 
     def __len__(self):
         return self._main_len + self._reg_len
@@ -819,6 +1179,118 @@ class BucketBatchSampler:
                 yield split_batch
 
 
+class FitTokenBatchSampler:
+    """Batch native FiT samples by token count to avoid wasteful padding."""
+
+    def __init__(self, dataset, batch_size, max_tokens_per_batch=0, shuffle=True, seed=42):
+        self.dataset = dataset
+        self.batch_size = max(1, int(batch_size))
+        self.max_tokens_per_batch = max(0, int(max_tokens_per_batch or 0))
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        token_counts = self._build_token_counts(dataset)
+        self.token_counts = [max(1, int(v)) for v in token_counts]
+
+    def _build_token_counts(self, dataset):
+        counts = getattr(dataset, "token_count_for_index", None)
+        if counts is not None and len(counts) > 0:
+            try:
+                dataset_len = len(dataset)
+            except TypeError:
+                dataset_len = len(counts)
+            return [int(counts[i % len(counts)]) for i in range(dataset_len)]
+        return [int(self._lookup_token_count(dataset, i) or 0) for i in range(len(dataset))]
+
+    def _lookup_token_count(self, d, idx):
+        main = getattr(d, "main_dataset", None)
+        reg = getattr(d, "reg_dataset", None)
+        if main is not None and reg is not None:
+            ml = getattr(d, "_main_len", len(main))
+            if idx < ml:
+                return self._lookup_token_count(main, idx)
+            return self._lookup_token_count(reg, idx - ml)
+        inner = getattr(d, "dataset", None)
+        if inner is not None and inner is not d and not isinstance(inner, list):
+            return self._lookup_token_count(inner, idx % len(inner))
+        counts = getattr(d, "token_count_for_index", None)
+        if counts is not None and len(counts) > 0:
+            return int(counts[idx % len(counts)])
+        inner = getattr(d, "base_dataset", None)
+        if inner is not None and inner is not d:
+            return self._lookup_token_count(inner, idx % len(inner))
+        return 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        indices = list(range(len(self.token_counts)))
+        indices.sort(key=lambda i: (self.token_counts[i], i))
+        if self.shuffle:
+            # Keep coarse token locality, but vary order within similarly sized neighborhoods.
+            chunks = [indices[i:i + self.batch_size * 8] for i in range(0, len(indices), self.batch_size * 8)]
+            for chunk in chunks:
+                rng.shuffle(chunk)
+            rng.shuffle(chunks)
+            indices = [idx for chunk in chunks for idx in chunk]
+
+        batch = []
+        batch_max = 0
+        for idx in indices:
+            tok = self.token_counts[idx]
+            next_max = max(batch_max, tok)
+            next_len = len(batch) + 1
+            over_count = next_len > self.batch_size
+            over_tokens = (
+                self.max_tokens_per_batch > 0
+                and next_max * next_len > self.max_tokens_per_batch
+                and batch
+            )
+            if over_count or over_tokens:
+                yield batch
+                batch = []
+                batch_max = 0
+            if self.max_tokens_per_batch > 0 and tok > self.max_tokens_per_batch:
+                logger.warning(
+                    "[FiT] sample index %d has %d tokens, above fit_max_tokens_per_batch=%d; "
+                    "it will be trained as a single-sample batch.",
+                    idx,
+                    tok,
+                    self.max_tokens_per_batch,
+                )
+            batch.append(idx)
+            batch_max = max(batch_max, tok)
+        if batch:
+            yield batch
+
+    def __len__(self):
+        total = 0
+        indices = sorted(range(len(self.token_counts)), key=lambda i: (self.token_counts[i], i))
+        batch = []
+        batch_max = 0
+        for idx in indices:
+            tok = self.token_counts[idx]
+            next_max = max(batch_max, tok)
+            next_len = len(batch) + 1
+            over_count = next_len > self.batch_size
+            over_tokens = (
+                self.max_tokens_per_batch > 0
+                and next_max * next_len > self.max_tokens_per_batch
+                and batch
+            )
+            if over_count or over_tokens:
+                total += 1
+                batch = []
+                batch_max = 0
+            batch.append(idx)
+            batch_max = max(batch_max, tok)
+        if batch:
+            total += 1
+        return total
+
+
 class CachedLatentDataset(Dataset):
     """Kohya 风格 npz 文件缓存的数据集。
 
@@ -851,9 +1323,15 @@ class CachedLatentDataset(Dataset):
         img_path = Path(img_path)
         return img_path.with_suffix(".npz")
 
-    def _is_cache_valid(self, img_path, npz_path):
+    def _is_cache_valid(self, sample_or_img_path, npz_path):
         """检查缓存是否有效（图像未修改，且格式含 latent 键）。
         若为其他模型的不兼容缓存，则删除并返回 False。"""
+        if isinstance(sample_or_img_path, dict):
+            img_path = Path(sample_or_img_path["image"])
+            expected_bucket = sample_or_img_path.get("bucket_key")
+        else:
+            img_path = Path(sample_or_img_path)
+            expected_bucket = None
         if not npz_path.exists():
             return False
         if npz_path.stat().st_mtime < img_path.stat().st_mtime:
@@ -873,6 +1351,26 @@ class CachedLatentDataset(Dataset):
                 logger.warning(f"删除疑似非 Anima/Qwen VAE 缓存（C={latent.shape[0]}，应为 16）: {npz_path}")
                 npz_path.unlink()
                 return False
+            if expected_bucket is not None and "bucket_h" in data.files and "bucket_w" in data.files:
+                expected_h, expected_w = int(expected_bucket[0]), int(expected_bucket[1])
+                cached_h, cached_w = int(data["bucket_h"]), int(data["bucket_w"])
+                if (cached_h, cached_w) != (expected_h, expected_w):
+                    logger.info(
+                        "删除 bucket 策略已变化的 latent 缓存: %s cached=%dx%d expected=%dx%d",
+                        npz_path, cached_w, cached_h, expected_w, expected_h,
+                    )
+                    npz_path.unlink()
+                    return False
+            elif expected_bucket is not None:
+                expected_h, expected_w = int(expected_bucket[0]), int(expected_bucket[1])
+                cached_h, cached_w = int(latent.shape[-2]) * 8, int(latent.shape[-1]) * 8
+                if (cached_h, cached_w) != (expected_h, expected_w):
+                    logger.info(
+                        "删除缺少 bucket 元数据且尺寸不匹配的 latent 缓存: %s cached≈%dx%d expected=%dx%d",
+                        npz_path, cached_w, cached_h, expected_w, expected_h,
+                    )
+                    npz_path.unlink()
+                    return False
             # bf16 cache 用 uint16 view 保存，跳过 isfinite 检查（uint16 永远 finite）。
             # 旧 fp32 / 新 fp16 cache 仍做 NaN/Inf 校验。
             dtype_kind = str(data["dtype_kind"]) if "dtype_kind" in data.files else "fp32"
@@ -895,7 +1393,7 @@ class CachedLatentDataset(Dataset):
         for i, sample in enumerate(self.samples):
             img_path = sample["image"]
             npz_path = self._get_npz_path(img_path)
-            if not self._is_cache_valid(img_path, npz_path):
+            if not self._is_cache_valid(sample, npz_path):
                 to_encode.append(i)
 
         if to_encode:
@@ -1061,6 +1559,42 @@ def collate_fn(batch):
     captions = [b["caption"] for b in batch]
     images = [b.get("image", "") for b in batch]
     return {"pixel_values": pixels, "captions": captions, "images": images}
+
+
+def collate_fn_fit_packed(batch):
+    """Collate native FiT image batches by padding pixels and masks.
+
+    This keeps source pixels intact. Any padding is explicit and carried in
+    ``pixel_mask`` so later patchification can exclude padded regions.
+    """
+    import torch.nn.functional as F
+
+    max_h = max(int(b["pixel_values"].shape[-2]) for b in batch)
+    max_w = max(int(b["pixel_values"].shape[-1]) for b in batch)
+    pixels = []
+    masks = []
+    token_counts = []
+    captions = []
+    images = []
+    for b in batch:
+        pixel = b["pixel_values"]
+        mask = b.get("pixel_mask")
+        if mask is None:
+            mask = torch.ones(1, pixel.shape[-2], pixel.shape[-1], dtype=pixel.dtype)
+        pad_h = max_h - int(pixel.shape[-2])
+        pad_w = max_w - int(pixel.shape[-1])
+        pixels.append(F.pad(pixel, (0, pad_w, 0, pad_h)))
+        masks.append(F.pad(mask, (0, pad_w, 0, pad_h)))
+        token_counts.append(int(b.get("token_count", 0) or 0))
+        captions.append(b["caption"])
+        images.append(b.get("image", ""))
+    return {
+        "pixel_values": torch.stack(pixels),
+        "pixel_mask": torch.stack(masks),
+        "fit_token_counts": torch.tensor(token_counts, dtype=torch.long),
+        "captions": captions,
+        "images": images,
+    }
 
 
 def collate_fn_cached(batch):

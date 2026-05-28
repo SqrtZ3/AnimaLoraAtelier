@@ -48,7 +48,10 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def _apply_rotary_pos_emb_base(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    freqs = freqs[: t.shape[1]].transpose(0, 1)
+    if freqs.ndim == 5:
+        freqs = freqs[:, : t.shape[1], 0]
+    else:
+        freqs = freqs[: t.shape[1]].transpose(0, 1)
     cos_ = torch.cos(freqs).to(t.dtype)
     sin_ = torch.sin(freqs).to(t.dtype)
     rot_dim = freqs.shape[-1]
@@ -110,7 +113,12 @@ class GPT2FeedForward(nn.Module):
         return x
 
 
-def torch_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor) -> torch.Tensor:
+def torch_attention_op(
+    q_B_S_H_D: torch.Tensor,
+    k_B_S_H_D: torch.Tensor,
+    v_B_S_H_D: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Computes multi-head attention using PyTorch's native implementation.
 
     This function provides a PyTorch backend alternative to Transformer Engine's attention operation.
@@ -132,7 +140,7 @@ def torch_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H
     Returns:
         Attention output tensor with shape (batch, seq_len, n_heads * head_dim)
     """
-    if _USE_XFORMERS and xops is not None:
+    if attn_mask is None and _USE_XFORMERS and xops is not None:
         try:
             out = xops.memory_efficient_attention(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D)
             return rearrange(out, "b s h d -> b s (h d)")
@@ -144,7 +152,10 @@ def torch_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H
     k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
     v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
     result_B_S_HD = rearrange(
-        torch.nn.functional.scaled_dot_product_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D), "b h ... l -> b ... (h l)"
+        torch.nn.functional.scaled_dot_product_attention(
+            q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, attn_mask=attn_mask
+        ),
+        "b h ... l -> b ... (h l)",
     )
 
     return result_B_S_HD
@@ -269,8 +280,14 @@ class Attention(nn.Module):
 
         return q, k, v
 
-    def compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        result = self.attn_op(q, k, v)  # [B, S, H, D]
+    def compute_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        result = self.attn_op(q, k, v, attn_mask=attn_mask)  # [B, S, H, D]
         return self.output_dropout(self.output_proj(result))
 
     def forward(
@@ -278,6 +295,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         rope_emb: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -286,7 +304,7 @@ class Attention(nn.Module):
             rope_emb (Optional[Tensor]): RoPE embedding tensor, or no RoPE embeddings (i.e. in cross attention)
         """
         q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
-        return self.compute_attention(q, k, v)
+        return self.compute_attention(q, k, v, attn_mask=attn_mask)
 
 
 class VideoPositionEmb(nn.Module):
@@ -633,6 +651,25 @@ class FinalLayer(nn.Module):
         x_B_T_H_W_O = self.linear(x_B_T_H_W_D)
         return x_B_T_H_W_O
 
+    def forward_tokens(
+        self,
+        x_B_N_D: torch.Tensor,
+        emb_B_T_D: torch.Tensor,
+        adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+    ):
+        if self.use_adaln_lora:
+            assert adaln_lora_B_T_3D is not None
+            shift_B_T_D, scale_B_T_D = (
+                self.adaln_modulation(emb_B_T_D) + adaln_lora_B_T_3D[:, :, : 2 * self.hidden_size]
+            ).chunk(2, dim=-1)
+        else:
+            shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
+
+        shift_B_1_D = shift_B_T_D[:, :1, :]
+        scale_B_1_D = scale_B_T_D[:, :1, :]
+        x_B_N_D = self.layer_norm(x_B_N_D) * (1 + scale_B_1_D) + shift_B_1_D
+        return self.linear(x_B_N_D)
+
 
 class Block(nn.Module):
     """
@@ -840,6 +877,94 @@ class Block(nn.Module):
         result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
         return x_B_T_H_W_D
+
+    def forward_tokens(
+        self,
+        x_B_N_D: torch.Tensor,
+        emb_B_T_D: torch.Tensor,
+        crossattn_emb: torch.Tensor,
+        rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
+        adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.use_adaln_lora:
+            assert adaln_lora_B_T_3D is not None
+            shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
+                self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+            shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
+                self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
+                self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+        else:
+            shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = self.adaln_modulation_self_attn(
+                emb_B_T_D
+            ).chunk(3, dim=-1)
+            shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = self.adaln_modulation_cross_attn(
+                emb_B_T_D
+            ).chunk(3, dim=-1)
+            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+
+        shift_self_attn_B_1_D = shift_self_attn_B_T_D[:, :1, :]
+        scale_self_attn_B_1_D = scale_self_attn_B_T_D[:, :1, :]
+        gate_self_attn_B_1_D = gate_self_attn_B_T_D[:, :1, :]
+        shift_cross_attn_B_1_D = shift_cross_attn_B_T_D[:, :1, :]
+        scale_cross_attn_B_1_D = scale_cross_attn_B_T_D[:, :1, :]
+        gate_cross_attn_B_1_D = gate_cross_attn_B_T_D[:, :1, :]
+        shift_mlp_B_1_D = shift_mlp_B_T_D[:, :1, :]
+        scale_mlp_B_1_D = scale_mlp_B_T_D[:, :1, :]
+        gate_mlp_B_1_D = gate_mlp_B_T_D[:, :1, :]
+
+        def _fn(_x_B_N_D, _norm_layer, _scale_B_1_D, _shift_B_1_D):
+            return _norm_layer(_x_B_N_D) * (1 + _scale_B_1_D) + _shift_B_1_D
+
+        attn_mask = None
+        if token_mask is not None:
+            bool_mask = token_mask.to(dtype=torch.bool)
+            if not bool(bool_mask.any(dim=1).all()):
+                raise ValueError("packed FiT sequence contains a sample with no valid tokens")
+            query_valid = bool_mask[:, None, :, None]
+            key_valid = bool_mask[:, None, None, :]
+            attn_mask = torch.zeros_like(key_valid, dtype=x_B_N_D.dtype)
+            attn_mask = attn_mask.masked_fill(~key_valid, -1.0e4)
+            attn_mask = attn_mask.masked_fill(~query_valid, 0.0)
+
+        normalized_x_B_N_D = _fn(
+            x_B_N_D,
+            self.layer_norm_self_attn,
+            scale_self_attn_B_1_D,
+            shift_self_attn_B_1_D,
+        )
+        result_B_N_D = self.self_attn(
+            normalized_x_B_N_D,
+            None,
+            rope_emb=rope_emb_L_1_1_D,
+            attn_mask=attn_mask,
+        )
+        x_B_N_D = x_B_N_D + gate_self_attn_B_1_D * result_B_N_D
+
+        normalized_x_B_N_D = _fn(
+            x_B_N_D,
+            self.layer_norm_cross_attn,
+            scale_cross_attn_B_1_D,
+            shift_cross_attn_B_1_D,
+        )
+        result_B_N_D = self.cross_attn(normalized_x_B_N_D, crossattn_emb, rope_emb=None)
+        x_B_N_D = result_B_N_D * gate_cross_attn_B_1_D + x_B_N_D
+
+        normalized_x_B_N_D = _fn(
+            x_B_N_D,
+            self.layer_norm_mlp,
+            scale_mlp_B_1_D,
+            shift_mlp_B_1_D,
+        )
+        result_B_N_D = self.mlp(normalized_x_B_N_D)
+        x_B_N_D = x_B_N_D + gate_mlp_B_1_D * result_B_N_D
+        if token_mask is not None:
+            x_B_N_D = x_B_N_D * token_mask.to(dtype=x_B_N_D.dtype).unsqueeze(-1)
+        return x_B_N_D
 
 
 class MiniTrainDIT(nn.Module):
@@ -1090,6 +1215,138 @@ class MiniTrainDIT(nn.Module):
             t=self.patch_temporal,
         )
         return x_B_C_Tt_Hp_Wp
+
+    def patchify_latents_to_tokens(
+        self,
+        x_B_C_T_H_W: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert x_B_C_T_H_W.dim() == 5
+        B, C, T, H, W = x_B_C_T_H_W.shape
+        assert H % self.patch_spatial == 0 and W % self.patch_spatial == 0
+        assert T % self.patch_temporal == 0
+        token_t = T // self.patch_temporal
+        token_h = H // self.patch_spatial
+        token_w = W // self.patch_spatial
+        tokens = rearrange(
+            x_B_C_T_H_W,
+            "b c (t pt) (h ph) (w pw) -> b (t h w) (c pt ph pw)",
+            pt=self.patch_temporal,
+            ph=self.patch_spatial,
+            pw=self.patch_spatial,
+        )
+
+        rows = torch.arange(token_h, device=x_B_C_T_H_W.device)
+        cols = torch.arange(token_w, device=x_B_C_T_H_W.device)
+        rr, cc = torch.meshgrid(rows, cols, indexing="ij")
+        grid_1 = torch.stack([rr.reshape(-1), cc.reshape(-1)], dim=0)
+        if token_t > 1:
+            grid_1 = grid_1.repeat(1, token_t)
+        grid = grid_1.unsqueeze(0).repeat(B, 1, 1)
+
+        if padding_mask is None:
+            mask = torch.ones(B, tokens.shape[1], device=x_B_C_T_H_W.device, dtype=x_B_C_T_H_W.dtype)
+        else:
+            pm = padding_mask
+            if pm.dim() == 5:
+                pm = pm[:, :, 0]
+            if pm.dim() == 3:
+                pm = pm.unsqueeze(1)
+            pm = F.interpolate(pm.float(), size=(H, W), mode="nearest")
+            pooled = F.avg_pool2d(pm, kernel_size=self.patch_spatial, stride=self.patch_spatial)
+            mask = (pooled > 0.0).flatten(1).to(dtype=x_B_C_T_H_W.dtype)
+            if token_t > 1:
+                mask = mask.repeat(1, token_t)
+
+        size = torch.tensor([[[token_h, token_w]]], device=x_B_C_T_H_W.device, dtype=torch.int32).repeat(B, 1, 1)
+        return tokens, grid, mask, size
+
+    def unpatchify_tokens(self, tokens_B_N_M: torch.Tensor, size_B_1_2: torch.Tensor) -> torch.Tensor:
+        sizes = size_B_1_2[:, 0, :].to(device="cpu", dtype=torch.long)
+        if not bool((sizes == sizes[:1]).all()):
+            raise ValueError("unpatchify_tokens currently requires a uniform token grid")
+        token_h = int(sizes[0, 0].item())
+        token_w = int(sizes[0, 1].item())
+        token_t = max(1, tokens_B_N_M.shape[1] // max(1, token_h * token_w))
+        channels = tokens_B_N_M.shape[-1] // (self.patch_temporal * self.patch_spatial * self.patch_spatial)
+        return rearrange(
+            tokens_B_N_M,
+            "b (t h w) (c pt ph pw) -> b c (t pt) (h ph) (w pw)",
+            t=token_t,
+            h=token_h,
+            w=token_w,
+            pt=self.patch_temporal,
+            ph=self.patch_spatial,
+            pw=self.patch_spatial,
+            c=channels,
+        )
+
+    def _packed_rope_from_grid(self, grid_B_2_N: torch.Tensor) -> Optional[torch.Tensor]:
+        if "rope" not in self.pos_emb_cls.lower():
+            return None
+        pe = self.pos_embedder
+        max_row = int(grid_B_2_N[:, 0, :].max().detach().item()) if grid_B_2_N.numel() else 0
+        max_col = int(grid_B_2_N[:, 1, :].max().detach().item()) if grid_B_2_N.numel() else 0
+        if max_row >= pe.max_h or max_col >= pe.max_w:
+            raise ValueError(
+                f"packed FiT token grid {(max_row + 1)}x{(max_col + 1)} exceeds RoPE capacity "
+                f"{pe.max_h}x{pe.max_w}; increase max_img_h/max_img_w for this native resolution."
+            )
+        h_theta = 10000.0 * pe.h_ntk_factor
+        w_theta = 10000.0 * pe.w_ntk_factor
+        t_theta = 10000.0 * pe.t_ntk_factor
+        h_freqs = 1.0 / (h_theta**pe.dim_spatial_range.to(grid_B_2_N.device))
+        w_freqs = 1.0 / (w_theta**pe.dim_spatial_range.to(grid_B_2_N.device))
+        t_freqs = 1.0 / (t_theta**pe.dim_temporal_range.to(grid_B_2_N.device))
+        row = grid_B_2_N[:, 0, :].float()
+        col = grid_B_2_N[:, 1, :].float()
+        half_emb_t = row.new_zeros((row.shape[0], row.shape[1], t_freqs.shape[0]))
+        half_emb_h = row.unsqueeze(-1) * h_freqs
+        half_emb_w = col.unsqueeze(-1) * w_freqs
+        emb = torch.cat([half_emb_t, half_emb_h, half_emb_w] * 2, dim=-1)
+        return emb[:, :, None, None, :].float()
+
+    def forward_packed_tokens(
+        self,
+        tokens_B_N_M: torch.Tensor,
+        timesteps_B_T: torch.Tensor,
+        crossattn_emb: torch.Tensor,
+        grid_B_2_N: torch.Tensor,
+        mask_B_N: torch.Tensor,
+        size_B_1_2: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del size_B_1_2
+        expected = self.x_embedder.proj[1].in_features
+        if tokens_B_N_M.shape[-1] < expected:
+            tokens_B_N_M = F.pad(tokens_B_N_M, (0, expected - tokens_B_N_M.shape[-1]))
+        elif tokens_B_N_M.shape[-1] > expected:
+            raise ValueError(
+                f"packed tokens have dim={tokens_B_N_M.shape[-1]}, but x_embedder expects {expected}"
+            )
+        x_B_N_D = self.x_embedder.proj[1](tokens_B_N_M)
+
+        if timesteps_B_T.ndim == 1:
+            timesteps_B_T = timesteps_B_T.unsqueeze(1)
+        t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
+        t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
+
+        self.affline_scale_log_info = {"t_embedding_B_T_D": t_embedding_B_T_D.detach()}
+        self.affline_emb = t_embedding_B_T_D
+        self.crossattn_emb = crossattn_emb
+
+        rope_emb = self._packed_rope_from_grid(grid_B_2_N)
+        for block in self.blocks:
+            x_B_N_D = block.forward_tokens(
+                x_B_N_D,
+                t_embedding_B_T_D,
+                crossattn_emb,
+                rope_emb_L_1_1_D=rope_emb,
+                token_mask=mask_B_N,
+                adaln_lora_B_T_3D=adaln_lora_B_T_3D,
+            )
+
+        out = self.final_layer.forward_tokens(x_B_N_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
+        return out * mask_B_N.to(dtype=out.dtype).unsqueeze(-1)
 
     def forward(
         self,
@@ -1363,7 +1620,7 @@ class Anima(MiniTrainDIT):
             layer_norm=False,
         )
 
-    def preprocess_text_embeds(self, text_embeds, text_ids):
+    def preprocess_text_embeds(self, text_embeds, text_ids, target_attention_mask=None, source_attention_mask=None):
         """
         Process text embeddings through the LLM adapter.
 
@@ -1375,6 +1632,9 @@ class Anima(MiniTrainDIT):
             Processed embeddings for cross-attention
         """
         if text_ids is not None:
-            return self.llm_adapter(text_embeds, text_ids)
+            return self.llm_adapter(text_embeds, text_ids, target_attention_mask, source_attention_mask)
         else:
             return text_embeds
+
+
+GeneralDIT = MiniTrainDIT

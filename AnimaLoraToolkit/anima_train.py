@@ -29,6 +29,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset
 
 # 尝试添加当前目录到路径，确保能找到 utils
@@ -237,6 +238,7 @@ from trainer.objective import (
     apply_loss_weighting_per_sample,
     compute_grad_norm,
     forward_with_optional_checkpoint,
+    masked_token_loss,
 )
 from trainer.lora import LoRALayer, LoKrLayer, LoRALinear, LoRAInjector
 from trainer.aux_losses import (
@@ -253,9 +255,11 @@ from trainer.data import (
     RepeatDataset,
     MergedDataset,
     BucketBatchSampler,
+    FitTokenBatchSampler,
     CachedLatentDataset,
     compute_sample_accumulation_steps,
     collate_fn,
+    collate_fn_fit_packed,
     collate_fn_cached,
 )
 from trainer.progress import (
@@ -322,6 +326,20 @@ def parse_args():
     p.add_argument("--grad-clip-max-norm", type=float, default=1.0, help="梯度裁剪最大范数 (0=禁用；ProdigyPlus 推荐设 0)")
     p.add_argument("--resolution", type=int, default=1024,
                    help="ARB 分桶的 base 边长（桶围着 base² 面积 ±10% 造）")
+    p.add_argument("--bucket-base-resos", default=None,
+                   help="多级 ARB base 边长，逗号分隔，如 512,768,1024。显式设置时优先于自动 base 范围。")
+    p.add_argument("--bucket-min-base-reso", type=int, default=0,
+                   help="自动生成多级 base 的起点；0=使用 min_bucket_reso。仅 bucket_base_resos 为空且 max>0 时生效。")
+    p.add_argument("--bucket-max-base-reso", type=int, default=0,
+                   help="自动生成多级 base 的终点；0=禁用自动 base 范围，回到单 resolution。")
+    p.add_argument("--bucket-base-reso-steps", type=int, default=256,
+                   help="自动 base 范围步长，如 512..2048 step 256。")
+    p.add_argument("--bucket-no-upscale", action="store_true",
+                   help="禁止把原图放大进更大的 bucket；小裁切会落到不超过原图尺寸的最近桶。")
+    p.add_argument("--bucket-max-upscale", type=float, default=0.0,
+                   help="允许的最大放大倍率；0=不限。与 bucket_no_upscale 同开时 no_upscale 优先。")
+    p.add_argument("--bucket-report", action="store_true",
+                   help="数据集初始化后打印原图尺寸到 bucket 的分配报告，用于调参。")
     p.add_argument("--min-bucket-reso", type=int, default=512,
                    help="ARB 单维下限（小于此的边长不会作为桶候选；默认 512）")
     p.add_argument("--max-bucket-reso", type=int, default=2048,
@@ -333,6 +351,27 @@ def parse_args():
                    help="ARB 分桶时，每个桶里不足 batch_size 的余数图片是否丢弃。"
                         "默认 False —— 不丢弃，余数桶产生小 batch，保证每张图每 epoch 1 次曝光。"
                         "显式传该 flag 恢复旧行为（丢弃残缺桶）。")
+    p.add_argument("--fit-packed-training", action="store_true",
+                   help="Enable native-first FiT-style packed-token training; default preserves source pixels.")
+    p.add_argument("--fit-max-tokens", type=int, default=65536,
+                   help="Maximum FiT tokens per image before applying the over-budget policy.")
+    p.add_argument("--fit-warn-tokens", type=int, default=16384,
+                   help="Warn when a native FiT image exceeds this token count.")
+    p.add_argument("--fit-min-tokens", type=int, default=16,
+                   help="Diagnostic minimum token count for native FiT training.")
+    p.add_argument("--fit-patch-size", type=int, default=2,
+                   help="FiT token patch size; must match model patch_spatial.")
+    p.add_argument("--fit-vae-downsample", type=int, default=8,
+                   help="VAE spatial downsample factor used to estimate FiT token counts.")
+    p.add_argument("--fit-over-budget-strategy", default="fail",
+                   choices=["fail", "skip", "resize", "crop", "random_resize_crop"],
+                   help="Policy for images above fit_max_tokens; default fail never silently resizes.")
+    p.add_argument("--fit-align-mode", default="pad", choices=["pad", "ceil", "floor"],
+                   help="How native FiT aligns source images to VAE+patch granularity.")
+    p.add_argument("--fit-pack-multiple-images", action="store_true",
+                   help="Pack multiple source images into one sequence; experimental and off by default.")
+    p.add_argument("--fit-max-tokens-per-batch", type=int, default=0,
+                   help="Maximum native FiT tokens per batch; 0 follows fit_max_tokens.")
     p.add_argument("--max-img-h", type=int, default=0,
                    help="RoPE 位置嵌入支持的最大单维（latent 单位 = image / 8）。0=自动从 "
                         "max_bucket_reso 推算并兜底到 240。preview3 训练在 240 = 120 patches，"
@@ -902,18 +941,49 @@ def main():
         logger.info(f"将从已有 LoRA 继续训练: {args.resume_lora}")
 
     # 数据集
+    fit_packed_training = bool(getattr(args, "fit_packed_training", False))
+    if fit_packed_training:
+        if bool(getattr(args, "fit_pack_multiple_images", False)):
+            raise RuntimeError("fit_pack_multiple_images is reserved for a later slice; current FiT path uses one image sequence per sample.")
+        fit_required_latent_dim = math.ceil(
+            int(getattr(args, "fit_max_tokens", 65536) or 65536) ** 0.5
+        ) * int(getattr(args, "fit_patch_size", 2) or 2)
+        if max_img_h < fit_required_latent_dim or max_img_w < fit_required_latent_dim:
+            logger.warning(
+                "[FiT] max_img_h/max_img_w=%dx%d latent may be too small for fit_max_tokens=%d. "
+                "A 4096x4096 image with patch=2, vae_downsample=8 needs max_img_h/max_img_w >= 512.",
+                max_img_h,
+                max_img_w,
+                int(getattr(args, "fit_max_tokens", 65536) or 65536),
+            )
+        logger.info(
+            "[FiT] native packed-token training enabled: max_tokens=%d warn_tokens=%d align=%s over_budget=%s",
+            int(getattr(args, "fit_max_tokens", 65536) or 65536),
+            int(getattr(args, "fit_warn_tokens", 16384) or 0),
+            str(getattr(args, "fit_align_mode", "pad") or "pad"),
+            str(getattr(args, "fit_over_budget_strategy", "fail") or "fail"),
+        )
+
     bucket_min_reso = int(getattr(args, "min_bucket_reso", 512) or 512)
     bucket_max_reso = int(getattr(args, "max_bucket_reso", 2048) or 2048)
     bucket_step = int(getattr(args, "bucket_reso_steps", 64) or 64)
+    bucket_base_resos = getattr(args, "bucket_base_resos", None)
     bucket_mgr = BucketManager(
         base_reso=args.resolution,
         min_reso=bucket_min_reso,
         max_reso=bucket_max_reso,
         step=bucket_step,
+        base_resos=bucket_base_resos,
+        min_base_reso=int(getattr(args, "bucket_min_base_reso", 0) or 0),
+        max_base_reso=int(getattr(args, "bucket_max_base_reso", 0) or 0),
+        base_reso_step=int(getattr(args, "bucket_base_reso_steps", 256) or 256),
+        no_upscale=bool(getattr(args, "bucket_no_upscale", False)),
+        max_upscale=float(getattr(args, "bucket_max_upscale", 0.0) or 0.0),
     )
     logger.info(
-        "[BucketManager] base=%d, min=%d, max=%d, step=%d, 桶数=%d",
-        args.resolution, bucket_min_reso, bucket_max_reso, bucket_step,
+        "[BucketManager] bases=%s, min=%d, max=%d, step=%d, no_upscale=%s, max_upscale=%.3g, 桶数=%d",
+        bucket_mgr.base_resos, bucket_min_reso, bucket_max_reso, bucket_step,
+        bucket_mgr.no_upscale, bucket_mgr.max_upscale,
         len(bucket_mgr.buckets),
     )
 
@@ -922,8 +992,10 @@ def main():
     # 并在控制台 emit 一个清楚的错误说明 —— 否则用户会看到一个看起来像随机崩溃
     # 的 AssertionError 出现在 forward 里。
     rope_max_image_dim = max_img_h * 8  # max_img_h 在 latent 单位（已经包含 patch_spatial=2 的余量）
-    bad_buckets = [(bw, bh) for (bw, bh) in bucket_mgr.buckets
-                   if bw > rope_max_image_dim or bh > rope_max_image_dim]
+    bad_buckets = [] if fit_packed_training else [
+        (bw, bh) for (bw, bh) in bucket_mgr.buckets
+        if bw > rope_max_image_dim or bh > rope_max_image_dim
+    ]
     if bad_buckets:
         good = [b for b in bucket_mgr.buckets if b not in bad_buckets]
         if not good:
@@ -941,14 +1013,24 @@ def main():
         )
         bucket_mgr.buckets = good
     base_dataset = ImageDataset(
-        args.data_dir, args.resolution, bucket_mgr,
+        args.data_dir, args.resolution, None if fit_packed_training else bucket_mgr,
         shuffle_caption=args.shuffle_caption,
         keep_tokens=args.keep_tokens,
         flip_augment=args.flip_augment,
         tag_dropout=args.tag_dropout,
         prefer_json=args.prefer_json,
         freq_balanced_dropout_strength=float(getattr(args, "freq_balanced_dropout_strength", 0.0) or 0.0),
+        fit_packed=fit_packed_training,
+        fit_max_tokens=int(getattr(args, "fit_max_tokens", 65536) or 65536),
+        fit_warn_tokens=int(getattr(args, "fit_warn_tokens", 16384) or 0),
+        fit_min_tokens=int(getattr(args, "fit_min_tokens", 16) or 0),
+        fit_patch_size=int(getattr(args, "fit_patch_size", 2) or 2),
+        fit_vae_downsample=int(getattr(args, "fit_vae_downsample", 8) or 8),
+        fit_over_budget_strategy=str(getattr(args, "fit_over_budget_strategy", "fail") or "fail"),
+        fit_align_mode=str(getattr(args, "fit_align_mode", "pad") or "pad"),
     )
+    if bool(getattr(args, "bucket_report", False)):
+        logger.info("\n%s", base_dataset.bucket_report(label="train"))
     dataset = base_dataset
 
     # 正则数据集（Kohya 风格，防过拟合）
@@ -963,21 +1045,33 @@ def main():
             reg_caption = (getattr(args, "reg_caption", "") or "").strip()
             reg_repeats = max(1, int(getattr(args, "reg_repeats", 1)) or 1)
             reg_base = ImageDataset(
-                reg_data_dir, args.resolution, bucket_mgr,
+                reg_data_dir, args.resolution, None if fit_packed_training else bucket_mgr,
                 shuffle_caption=args.shuffle_caption,
                 keep_tokens=args.keep_tokens,
                 flip_augment=args.flip_augment,
                 tag_dropout=0.0,  # 正则集通常不用 dropout
                 prefer_json=args.prefer_json,
                 caption_override=reg_caption if reg_caption else None,
+                fit_packed=fit_packed_training,
+                fit_max_tokens=int(getattr(args, "fit_max_tokens", 65536) or 65536),
+                fit_warn_tokens=int(getattr(args, "fit_warn_tokens", 16384) or 0),
+                fit_min_tokens=int(getattr(args, "fit_min_tokens", 16) or 0),
+                fit_patch_size=int(getattr(args, "fit_patch_size", 2) or 2),
+                fit_vae_downsample=int(getattr(args, "fit_vae_downsample", 8) or 8),
+                fit_over_budget_strategy=str(getattr(args, "fit_over_budget_strategy", "fail") or "fail"),
+                fit_align_mode=str(getattr(args, "fit_align_mode", "pad") or "pad"),
                 freq_balanced_dropout_strength=0.0,  # 正则集不参与频率均衡
             )
             reg_dataset = reg_base
+            if bool(getattr(args, "bucket_report", False)):
+                logger.info("\n%s", reg_base.bucket_report(label="reg"))
             cap_preview = f", caption=\"{reg_caption[:50]}{'...' if len(reg_caption) > 50 else ''}\"" if reg_caption else ""
             logger.info(f"正则数据集: {reg_data_dir} ({len(reg_base)} 张, repeats={reg_repeats}){cap_preview}")
 
     # 缓存 VAE latents（在 repeat 之前）
     use_cached = getattr(args, "cache_latents", False)
+    if fit_packed_training and use_cached:
+        raise RuntimeError("fit_packed_training currently requires cache_latents=false so pixel masks stay available.")
     if use_cached and bool(getattr(args, "flip_augment", False)):
         # flip_augment 在 ImageDataset.__getitem__ 中作用于像素图像；启用 cache_latents 后，
         # 每张图只在首次缓存时调用一次 __getitem__，是否 flip 在那一刻被随机决定并冻结。
@@ -1042,7 +1136,26 @@ def main():
             "Sample-window accumulation: native batch_size<=%d, effective_batch_size=%d",
             int(args.batch_size), _effective_batch_size,
         )
-    if use_cached:
+    if fit_packed_training:
+        if int(getattr(args, "effective_batch_size", 0) or 0) > 0:
+            raise RuntimeError("fit_packed_training currently uses token-based batches; effective_batch_size sample-window accumulation is not supported yet.")
+        max_tokens_per_batch = int(getattr(args, "fit_max_tokens_per_batch", 0) or 0)
+        if max_tokens_per_batch <= 0:
+            max_tokens_per_batch = int(getattr(args, "fit_max_tokens", 65536) or 65536)
+        batch_sampler = FitTokenBatchSampler(
+            dataset,
+            batch_size=args.batch_size,
+            max_tokens_per_batch=max_tokens_per_batch,
+            shuffle=True,
+            seed=getattr(args, "seed", 42),
+        )
+        dataloader = DataLoader(
+            dataset, batch_sampler=batch_sampler,
+            collate_fn=collate_fn_fit_packed,
+            num_workers=args.num_workers,
+            **_loader_kwargs,
+        )
+    elif use_cached:
         batch_sampler = BucketBatchSampler(
             dataset, batch_size=args.batch_size,
             drop_last=_bucket_drop_last, shuffle=True,
@@ -1095,6 +1208,8 @@ def main():
     # ★ 例外：若启用了 perceptual loss，训练主循环每步都要 vae.model.decode，offload
     #   到 CPU 会让每步都 swap，巨慢。这种情况下 VAE 必须常驻 GPU。
     aux_cfg = build_aux_loss_config(args)
+    if fit_packed_training and aux_cfg.any_enabled:
+        raise RuntimeError("fit_packed_training currently supports the main masked token objective only; disable aux losses for this path.")
     vae_offloaded_to_cpu = False
     keep_vae_on_gpu = bool(getattr(args, "keep_vae_on_gpu", False))
     if use_cached and keep_vae_on_gpu:
@@ -1229,7 +1344,7 @@ def main():
                 effective_batch_size=effective_batch_size,
             )
         else:
-            steps_per_epoch = len(dataloader) // args.grad_accum
+            steps_per_epoch = (len(dataloader) + max(1, args.grad_accum) - 1) // max(1, args.grad_accum)
     except Exception:
         steps_per_epoch = None
 
@@ -1653,10 +1768,13 @@ def main():
             # 获取 latents（缓存模式或实时编码）。
             # ★ 用 non_blocking=True 配合 DataLoader pin_memory，让 H2D 拷贝与下个 batch overlap。
             _non_blk = bool(_loader_kwargs.get("pin_memory", False))
+            pixel_mask = None
             if use_cached:
                 latents = batch["latents"].to(device, dtype=dtype, non_blocking=_non_blk)
             else:
                 pixels = batch["pixel_values"].to(device, dtype=dtype, non_blocking=_non_blk)
+                if fit_packed_training:
+                    pixel_mask = batch["pixel_mask"].to(device, dtype=torch.float32, non_blocking=_non_blk)
                 with torch.no_grad():
                     pixels_5d = pixels.unsqueeze(2)
                     # VAE 权重已是 bf16；与 _build_cache / roundtrip 自检保持一致，
@@ -1705,15 +1823,25 @@ def main():
             noisy = (1 - t_exp) * latents + t_exp * noise
             target = noise - latents
 
+            latent_mask = None
+            if fit_packed_training:
+                latent_mask = F.interpolate(
+                    pixel_mask.float(),
+                    size=latents.shape[-2:],
+                    mode="nearest",
+                )
+
             # 前向
             # ★ pad_mask 是全零张量，每步都 zeros 分配 → ARB 多 bucket 时
             # 频繁触发 cudaMalloc/cudaFree。改成 by-shape cache，相同 shape 复用同一张量
             # （forward 内不修改它，只是把它当 attention mask 的占位）。
-            _pad_key = (int(bs), 1, int(latents.shape[-2]), int(latents.shape[-1]))
-            pad_mask = _pad_mask_cache.get(_pad_key)
-            if pad_mask is None or pad_mask.device != latents.device or pad_mask.dtype != dtype:
-                pad_mask = torch.zeros(*_pad_key, device=device, dtype=dtype)
-                _pad_mask_cache[_pad_key] = pad_mask
+            pad_mask = None
+            if not fit_packed_training:
+                _pad_key = (int(bs), 1, int(latents.shape[-2]), int(latents.shape[-1]))
+                pad_mask = _pad_mask_cache.get(_pad_key)
+                if pad_mask is None or pad_mask.device != latents.device or pad_mask.dtype != dtype:
+                    pad_mask = torch.zeros(*_pad_key, device=device, dtype=dtype)
+                    _pad_mask_cache[_pad_key] = pad_mask
             # T-LoRA: 把当前 batch 的 timestep 写到每个注入的 LoRA adapter，让其在 forward
             # 内按 r(t) 应用 rank mask；其它 variant 该调用是空操作。完成后 reset 避免
             # 跨 step 残留（采样 / eval / 其它前向不应受影响）。
@@ -1724,19 +1852,50 @@ def main():
             # 分支会变，autograd 图保存的张量数对不上（torch.utils.checkpoint.CheckpointError）。
             # reset 已移到 backward 之后，以及 NaN-loss continue 路径之前。
             with torch.autocast("cuda", dtype=dtype):
-                pred = forward_with_optional_checkpoint(
-                    model, noisy, t.view(-1, 1), cross, pad_mask,
-                    use_checkpoint=args.grad_checkpoint
-                )
-                # ★ 损失始终 fp32 计算（per-sample，便于按 t 加权）
-                per_sample = per_sample_loss(
-                    pred,
-                    target,
-                    loss_type=objective_cfg.loss.loss_type,
-                    huber_c=objective_cfg.loss.huber_c,
-                    huber_schedule=objective_cfg.loss.huber_schedule,
-                    t=t.float(),
-                )
+                if fit_packed_training:
+                    noisy_tokens, fit_grid, fit_mask, fit_size = model.patchify_latents_to_tokens(noisy, latent_mask)
+                    target_tokens, _target_grid, _target_mask, _target_size = model.patchify_latents_to_tokens(target, latent_mask)
+                    if bool(getattr(args, "grad_checkpoint", False)):
+                        pred = checkpoint(
+                            model.forward_packed_tokens,
+                            noisy_tokens,
+                            t.view(-1, 1),
+                            cross,
+                            fit_grid,
+                            fit_mask,
+                            fit_size,
+                            use_reentrant=False,
+                        )
+                    else:
+                        pred = model.forward_packed_tokens(
+                            noisy_tokens,
+                            t.view(-1, 1),
+                            cross,
+                            fit_grid,
+                            fit_mask,
+                            fit_size,
+                        )
+                    target = target_tokens
+                    per_sample = masked_token_loss(
+                        pred,
+                        target,
+                        fit_mask,
+                        loss_type=objective_cfg.loss.loss_type,
+                        huber_c=objective_cfg.loss.huber_c,
+                    )
+                else:
+                    pred = forward_with_optional_checkpoint(
+                        model, noisy, t.view(-1, 1), cross, pad_mask,
+                        use_checkpoint=args.grad_checkpoint
+                    )
+                    per_sample = per_sample_loss(
+                        pred,
+                        target,
+                        loss_type=objective_cfg.loss.loss_type,
+                        huber_c=objective_cfg.loss.huber_c,
+                        huber_schedule=objective_cfg.loss.huber_schedule,
+                        t=t.float(),
+                    )
 
                 if sample_accum_enabled:
                     main_loss_per_sample = apply_loss_weighting_per_sample(
@@ -1885,7 +2044,9 @@ def main():
                     del aux_total
                 continue
 
-            if adaptive_ts.enabled:
+            if adaptive_ts.enabled and fit_packed_training:
+                adaptive_ts.update(t.float(), per_sample.detach().float())
+            elif adaptive_ts.enabled:
                 adaptive_signal = adaptive_timestep_metric_signal(
                     per_sample,
                     pred,
@@ -1910,7 +2071,7 @@ def main():
             else:
                 loss_to_backward = loss / args.grad_accum
                 legacy_accum_samples += int(bs)
-                step_boundary = (batch_idx + 1) % args.grad_accum == 0
+                step_boundary = (batch_idx + 1) % args.grad_accum == 0 or (batch_idx + 1) == len(dataloader)
             loss_to_backward.backward()
             # T-LoRA: backward 完成后才能 reset，否则 grad checkpoint recompute 会看到
             # current_t=None，与原 forward 走的分支不一致 → CheckpointError

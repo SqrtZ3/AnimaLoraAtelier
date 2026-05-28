@@ -21,6 +21,16 @@ data_dir: "./dataset"                # 数据集目录
 resolution: 1024                     # 训练分辨率
 repeats: 1                           # 数据重复次数（小数据集增加）
 
+# 多级 ARB 分桶。bucket_base_resos 显式列表优先；留空且 bucket_max_base_reso>0 时自动展开。
+# 例如 min=512/max=2048/step=256 会生成 [512,768,1024,1280,1536,1792,2048]。
+bucket_base_resos: []
+bucket_min_base_reso: 0              # 0=从 min_bucket_reso 开始；自动展开时也可显式设 512
+bucket_max_base_reso: 0              # 0=禁用自动展开；大图多时可试 2048/2560
+bucket_base_reso_steps: 256
+bucket_no_upscale: false             # true 时不把小图强行放大到更大的 bucket
+bucket_max_upscale: 0.0              # 0=不限；如 1.25 表示最多放大 25%
+bucket_report: false                 # true 时启动时打印原图尺寸 -> bucket 的分配报告
+
 # 正则数据集（Kohya 风格，防过拟合）
 # reg_data_dir: ""                   # 正则图目录（通用 1girl 等，不含角色）
 # reg_repeats: 1                     # 正则集每张图重复次数（通常 1）

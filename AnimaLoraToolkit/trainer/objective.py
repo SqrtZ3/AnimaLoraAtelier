@@ -468,6 +468,42 @@ def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "
     return loss_map.view(loss_map.shape[0], -1).mean(dim=1)
 
 
+def masked_token_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
+                      loss_type: str = "mse", huber_c: float = 0.1) -> torch.Tensor:
+    """Return per-sample token loss, ignoring padded FiT tokens.
+
+    pred/target: (B, N, C)
+    mask: (B, N), with non-zero entries marking valid tokens.
+    """
+    pred_f = pred.float()
+    target_f = target.float()
+    loss_type = (loss_type or "mse").lower()
+    if loss_type in ("mse", "l2"):
+        loss_map = F.mse_loss(pred_f, target_f, reduction="none")
+    elif loss_type in ("l1", "mae"):
+        loss_map = F.l1_loss(pred_f, target_f, reduction="none")
+    elif loss_type in ("huber", "smooth_l1"):
+        err = (pred_f - target_f).abs()
+        c = max(float(huber_c or 0.1), 1e-8)
+        if loss_type == "huber":
+            loss_map = torch.where(err <= c, 0.5 * err * err / c, err - 0.5 * c)
+        else:
+            loss_map = torch.where(err < c, 0.5 * err * err / c, err - 0.5 * c)
+    else:
+        logger.warning(f"Unknown loss_type={loss_type!r}; falling back to mse")
+        loss_map = F.mse_loss(pred_f, target_f, reduction="none")
+
+    token_loss = loss_map.mean(dim=-1)
+    valid = (mask.float() > 0).to(token_loss.dtype)
+    weighted = token_loss * valid
+    denom = valid.sum(dim=1).clamp(min=1.0)
+    out = weighted.sum(dim=1) / denom
+    empty = valid.sum(dim=1) <= 0
+    if bool(empty.any()):
+        out = out.masked_fill(empty, 0.0)
+    return out
+
+
 def per_sample_highfreq_loss(pred: torch.Tensor, target: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
     """Return per-sample high-frequency residual energy for latent tensors.
 
@@ -569,7 +605,7 @@ def compute_loss_weight(t: torch.Tensor, scheme: str = "none", min_snr_gamma: fl
         hi = float(detail_inv_t_max or 5.0)
         if lo > hi:
             lo, hi = hi, lo
-        w = (1.0 / t_c).clamp(min=lo, max=hi)
+        w = (1.0 / t.clamp(min=eps)).clamp(min=lo, max=hi)
     elif scheme == "cosmap":
         bot = 1 - 2 * t_c + 2 * t_c ** 2
         w = 2.0 / (math.pi * bot)

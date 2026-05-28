@@ -41,8 +41,30 @@ reg_repeats: 1
 # 正则集统一 caption。留空则读取正则图自己的 caption。
 reg_caption: ""
 
-# 训练分辨率。Anima 原生 1024；调高吃显存且慢，调低可能损失细节/光照层次。
+# 训练分辨率。默认也是 ARB 的主 base 边长。Anima 原生 1024；调高吃显存且慢，调低可能损失细节/光照层次。
 resolution: 1024
+
+# 多级 ARB base 边长。显式列表优先；例如 [512, 768, 1024] 会生成三档面积层。
+# 留空/[] 且 bucket_max_base_reso=0 时保持旧行为：只围绕 resolution² 生成宽高比桶。
+# 留空/[] 且 bucket_max_base_reso>0 时自动展开 base 范围。
+bucket_base_resos: []
+
+# 自动 base 范围。例：min=512/max=2048/step=256 -> [512,768,1024,1280,1536,1792,2048]。
+# 显式 bucket_base_resos 非空时这三个值会被忽略。
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+
+# 禁止上采样进桶。true 时，600x600 不会被拉到 768/1024，而会选择不超过原图尺寸的最近桶
+# （受 min_bucket_reso / bucket_reso_steps 约束，通常落到 512）。适合细节补充集。
+bucket_no_upscale: false
+
+# 允许的最大上采样倍率。0=不限；1.25 表示最多放大 25%。
+# 若 bucket_no_upscale=true，则等价于最大 1.0，优先生效。
+bucket_max_upscale: 0.0
+
+# 打印原图尺寸 -> bucket 的分配报告，方便先看 4K/小裁切实际落在哪些桶。
+bucket_report: false
 
 # 全局重复次数。调大等价增加每 epoch 步数；小数据集可用，但太大会让 epoch 统计失真。
 repeats: 1

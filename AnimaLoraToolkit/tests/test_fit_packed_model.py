@@ -9,11 +9,13 @@ sys.path.insert(0, str(ROOT))
 try:
     import torch
     from models.anima_modeling_core import GeneralDIT
+    from models.anima_modeling import Anima as TrainingAnima
     HAS_TORCH = True
 except ModuleNotFoundError:
     HAS_TORCH = False
     torch = None
     GeneralDIT = None
+    TrainingAnima = None
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is required for model tests")
@@ -35,6 +37,42 @@ class PackedTokenModelTests(unittest.TestCase):
             crossattn_emb_channels=48,
             pos_emb_cls="rope3d",
         )
+
+    def _training_anima_model(self):
+        return TrainingAnima(
+            max_img_h=16,
+            max_img_w=16,
+            max_frames=1,
+            in_channels=16,
+            out_channels=16,
+            patch_spatial=2,
+            patch_temporal=1,
+            concat_padding_mask=False,
+            model_channels=48,
+            num_blocks=1,
+            num_heads=4,
+            mlp_ratio=2.0,
+            crossattn_emb_channels=48,
+            pos_emb_cls="rope3d",
+        )
+
+    def test_training_anima_exposes_packed_token_helpers(self):
+        model = self._training_anima_model()
+        latents = torch.arange(1 * 16 * 1 * 4 * 4, dtype=torch.float32).view(1, 16, 1, 4, 4)
+
+        tokens, grid, mask, size = model.patchify_latents_to_tokens(latents)
+        restored = model.unpatchify_tokens(tokens, size)
+        out = model.forward_packed_tokens(
+            tokens,
+            torch.tensor([[0.5]]),
+            torch.randn(1, 512, 48),
+            grid,
+            mask,
+            size,
+        )
+
+        self.assertTrue(torch.equal(restored, latents))
+        self.assertEqual(tuple(out.shape), tuple(tokens.shape))
 
     def test_patchify_unpatchify_round_trip(self):
         model = self._model()

@@ -5,7 +5,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from models.cosmos_predict2_modeling import MiniTrainDIT
+from models.anima_modeling_core import Anima as CoreAnima
+from models.anima_modeling_core import MiniTrainDIT
 
 
 def rotate_half(x):
@@ -195,7 +196,7 @@ class LLMAdapter(nn.Module):
         return self.norm(self.out_proj(x))
 
 
-class Anima(MiniTrainDIT):
+class Anima(CoreAnima):
     """
     Anima model - extends MiniTrainDIT (Cosmos-Predict2 base) with an LLMAdapter
     for processing dual text encoder outputs (Qwen3 + T5).

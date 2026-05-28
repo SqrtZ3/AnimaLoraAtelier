@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .aux_losses import AuxLossConfig, build_aux_loss_config
 
@@ -729,8 +730,6 @@ def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_m
     """
     if not use_checkpoint:
         return model(latents, timesteps, cross, padding_mask=padding_mask)
-    from torch.utils.checkpoint import checkpoint
-
     x_B_T_H_W_D, rope_emb, extra_pos_emb = model.prepare_embedded_sequence(
         latents, fps=None, padding_mask=padding_mask,
     )
@@ -757,3 +756,59 @@ def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_m
 
     x_B_T_H_W_O = model.final_layer(x_B_T_H_W_D, t_embedding, adaln_lora_B_T_3D=adaln_lora)
     return model.unpatchify(x_B_T_H_W_O)
+
+
+def forward_packed_with_optional_checkpoint(
+    model,
+    tokens,
+    timesteps,
+    cross,
+    grid,
+    mask,
+    size,
+    use_checkpoint=False,
+):
+    """Forward packed FiT tokens with the same per-block checkpoint strategy.
+
+    A whole-model checkpoint makes backward recompute the entire packed
+    transformer at once. For long native FiT sequences, keeping the checkpoint
+    boundary at each transformer block is much friendlier to peak VRAM.
+    """
+    if not use_checkpoint:
+        return model.forward_packed_tokens(tokens, timesteps, cross, grid, mask, size)
+
+    del size
+    expected = model.x_embedder.proj[1].in_features
+    if tokens.shape[-1] < expected:
+        tokens = F.pad(tokens, (0, expected - tokens.shape[-1]))
+    elif tokens.shape[-1] > expected:
+        raise ValueError(
+            f"packed tokens have dim={tokens.shape[-1]}, but x_embedder expects {expected}"
+        )
+    x = model.x_embedder.proj[1](tokens)
+
+    if timesteps.ndim == 1:
+        timesteps = timesteps.unsqueeze(1)
+    t_embedding, adaln_lora = model.t_embedder(timesteps)
+    t_embedding = model.t_embedding_norm(t_embedding)
+
+    model.affline_scale_log_info = {"t_embedding_B_T_D": t_embedding.detach()}
+    model.affline_emb = t_embedding
+    model.crossattn_emb = cross
+
+    rope_emb = model._packed_rope_from_grid(grid)
+    for block in model.blocks:
+        def custom_forward(x_in, blk=block):
+            return blk.forward_tokens(
+                x_in,
+                t_embedding,
+                cross,
+                rope_emb_L_1_1_D=rope_emb,
+                token_mask=mask,
+                adaln_lora_B_T_3D=adaln_lora,
+            )
+
+        x = checkpoint(custom_forward, x, use_reentrant=False)
+
+    out = model.final_layer.forward_tokens(x, t_embedding, adaln_lora_B_T_3D=adaln_lora)
+    return out * mask.to(dtype=out.dtype).unsqueeze(-1)

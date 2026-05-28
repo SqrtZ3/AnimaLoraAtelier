@@ -925,11 +925,9 @@ class Block(nn.Module):
             bool_mask = token_mask.to(dtype=torch.bool)
             if not bool(bool_mask.any(dim=1).all()):
                 raise ValueError("packed FiT sequence contains a sample with no valid tokens")
-            query_valid = bool_mask[:, None, :, None]
             key_valid = bool_mask[:, None, None, :]
             attn_mask = torch.zeros_like(key_valid, dtype=x_B_N_D.dtype)
             attn_mask = attn_mask.masked_fill(~key_valid, -1.0e4)
-            attn_mask = attn_mask.masked_fill(~query_valid, 0.0)
 
         normalized_x_B_N_D = _fn(
             x_B_N_D,

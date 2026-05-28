@@ -42,5 +42,66 @@ class MaskedTokenLossTests(unittest.TestCase):
         self.assertEqual(float(loss.item()), 0.0)
 
 
+@unittest.skipUnless(HAS_TORCH, "torch is required for objective tests")
+class PackedForwardCheckpointTests(unittest.TestCase):
+    def test_forward_packed_with_optional_checkpoint_checkpoints_each_block(self):
+        from trainer import objective
+        from trainer.objective import forward_packed_with_optional_checkpoint
+
+        calls = []
+        original_checkpoint = objective.checkpoint
+
+        def fake_checkpoint(fn, x, use_reentrant=False):
+            calls.append(use_reentrant)
+            return fn(x)
+
+        class Block(torch.nn.Module):
+            def __init__(self, value):
+                super().__init__()
+                self.value = value
+
+            def forward_tokens(self, x, *args, **kwargs):
+                return x + self.value
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = torch.nn.ModuleList([Block(1.0), Block(2.0), Block(3.0)])
+                embed = torch.nn.Linear(4, 4, bias=False)
+                torch.nn.init.eye_(embed.weight)
+                self.x_embedder = types.SimpleNamespace(proj=[None, embed])
+                self.t_embedder = lambda timesteps: (torch.zeros(timesteps.shape[0], 1, 4), None)
+                self.t_embedding_norm = torch.nn.Identity()
+                self.final_layer = types.SimpleNamespace(
+                    forward_tokens=lambda x, emb, adaln_lora_B_T_3D=None: x
+                )
+
+            def _packed_rope_from_grid(self, grid):
+                return None
+
+            def forward_packed_tokens(self, tokens, timesteps, cross, grid, mask, size):
+                raise AssertionError("whole packed forward should not be checkpointed")
+
+        try:
+            objective.checkpoint = fake_checkpoint
+            model = Model()
+            tokens = torch.zeros(1, 2, 4)
+            out = forward_packed_with_optional_checkpoint(
+                model,
+                tokens,
+                torch.tensor([[0.5]]),
+                torch.zeros(1, 1, 4),
+                torch.zeros(1, 2, 2, dtype=torch.long),
+                torch.ones(1, 2),
+                torch.tensor([[[1, 2]]], dtype=torch.int32),
+                use_checkpoint=True,
+            )
+        finally:
+            objective.checkpoint = original_checkpoint
+
+        self.assertEqual(calls, [False, False, False])
+        self.assertTrue(torch.equal(out, torch.full_like(tokens, 6.0)))
+
+
 if __name__ == "__main__":
     unittest.main()

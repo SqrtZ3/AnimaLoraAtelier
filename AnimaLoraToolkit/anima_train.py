@@ -29,7 +29,6 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset
 
 # 尝试添加当前目录到路径，确保能找到 utils
@@ -238,6 +237,7 @@ from trainer.objective import (
     apply_loss_weighting_per_sample,
     compute_grad_norm,
     forward_with_optional_checkpoint,
+    forward_packed_with_optional_checkpoint,
     masked_token_loss,
 )
 from trainer.lora import LoRALayer, LoKrLayer, LoRALinear, LoRAInjector
@@ -1867,26 +1867,16 @@ def main():
                 if fit_packed_training:
                     noisy_tokens, fit_grid, fit_mask, fit_size = model.patchify_latents_to_tokens(noisy, latent_mask)
                     target_tokens, _target_grid, _target_mask, _target_size = model.patchify_latents_to_tokens(target, latent_mask)
-                    if bool(getattr(args, "grad_checkpoint", False)):
-                        pred = checkpoint(
-                            model.forward_packed_tokens,
-                            noisy_tokens,
-                            t.view(-1, 1),
-                            cross,
-                            fit_grid,
-                            fit_mask,
-                            fit_size,
-                            use_reentrant=False,
-                        )
-                    else:
-                        pred = model.forward_packed_tokens(
-                            noisy_tokens,
-                            t.view(-1, 1),
-                            cross,
-                            fit_grid,
-                            fit_mask,
-                            fit_size,
-                        )
+                    pred = forward_packed_with_optional_checkpoint(
+                        model,
+                        noisy_tokens,
+                        t.view(-1, 1),
+                        cross,
+                        fit_grid,
+                        fit_mask,
+                        fit_size,
+                        use_checkpoint=bool(getattr(args, "grad_checkpoint", False)),
+                    )
                     target = target_tokens
                     per_sample = masked_token_loss(
                         pred,

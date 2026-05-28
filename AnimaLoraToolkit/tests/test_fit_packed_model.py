@@ -96,6 +96,51 @@ class PackedTokenModelTests(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (1, 4, 64))
         self.assertTrue(torch.allclose(out[:, 3], torch.zeros_like(out[:, 3]), atol=1e-6))
 
+    def test_forward_packed_tokens_uses_key_only_padding_mask(self):
+        model = self._model()
+        captured = {}
+
+        def fake_attention(q, k, v, attn_mask=None):
+            captured["shape"] = tuple(attn_mask.shape)
+            return torch.zeros(q.shape[0], q.shape[1], q.shape[2] * q.shape[3], device=q.device, dtype=q.dtype)
+
+        model.blocks[0].self_attn.attn_op = fake_attention
+        tokens = torch.randn(1, 4, 64)
+        grid = torch.tensor([[[0, 0, 1, 1], [0, 1, 0, 1]]])
+        mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.float32)
+        size = torch.tensor([[[2, 2]]], dtype=torch.int32)
+        cross = torch.randn(1, 512, 48)
+
+        model.forward_packed_tokens(tokens, torch.tensor([[0.5]]), cross, grid, mask, size)
+
+        self.assertEqual(captured["shape"], (1, 1, 1, 4))
+
+    def test_packed_checkpoint_helper_matches_model_forward(self):
+        from trainer.objective import forward_packed_with_optional_checkpoint
+
+        torch.manual_seed(123)
+        model = self._model()
+        tokens = torch.randn(1, 4, 64)
+        grid = torch.tensor([[[0, 0, 1, 1], [0, 1, 0, 1]]])
+        mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.float32)
+        size = torch.tensor([[[2, 2]]], dtype=torch.int32)
+        cross = torch.randn(1, 512, 48)
+        timesteps = torch.tensor([[0.5]])
+
+        expected = model.forward_packed_tokens(tokens, timesteps, cross, grid, mask, size)
+        actual = forward_packed_with_optional_checkpoint(
+            model,
+            tokens,
+            timesteps,
+            cross,
+            grid,
+            mask,
+            size,
+            use_checkpoint=True,
+        )
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+
     def test_patchify_mask_keeps_partial_source_edge_tokens(self):
         model = self._model()
         latents = torch.zeros(1, 16, 1, 4, 4)

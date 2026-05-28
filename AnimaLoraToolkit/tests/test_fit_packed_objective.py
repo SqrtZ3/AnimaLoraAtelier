@@ -41,6 +41,52 @@ class MaskedTokenLossTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss).all())
         self.assertEqual(float(loss.item()), 0.0)
 
+    def test_masked_huber_uses_same_scale_as_grid_huber(self):
+        from trainer.objective import masked_token_loss, per_sample_loss
+
+        pred_tokens = torch.ones(1, 1, 1)
+        target_tokens = torch.zeros_like(pred_tokens)
+        mask = torch.ones(1, 1)
+        pred_grid = torch.ones(1, 1, 1, 1, 1)
+        target_grid = torch.zeros_like(pred_grid)
+
+        token_loss = masked_token_loss(
+            pred_tokens,
+            target_tokens,
+            mask,
+            loss_type="huber",
+            huber_c=0.2,
+        )
+        grid_loss = per_sample_loss(
+            pred_grid,
+            target_grid,
+            loss_type="huber",
+            huber_c=0.2,
+            huber_schedule="constant",
+        )
+
+        self.assertTrue(torch.allclose(token_loss, grid_loss))
+
+    def test_masked_huber_applies_timestep_schedule(self):
+        from trainer.objective import masked_token_loss
+
+        pred = torch.ones(2, 1, 1)
+        target = torch.zeros_like(pred)
+        mask = torch.ones(2, 1)
+        t = torch.tensor([0.2, 0.8])
+
+        loss = masked_token_loss(
+            pred,
+            target,
+            mask,
+            loss_type="huber",
+            huber_c=0.2,
+            huber_schedule="snr",
+            t=t,
+        )
+
+        self.assertGreater(float(loss[0]), float(loss[1]))
+
 
 @unittest.skipUnless(HAS_TORCH, "torch is required for objective tests")
 class PackedForwardCheckpointTests(unittest.TestCase):

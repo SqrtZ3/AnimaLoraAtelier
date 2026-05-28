@@ -470,7 +470,9 @@ def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "
 
 
 def masked_token_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
-                      loss_type: str = "mse", huber_c: float = 0.1) -> torch.Tensor:
+                      loss_type: str = "mse", huber_c: float = 0.1,
+                      huber_schedule: str = "constant",
+                      t: torch.Tensor | None = None) -> torch.Tensor:
     """Return per-sample token loss, ignoring padded FiT tokens.
 
     pred/target: (B, N, C)
@@ -485,11 +487,26 @@ def masked_token_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tens
         loss_map = F.l1_loss(pred_f, target_f, reduction="none")
     elif loss_type in ("huber", "smooth_l1"):
         err = (pred_f - target_f).abs()
-        c = max(float(huber_c or 0.1), 1e-8)
-        if loss_type == "huber":
-            loss_map = torch.where(err <= c, 0.5 * err * err / c, err - 0.5 * c)
+        delta = _huber_delta_for_t(t, huber_c, huber_schedule)
+        if not torch.is_tensor(delta):
+            delta_t = torch.tensor(float(delta), device=err.device, dtype=err.dtype)
         else:
-            loss_map = torch.where(err < c, 0.5 * err * err / c, err - 0.5 * c)
+            delta_t = delta.to(device=err.device, dtype=err.dtype)
+            if delta_t.ndim > 1:
+                delta_t = delta_t.reshape(delta_t.shape[0], -1).mean(dim=1)
+            delta_t = delta_t.view(-1, 1, 1)
+        if loss_type == "huber":
+            loss_map = torch.where(
+                err < delta_t,
+                0.5 * err.square(),
+                delta_t * (err - 0.5 * delta_t),
+            )
+        else:
+            loss_map = torch.where(
+                err < delta_t,
+                0.5 * err.square() / delta_t,
+                err - 0.5 * delta_t,
+            )
     else:
         logger.warning(f"Unknown loss_type={loss_type!r}; falling back to mse")
         loss_map = F.mse_loss(pred_f, target_f, reduction="none")

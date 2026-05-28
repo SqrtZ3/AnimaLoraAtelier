@@ -1884,6 +1884,8 @@ def main():
                         fit_mask,
                         loss_type=objective_cfg.loss.loss_type,
                         huber_c=objective_cfg.loss.huber_c,
+                        huber_schedule=objective_cfg.loss.huber_schedule,
+                        t=t.float(),
                     )
                 else:
                     pred = forward_with_optional_checkpoint(

@@ -90,6 +90,9 @@ class NativeFitSizingTests(unittest.TestCase):
             "fit_over_budget_strategy": "fail",
             "fit_align_mode": "pad",
             "fit_max_tokens_per_batch": 70000,
+            "alpha_handling": "mask",
+            "alpha_background": "neutral",
+            "alpha_threshold": 0.5,
         })
 
         self.assertTrue(args.fit_packed_training)
@@ -98,6 +101,9 @@ class NativeFitSizingTests(unittest.TestCase):
         self.assertEqual(args.fit_over_budget_strategy, "fail")
         self.assertEqual(args.fit_align_mode, "pad")
         self.assertEqual(args.fit_max_tokens_per_batch, 70000)
+        self.assertEqual(args.alpha_handling, "mask")
+        self.assertEqual(args.alpha_background, "neutral")
+        self.assertEqual(args.alpha_threshold, 0.5)
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is required for collate/sampler tests")
@@ -168,6 +174,42 @@ class NativeFitBatchingTests(unittest.TestCase):
             self.assertEqual(float(item["pixel_mask"][:, :19, :17].sum()), 19 * 17)
             self.assertEqual(float(item["pixel_mask"][:, 19:, :].sum()), 0.0)
             self.assertEqual(item["token_count"], 4)
+
+    def test_image_dataset_fit_mode_uses_alpha_as_training_mask_for_webp(self):
+        import tempfile
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            image_path = root / "alpha.webp"
+            img = Image.new("RGBA", (17, 19), (255, 0, 0, 255))
+            for y in range(19):
+                for x in range(8, 17):
+                    img.putpixel((x, y), (0, 0, 0, 0))
+            try:
+                img.save(image_path, "WEBP", lossless=True)
+            except Exception as exc:
+                self.skipTest(f"Pillow WebP alpha support is unavailable: {exc}")
+            image_path.with_suffix(".txt").write_text("transparent character", encoding="utf-8")
+
+            dataset = data_module.ImageDataset(
+                root,
+                fit_packed=True,
+                fit_max_tokens=16,
+                fit_patch_size=2,
+                fit_vae_downsample=8,
+                alpha_handling="mask",
+                alpha_background="neutral",
+                alpha_threshold=0.5,
+            )
+
+            item = dataset[0]
+            mask = item["pixel_mask"][0]
+
+            self.assertEqual(tuple(item["pixel_values"].shape), (3, 32, 32))
+            self.assertEqual(float(mask[:19, :8].sum()), 19 * 8)
+            self.assertEqual(float(mask[:19, 8:17].sum()), 0.0)
+            self.assertEqual(float(mask[19:, :].sum()), 0.0)
 
 
 if __name__ == "__main__":

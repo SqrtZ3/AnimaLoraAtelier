@@ -372,6 +372,12 @@ def parse_args():
                    help="Pack multiple source images into one sequence; experimental and off by default.")
     p.add_argument("--fit-max-tokens-per-batch", type=int, default=0,
                    help="Maximum native FiT tokens per batch; 0 follows fit_max_tokens.")
+    p.add_argument("--alpha-handling", default="none", choices=["none", "mask"],
+                   help="How to handle transparent source pixels. mask excludes alpha-transparent pixels from FiT supervision.")
+    p.add_argument("--alpha-background", default="neutral", choices=["neutral", "white", "black"],
+                   help="RGB matte used before VAE encoding when alpha_handling=mask.")
+    p.add_argument("--alpha-threshold", type=float, default=0.01,
+                   help="Alpha values at or below this normalized threshold are excluded when alpha_handling=mask.")
     p.add_argument("--max-img-h", type=int, default=0,
                    help="RoPE 位置嵌入支持的最大单维（latent 单位 = image / 8）。0=自动从 "
                         "max_bucket_reso 推算并兜底到 240。preview3 训练在 240 = 120 patches，"
@@ -1028,6 +1034,9 @@ def main():
         fit_vae_downsample=int(getattr(args, "fit_vae_downsample", 8) or 8),
         fit_over_budget_strategy=str(getattr(args, "fit_over_budget_strategy", "fail") or "fail"),
         fit_align_mode=str(getattr(args, "fit_align_mode", "pad") or "pad"),
+        alpha_handling=str(getattr(args, "alpha_handling", "none") or "none"),
+        alpha_background=str(getattr(args, "alpha_background", "neutral") or "neutral"),
+        alpha_threshold=float(getattr(args, "alpha_threshold", 0.01)),
     )
     if bool(getattr(args, "bucket_report", False)):
         logger.info("\n%s", base_dataset.bucket_report(label="train"))
@@ -1060,6 +1069,9 @@ def main():
                 fit_vae_downsample=int(getattr(args, "fit_vae_downsample", 8) or 8),
                 fit_over_budget_strategy=str(getattr(args, "fit_over_budget_strategy", "fail") or "fail"),
                 fit_align_mode=str(getattr(args, "fit_align_mode", "pad") or "pad"),
+                alpha_handling=str(getattr(args, "alpha_handling", "none") or "none"),
+                alpha_background=str(getattr(args, "alpha_background", "neutral") or "neutral"),
+                alpha_threshold=float(getattr(args, "alpha_threshold", 0.01)),
                 freq_balanced_dropout_strength=0.0,  # 正则集不参与频率均衡
             )
             reg_dataset = reg_base

@@ -332,7 +332,9 @@ class ImageDataset(Dataset):
                  fit_packed=False, fit_max_tokens=65536,
                  fit_warn_tokens=16384, fit_min_tokens=16,
                  fit_patch_size=2, fit_vae_downsample=8,
-                 fit_over_budget_strategy="fail", fit_align_mode="pad"):
+                 fit_over_budget_strategy="fail", fit_align_mode="pad",
+                 alpha_handling="none", alpha_background="neutral",
+                 alpha_threshold=0.01):
         self.data_dir = Path(data_dir)
         self.resolution = resolution
         self.bucket_mgr = bucket_mgr
@@ -350,6 +352,9 @@ class ImageDataset(Dataset):
         self.fit_vae_downsample = int(fit_vae_downsample or 8)
         self.fit_over_budget_strategy = str(fit_over_budget_strategy or "fail").lower()
         self.fit_align_mode = str(fit_align_mode or "pad").lower()
+        self.alpha_handling = str(alpha_handling or "none").lower()
+        self.alpha_background = str(alpha_background or "neutral").lower()
+        self.alpha_threshold = float(alpha_threshold if alpha_threshold is not None else 0.01)
         # ★ v5 ② frequency-balanced tag dropout
         # 0 = 关闭；>0 启用。在数据集 init 时统计 tag 频率，对在数据集中过度共现的 tag 额外提高 dropout
         # 概率，强迫模型把"风格"与"高频共现 tag"解耦。完全数据驱动，自动适配任何画师。
@@ -739,11 +744,35 @@ class ImageDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def _alpha_background_rgb(self):
+        if self.alpha_background == "white":
+            return (255, 255, 255)
+        if self.alpha_background == "black":
+            return (0, 0, 0)
+        return (127, 127, 127)
+
+    def _load_rgb_and_alpha_mask(self, image_path):
+        from PIL import Image
+
+        raw = Image.open(image_path)
+        has_alpha = (
+            "A" in raw.getbands()
+            or raw.mode in ("LA", "PA")
+            or raw.info.get("transparency") is not None
+        )
+        if self.alpha_handling == "mask" and has_alpha:
+            rgba = raw.convert("RGBA")
+            rgb = Image.new("RGB", rgba.size, self._alpha_background_rgb())
+            rgb.paste(rgba.convert("RGB"), mask=rgba.getchannel("A"))
+            alpha = rgba.getchannel("A")
+            return rgb, alpha
+        return raw.convert("RGB"), None
+
     def __getitem__(self, idx):
         import numpy as np
         from PIL import Image
         sample = self.samples[idx]
-        img = Image.open(sample["image"]).convert("RGB")
+        img, alpha = self._load_rgb_and_alpha_mask(sample["image"])
 
         caption = None
         if self.caption_override is not None:
@@ -771,6 +800,8 @@ class ImageDataset(Dataset):
 
             if self.fit_align_mode == "floor":
                 img = img.crop((0, 0, min(img.width, plan.width), min(img.height, plan.height)))
+                if alpha is not None:
+                    alpha = alpha.crop((0, 0, min(alpha.width, plan.width), min(alpha.height, plan.height)))
             padded = Image.new("RGB", (plan.width, plan.height), (127, 127, 127))
             padded.paste(img, (0, 0))
 
@@ -780,6 +811,10 @@ class ImageDataset(Dataset):
             valid_h = min(plan.source_height, plan.height)
             valid_w = min(plan.source_width, plan.width)
             mask[:, :valid_h, :valid_w] = 1.0
+            if alpha is not None:
+                alpha_arr = np.array(alpha).astype(np.float32) / 255.0
+                alpha_mask = torch.from_numpy((alpha_arr > self.alpha_threshold).astype(np.float32))
+                mask[:, :valid_h, :valid_w] *= alpha_mask[:valid_h, :valid_w].unsqueeze(0)
             return {
                 "pixel_values": tensor,
                 "pixel_mask": mask,

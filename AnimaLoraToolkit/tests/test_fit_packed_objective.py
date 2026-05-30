@@ -125,6 +125,12 @@ class PackedForwardCheckpointTests(unittest.TestCase):
             def _packed_rope_from_grid(self, grid):
                 return None
 
+            def _output_tokens_to_patch_tokens(self, tokens, size=None):
+                # The real model permutes within-token channels; the fake blocks use a flat
+                # token dim, so an identity passthrough keeps this checkpoint-structure test
+                # focused on per-block checkpointing.
+                return tokens
+
             def forward_packed_tokens(self, tokens, timesteps, cross, grid, mask, size):
                 raise AssertionError("whole packed forward should not be checkpointed")
 

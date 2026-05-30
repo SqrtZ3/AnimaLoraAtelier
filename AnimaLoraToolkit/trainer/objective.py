@@ -794,7 +794,6 @@ def forward_packed_with_optional_checkpoint(
     if not use_checkpoint:
         return model.forward_packed_tokens(tokens, timesteps, cross, grid, mask, size)
 
-    del size
     expected = model.x_embedder.proj[1].in_features
     if tokens.shape[-1] < expected:
         tokens = F.pad(tokens, (0, expected - tokens.shape[-1]))
@@ -828,4 +827,5 @@ def forward_packed_with_optional_checkpoint(
         x = checkpoint(custom_forward, x, use_reentrant=False)
 
     out = model.final_layer.forward_tokens(x, t_embedding, adaln_lora_B_T_3D=adaln_lora)
+    out = model._output_tokens_to_patch_tokens(out, size)
     return out * mask.to(dtype=out.dtype).unsqueeze(-1)

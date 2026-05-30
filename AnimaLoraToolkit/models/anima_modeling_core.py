@@ -1279,6 +1279,31 @@ class MiniTrainDIT(nn.Module):
             c=channels,
         )
 
+    def _output_tokens_to_patch_tokens(
+        self,
+        tokens_B_N_M: torch.Tensor,
+        size_B_1_2: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Reorder final-layer tokens into the ``patchify_latents_to_tokens`` channel layout.
+
+        The final layer emits each token's patch as ``(ph pw pt c)`` — the order that
+        :meth:`unpatchify` folds back into a latent grid — whereas the training targets come
+        from :meth:`patchify_latents_to_tokens` in ``(c pt ph pw)`` order. The two differ only
+        by a permutation *inside* each token; the token positions themselves are untouched. A
+        single ``rearrange`` is therefore exact (verified bit-for-bit against the
+        ``unpatchify`` -> ``patchify_latents_to_tokens`` round trip) while avoiding both the
+        intermediate latent grid and the per-step device->host sync that reading
+        ``size_B_1_2`` would force on CUDA.
+        """
+        del size_B_1_2  # grid shape is implicit in each token; kept only for call-site parity
+        return rearrange(
+            tokens_B_N_M,
+            "b n (ph pw pt c) -> b n (c pt ph pw)",
+            ph=self.patch_spatial,
+            pw=self.patch_spatial,
+            pt=self.patch_temporal,
+        )
+
     def _packed_rope_from_grid(self, grid_B_2_N: torch.Tensor) -> Optional[torch.Tensor]:
         if "rope" not in self.pos_emb_cls.lower():
             return None
@@ -1313,7 +1338,8 @@ class MiniTrainDIT(nn.Module):
         mask_B_N: torch.Tensor,
         size_B_1_2: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        del size_B_1_2
+        if size_B_1_2 is None:
+            raise ValueError("size_B_1_2 (token grid shape) is required for packed FiT")
         expected = self.x_embedder.proj[1].in_features
         if tokens_B_N_M.shape[-1] < expected:
             tokens_B_N_M = F.pad(tokens_B_N_M, (0, expected - tokens_B_N_M.shape[-1]))
@@ -1344,6 +1370,7 @@ class MiniTrainDIT(nn.Module):
             )
 
         out = self.final_layer.forward_tokens(x_B_N_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
+        out = self._output_tokens_to_patch_tokens(out, size_B_1_2)
         return out * mask_B_N.to(dtype=out.dtype).unsqueeze(-1)
 
     def forward(

@@ -8,12 +8,14 @@ sys.path.insert(0, str(ROOT))
 
 try:
     import torch
+    from einops import rearrange
     from models.anima_modeling_core import GeneralDIT
     from models.anima_modeling import Anima as TrainingAnima
     HAS_TORCH = True
 except ModuleNotFoundError:
     HAS_TORCH = False
     torch = None
+    rearrange = None
     GeneralDIT = None
     TrainingAnima = None
 
@@ -140,6 +142,45 @@ class PackedTokenModelTests(unittest.TestCase):
         )
 
         self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+
+    def test_packed_forward_matches_dense_forward(self):
+        # The packed FiT path must be numerically identical to the dense grid forward.
+        # This is the real guarantee behind _output_tokens_to_patch_tokens: without the
+        # per-token channel reorder, the packed output would decode to a permuted latent
+        # and silently diverge from the dense path (and from the training target tokens).
+        torch.manual_seed(0)
+        model = self._model().eval()
+        latents = torch.randn(1, 16, 1, 4, 6)
+        timesteps = torch.tensor([[0.5]])
+        cross = torch.randn(1, 12, 48)
+
+        with torch.no_grad():
+            dense = model.forward(latents, timesteps, cross)
+            tokens, grid, mask, size = model.patchify_latents_to_tokens(latents)
+            packed_tokens = model.forward_packed_tokens(tokens, timesteps, cross, grid, mask, size)
+            packed = model.unpatchify_tokens(packed_tokens, size)
+
+        self.assertEqual(tuple(dense.shape), tuple(packed.shape))
+        self.assertTrue(
+            torch.allclose(dense, packed, atol=1e-5),
+            msg=f"packed vs dense max abs diff={float((dense - packed).abs().max())}",
+        )
+
+    def test_output_tokens_reorder_preserves_decoded_latent(self):
+        # _output_tokens_to_patch_tokens bridges the two token channel orders: final-layer
+        # output is (ph pw pt c) (what unpatchify consumes); patchify targets are
+        # (c pt ph pw). The reorder must change only the layout, not the decoded latent.
+        model = self._model()
+        final_layer_tokens = torch.randn(1, 6, 64)  # 4x6 latent, ps=2 -> 2x3 token grid
+        size = torch.tensor([[[2, 3]]], dtype=torch.int32)
+
+        grid = rearrange(final_layer_tokens, "b (t h w) m -> b t h w m", t=1, h=2, w=3)
+        latent_from_final = model.unpatchify(grid)
+        patch_tokens = model._output_tokens_to_patch_tokens(final_layer_tokens, size)
+        latent_from_patch = model.unpatchify_tokens(patch_tokens, size)
+
+        self.assertEqual(tuple(patch_tokens.shape), tuple(final_layer_tokens.shape))
+        self.assertTrue(torch.equal(latent_from_final, latent_from_patch))
 
     def test_patchify_mask_keeps_partial_source_edge_tokens(self):
         model = self._model()

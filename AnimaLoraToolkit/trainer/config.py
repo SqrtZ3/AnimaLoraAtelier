@@ -88,6 +88,7 @@ YAML_TO_ARGS = {
     "tag_dropout": "tag_dropout",
     "prefer_json": "prefer_json",
     "cache_latents": "cache_latents",
+    "cache_encode_batch_size": "cache_encode_batch_size",
     # LoRA 配置
     "lora_type": "lora_type",
     "lora_rank": "lora_rank",
@@ -277,6 +278,7 @@ DEFAULTS = {
     "tag_dropout": 0.0,
     "prefer_json": True,
     "cache_latents": False,
+    "cache_encode_batch_size": 8,
     "lora_type": "lokr",
     "lora_rank": 32,
     "lora_alpha": 32.0,

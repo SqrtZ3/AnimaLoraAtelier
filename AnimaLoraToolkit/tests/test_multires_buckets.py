@@ -40,7 +40,7 @@ except ModuleNotFoundError:
     sys.modules["torch.utils.data"] = torch_data
 
 import trainer.data as data_module
-from trainer.data import BucketManager, CachedLatentDataset, ImageDataset
+from trainer.data import BucketManager, CachedLatentDataset, ImageDataset, _plan_encode_batches
 from trainer.config import DEFAULTS, apply_yaml_config
 
 if INSTALLED_FAKE_TORCH:
@@ -276,6 +276,136 @@ class CachedLatentBucketPolicyTests(unittest.TestCase):
 
         self.assertFalse(valid)
         self.assertFalse(npz_path.exists())
+
+    def test_cache_invalidated_when_flip_enabled_but_flipped_latent_missing(self):
+        # flip + cache：启用 flip 但旧缓存只有单份 latent → 必须失效重编码，
+        # 否则会静默退化为"flip 关闭"。
+        with tempfile.TemporaryDirectory() as tmp:
+            img_path = pathlib.Path(tmp) / "detail.png"
+            img_path.write_bytes(b"fake image bytes")
+            npz_path = img_path.with_suffix(".npz")
+            npz_path.write_bytes(b"fake npz bytes")
+
+            dataset = object.__new__(CachedLatentDataset)
+            dataset.flip_enabled = True
+            dataset.np = _FakeNumpy({
+                "latent": _FakeArray((16, 1, 128, 128)),
+                "bucket_w": 1024,
+                "bucket_h": 1024,
+                "dtype_kind": "fp32",
+            })
+
+            valid = dataset._is_cache_valid(
+                {"image": img_path, "bucket_key": (1024, 1024)},
+                npz_path,
+            )
+            # 在 tempdir 清理前捕获，否则 exists() 反映的是目录删除而非 unlink。
+            exists_after = npz_path.exists()
+
+        self.assertFalse(valid)
+        self.assertFalse(exists_after)
+
+    def test_cache_kept_when_flip_enabled_and_flipped_latent_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img_path = pathlib.Path(tmp) / "detail.png"
+            img_path.write_bytes(b"fake image bytes")
+            npz_path = img_path.with_suffix(".npz")
+            npz_path.write_bytes(b"fake npz bytes")
+
+            dataset = object.__new__(CachedLatentDataset)
+            dataset.flip_enabled = True
+            dataset.np = _FakeNumpy({
+                "latent": _FakeArray((16, 1, 128, 128)),
+                "latent_flipped": _FakeArray((16, 1, 128, 128)),
+                "bucket_w": 1024,
+                "bucket_h": 1024,
+                "dtype_kind": "fp32",
+            })
+
+            valid = dataset._is_cache_valid(
+                {"image": img_path, "bucket_key": (1024, 1024)},
+                npz_path,
+            )
+            exists_after = npz_path.exists()
+
+        self.assertTrue(valid)
+        self.assertTrue(exists_after)
+
+    def test_cache_kept_without_flipped_latent_when_flip_disabled(self):
+        # 向后兼容：flip 关闭时，仅含单份 latent 的旧缓存不应被新规则误删。
+        with tempfile.TemporaryDirectory() as tmp:
+            img_path = pathlib.Path(tmp) / "detail.png"
+            img_path.write_bytes(b"fake image bytes")
+            npz_path = img_path.with_suffix(".npz")
+            npz_path.write_bytes(b"fake npz bytes")
+
+            dataset = object.__new__(CachedLatentDataset)
+            dataset.flip_enabled = False
+            dataset.np = _FakeNumpy({
+                "latent": _FakeArray((16, 1, 128, 128)),
+                "bucket_w": 1024,
+                "bucket_h": 1024,
+                "dtype_kind": "fp32",
+            })
+
+            valid = dataset._is_cache_valid(
+                {"image": img_path, "bucket_key": (1024, 1024)},
+                npz_path,
+            )
+            exists_after = npz_path.exists()
+
+        self.assertTrue(valid)
+        self.assertTrue(exists_after)
+
+
+class PlanEncodeBatchesTests(unittest.TestCase):
+    """缓存批量编码的分组/切分纯逻辑（#1 批量编码的核心）。"""
+
+    @staticmethod
+    def _bucket_of(sizes):
+        return lambda i: sizes[i]
+
+    def test_same_bucket_split_by_max_batch_and_covers_all(self):
+        idxs = list(range(8))
+        sizes = {i: (64, 64) for i in idxs}
+        planned = _plan_encode_batches(idxs, self._bucket_of(sizes),
+                                       max_batch=4, max_encode_pixels=0, flip=False)
+        # 8 张同桶、上限 4 → 两批各 4，且覆盖且仅覆盖所有索引、保持顺序。
+        self.assertEqual(planned, [[0, 1, 2, 3], [4, 5, 6, 7]])
+
+    def test_different_buckets_never_mixed(self):
+        sizes = {0: (64, 64), 1: (64, 64), 2: (128, 128), 3: (128, 128)}
+        planned = _plan_encode_batches([0, 1, 2, 3], self._bucket_of(sizes),
+                                       max_batch=8, max_encode_pixels=0, flip=False)
+        for batch in planned:
+            self.assertEqual(len({sizes[i] for i in batch}), 1, f"batch 尺寸不一致: {batch}")
+        # 摊平后覆盖全部、无重复。
+        self.assertEqual(sorted(i for b in planned for i in b), [0, 1, 2, 3])
+
+    def test_pixel_budget_shrinks_large_images_and_flip_halves_it(self):
+        idxs = list(range(5))
+        sizes = {i: (256, 256) for i in idxs}  # 65536 px each
+        budget = 2 * 256 * 256  # 容纳 2 张原图
+        no_flip = _plan_encode_batches(idxs, self._bucket_of(sizes),
+                                       max_batch=99, max_encode_pixels=budget, flip=False)
+        self.assertEqual(no_flip, [[0, 1], [2, 3], [4]])
+        # flip 时一次进网络 2×，像素预算折半 → 每批退化到 1 张原图（+1 翻转）。
+        with_flip = _plan_encode_batches(idxs, self._bucket_of(sizes),
+                                         max_batch=99, max_encode_pixels=budget, flip=True)
+        self.assertEqual(with_flip, [[0], [1], [2], [3], [4]])
+
+    def test_max_batch_one_is_per_sample(self):
+        idxs = [0, 1, 2]
+        sizes = {i: (64, 64) for i in idxs}
+        planned = _plan_encode_batches(idxs, self._bucket_of(sizes),
+                                       max_batch=1, max_encode_pixels=0, flip=True)
+        self.assertEqual(planned, [[0], [1], [2]])
+
+    def test_missing_bucket_key_groups_together_without_crash(self):
+        # bucket_of 返回 None（无 bucket_key）应归一到同一组而非报错。
+        planned = _plan_encode_batches([0, 1], lambda i: None,
+                                       max_batch=8, max_encode_pixels=0, flip=False)
+        self.assertEqual(planned, [[0, 1]])
 
 
 if __name__ == "__main__":

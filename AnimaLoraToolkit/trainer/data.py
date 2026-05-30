@@ -150,7 +150,8 @@ class BucketManager:
     """ARB 分桶管理"""
     def __init__(self, base_reso=1024, min_reso=512, max_reso=2048, step=64,
                  base_resos=None, min_base_reso=0, max_base_reso=0,
-                 base_reso_step=256, no_upscale=False, max_upscale=0.0):
+                 base_reso_step=256, no_upscale=False, max_upscale=0.0,
+                 ar_tolerance=0.05):
         self.base_reso = int(base_reso)
         self.base_resos = self._normalize_base_resos(
             base_reso, base_resos, min_base_reso, max_base_reso,
@@ -158,6 +159,9 @@ class BucketManager:
         )
         self.no_upscale = bool(no_upscale)
         self.max_upscale = float(max_upscale or 0.0)
+        # 选桶的长宽比容差：见 get_bucket。多级分桶时把它和 detail-first 选择配合，
+        # 避免大图被丢进长宽比略好的小面积桶。
+        self.ar_tolerance = float(ar_tolerance)
         self.buckets = self._generate(min_reso, max_reso, step, self.base_resos)
 
     @staticmethod
@@ -229,20 +233,30 @@ class BucketManager:
         return (aspect_diff, scale_diff, area_diff)
 
     def get_bucket(self, w, h):
-        best = (self.base_reso, self.base_reso)
-        best_score = None
         candidates = [
             (bw, bh) for (bw, bh) in self.buckets
             if self._bucket_allowed_for_image(bw, bh, w, h)
         ]
         if not candidates:
-            candidates = self.buckets
-        for bw, bh in candidates:
-            score = self._score_bucket(bw, bh, w, h)
-            if best_score is None or score < best_score:
-                best_score = score
-                best = (bw, bh)
-        return best
+            candidates = list(self.buckets)
+        if not candidates:
+            return (self.base_reso, self.base_reso)
+
+        def _aspect_diff(b):
+            bw, bh = b
+            return abs((w / max(1, h)) - (bw / max(1, bh)))
+
+        # ★ detail-first 选桶（修复多级分桶下大图被丢进小面积桶的细节流失）：
+        #   1) 先用长宽比容差圈出"裁切量可接受"的桶，避免为了塞进某个面积层而过度裁切；
+        #   2) 在其中选 _score_bucket 的 (scale_diff, area_diff) 最小者 = 重采样最少。
+        #      - 降采样场景：重采样最少 = 能容纳的最大面积桶 = 保留最多细节
+        #        （旧实现以 aspect_diff 为唯一首要键，会把 2000x3000 丢进长宽比略好的
+        #         640x960 小桶；现在它会落到最大的 ~1MP 桶）。
+        #      - 上采样 fallback 场景：重采样最少 = 最接近源尺寸的桶 = 上采样幅度最小。
+        best_ar = min(_aspect_diff(b) for b in candidates)
+        tol = float(getattr(self, "ar_tolerance", 0.10))
+        near = [b for b in candidates if _aspect_diff(b) <= best_ar + tol]
+        return min(near, key=lambda b: self._score_bucket(b[0], b[1], w, h)[1:])
 
 
 def _format_size(size):
@@ -1326,6 +1340,51 @@ class FitTokenBatchSampler:
         return total
 
 
+# 单次送入 VAE encode 的「总像素」软上限（含翻转份）。VAE 3D encoder 中间激活很占显存，
+# 用像素预算让大图自动减小每批张数，避免缓存阶段 OOM；真遇到 OOM 还有逐张兜底。
+# 偏保守：1024² 原图在 flip 下每批 2 张（进网络 4 张），512² 每批可达 cache_encode_batch_size。
+# 想更激进可调大 cache_encode_batch_size（仍受本预算约束），或按显存改本常量。
+_CACHE_ENCODE_MAX_PIXELS = 4 * 1024 * 1024
+
+
+def _plan_encode_batches(indices, bucket_of, max_batch, max_encode_pixels, flip):
+    """把待编码样本索引按 bucket（像素尺寸）分组，再按张数 / 显存像素预算切成 micro-batch。
+
+    同一 micro-batch 内尺寸一致 → 可 stack 成一个张量一次送进 VAE（替代逐张 batch=1）。
+    flip=True 时每张图在 encode 时会额外拼一份水平翻转，一次进网络的张数是 2×，像素预算据此折半。
+
+    参数：
+        indices:           待编码样本索引（指向 self.samples）。
+        bucket_of:         callable(idx) -> (h, w) 或 None；返回该样本的像素分桶尺寸。
+        max_batch:         单个 micro-batch 的原图张数上限（>=1）。
+        max_encode_pixels: 单次 encode 进网络的总像素上限（含翻转份）；<=0 表示不按像素限。
+        flip:              是否会拼翻转份（影响像素预算折算）。
+    返回：list[list[idx]]，保持桶内原顺序，覆盖且仅覆盖所有输入索引；同批尺寸一致。
+    """
+    max_batch = max(1, int(max_batch))
+    groups = {}
+    order = []
+    for i in indices:
+        key = bucket_of(i)
+        key = tuple(key) if key else (0, 0)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(i)
+
+    planned = []
+    for key in order:
+        idxs = groups[key]
+        h, w = int(key[0] or 0), int(key[1] or 0)
+        per = max_batch
+        if max_encode_pixels and max_encode_pixels > 0 and h > 0 and w > 0:
+            mult = 2 if flip else 1
+            per = min(per, max(1, int(max_encode_pixels) // (mult * h * w)))
+        for j in range(0, len(idxs), per):
+            planned.append(idxs[j:j + per])
+    return planned
+
+
 class CachedLatentDataset(Dataset):
     """Kohya 风格 npz 文件缓存的数据集。
 
@@ -1334,9 +1393,15 @@ class CachedLatentDataset(Dataset):
         - numpy 1.x 没有原生 bf16，bf16 在磁盘上以 uint16 view 保存，并附带 sentinel
           key (`dtype_kind = "bf16"`) 让读端正确还原。
         - 旧 cache（无 dtype_kind 键）默认按 fp32 读，向后兼容。
+
+    flip + cache 兼容（kohya 风格）：若底层 ImageDataset 启用了 flip_augment，缓存阶段会为
+    每张图额外编码一份"像素域水平翻转后再 encode"的 latent，存入 npz 的 `latent_flipped`。
+    __getitem__ 每次随机取原图 / 翻转其一，逐 epoch 随机翻转得以保留。绝不在 latent 空间翻转：
+    VAE conv encoder 非 flip-equivariant（flip(encode(x)) ≠ encode(flip(x))），故翻转只能发生
+    在像素域、encode 之前。代价：npz 体积与首次编码量约 ×2（一次性）。
     """
     def __init__(self, base_dataset, vae, device, dtype, cache_dir=None,
-                 save_dtype: torch.dtype = torch.bfloat16):
+                 save_dtype: torch.dtype = torch.bfloat16, encode_batch_size=8):
         import numpy as np
         self.base_dataset = base_dataset
         self.np = np
@@ -1344,6 +1409,14 @@ class CachedLatentDataset(Dataset):
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.bucket_for_index = []
         self.save_dtype = save_dtype
+        # 缓存编码时单个 micro-batch 的原图张数上限（仍受 _CACHE_ENCODE_MAX_PIXELS 像素预算约束）。
+        self.encode_batch_size = max(1, int(encode_batch_size or 1))
+        # 捕获用户的 flip 意图（最底层 ImageDataset.flip_augment）。必须在 _build_cache 之前设好：
+        # _is_cache_valid 依赖它判断旧的"仅单份 latent"缓存是否需要失效重编码。
+        leaf = base_dataset
+        while hasattr(leaf, "dataset"):
+            leaf = leaf.dataset
+        self.flip_enabled = bool(getattr(leaf, "flip_augment", False))
         self._build_cache(vae, device, dtype)
 
     def _get_base_samples(self, dataset):
@@ -1384,6 +1457,14 @@ class CachedLatentDataset(Dataset):
                 return False
             if latent.shape[0] != 16:
                 logger.warning(f"删除疑似非 Anima/Qwen VAE 缓存（C={latent.shape[0]}，应为 16）: {npz_path}")
+                npz_path.unlink()
+                return False
+            # flip + cache：启用 flip 时缓存必须含 latent_flipped；旧的"仅单份 latent"缓存失效重编码，
+            # 否则会静默退化为"flip 关闭"（拿不到翻转份）。flip 关闭时本检查跳过，多余的 flipped 份无害。
+            if getattr(self, "flip_enabled", False) and "latent_flipped" not in data.files:
+                logger.info(
+                    "删除缺少翻转 latent 的缓存（flip_augment 已启用，需原图+翻转两份）: %s", npz_path
+                )
                 npz_path.unlink()
                 return False
             if expected_bucket is not None and "bucket_h" in data.files and "bucket_w" in data.files:
@@ -1457,69 +1538,138 @@ class CachedLatentDataset(Dataset):
             self.bucket_for_index[i] = (int(h), int(w))
 
     def _encode_and_save(self, indices, vae, device, dtype):
-        # ★ flip_augment + cache 不能同时生效：base_dataset.__getitem__ 会做一次随机 flip
-        # 然后被烘焙进 npz，等价于 50% 数据集预 flip，再也不会每 epoch 随机翻转。
-        # 这里临时把 base 的 flip 关掉，编码完恢复。
-        base = self.base_dataset
-        while hasattr(base, "dataset") and base is not self.base_dataset:
-            base = base.dataset
-        # 找到最底层的 ImageDataset
+        # flip + cache 兼容：编码期间临时关闭 base 的随机 flip，确保 self.base_dataset[i] 返回
+        # 规范（未翻转）朝向。若用户启用了 flip，则下面对每张图再额外编码一份像素域水平翻转的 latent，
+        # 两份一起存盘；__getitem__ 每次随机二选一，逐 epoch 随机翻转得以保留。
         leaf = self.base_dataset
         while hasattr(leaf, "dataset"):
             leaf = leaf.dataset
         _orig_flip = bool(getattr(leaf, "flip_augment", False))
         if _orig_flip:
-            logger.warning(
-                "[cache] 临时关闭 flip_augment 编码 latent（避免随机 flip 被烘焙进 npz）。"
-                "编码完后恢复，但请注意：cache_latents=True 时 flip 不会每 epoch 随机生效。"
+            logger.info(
+                "[cache] flip_augment + cache_latents：为每张图编码原图与水平翻转两份 latent，"
+                "训练时每次随机取其一（逐 epoch 随机翻转）。编码期间临时关闭 base 随机 flip 以取规范朝向。"
             )
             leaf.flip_augment = False
 
+        # latent → npz 落盘数组的 dtype 转换收敛到一处，原图与翻转份共用，避免分支重复。
         save_dtype = getattr(self, "save_dtype", torch.bfloat16)
-        try:
-            for count, i in enumerate(indices):
-                item = self.base_dataset[i]
-                pixels = item["pixel_values"].unsqueeze(0).to(device, dtype=dtype)
-                _, _, ph, pw = pixels.shape
-                bucket_w, bucket_h = pw, ph
-                with torch.no_grad():
-                    pixels_5d = pixels.unsqueeze(2)
-                    latent = vae.model.encode(pixels_5d, vae.scale)
-                if not torch.isfinite(latent).all():
-                    logger.warning(f"VAE 编码产生非有限 latent，跳过缓存: {self.samples[i]['image']}")
-                    continue
+        if save_dtype == torch.bfloat16:
+            dtype_kind = "bf16"
+            # bf16 → uint16 view（同等 bit pattern；numpy 1.x 没有原生 bf16）
+            def _to_npz_array(lat):
+                return lat.to(dtype=torch.bfloat16).cpu().contiguous().view(torch.uint16).numpy()
+        elif save_dtype == torch.float16:
+            dtype_kind = "fp16"
+            def _to_npz_array(lat):
+                return lat.to(dtype=torch.float16).cpu().numpy()
+        else:
+            dtype_kind = "fp32"
+            def _to_npz_array(lat):
+                return lat.cpu().float().numpy()
 
-                latent_gpu = latent.squeeze(0)
-                npz_path = self._get_npz_path(self.samples[i]["image"])
-                if save_dtype == torch.bfloat16:
-                    # bf16 → uint16 view（同等 bit pattern；numpy 1.x 没有原生 bf16）
-                    latent_bf16 = latent_gpu.to(dtype=torch.bfloat16).cpu().contiguous()
-                    latent_u16 = latent_bf16.view(torch.uint16).numpy()
-                    self.np.savez(
-                        npz_path,
-                        latent=latent_u16,
-                        bucket_w=bucket_w, bucket_h=bucket_h,
-                        dtype_kind="bf16",
+        # #1 同桶分组批量编码：把同尺寸的图 stack 成一个张量送进 VAE（底层 WanVAE_.encode 对 batch
+        #    维通用），flip 份拼进同一 batch（[2N]）一次编码再切回，几乎零额外成本吃掉翻转开销。
+        flip = bool(self.flip_enabled)
+        planned = _plan_encode_batches(
+            indices,
+            lambda i: self.samples[i].get("bucket_key"),
+            self.encode_batch_size,
+            _CACHE_ENCODE_MAX_PIXELS,
+            flip,
+        )
+        use_cuda = str(getattr(device, "type", device)).startswith("cuda")
+        oom_error = getattr(torch.cuda, "OutOfMemoryError", RuntimeError)
+
+        def _save_one(npz_path, lat, lat_flip, ph, pw):
+            save_kwargs = {
+                "latent": _to_npz_array(lat),
+                "bucket_w": pw,
+                "bucket_h": ph,
+                "dtype_kind": dtype_kind,
+            }
+            if lat_flip is not None:
+                save_kwargs["latent_flipped"] = _to_npz_array(lat_flip)
+            self.np.savez(npz_path, **save_kwargs)
+
+        def _save_batch(latent_cpu, batch_i, n, ph, pw):
+            # #2 后台线程：dtype 转换 + 落盘，与下一批 GPU 编码重叠。latent_cpu 已在 CPU（只读，线程安全）。
+            for k in range(n):
+                lat_flip = latent_cpu[n + k] if flip else None
+                _save_one(self._get_npz_path(self.samples[batch_i[k]]["image"]),
+                          latent_cpu[k], lat_flip, ph, pw)
+
+        def _load_batch(batch_idxs):
+            # #3 预处理预取（线程）：PIL 解码 / resize / crop 与 GPU 编码重叠。
+            return [(i, self.base_dataset[i]["pixel_values"]) for i in batch_idxs]
+
+        from concurrent.futures import ThreadPoolExecutor
+        save_pool = ThreadPoolExecutor(max_workers=2)
+        prefetch_pool = ThreadPoolExecutor(max_workers=1)
+        save_futures = []
+        total = len(indices)
+        done = 0
+        try:
+            next_future = prefetch_pool.submit(_load_batch, planned[0]) if planned else None
+            for bi in range(len(planned)):
+                loaded = next_future.result()
+                if bi + 1 < len(planned):
+                    next_future = prefetch_pool.submit(_load_batch, planned[bi + 1])
+
+                batch_i = [i for i, _ in loaded]
+                n = len(batch_i)
+                if n == 0:
+                    continue
+                pixels = torch.stack([px for _, px in loaded]).to(device, dtype=dtype)  # [N,C,H,W]
+                _, _, ph, pw = pixels.shape
+                enc_in = pixels.unsqueeze(2)  # [N,C,1,H,W]
+                if flip:
+                    # 像素域水平翻转（dims=[-1]=宽）后拼进同一 batch；绝不在 latent 上翻转。
+                    enc_in = torch.cat([enc_in, torch.flip(enc_in, dims=[-1])], dim=0)  # [2N,...]
+
+                try:
+                    with torch.no_grad():
+                        latent_all = vae.model.encode(enc_in, vae.scale)
+                except oom_error:
+                    # 显存不够：清缓存并降级逐张编码（慢但不中断整个缓存任务）。
+                    if use_cuda:
+                        torch.cuda.empty_cache()
+                    logger.warning(
+                        "[cache] encode OOM at batch=%d (%dx%d)，降级逐张。可调小 cache_encode_batch_size。",
+                        enc_in.shape[0], pw, ph,
                     )
-                elif save_dtype == torch.float16:
-                    latent_np = latent_gpu.to(dtype=torch.float16).cpu().numpy()
-                    self.np.savez(
-                        npz_path,
-                        latent=latent_np,
-                        bucket_w=bucket_w, bucket_h=bucket_h,
-                        dtype_kind="fp16",
-                    )
+                    with torch.no_grad():
+                        latent_all = torch.cat(
+                            [vae.model.encode(enc_in[s:s + 1], vae.scale) for s in range(enc_in.shape[0])],
+                            dim=0,
+                        )
+
+                # #4 批级 isfinite：整批一次同步而非每张。全有限走后台落盘；否则逐张定位、跳过坏图。
+                latent_cpu = latent_all.detach().to("cpu")
+                if torch.isfinite(latent_all).all().item():
+                    save_futures.append(save_pool.submit(_save_batch, latent_cpu, batch_i, n, ph, pw))
                 else:
-                    latent_np = latent_gpu.cpu().float().numpy()
-                    self.np.savez(
-                        npz_path,
-                        latent=latent_np,
-                        bucket_w=bucket_w, bucket_h=bucket_h,
-                        dtype_kind="fp32",
-                    )
-                if (count + 1) % 10 == 0 or count == len(indices) - 1:
-                    logger.info(f"  编码进度: {count + 1}/{len(indices)}")
+                    for k in range(n):
+                        lat = latent_cpu[k]
+                        lat_flip = latent_cpu[n + k] if flip else None
+                        ok = bool(torch.isfinite(lat).all().item()) and (
+                            lat_flip is None or bool(torch.isfinite(lat_flip).all().item())
+                        )
+                        if not ok:
+                            logger.warning("VAE 编码产生非有限 latent，跳过缓存: %s",
+                                           self.samples[batch_i[k]]["image"])
+                            continue
+                        _save_one(self._get_npz_path(self.samples[batch_i[k]]["image"]),
+                                  lat, lat_flip, ph, pw)
+
+                done += n
+                logger.info("  编码进度: %d/%d", min(done, total), total)
+
+            for f in save_futures:
+                f.result()  # 传播后台落盘异常
         finally:
+            save_pool.shutdown(wait=True)
+            prefetch_pool.shutdown(wait=True)
             if _orig_flip:
                 leaf.flip_augment = True
 
@@ -1530,10 +1680,19 @@ class CachedLatentDataset(Dataset):
         sample = self.samples[idx]
         npz_path = self._get_npz_path(sample["image"])
         data = self.np.load(npz_path)
-        latent_np = data["latent"]
         # dtype_kind sentinel：bf16 cache 在磁盘上是 uint16 view，要 view 回 bf16；
         # fp16 / fp32 直接 from_numpy。旧 cache 无 dtype_kind，按 fp32 兼容。
         dtype_kind = str(data["dtype_kind"]) if "dtype_kind" in data.files else "fp32"
+        # flip + cache：缓存阶段已在像素域翻转后编码了 latent_flipped；这里每次随机二选一，
+        # 恢复逐 epoch 随机水平翻转。绝不在 latent 空间翻转（VAE conv encoder 非 flip-equivariant，
+        # flip(encode(x)) ≠ encode(flip(x))，在 latent 上翻会喂给训练偏离真实分布的潜变量，
+        # 推理时表现为马赛克 / 边缘溶解）。
+        latent_key = "latent"
+        if (getattr(self, "flip_enabled", False)
+                and "latent_flipped" in data.files
+                and random.random() < 0.5):
+            latent_key = "latent_flipped"
+        latent_np = data[latent_key]
         if dtype_kind == "bf16":
             # uint16 → torch.uint16 → view as bf16（bit pattern 相同）
             latent = torch.from_numpy(latent_np).view(torch.bfloat16)
@@ -1548,14 +1707,6 @@ class CachedLatentDataset(Dataset):
         base = self.base_dataset
         while hasattr(base, "dataset"):
             base = base.dataset
-
-        # NOTE: 不要在缓存 latent 上做空间 flip！
-        # Anima/Qwen VAE 的 conv encoder 不是 flip-equivariant，
-        # 即 flip(encode(img)) ≠ encode(flip(img))；
-        # 在 latent 空间翻转会喂给训练"非自然"的潜变量，模型学到的是
-        # 偏离真实分布的 latent，推理时表现为马赛克 / 边缘溶解。
-        # flip 增强在缓存阶段（base ImageDataset 的 __getitem__ 里做图像 flip
-        # 后再 encode）已经生效一次；想要每个 epoch 重新 flip，请关闭 cache_latents。
 
         caption = None
         if getattr(base, "caption_override", None) is not None:

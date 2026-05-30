@@ -402,6 +402,10 @@ def parse_args():
     p.add_argument("--cache-latents-dtype", choices=["fp32", "bf16", "fp16"], default="bf16",
                    help="latent 缓存 dtype。默认 bf16 与训练 dtype 对齐，disk 占用减半，"
                         "且省去训练取数时的 fp32→bf16 转换开销。fp32 仅在需要最高精度时用。")
+    p.add_argument("--cache-encode-batch-size", type=int, default=8,
+                   help="缓存 VAE latent 时单个 micro-batch 的原图张数上限（同尺寸图 stack 一次编码，"
+                        "flip 份拼进同批）。越大越快但越吃显存；仍受内部像素预算约束，OOM 会自动降级逐张。"
+                        "显存紧张可调小（如 4 / 2 / 1）。")
     p.add_argument("--baseline-sample-count", type=int, default=3,
                    help="step 0 基线采样的提示词数量（最多取 sample_prompts 前 N 个）")
     p.add_argument("--dataloader-pin-memory", action="store_true", default=True,
@@ -1085,16 +1089,14 @@ def main():
     if fit_packed_training and use_cached:
         raise RuntimeError("fit_packed_training currently requires cache_latents=false so pixel masks stay available.")
     if use_cached and bool(getattr(args, "flip_augment", False)):
-        # flip_augment 在 ImageDataset.__getitem__ 中作用于像素图像；启用 cache_latents 后，
-        # 每张图只在首次缓存时调用一次 __getitem__，是否 flip 在那一刻被随机决定并冻结。
-        # 后续每个 epoch 永远拿到同一份 latent，flip 不再随机 → 增强等同于"50% 数据集预 flip"，
-        # 失去逐 epoch 增广的本意。VAE encoder 非 flip-equivariant，也不能在 latent 上后补 flip。
-        # 此处只警告，不强行覆盖用户配置。
-        logger.warning(
-            "[dataset] cache_latents=True 与 flip_augment=True 同时开启："
-            "flip 仅在首次 latent 缓存时一次性生效，后续 epoch 不再随机翻转。"
-            "若想让 flip 在每个 epoch 随机，请关闭 cache_latents；"
-            "若想保持 cache_latents 的速度，请关闭 flip_augment。"
+        # cache_latents 与 flip_augment 现已兼容（kohya 风格）：CachedLatentDataset 在缓存阶段
+        # 为每张图额外编码一份"像素域水平翻转后再 encode"的 latent（VAE 非 flip-equivariant，
+        # 翻转只能发生在像素域、encode 之前），训练时每次 __getitem__ 随机取原图 / 翻转其一，
+        # 逐 epoch 随机翻转得以保留。代价：npz 体积 ≈ ×2、首次缓存的 VAE 编码量 ≈ ×2（一次性）。
+        logger.info(
+            "[dataset] cache_latents=True 且 flip_augment=True：将为每张图缓存原图 + 水平翻转两份 latent，"
+            "训练时逐次随机二选一（保留逐 epoch 翻转）。npz 体积与首次编码量约翻倍；"
+            "已有的旧缓存（仅含单份 latent）会被自动失效并重新编码一次。"
         )
     if use_cached:
         # cache_latents_dtype 让 npz 保存为 bf16/fp16 而非 fp32：
@@ -1104,9 +1106,12 @@ def main():
         _cache_dtype_str = str(getattr(args, "cache_latents_dtype", "bf16") or "bf16").lower()
         _cache_dtype_map = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
         _cache_save_dtype = _cache_dtype_map.get(_cache_dtype_str, torch.bfloat16)
-        dataset = CachedLatentDataset(dataset, vae, device, dtype, save_dtype=_cache_save_dtype)
+        _cache_encode_bs = int(getattr(args, "cache_encode_batch_size", 8) or 8)
+        dataset = CachedLatentDataset(dataset, vae, device, dtype, save_dtype=_cache_save_dtype,
+                                      encode_batch_size=_cache_encode_bs)
     if reg_dataset is not None and use_cached:
-        reg_dataset = CachedLatentDataset(reg_dataset, vae, device, dtype, save_dtype=_cache_save_dtype)
+        reg_dataset = CachedLatentDataset(reg_dataset, vae, device, dtype, save_dtype=_cache_save_dtype,
+                                          encode_batch_size=_cache_encode_bs)
 
     # repeat 放在缓存之后
     if args.repeats > 1:

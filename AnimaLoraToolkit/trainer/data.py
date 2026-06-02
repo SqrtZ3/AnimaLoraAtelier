@@ -151,7 +151,7 @@ class BucketManager:
     def __init__(self, base_reso=1024, min_reso=512, max_reso=2048, step=64,
                  base_resos=None, min_base_reso=0, max_base_reso=0,
                  base_reso_step=256, no_upscale=False, max_upscale=0.0,
-                 ar_tolerance=0.05):
+                 ar_tolerance=0.05, max_aspect_ratio=2.0):
         self.base_reso = int(base_reso)
         self.base_resos = self._normalize_base_resos(
             base_reso, base_resos, min_base_reso, max_base_reso,
@@ -162,6 +162,10 @@ class BucketManager:
         # 选桶的长宽比容差：见 get_bucket。多级分桶时把它和 detail-first 选择配合，
         # 避免大图被丢进长宽比略好的小面积桶。
         self.ar_tolerance = float(ar_tolerance)
+        # 桶生成允许的最大单维长宽比 max(w/h, h/w)。历史写死 2.0；现可配置，
+        # 让比 2:1 更扁的原生图（如 640x1664=2.6）也能得到匹配桶 → 训练侧零裁切零上采样，
+        # 而不是被塞进 1.83:1 桶后上采样。受模型 RoPE 约束：~3.5:1 @1MP（长边 ≤1920）。
+        self.max_aspect_ratio = max(1.0, float(max_aspect_ratio or 2.0))
         self.buckets = self._generate(min_reso, max_reso, step, self.base_resos)
 
     @staticmethod
@@ -208,7 +212,7 @@ class BucketManager:
                 for h in range(min_r, max_r + 1, step):
                     if abs(w * h - base_area) / base_area > 0.1:
                         continue
-                    if max(w / h, h / w) > 2.0:
+                    if max(w / h, h / w) > self.max_aspect_ratio + 1e-9:
                         continue
                     bucket = (w, h)
                     if bucket in seen:
@@ -273,6 +277,19 @@ def _downscale_ratio(source_size, bucket_key):
     )
 
 
+def _cover_scale(source_size, bucket_key):
+    """训练 __getitem__ 的等比 cover-crop 缩放系数 = max(bw/sw, bh/sh)。
+    >1 即"放大"（no_upscale 下不应出现）。注意它和 _downscale_ratio 不是互为倒数：
+    cover-crop 取 max(bucket/source)，而 _downscale_ratio 取 max(source/bucket)，
+    所以一张图可能 _downscale_ratio>1 却同时被放大（一维缩、另一维被放大裁切）。"""
+    source_h, source_w = source_size
+    bucket_h, bucket_w = bucket_key
+    return max(
+        float(bucket_w) / max(1, float(source_w)),
+        float(bucket_h) / max(1, float(source_h)),
+    )
+
+
 def format_bucket_report(samples, limit=12, label="dataset"):
     """Return a compact text report of source sizes and bucket assignments."""
     from collections import Counter
@@ -291,6 +308,7 @@ def format_bucket_report(samples, limit=12, label="dataset"):
     bucket_counts = Counter(bucket_key for _, _, bucket_key in rows)
     source_bins = Counter()
     downscales = []
+    upscales = []
     for image, source_size, bucket_key in rows:
         longest = max(int(source_size[0]), int(source_size[1]))
         if longest < 768:
@@ -308,6 +326,9 @@ def format_bucket_report(samples, limit=12, label="dataset"):
         ratio = _downscale_ratio(source_size, bucket_key)
         if ratio > 1.0:
             downscales.append((ratio, image, source_size, bucket_key))
+        cover = _cover_scale(source_size, bucket_key)
+        if cover > 1.0 + 1e-6:
+            upscales.append((cover, image, source_size, bucket_key))
 
     bucket_preview = ", ".join(
         f"{_format_size(bucket)}={count}"
@@ -332,6 +353,19 @@ def format_bucket_report(samples, limit=12, label="dataset"):
     ]
     if downscale_preview:
         lines.append("  largest downscales: " + "; ".join(downscale_preview))
+    if upscales:
+        upscales.sort(reverse=True, key=lambda row: row[0])
+        upscale_preview = []
+        for scale, image, source_size, bucket_key in upscales[:limit]:
+            name = Path(image).name if image is not None else "?"
+            upscale_preview.append(
+                f"{name}: {_format_size(source_size)} -> {_format_size(bucket_key)} (放大 {scale:.2f}x)"
+            )
+        lines.append(
+            f"  ⚠ UPSCALED {len(upscales)} 张（no_upscale 下不应出现：该长宽比在桶网格无匹配桶被放大）。"
+            f"修复：bucket_max_aspect_ratio 提到覆盖这些图，或 bucket_reso_steps=64 补桶，或数据集端裁到更接近的 AR: "
+            + "; ".join(upscale_preview)
+        )
     return "\n".join(lines)
 
 
@@ -503,6 +537,16 @@ class ImageDataset(Dataset):
                     except Exception:
                         pass
                     bw, bh = self.bucket_mgr.get_bucket(w, h)
+                    if getattr(self.bucket_mgr, "no_upscale", False):
+                        _cover = max(bw / max(1, w), bh / max(1, h))
+                        if _cover > 1.0 + 1e-6:
+                            logger.warning(
+                                "[no_upscale] %s 源 %dx%d 无可容纳的桶，被放大 %.2fx 到 %dx%d"
+                                "（该长宽比在桶网格无匹配桶）。建议：bucket_max_aspect_ratio 提到覆盖此图，"
+                                "或 bucket_reso_steps=64 补桶，或数据集端把该图裁到 AR≤%.2f。",
+                                Path(img_path).name, w, h, _cover, bw, bh,
+                                float(getattr(self.bucket_mgr, "max_aspect_ratio", 2.0)),
+                            )
                     cache[img_path] = ((bh, bw), (h, w), None)  # (bucket h,w), (source h,w), fit plan
                 except Exception as e:
                     logger.warning(f"[bucket_key] 无法读取 {img_path}: {e}，回退到 ({self.resolution},{self.resolution})")

@@ -989,11 +989,12 @@ def main():
         base_reso_step=int(getattr(args, "bucket_base_reso_steps", 256) or 256),
         no_upscale=bool(getattr(args, "bucket_no_upscale", False)),
         max_upscale=float(getattr(args, "bucket_max_upscale", 0.0) or 0.0),
+        max_aspect_ratio=float(getattr(args, "bucket_max_aspect_ratio", 2.0) or 2.0),
     )
     logger.info(
-        "[BucketManager] bases=%s, min=%d, max=%d, step=%d, no_upscale=%s, max_upscale=%.3g, 桶数=%d",
+        "[BucketManager] bases=%s, min=%d, max=%d, step=%d, max_ar=%.2f, no_upscale=%s, max_upscale=%.3g, 桶数=%d",
         bucket_mgr.base_resos, bucket_min_reso, bucket_max_reso, bucket_step,
-        bucket_mgr.no_upscale, bucket_mgr.max_upscale,
+        bucket_mgr.max_aspect_ratio, bucket_mgr.no_upscale, bucket_mgr.max_upscale,
         len(bucket_mgr.buckets),
     )
 

@@ -1393,6 +1393,10 @@ def main():
             lr_sched = "none"
         elif not sf_enabled and lr_sched == "none":
             logger.warning("ProdigyPlus 关闭 Schedule-Free 时建议配 cosine 调度器，否则后期没有 LR 衰减")
+    if opt_type in ("soap_sf", "soapsf") and lr_sched != "none":
+        # SOAP-SF 自带 schedule-free 平均，外部 cosine 会改写 group['lr'] 造成双重退火。
+        logger.warning("SOAP-SF (Schedule-Free) 不需要学习率调度器，已将其设为 none")
+        lr_sched = "none"
     if opt_type == "emosens" and lr_sched != "none":
         logger.warning("EmoSens 内部会根据 loss 序列动态写入学习率，已将外部 lr_scheduler 设为 none")
         lr_sched = "none"

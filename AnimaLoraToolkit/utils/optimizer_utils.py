@@ -17,6 +17,7 @@ Optimizer Utils Module - 优化器创建（修复版）
 - adamw    - 标准 PyTorch AdamW，后备选项
 - prodigyplus (prodigyplus) - 自适应学习率 + Schedule-Free
 - soap     - Shampoo/Adam 矩阵预条件优化器
+- soap_sf  - Schedule-Free SOAP（预条件 + Polyak 平均，无需 LR 调度）
 - adopt    - ADOPT（NeurIPS 2024），diffusion 等无界梯度噪声下收敛保证的 Adam 变种
 - lion     - Lion（NeurIPS 2023），sign-based 极简优化器
 - clion    - Cautious Lion，Lion + 一行 mask（arxiv 2411.16085）
@@ -36,9 +37,9 @@ from torch.optim import AdamW, Optimizer
 logger = logging.getLogger(__name__)
 
 try:
-    from .soap_optimizer import SOAP
+    from .soap_optimizer import SOAP, SOAPScheduleFree
 except ImportError:  # pragma: no cover - fallback for direct script execution
-    from soap_optimizer import SOAP  # type: ignore
+    from soap_optimizer import SOAP, SOAPScheduleFree  # type: ignore
 
 try:
     from .adopt_optimizer import ADOPT
@@ -246,6 +247,24 @@ def create_optimizer(
             params=params, lr=learning_rate, betas=betas,
             weight_decay=weight_decay, eps=eps, **kwargs,
         )
+    if optimizer_type in {"soap_sf", "soapsf"}:
+        if "lr" in kwargs:
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
+        if "betas" in kwargs:
+            betas = _coerce_betas(kwargs.pop("betas"))
+        elif betas == (0.9, 0.999):
+            # SF interpolation β1=0.9 (SF default) + SOAP's fast second moment β2=0.95.
+            betas = (0.9, 0.95)
+        if "weight_decay" in kwargs:
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
+        if "eps" in kwargs:
+            eps = _coerce_float(kwargs.pop("eps"), "optimizer_args.eps")
+        return create_soap_sf_optimizer(
+            params=params, lr=learning_rate, betas=betas,
+            weight_decay=weight_decay, eps=eps, **kwargs,
+        )
     if optimizer_type == "adopt":
         if "lr" in kwargs:
             learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
@@ -303,7 +322,7 @@ def create_optimizer(
 
     raise ValueError(
         f"Unknown optimizer type: {optimizer_type}. "
-        f"Choose from: adamw8bit, adamw, prodigyplus, soap, adopt, lion, clion, emosens"
+        f"Choose from: adamw8bit, adamw, prodigyplus, soap, soap_sf, adopt, lion, clion, emosens"
     )
 
 
@@ -384,6 +403,7 @@ def create_soap_optimizer(
         "normalize_grads",
         "data_format",
         "correct_bias",
+        "precond_in_state",
     }
     soap_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
     ignored = [k for k in kwargs if k not in valid_keys]
@@ -411,6 +431,63 @@ def create_soap_optimizer(
         weight_decay=weight_decay,
         eps=eps,
         **soap_kwargs,
+    )
+
+
+# =============================================================================
+# SOAP-SF (Schedule-Free SOAP)
+# =============================================================================
+
+def create_soap_sf_optimizer(
+    params: ParamInput,
+    lr: float,
+    betas: tuple = (0.9, 0.95),
+    weight_decay: float = 0.01,
+    eps: float = 1e-8,
+    **kwargs,
+) -> Optimizer:
+    valid_keys = {
+        "shampoo_beta",
+        "precondition_frequency",
+        "max_precond_dim",
+        "merge_dims",
+        "precondition_1d",
+        "normalize_grads",
+        "data_format",
+        "correct_bias",
+        "precond_in_state",
+        # Schedule-Free specific
+        "weight_lr_power",
+        "r",
+        "warmup_steps",
+    }
+    sf_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+    ignored = [k for k in kwargs if k not in valid_keys]
+    if ignored:
+        logger.warning(f"[SOAP-SF] Ignored unsupported params: {ignored}")
+
+    param_list = params if _is_param_groups(params) else list(params)
+    logger.info(
+        "Creating SOAP-SF (Schedule-Free) optimizer "
+        "(lr=%s, betas=%s, wd=%s, eps=%s, precondition_frequency=%s, "
+        "max_precond_dim=%s, weight_lr_power=%s, r=%s, warmup_steps=%s)",
+        lr,
+        betas,
+        weight_decay,
+        eps,
+        sf_kwargs.get("precondition_frequency", 10),
+        sf_kwargs.get("max_precond_dim", 10000),
+        sf_kwargs.get("weight_lr_power", 2.0),
+        sf_kwargs.get("r", 0.0),
+        sf_kwargs.get("warmup_steps", 0),
+    )
+    return SOAPScheduleFree(
+        param_list,
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
+        eps=eps,
+        **sf_kwargs,
     )
 
 

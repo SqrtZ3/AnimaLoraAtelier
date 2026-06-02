@@ -104,6 +104,56 @@ class SoapOptimizerFactoryTests(unittest.TestCase):
         self.assertNotIn("GG", state)
         self.assertNotIn("Q", state)
 
+    def test_soap_precond_in_state_true_keeps_GG_Q_in_state_dict(self):
+        param = torch.nn.Parameter(torch.randn(6, 4))
+        optimizer = create_optimizer(
+            "soap", [param], learning_rate=1e-3, betas=(0.95, 0.95),
+            precondition_frequency=1, max_precond_dim=16, precond_in_state=True,
+        )
+        for _ in range(3):
+            optimizer.zero_grad()
+            (param ** 2).sum().backward()
+            optimizer.step()
+        pstate = optimizer.state_dict()["state"][0]
+        self.assertIn("GG", pstate)
+        self.assertIn("Q", pstate)
+
+    def test_soap_precond_in_state_false_strips_GG_Q_and_rebuilds_on_resume(self):
+        param = torch.nn.Parameter(torch.randn(6, 4))
+        optimizer = create_optimizer(
+            "soap", [param], learning_rate=1e-3, betas=(0.95, 0.95),
+            precondition_frequency=1, max_precond_dim=16, precond_in_state=False,
+        )
+        for _ in range(3):
+            optimizer.zero_grad()
+            (param ** 2).sum().backward()
+            optimizer.step()
+
+        sd = optimizer.state_dict()
+        pstate = sd["state"][0]
+        # The recomputable Shampoo matrices must be gone; moments must survive.
+        self.assertNotIn("GG", pstate)
+        self.assertNotIn("Q", pstate)
+        self.assertIn("exp_avg", pstate)
+        self.assertIn("exp_avg_sq", pstate)
+        # Live optimizer state must NOT be mutated by serialization.
+        self.assertIn("GG", optimizer.state[param])
+
+        # Resume into a fresh optimizer and confirm the preconditioner rebuilds.
+        param2 = torch.nn.Parameter(param.detach().clone())
+        optimizer2 = create_optimizer(
+            "soap", [param2], learning_rate=1e-3, betas=(0.95, 0.95),
+            precondition_frequency=1, max_precond_dim=16, precond_in_state=False,
+        )
+        optimizer2.load_state_dict(sd)
+        self.assertNotIn("has_preconditioner", optimizer2.state[param2])  # stripped
+        optimizer2.zero_grad()
+        (param2 ** 2).sum().backward()
+        optimizer2.step()
+        self.assertTrue(optimizer2.state[param2].get("has_preconditioner", False))
+        self.assertIsNotNone(optimizer2.state[param2].get("Q"))
+        self.assertTrue(torch.isfinite(param2.detach()).all())
+
     def test_soap_ignores_unsupported_optimizer_args_with_warning(self):
         param = torch.nn.Parameter(torch.randn(2, 2))
 
@@ -116,6 +166,156 @@ class SoapOptimizerFactoryTests(unittest.TestCase):
             )
 
         self.assertEqual(type(optimizer).__name__, "SOAP")
+        self.assertTrue(any("Ignored unsupported params" in line for line in logs.output))
+
+
+class SoapSfOptimizerFactoryTests(unittest.TestCase):
+    def _make(self, param, **overrides):
+        kwargs = dict(
+            learning_rate=1.0e-1,
+            betas=(0.9, 0.95),
+            weight_decay=0.0,
+            precondition_frequency=1,
+            max_precond_dim=16,
+            merge_dims=False,
+        )
+        kwargs.update(overrides)
+        return create_optimizer("soap_sf", [param], **kwargs)
+
+    def test_create_soap_sf_preserves_param_group_lr_and_weight_decay(self):
+        matrix = torch.nn.Parameter(torch.randn(4, 3))
+        vector = torch.nn.Parameter(torch.randn(4))
+        groups = [
+            {"params": [matrix], "lr": 2.5e-4, "weight_decay": 0.01},
+            {"params": [vector], "lr": 8.0e-5, "weight_decay": 0.0},
+        ]
+
+        optimizer = create_optimizer(
+            "soap_sf",
+            groups,
+            learning_rate=2.5e-4,
+            betas=(0.9, 0.95),
+            weight_decay=0.01,
+            precondition_frequency=5,
+            max_precond_dim=512,
+        )
+
+        self.assertEqual(type(optimizer).__name__, "SOAPScheduleFree")
+        self.assertEqual(optimizer.param_groups[0]["lr"], 2.5e-4)
+        self.assertEqual(optimizer.param_groups[1]["lr"], 8.0e-5)
+        self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.01)
+        self.assertEqual(optimizer.param_groups[1]["weight_decay"], 0.0)
+        # Schedule-Free runtime bookkeeping must exist per group.
+        for key in ("k", "weight_sum", "lr_max", "train_mode"):
+            self.assertIn(key, optimizer.param_groups[0])
+
+    def test_soapsf_alias_maps_to_same_optimizer(self):
+        param = torch.nn.Parameter(torch.randn(2, 2))
+        optimizer = create_optimizer("soapsf", [param], learning_rate=1e-3)
+        self.assertEqual(type(optimizer).__name__, "SOAPScheduleFree")
+
+    def test_soap_sf_minimizes_quadratic_at_averaged_iterate(self):
+        torch.manual_seed(0)
+        param = torch.nn.Parameter(torch.randn(4, 4))
+        optimizer = self._make(param)
+
+        initial_loss = (param.detach() ** 2).sum().item()
+        for _ in range(100):
+            optimizer.zero_grad()
+            loss = (param ** 2).sum()
+            loss.backward()
+            optimizer.step()
+
+        # Evaluate at the Polyak-averaged iterate x (what we sample / checkpoint with).
+        optimizer.eval()
+        eval_loss = (param.detach() ** 2).sum().item()
+        self.assertTrue(torch.isfinite(param.detach()).all())
+        self.assertLess(eval_loss, 0.1 * initial_loss)
+
+    def test_soap_sf_train_eval_swap_is_invertible(self):
+        torch.manual_seed(1)
+        param = torch.nn.Parameter(torch.randn(3, 3))
+        optimizer = self._make(param)
+
+        for _ in range(5):
+            optimizer.zero_grad()
+            (param ** 2).sum().backward()
+            optimizer.step()
+
+        y = param.detach().clone()           # gradient-evaluation point (train mode)
+        optimizer.eval()
+        x = param.detach().clone()           # averaged iterate
+        # x must actually differ from y once z has moved away from init.
+        self.assertGreater((x - y).abs().max().item(), 1e-6)
+        optimizer.train()
+        y_again = param.detach().clone()     # swapping back must restore y
+        self.assertTrue(torch.allclose(y, y_again, atol=1e-5))
+
+    def test_soap_sf_step_in_eval_mode_raises(self):
+        param = torch.nn.Parameter(torch.randn(2, 2))
+        optimizer = self._make(param)
+        optimizer.zero_grad()
+        (param ** 2).sum().backward()
+        optimizer.step()
+        optimizer.eval()
+        with self.assertRaises(RuntimeError):
+            optimizer.step()
+
+    def test_soap_sf_state_dict_round_trip_preserves_schedule(self):
+        param = torch.nn.Parameter(torch.randn(3, 3))
+        optimizer = self._make(param)
+        for _ in range(7):
+            optimizer.zero_grad()
+            (param ** 2).sum().backward()
+            optimizer.step()
+
+        sd = optimizer.state_dict()
+        self.assertEqual(optimizer.param_groups[0]["k"], 7)
+
+        param2 = torch.nn.Parameter(param.detach().clone())
+        optimizer2 = self._make(param2)
+        optimizer2.load_state_dict(sd)
+        self.assertEqual(optimizer2.param_groups[0]["k"], 7)
+        self.assertEqual(
+            optimizer2.param_groups[0]["weight_sum"],
+            optimizer.param_groups[0]["weight_sum"],
+        )
+        state2 = optimizer2.state[param2]
+        self.assertIn("z", state2)
+        self.assertIn("exp_avg_sq", state2)
+        self.assertNotIn("exp_avg", state2)  # SF drops the first moment
+
+    def test_soap_sf_precond_in_state_false_drops_GG_Q_keeps_z_and_resumes(self):
+        param = torch.nn.Parameter(torch.randn(6, 4))
+        optimizer = self._make(param, precond_in_state=False)
+        for _ in range(6):
+            optimizer.zero_grad()
+            (param ** 2).sum().backward()
+            optimizer.step()
+
+        sd = optimizer.state_dict()
+        pstate = sd["state"][0]
+        self.assertNotIn("GG", pstate)
+        self.assertNotIn("Q", pstate)
+        self.assertIn("z", pstate)            # SF base sequence is NOT recomputable
+        self.assertIn("exp_avg_sq", pstate)
+
+        param2 = torch.nn.Parameter(param.detach().clone())
+        optimizer2 = self._make(param2, precond_in_state=False)
+        optimizer2.load_state_dict(sd)
+        optimizer2.zero_grad()
+        (param2 ** 2).sum().backward()
+        optimizer2.step()
+        self.assertTrue(optimizer2.state[param2].get("has_preconditioner", False))
+        self.assertTrue(torch.isfinite(param2.detach()).all())
+        optimizer2.eval()  # averaged iterate must still be finite after a resumed step
+        self.assertTrue(torch.isfinite(param2.detach()).all())
+
+    def test_soap_sf_ignores_unsupported_optimizer_args_with_warning(self):
+        param = torch.nn.Parameter(torch.randn(2, 2))
+        with self.assertLogs("utils.optimizer_utils", level=logging.WARNING) as logs:
+            optimizer = create_optimizer("soap_sf", [param], learning_rate=1e-3, made_up_option=True)
+        self.assertEqual(type(optimizer).__name__, "SOAPScheduleFree")
         self.assertTrue(any("Ignored unsupported params" in line for line in logs.output))
 
 

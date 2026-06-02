@@ -5,3 +5,12 @@ output/*
 **/__pycache__
 AnimaLoraToolkit/monitor_data/*
 *.log
+
+# Optimizer / training-state checkpoints (can be multi-GB — e.g. SOAP GG/Q matrices)
+*.pt
+*.ckpt
+
+# Personal / experimental training configs (kept local, not shared)
+AnimaLoraToolkit/config/train_my_1024.yaml
+AnimaLoraToolkit/config/train_my_1536.yaml
+AnimaLoraToolkit/config/train_my_soap_sf.yaml

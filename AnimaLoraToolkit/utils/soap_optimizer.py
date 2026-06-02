@@ -27,6 +27,12 @@ SOFTWARE.
 
 The implementation below keeps SOAP's Adam-in-Shampoo-eigenbasis update, but
 uses fp32 optimizer state so bf16 LoRA/LoKr training remains numerically sane.
+
+`SOAPScheduleFree` (further down) wraps the Schedule-Free mechanism
+(arXiv:2405.15682) around the same preconditioner: it drops the first-moment
+buffer and replaces the LR schedule with a Polyak-Ruppert average, so it needs
+no `total_steps`/decay schedule and exposes `train()`/`eval()` like the other
+schedule-free optimizers in this repo.
 """
 
 from __future__ import annotations
@@ -61,6 +67,7 @@ class SOAP(Optimizer):
         normalize_grads: bool = False,
         data_format: str = "channels_first",
         correct_bias: bool = True,
+        precond_in_state: bool = True,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -96,6 +103,25 @@ class SOAP(Optimizer):
         }
         super().__init__(params, defaults)
         self._data_format = data_format
+        # When False, the (recomputable) Shampoo matrices GG/Q are stripped from
+        # state_dict() — they dominate checkpoint size for low-rank adapters with
+        # large feature dims. They are rebuilt lazily on resume (see step()).
+        self._precond_in_state = bool(precond_in_state)
+
+    def state_dict(self) -> dict:
+        sd = super().state_dict()
+        if not getattr(self, "_precond_in_state", True):
+            # Drop the recomputable Shampoo matrices (GG/Q) AND the
+            # `has_preconditioner` flag, without mutating live optimizer state.
+            # Removing the flag is what triggers the lazy rebuild in step() on
+            # resume; leaving GG/Q out while keeping the flag would KeyError.
+            drop = ("GG", "Q", "has_preconditioner")
+            sd = dict(sd)
+            sd["state"] = {
+                idx: {k: v for k, v in pstate.items() if k not in drop}
+                for idx, pstate in sd["state"].items()
+            }
+        return sd
 
     def _merge_dims(self, grad: Tensor, max_precond_dim: int) -> Tensor:
         if self._data_format == "channels_last" and grad.dim() == 4:
@@ -332,6 +358,18 @@ class SOAP(Optimizer):
                         merge_dims=group["merge_dims"],
                         precondition_frequency=group["precondition_frequency"],
                     )
+                elif "has_preconditioner" not in state:
+                    # Resumed from a checkpoint saved with precond_in_state=False:
+                    # moments survived but GG/Q were stripped — rebuild them cold.
+                    self._init_preconditioner(
+                        grad=grad,
+                        state=state,
+                        shampoo_beta=shampoo_beta,
+                        max_precond_dim=group["max_precond_dim"],
+                        precondition_1d=group["precondition_1d"],
+                        merge_dims=group["merge_dims"],
+                        precondition_frequency=group["precondition_frequency"],
+                    )
 
                 use_preconditioner = bool(state.get("has_preconditioner", False) and state.get("Q") is not None)
                 if use_preconditioner:
@@ -373,5 +411,275 @@ class SOAP(Optimizer):
                     merge_dims=group["merge_dims"],
                     precondition_1d=group["precondition_1d"],
                 )
+
+        return loss
+
+
+class SOAPScheduleFree(SOAP):
+    """Schedule-Free SOAP — SOAP's preconditioner with a schedule-free trajectory.
+
+    This wraps the Schedule-Free mechanism (Defazio et al., 2024,
+    "The Road Less Scheduled", arXiv:2405.15682) around SOAP's Adam-in-the-
+    Shampoo-eigenbasis update. The Schedule-Free wrapper is base-optimizer
+    agnostic by design, so the construction is a clean substitution:
+
+      * The first-moment EMA (``exp_avg``) is **dropped**. Schedule-Free
+        replaces Adam-style momentum with an interpolation between a base
+        sequence ``z`` and a Polyak-Ruppert average ``x``. ``betas[0]``
+        therefore becomes the SF interpolation weight (not a momentum buffer),
+        and ``betas[1]`` stays the second-moment decay.
+      * The second moment ``exp_avg_sq`` is kept **in the Shampoo eigenbasis**,
+        exactly as in SOAP, and is re-ordered with the basis by the inherited
+        ``_orthogonal_matrix_qr``. ``z`` lives in parameter space and is
+        basis-independent, so it needs no rotation bookkeeping.
+
+    Memory is neutral vs SOAP: ``z`` replaces ``exp_avg`` (param + 1 buffer +
+    ``exp_avg_sq`` + GG + Q). The parameter tensor holds the gradient-evaluation
+    point ``y`` while in train mode; call :meth:`eval` before sampling /
+    checkpointing to swap it to the averaged iterate ``x``, and :meth:`train`
+    to swap back. The trainer already gates these via ``hasattr(opt, "eval")``.
+
+    The in-place ``y``/``z`` update and the ``train``/``eval`` swap follow the
+    reference ``AdamWScheduleFree`` (facebookresearch/schedule-free).
+
+    Schedule-specific args:
+        weight_lr_power: power on lr in the Polyak averaging weight (default 2.0).
+        r: power on the step index in the averaging weight (default 0.0 = uniform
+           average). Larger r weights *later* iterates more, so ``x`` tracks ``z``
+           faster — useful for very short runs where a uniform average lags badly.
+        warmup_steps: linear lr warmup (default 0). SF rarely needs warmup, but a
+           few steps can stabilise the early preconditioner estimate.
+    """
+
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 2.5e-3,
+        betas: tuple[float, float] = (0.9, 0.95),
+        shampoo_beta: float = -1.0,
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        precondition_frequency: int = 10,
+        max_precond_dim: int = 10000,
+        merge_dims: bool = False,
+        precondition_1d: bool = False,
+        normalize_grads: bool = False,
+        data_format: str = "channels_first",
+        correct_bias: bool = True,
+        weight_lr_power: float = 2.0,
+        r: float = 0.0,
+        warmup_steps: int = 0,
+        precond_in_state: bool = True,
+    ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if eps < 0.0:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        # SF needs a strictly positive interpolation weight; eval() divides by it.
+        if not 0.0 < betas[0] < 1.0:
+            raise ValueError(f"Invalid beta1 (SF interpolation) value: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta2 value: {betas[1]}")
+        if shampoo_beta >= 1.0:
+            raise ValueError(f"Invalid shampoo_beta value: {shampoo_beta}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if precondition_frequency < 1:
+            raise ValueError("precondition_frequency must be >= 1")
+        if max_precond_dim < 1:
+            raise ValueError("max_precond_dim must be >= 1")
+        if warmup_steps < 0:
+            raise ValueError("warmup_steps must be >= 0")
+        if data_format not in {"channels_first", "channels_last"}:
+            raise ValueError("data_format must be 'channels_first' or 'channels_last'")
+
+        defaults = {
+            "lr": lr,
+            "betas": betas,
+            "shampoo_beta": shampoo_beta,
+            "eps": eps,
+            "weight_decay": weight_decay,
+            "precondition_frequency": int(precondition_frequency),
+            "max_precond_dim": int(max_precond_dim),
+            "merge_dims": bool(merge_dims),
+            "precondition_1d": bool(precondition_1d),
+            "normalize_grads": bool(normalize_grads),
+            "correct_bias": bool(correct_bias),
+            "weight_lr_power": float(weight_lr_power),
+            "r": float(r),
+            "warmup_steps": int(warmup_steps),
+            # Schedule-Free runtime bookkeeping (persisted in param_groups).
+            "k": 0,
+            "weight_sum": 0.0,
+            "lr_max": 0.0,
+            "train_mode": True,
+        }
+        # Bypass SOAP.__init__ (its defaults lack the SF keys); set up directly.
+        Optimizer.__init__(self, params, defaults)
+        self._data_format = data_format
+        self._precond_in_state = bool(precond_in_state)
+
+    # -- Schedule-Free preconditioner update: identical to SOAP's GG/Q refresh
+    #    but without any exp_avg (first moment) projection, since SF has none.
+    def _update_preconditioner(
+        self,
+        grad: Tensor,
+        state: dict,
+        max_precond_dim: int,
+        merge_dims: bool,
+        precondition_1d: bool,
+    ) -> None:
+        if not state.get("has_preconditioner", False):
+            return
+
+        working_grad = grad
+        if working_grad.dim() == 1:
+            if precondition_1d and working_grad.shape[0] <= max_precond_dim:
+                outer = working_grad.unsqueeze(1).matmul(working_grad.unsqueeze(0))
+                state["GG"][0].lerp_(outer, 1.0 - state["shampoo_beta"])
+        else:
+            if merge_dims:
+                working_grad = self._merge_dims(working_grad, max_precond_dim)
+            for dim, size in enumerate(working_grad.shape):
+                if int(size) <= max_precond_dim and state["GG"][dim] is not None:
+                    state["GG"][dim].lerp_(self._outer_for_dim(working_grad, dim), 1.0 - state["shampoo_beta"])
+
+        if state.get("Q") is None:
+            state["Q"] = self._orthogonal_matrix(state["GG"])
+        elif state["step"] > 0 and state["step"] % state["precondition_frequency"] == 0:
+            # Re-orders state["exp_avg_sq"] (the eigenbasis second moment) in place.
+            state["Q"] = self._orthogonal_matrix_qr(state, max_precond_dim, merge_dims)
+
+    @torch.no_grad()
+    def train(self) -> None:
+        """Swap the parameter from the eval point x back to the gradient point y."""
+        for group in self.param_groups:
+            beta1, _ = group["betas"]
+            if not group.get("train_mode", False):
+                for param in group["params"]:
+                    z = self.state.get(param, {}).get("z")
+                    if z is not None:
+                        y = param.detach().float()
+                        y.lerp_(z, weight=1.0 - beta1)
+                        param.copy_(y.to(dtype=param.dtype))
+                group["train_mode"] = True
+
+    @torch.no_grad()
+    def eval(self) -> None:
+        """Swap the parameter to the Polyak-averaged iterate x (for sampling/saving)."""
+        for group in self.param_groups:
+            beta1, _ = group["betas"]
+            if group.get("train_mode", True):
+                for param in group["params"]:
+                    z = self.state.get(param, {}).get("z")
+                    if z is not None:
+                        x = param.detach().float()
+                        x.lerp_(z, weight=1.0 - 1.0 / beta1)
+                        param.copy_(x.to(dtype=param.dtype))
+                group["train_mode"] = False
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Callable[[], float]] = None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if not group.get("train_mode", True):
+                raise RuntimeError(
+                    "SOAPScheduleFree.step() called in eval mode; call optimizer.train() first."
+                )
+            beta1, beta2 = group["betas"]
+            shampoo_beta = group["shampoo_beta"] if group["shampoo_beta"] >= 0 else beta2
+            eps = group["eps"]
+            decay = group["weight_decay"]
+            lr = group["lr"]
+            warmup_steps = group["warmup_steps"]
+
+            k = group["k"]
+            sched = (k + 1) / warmup_steps if (warmup_steps > 0 and k < warmup_steps) else 1.0
+            bias_correction2 = (1.0 - beta2 ** (k + 1)) if group["correct_bias"] else 1.0
+            lr_eff = lr * sched * (bias_correction2 ** 0.5)
+
+            lr_max = group["lr_max"] = max(lr_eff, group["lr_max"])
+            weight = ((k + 1) ** group["r"]) * (lr_max ** group["weight_lr_power"])
+            weight_sum = group["weight_sum"] = group["weight_sum"] + weight
+            ckp1 = weight / weight_sum if weight_sum > 0 else 0.0
+            adaptive_y_lr = lr_eff * (beta1 * (1.0 - ckp1) - 1.0)
+
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                if param.grad.is_sparse:
+                    raise RuntimeError("SOAPScheduleFree does not support sparse gradients")
+
+                grad = param.grad.detach().float()
+                state = self.state[param]
+
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["z"] = param.detach().clone().float()
+                    state["exp_avg_sq"] = torch.zeros_like(param.detach(), dtype=torch.float32)
+                    self._init_preconditioner(
+                        grad=grad,
+                        state=state,
+                        shampoo_beta=shampoo_beta,
+                        max_precond_dim=group["max_precond_dim"],
+                        precondition_1d=group["precondition_1d"],
+                        merge_dims=group["merge_dims"],
+                        precondition_frequency=group["precondition_frequency"],
+                    )
+                elif "has_preconditioner" not in state:
+                    # Resumed with precond_in_state=False: z/exp_avg_sq survived,
+                    # GG/Q were stripped — rebuild them cold.
+                    self._init_preconditioner(
+                        grad=grad,
+                        state=state,
+                        shampoo_beta=shampoo_beta,
+                        max_precond_dim=group["max_precond_dim"],
+                        precondition_1d=group["precondition_1d"],
+                        merge_dims=group["merge_dims"],
+                        precondition_frequency=group["precondition_frequency"],
+                    )
+
+                use_preconditioner = bool(state.get("has_preconditioner", False) and state.get("Q") is not None)
+                grad_proj = (
+                    self._project(grad, state, merge_dims=group["merge_dims"], max_precond_dim=group["max_precond_dim"])
+                    if use_preconditioner
+                    else grad
+                )
+
+                # Second moment lives in the eigenbasis; numerator is g' (no first moment).
+                exp_avg_sq = state["exp_avg_sq"]
+                exp_avg_sq.mul_(beta2).addcmul_(grad_proj, grad_proj, value=1.0 - beta2)
+                update = grad_proj / exp_avg_sq.sqrt().add_(eps)
+                if use_preconditioner:
+                    update = self._project_back(
+                        update, state, merge_dims=group["merge_dims"], max_precond_dim=group["max_precond_dim"]
+                    )
+                if group["normalize_grads"]:
+                    update = update / (update.pow(2).mean().sqrt() + 1e-30)
+
+                # Schedule-Free in-place y/z update (fp32), then cast y back to param dtype.
+                y = param.detach().float()
+                if decay != 0.0:
+                    update = update.add(y, alpha=decay)  # decoupled WD evaluated at y
+                z = state["z"]
+                y.lerp_(z, weight=ckp1)
+                y.add_(update, alpha=adaptive_y_lr)
+                param.copy_(y.to(dtype=param.dtype))
+                z.sub_(update, alpha=lr_eff)
+
+                state["step"] += 1
+                self._update_preconditioner(
+                    grad=grad,
+                    state=state,
+                    max_precond_dim=group["max_precond_dim"],
+                    merge_dims=group["merge_dims"],
+                    precondition_1d=group["precondition_1d"],
+                )
+
+            group["k"] = k + 1
 
         return loss

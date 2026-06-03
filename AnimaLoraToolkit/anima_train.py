@@ -230,6 +230,7 @@ from trainer.objective import (
     make_noise_from_config,
     _huber_delta_for_t,
     per_sample_loss,
+    contrastive_flow_matching_neg,
     per_sample_highfreq_loss,
     adaptive_timestep_metric_signal,
     compute_loss_weight,
@@ -497,9 +498,13 @@ def parse_args():
     p.add_argument("--no-t5-token-weights", dest="use_t5_token_weights", action="store_false")
     p.add_argument("--flow-shift", type=float, default=3.0, help="logit/timestep shift used by shifted timestep samplers")
     p.add_argument("--timestep-sampling", default="logit_normal",
-                   choices=["logit_normal", "uniform", "logit_normal_low", "mode", "mixed_uniform_low", "mixed_uniform_logit"],
+                   choices=["logit_normal", "uniform", "logit_normal_low", "mode", "mixed_uniform_low", "mixed_uniform_logit", "laplace"],
                    help="timestep sampling distribution")
     p.add_argument("--timestep-mix-low-prob", type=float, default=0.25, help="mixed_uniform_low 中低噪声样本比例")
+    p.add_argument("--timestep-laplace-mu", type=float, default=0.0,
+                   help="Laplace 噪声调度（timestep_sampling=laplace）log-SNR 峰位 μ；>0 偏低噪声/细节端，<0 偏高噪。")
+    p.add_argument("--timestep-laplace-b", type=float, default=0.5,
+                   help="Laplace 噪声调度的尺度 b（越小越集中在 μ 附近）。论文 256→0.5、512→0.75。")
     p.add_argument("--adaptive-timestep", action="store_true",
                    help="启用保守自适应 timestep：按 per-timestep raw loss 重采样，不改变 loss 权重。")
     p.add_argument("--adaptive-timestep-metric", choices=["raw", "highfreq", "mixed", "entropy_rate"], default="raw",
@@ -526,6 +531,12 @@ def parse_args():
     p.add_argument("--loss-type", default="mse", choices=["mse", "l2", "l1", "huber", "smooth_l1"], help="训练损失类型")
     p.add_argument("--huber-c", type=float, default=0.1, help="Huber/SmoothL1 切换阈值")
     p.add_argument("--huber-schedule", default="constant", choices=["constant", "snr", "sigma"], help="Huber 阈值随 timestep 的调度")
+    p.add_argument("--huber-snr-clamp-max", type=float, default=10.0,
+                   help="huber_schedule=snr 时低 t（细节区）δ 的上限倍率。默认 10.0=旧行为（低噪近纯 L2）；"
+                        "调小（如 3）让低噪区保留 L1 鲁棒，抗脏数据集 outlier。")
+    p.add_argument("--dfm-lambda", type=float, default=0.0,
+                   help="Contrastive Flow Matching（ΔFM, arxiv:2506.05350）排斥项权重。0=关闭；"
+                        "论文甜点 0.05，≥0.15 易分布塌缩。反'回归条件均值→发灰发雾'，零额外前向。")
     p.add_argument("--loss-weighting-scheme", default="none",
                    choices=["none", "min_snr", "max_snr_inv", "logit_normal", "sigma_sqrt", "sigma_sqrt_sd3", "detail_inv_t", "cosmap"],
                    help="per-sample loss weighting scheme")
@@ -1831,6 +1842,8 @@ def main():
             t = adaptive_ts.sample(
                 bs, device, mode=ts_mode, shift=f_shift,
                 mix_low_prob=mix_low_prob, schedule_shift=sched_shift,
+                laplace_mu=objective_cfg.timestep.laplace_mu,
+                laplace_b=objective_cfg.timestep.laplace_b,
                 global_step=global_step,
             )
 
@@ -1896,6 +1909,7 @@ def main():
                         huber_c=objective_cfg.loss.huber_c,
                         huber_schedule=objective_cfg.loss.huber_schedule,
                         t=t.float(),
+                        huber_snr_clamp_max=objective_cfg.loss.huber_snr_clamp_max,
                     )
                 else:
                     pred = forward_with_optional_checkpoint(
@@ -1909,7 +1923,23 @@ def main():
                         huber_c=objective_cfg.loss.huber_c,
                         huber_schedule=objective_cfg.loss.huber_schedule,
                         t=t.float(),
+                        huber_snr_clamp_max=objective_cfg.loss.huber_snr_clamp_max,
                     )
+
+                # ── ΔFM: Contrastive Flow Matching（默认关闭，dfm_lambda=0）──
+                # per_sample ← per_sample - λ·||v_pred - v_另一样本target||²，反"回归条件均值→发灰发雾"。
+                # 不改噪声分布、零额外前向 → 不会重演 Immiscible 的推理斑块问题。
+                _dfm_lambda = float(objective_cfg.loss.dfm_lambda or 0.0)
+                if _dfm_lambda > 0.0 and bs > 1:
+                    per_sample_neg = contrastive_flow_matching_neg(
+                        pred, target, t.float(),
+                        loss_type=objective_cfg.loss.loss_type,
+                        huber_c=objective_cfg.loss.huber_c,
+                        huber_schedule=objective_cfg.loss.huber_schedule,
+                        huber_snr_clamp_max=objective_cfg.loss.huber_snr_clamp_max,
+                        mask=fit_mask if fit_packed_training else None,
+                    )
+                    per_sample = per_sample - _dfm_lambda * per_sample_neg
 
                 if sample_accum_enabled:
                     main_loss_per_sample = apply_loss_weighting_per_sample(

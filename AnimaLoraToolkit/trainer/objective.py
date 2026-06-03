@@ -37,6 +37,13 @@ class TimestepConfig:
     flow_shift: float = 3.0
     mix_low_prob: float = 0.25
     schedule_shift: float = 1.0
+    # ── Laplace 噪声调度（Hang et al. 2024, arxiv:2407.03297）——仅 mode="laplace" 生效 ──
+    # log-SNR 按 Laplace 分布采样：λ = μ - b·sgn(0.5-u)·log(1-2|u-0.5|)，再映射回 flow t。
+    # μ>0 把采样推向高 SNR / 低噪声（细节）端；μ<0 推向高噪；b 控制集中度（越小越集中）。
+    # 默认 μ=0,b=0.5 = 论文 ImageNet-256 设置（中噪聚焦）。
+    # 建议与 schedule_shift=1.0 + adaptive_timestep=false 搭配做干净对照（避免二次偏移）。
+    laplace_mu: float = 0.0
+    laplace_b: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -60,6 +67,15 @@ class LossConfig:
     # [1.5, 3]（hazy 画风）或彻底关掉 detail_inv_t（balanced 配方）。
     detail_inv_t_min: float = 1.0
     detail_inv_t_max: float = 5.0
+    # ── 新增旋钮（默认值 = 历史行为，全部 no-op）──
+    # snr 调度下低 t（细节区）δ 的上限。当前 snr 调度在 t→0 处 δ 可冲到 10·huber_c
+    #   = 近乎纯 L2 = 对脏样本坏细节零 outlier 保护。调小（如 3）让低噪区也保留部分
+    #   L1 鲁棒（抗脏数据，代价是极细节精度略降）。10.0 = 旧行为。
+    huber_snr_clamp_max: float = 10.0
+    # Contrastive Flow Matching（ΔFM, arxiv:2506.05350）排斥项权重 λ。
+    #   per_sample ← per_sample - λ·||v_pred - v_另一样本||²，反"回归条件均值→发灰发雾"。
+    #   零额外前向；0=关闭，论文甜点 0.05，≥0.15 会分布塌缩。
+    dfm_lambda: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -78,6 +94,8 @@ def build_training_objective_config(args) -> TrainingObjectiveConfig:
             flow_shift=float(getattr(args, "flow_shift", 3.0) or 3.0),
             mix_low_prob=float(getattr(args, "timestep_mix_low_prob", 0.25) or 0.0),
             schedule_shift=float(getattr(args, "schedule_shift", 1.0) or 1.0),
+            laplace_mu=float(getattr(args, "timestep_laplace_mu", 0.0) or 0.0),
+            laplace_b=float(getattr(args, "timestep_laplace_b", 0.5) or 0.5),
         ),
         noise=NoiseConfig(
             offset=float(getattr(args, "noise_offset", 0.0) or 0.0),
@@ -95,6 +113,8 @@ def build_training_objective_config(args) -> TrainingObjectiveConfig:
             weight_cap_ratio=float(getattr(args, "weight_cap_ratio", 0.0) or 0.0),
             detail_inv_t_min=float(getattr(args, "detail_inv_t_min", 1.0) or 1.0),
             detail_inv_t_max=float(getattr(args, "detail_inv_t_max", 5.0) or 5.0),
+            huber_snr_clamp_max=float(getattr(args, "huber_snr_clamp_max", 10.0) or 10.0),
+            dfm_lambda=float(getattr(args, "dfm_lambda", 0.0) or 0.0),
         ),
         aux=build_aux_loss_config(args),
     )
@@ -110,6 +130,8 @@ def sample_t(
     mode: str = "logit_normal",
     shift: float = 3.0,
     mix_low_prob: float = 0.25,
+    laplace_mu: float = 0.0,
+    laplace_b: float = 0.5,
 ):
     """采样 Flow Matching 时间步 t ∈ (0, 1)。
 
@@ -119,10 +141,23 @@ def sample_t(
       - "logit_normal_low": logit-normal 但 shift 反向（推 t 偏向低噪声/细节端），适合刻画细节差的训练集。
       - "mode":         SD3 式 mode-distribution（用 sigma 形式，需要 shift）。
       - "mixed_uniform_low": 以 uniform 为主体，按 mix_low_prob 混入 logit_normal_low；
+      - "laplace":      log-SNR 按 Laplace 分布采样（arxiv:2407.03297）。用 laplace_mu/laplace_b
+                        控制峰位与集中度，μ>0 偏低噪声/细节端。是 detail_inv_t+mix_low+schedule_shift
+                        那一堆 ad-hoc 旋钮的原理化替代。
     """
     mode = (mode or "logit_normal").lower()
     if mode == "uniform":
         return torch.rand(bs, device=device).clamp(1e-4, 1.0 - 1e-4)
+
+    if mode == "laplace":
+        # u ~ U(0,1) 作为分位点；λ = log-SNR 按 Laplace(μ, b) 逆 CDF 采样。
+        u = torch.rand(bs, device=device).clamp(1e-4, 1.0 - 1e-4)
+        sgn = torch.sign(0.5 - u)
+        # log(1 - 2|u-0.5|)：u→0/1 时 →-inf（λ→±inf），u→0.5 时 →0（λ→μ）
+        lam = float(laplace_mu) - float(laplace_b) * sgn * torch.log1p(-2.0 * (u - 0.5).abs())
+        # 映射 log-SNR → flow-matching t：CONST 调度 SNR=((1-t)/t)^2 ⇒ t = 1/(1+exp(λ/2))
+        t = 1.0 / (1.0 + torch.exp(0.5 * lam))
+        return t.clamp(1e-4, 1.0 - 1e-4)
 
     if mode in ("mixed_uniform_low", "uniform_low_mix"):
         uniform_t = torch.rand(bs, device=device)
@@ -274,8 +309,10 @@ class AdaptiveTimestepSampler:
 
     def sample(self, bs, device, *, mode: str, shift: float, mix_low_prob: float,
                schedule_shift: float = 1.0,
+               laplace_mu: float = 0.0, laplace_b: float = 0.5,
                global_step: int) -> torch.Tensor:
-        base_t = sample_t(bs, device, mode=mode, shift=shift, mix_low_prob=mix_low_prob)
+        base_t = sample_t(bs, device, mode=mode, shift=shift, mix_low_prob=mix_low_prob,
+                          laplace_mu=laplace_mu, laplace_b=laplace_b)
         if (not self.enabled) or global_step < self.burn_in_steps or not self.ready:
             return base_t
 
@@ -284,7 +321,8 @@ class AdaptiveTimestepSampler:
             return base_t
 
         candidates_n = max(adaptive_count * self.candidate_mult, adaptive_count)
-        candidates = sample_t(candidates_n, device, mode=mode, shift=shift, mix_low_prob=mix_low_prob)
+        candidates = sample_t(candidates_n, device, mode=mode, shift=shift, mix_low_prob=mix_low_prob,
+                              laplace_mu=laplace_mu, laplace_b=laplace_b)
         candidates_final = apply_timestep_schedule_shift(candidates, schedule_shift)
         candidate_bins = torch.clamp((candidates_final.float() * self.bins).long(), 0, self.bins - 1)
         weights = self.factors().to(device=candidates.device)[candidate_bins]
@@ -411,7 +449,8 @@ def make_noise_from_config(latents: torch.Tensor, cfg: NoiseConfig) -> torch.Ten
 # Loss
 # ============================================================================
 
-def _huber_delta_for_t(t: torch.Tensor | None, huber_c: float, schedule: str):
+def _huber_delta_for_t(t: torch.Tensor | None, huber_c: float, schedule: str,
+                       snr_clamp_max: float = 10.0):
     delta = max(float(huber_c), 1e-8)
     if t is None:
         return delta
@@ -423,7 +462,10 @@ def _huber_delta_for_t(t: torch.Tensor | None, huber_c: float, schedule: str):
     t_c = t.float().clamp(1e-4, 1.0 - 1e-4)
     if schedule == "snr":
         # High SNR / low-noise steps get a larger quadratic basin; high-noise steps become more L1-like.
-        snr_sqrt = ((1.0 - t_c) / t_c).clamp(0.1, 10.0)
+        # snr_clamp_max 决定低 t（细节区）δ 上限：默认 10.0=旧行为（低 t 近纯 L2，脏数据零保护）；
+        # 调小（如 3）让低噪区也保留部分 L1 鲁棒（抗脏数据集）。
+        hi = max(float(snr_clamp_max), 0.1 + 1e-6)
+        snr_sqrt = ((1.0 - t_c) / t_c).clamp(0.1, hi)
         return (delta * snr_sqrt).view(-1, *([1] * 4))
     if schedule == "sigma":
         return (delta * t_c.clamp(0.1, 1.0)).view(-1, *([1] * 4))
@@ -433,7 +475,8 @@ def _huber_delta_for_t(t: torch.Tensor | None, huber_c: float, schedule: str):
 
 def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "mse",
                     huber_c: float = 0.1, huber_schedule: str = "constant",
-                    t: torch.Tensor | None = None) -> torch.Tensor:
+                    t: torch.Tensor | None = None,
+                    huber_snr_clamp_max: float = 10.0) -> torch.Tensor:
     """Return per-sample loss for tensors shaped (B, C, T, H, W)."""
     pred_f = pred.float()
     target_f = target.float()
@@ -444,7 +487,7 @@ def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "
     elif loss_type in ("l1", "mae"):
         loss_map = F.l1_loss(pred_f, target_f, reduction="none")
     elif loss_type in ("huber", "smooth_l1"):
-        delta = _huber_delta_for_t(t, huber_c, huber_schedule)
+        delta = _huber_delta_for_t(t, huber_c, huber_schedule, huber_snr_clamp_max)
         err = (pred_f - target_f).abs()
         if not torch.is_tensor(delta):
             delta_t = torch.tensor(float(delta), device=err.device, dtype=err.dtype)
@@ -472,7 +515,8 @@ def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "
 def masked_token_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
                       loss_type: str = "mse", huber_c: float = 0.1,
                       huber_schedule: str = "constant",
-                      t: torch.Tensor | None = None) -> torch.Tensor:
+                      t: torch.Tensor | None = None,
+                      huber_snr_clamp_max: float = 10.0) -> torch.Tensor:
     """Return per-sample token loss, ignoring padded FiT tokens.
 
     pred/target: (B, N, C)
@@ -487,7 +531,7 @@ def masked_token_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tens
         loss_map = F.l1_loss(pred_f, target_f, reduction="none")
     elif loss_type in ("huber", "smooth_l1"):
         err = (pred_f - target_f).abs()
-        delta = _huber_delta_for_t(t, huber_c, huber_schedule)
+        delta = _huber_delta_for_t(t, huber_c, huber_schedule, huber_snr_clamp_max)
         if not torch.is_tensor(delta):
             delta_t = torch.tensor(float(delta), device=err.device, dtype=err.dtype)
         else:
@@ -520,6 +564,36 @@ def masked_token_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tens
     if bool(empty.any()):
         out = out.masked_fill(empty, 0.0)
     return out
+
+
+def contrastive_flow_matching_neg(pred: torch.Tensor, target: torch.Tensor,
+                                  t: torch.Tensor | None = None, loss_type: str = "mse",
+                                  huber_c: float = 0.1, huber_schedule: str = "constant",
+                                  huber_snr_clamp_max: float = 10.0,
+                                  mask: torch.Tensor | None = None) -> torch.Tensor:
+    """ΔFM（Contrastive Flow Matching, arxiv:2506.05350）的负样本 per-sample loss。
+
+    返回 ||v_pred_i - target_j||²（j = batch 内另一样本，用 roll(shifts=1) 取，
+    bs>1 时保证 j≠i）。训练时 per_sample ← per_sample - λ·(本函数返回值)，形成排斥项，
+    反"回归条件均值→发灰/材质难分"。
+
+    不改噪声分布、复用已算好的 pred → 零额外前向。bs<=1 时返回全 0（无可配对样本）。
+    mask 给 FiT packed token 路径用（与 masked_token_loss 对齐）；None 走 dense 路径。
+    """
+    bs = pred.shape[0]
+    if bs <= 1:
+        return pred.new_zeros((bs,), dtype=torch.float32)
+    perm = torch.roll(torch.arange(bs, device=pred.device), shifts=1)
+    target_neg = target.index_select(0, perm)
+    if mask is not None:
+        return masked_token_loss(
+            pred, target_neg, mask, loss_type=loss_type, huber_c=huber_c,
+            huber_schedule=huber_schedule, t=t, huber_snr_clamp_max=huber_snr_clamp_max,
+        )
+    return per_sample_loss(
+        pred, target_neg, loss_type=loss_type, huber_c=huber_c,
+        huber_schedule=huber_schedule, t=t, huber_snr_clamp_max=huber_snr_clamp_max,
+    )
 
 
 def per_sample_highfreq_loss(pred: torch.Tensor, target: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:

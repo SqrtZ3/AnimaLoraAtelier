@@ -123,6 +123,29 @@ class SOAP(Optimizer):
             }
         return sd
 
+    @staticmethod
+    def _fp32_tree(value):
+        if isinstance(value, torch.Tensor):
+            return value.float() if value.is_floating_point() and value.dtype != torch.float32 else value
+        if isinstance(value, list):
+            return [SOAP._fp32_tree(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(SOAP._fp32_tree(item) for item in value)
+        return value
+
+    def _restore_fp32_state(self) -> None:
+        # Optimizer.load_state_dict casts floating state tensors to the matching
+        # parameter dtype. SOAP intentionally keeps optimizer state in fp32 even
+        # when the trainable adapter weights are bf16/fp16.
+        for state in self.state.values():
+            for key in ("exp_avg", "exp_avg_sq", "z", "GG", "Q"):
+                if key in state:
+                    state[key] = self._fp32_tree(state[key])
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self._restore_fp32_state()
+
     def _merge_dims(self, grad: Tensor, max_precond_dim: int) -> Tensor:
         if self._data_format == "channels_last" and grad.dim() == 4:
             grad = grad.permute(0, 3, 1, 2)

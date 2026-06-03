@@ -154,6 +154,43 @@ class SoapOptimizerFactoryTests(unittest.TestCase):
         self.assertIsNotNone(optimizer2.state[param2].get("Q"))
         self.assertTrue(torch.isfinite(param2.detach()).all())
 
+    def test_soap_bf16_resume_keeps_fp32_state(self):
+        param = torch.nn.Parameter(torch.randn(3, 3, dtype=torch.bfloat16))
+        optimizer = create_optimizer(
+            "soap",
+            [param],
+            learning_rate=1e-3,
+            betas=(0.95, 0.95),
+            weight_decay=0.0,
+            precondition_frequency=1,
+            max_precond_dim=16,
+        )
+        optimizer.zero_grad()
+        (param.float() ** 2).sum().backward()
+        optimizer.step()
+
+        param2 = torch.nn.Parameter(param.detach().clone())
+        optimizer2 = create_optimizer(
+            "soap",
+            [param2],
+            learning_rate=1e-3,
+            betas=(0.95, 0.95),
+            weight_decay=0.0,
+            precondition_frequency=1,
+            max_precond_dim=16,
+        )
+        optimizer2.load_state_dict(optimizer.state_dict())
+        state2 = optimizer2.state[param2]
+
+        self.assertEqual(state2["exp_avg"].dtype, torch.float32)
+        self.assertEqual(state2["exp_avg_sq"].dtype, torch.float32)
+        self.assertTrue(all(q is None or q.dtype == torch.float32 for q in state2["Q"]))
+        optimizer2.zero_grad()
+        (param2.float() ** 2).sum().backward()
+        optimizer2.step()
+        self.assertEqual(param2.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(param2.detach()).all())
+
     def test_soap_ignores_unsupported_optimizer_args_with_warning(self):
         param = torch.nn.Parameter(torch.randn(2, 2))
 
@@ -284,6 +321,28 @@ class SoapSfOptimizerFactoryTests(unittest.TestCase):
         self.assertIn("z", state2)
         self.assertIn("exp_avg_sq", state2)
         self.assertNotIn("exp_avg", state2)  # SF drops the first moment
+
+    def test_soap_sf_bf16_resume_keeps_fp32_state_for_train_swap(self):
+        param = torch.nn.Parameter(torch.randn(3, 3, dtype=torch.bfloat16))
+        optimizer = self._make(param)
+        for _ in range(3):
+            optimizer.zero_grad()
+            (param.float() ** 2).sum().backward()
+            optimizer.step()
+
+        optimizer.eval()
+        sd = optimizer.state_dict()
+
+        param2 = torch.nn.Parameter(param.detach().clone())
+        optimizer2 = self._make(param2)
+        optimizer2.load_state_dict(sd)
+        state2 = optimizer2.state[param2]
+
+        optimizer2.train()
+        self.assertEqual(state2["z"].dtype, torch.float32)
+        self.assertEqual(state2["exp_avg_sq"].dtype, torch.float32)
+        self.assertEqual(param2.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(param2.detach()).all())
 
     def test_soap_sf_precond_in_state_false_drops_GG_Q_keeps_z_and_resumes(self):
         param = torch.nn.Parameter(torch.randn(6, 4))

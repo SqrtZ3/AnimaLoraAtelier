@@ -28,6 +28,11 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 
+try:
+    from .token_buckets import generate_token_buckets
+except ImportError:  # when data.py is imported as a top-level module
+    from token_buckets import generate_token_buckets
+
 logger = logging.getLogger(__name__)
 
 
@@ -151,7 +156,10 @@ class BucketManager:
     def __init__(self, base_reso=1024, min_reso=512, max_reso=2048, step=64,
                  base_resos=None, min_base_reso=0, max_base_reso=0,
                  base_reso_step=256, no_upscale=False, max_upscale=0.0,
-                 ar_tolerance=0.05, max_aspect_ratio=2.0):
+                 ar_tolerance=0.05, max_aspect_ratio=2.0,
+                 token_bucket=False, token_bucket_counts=None,
+                 token_bucket_max_aspect_ratio=2.0,
+                 token_bucket_min_dim=512, token_bucket_max_dim=2016):
         self.base_reso = int(base_reso)
         self.base_resos = self._normalize_base_resos(
             base_reso, base_resos, min_base_reso, max_base_reso,
@@ -166,7 +174,22 @@ class BucketManager:
         # 让比 2:1 更扁的原生图（如 640x1664=2.6）也能得到匹配桶 → 训练侧零裁切零上采样，
         # 而不是被塞进 1.83:1 桶后上采样。受模型 RoPE 约束：~3.5:1 @1MP（长边 ≤1920）。
         self.max_aspect_ratio = max(1.0, float(max_aspect_ratio or 2.0))
-        self.buckets = self._generate(min_reso, max_reso, step, self.base_resos)
+        if token_bucket:
+            counts = token_bucket_counts or [4032, 4200]
+            if isinstance(counts, str):
+                counts = [int(c) for c in counts.split(",") if c.strip()]
+            self.token_bucket = True
+            self.token_bucket_counts = [int(c) for c in counts]
+            self.buckets = generate_token_buckets(
+                self.token_bucket_counts,
+                max_aspect_ratio=float(token_bucket_max_aspect_ratio or 2.0),
+                min_dim_px=int(token_bucket_min_dim),
+                max_dim_px=int(token_bucket_max_dim),
+            )
+        else:
+            self.token_bucket = False
+            self.token_bucket_counts = None
+            self.buckets = self._generate(min_reso, max_reso, step, self.base_resos)
 
     @staticmethod
     def _normalize_base_resos(base_reso, base_resos, min_base_reso=0,

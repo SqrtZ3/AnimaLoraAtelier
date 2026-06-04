@@ -903,3 +903,26 @@ def forward_packed_with_optional_checkpoint(
     out = model.final_layer.forward_tokens(x, t_embedding, adaln_lora_B_T_3D=adaln_lora)
     out = model._output_tokens_to_patch_tokens(out, size)
     return out * mask.to(dtype=out.dtype).unsqueeze(-1)
+
+
+def validate_compile_requirements(torch_compile: bool, fit_packed_training: bool,
+                                  token_bucket: bool) -> None:
+    """Fail fast if torch_compile is requested without its prerequisites.
+
+    The compiled fast path runs through the packed-token forward
+    (``block.forward_tokens``), so it requires ``fit_packed_training``; and it
+    only pays off when the packed sequence length is fixed, which requires
+    ``token_bucket`` (constant / N-token bucketing). No-op when compile is off.
+    """
+    if not torch_compile:
+        return
+    if not fit_packed_training:
+        raise RuntimeError(
+            "torch_compile=true requires fit_packed_training=true: the compiled fast "
+            "path runs through the packed-token forward (block.forward_tokens)."
+        )
+    if not token_bucket:
+        raise RuntimeError(
+            "torch_compile=true requires token_bucket=true so the packed sequence "
+            "length is fixed across the run (else torch.compile recompiles per shape)."
+        )

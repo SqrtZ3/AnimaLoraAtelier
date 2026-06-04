@@ -240,6 +240,7 @@ from trainer.objective import (
     forward_with_optional_checkpoint,
     forward_packed_with_optional_checkpoint,
     masked_token_loss,
+    validate_compile_requirements,
 )
 from trainer.lora import LoRALayer, LoKrLayer, LoRALinear, LoRAInjector
 from trainer.aux_losses import (
@@ -1244,6 +1245,19 @@ def main():
     aux_cfg = build_aux_loss_config(args)
     if fit_packed_training and aux_cfg.any_enabled:
         raise RuntimeError("fit_packed_training currently supports the main masked token objective only; disable aux losses for this path.")
+    validate_compile_requirements(
+        bool(getattr(args, "torch_compile", False)),
+        fit_packed_training,
+        bool(getattr(args, "token_bucket", False)),
+    )
+    if bool(getattr(args, "torch_compile", False)):
+        _compile_target = model.module if hasattr(model, "module") else model
+        _compile_target.compile_blocks(mode=getattr(args, "compile_mode", None))
+        logger.info(
+            "[torch_compile] per-block token path compiled (compile_mode=%s); "
+            "first step will be slow (Inductor warmup).",
+            getattr(args, "compile_mode", None),
+        )
     vae_offloaded_to_cpu = False
     keep_vae_on_gpu = bool(getattr(args, "keep_vae_on_gpu", False))
     if use_cached and keep_vae_on_gpu:

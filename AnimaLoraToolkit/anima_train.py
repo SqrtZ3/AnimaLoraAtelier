@@ -1001,12 +1001,17 @@ def main():
         no_upscale=bool(getattr(args, "bucket_no_upscale", False)),
         max_upscale=float(getattr(args, "bucket_max_upscale", 0.0) or 0.0),
         max_aspect_ratio=float(getattr(args, "bucket_max_aspect_ratio", 2.0) or 2.0),
+        token_bucket=bool(getattr(args, "token_bucket", False)),
+        token_bucket_counts=getattr(args, "token_bucket_counts", None),
+        token_bucket_max_aspect_ratio=float(getattr(args, "token_bucket_max_aspect_ratio", 2.0) or 2.0),
+        token_bucket_min_dim=int(getattr(args, "token_bucket_min_dim", 512) or 512),
+        token_bucket_max_dim=int(getattr(args, "token_bucket_max_dim", 2016) or 2016),
     )
     logger.info(
-        "[BucketManager] bases=%s, min=%d, max=%d, step=%d, max_ar=%.2f, no_upscale=%s, max_upscale=%.3g, 桶数=%d",
+        "[BucketManager] bases=%s, min=%d, max=%d, step=%d, max_ar=%.2f, no_upscale=%s, max_upscale=%.3g, 桶数=%d, token_bucket=%s",
         bucket_mgr.base_resos, bucket_min_reso, bucket_max_reso, bucket_step,
         bucket_mgr.max_aspect_ratio, bucket_mgr.no_upscale, bucket_mgr.max_upscale,
-        len(bucket_mgr.buckets),
+        len(bucket_mgr.buckets), getattr(bucket_mgr, "token_bucket", False),
     )
 
     # 模型 RoPE 能容纳的最大单维（image pixels）= max_img_h * 8。

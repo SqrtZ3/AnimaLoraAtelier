@@ -1036,6 +1036,7 @@ class MiniTrainDIT(nn.Module):
         atten_backend = 'torch'
 
         super().__init__()
+        self._blocks_compiled = False
         self.max_img_h = max_img_h
         self.max_img_w = max_img_w
         self.max_frames = max_frames
@@ -1154,6 +1155,29 @@ class MiniTrainDIT(nn.Module):
             **kwargs,  # type: ignore
         )
 
+
+    def compile_blocks(self, backend: str = "inductor", mode=None):
+        """Per-block torch.compile of the token forward path (``block.forward_tokens``).
+
+        Intended for constant / N-token bucketing: when the packed sequence length is
+        fixed across the run, each compiled block traces a tiny fixed set of graphs.
+        The eager grid ``forward`` is unaffected (only ``forward_tokens`` is wrapped).
+        ``backend='eager'`` validates compile-compatibility without Inductor/Triton;
+        ``backend='inductor'`` is for the real speedup on CUDA/Linux.
+        """
+        import torch._dynamo as _dynamo
+        self._blocks_compiled = True
+        _dynamo.config.cache_size_limit = max(_dynamo.config.cache_size_limit, 32)
+        kwargs = {"backend": backend, "dynamic": False}
+        if mode is not None:
+            kwargs["mode"] = mode
+        for block in self.blocks:
+            block.forward_tokens = torch.compile(block.forward_tokens, **kwargs)
+        import logging
+        logging.getLogger(__name__).info(
+            "compile_blocks: compiled %d block.forward_tokens (backend=%s, mode=%s)",
+            len(self.blocks), backend, mode,
+        )
 
     def prepare_embedded_sequence(
         self,

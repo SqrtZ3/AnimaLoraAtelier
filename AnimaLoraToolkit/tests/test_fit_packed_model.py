@@ -214,6 +214,24 @@ class PackedTokenModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "RoPE capacity"):
             model.forward_packed_tokens(tokens, torch.tensor([[0.5]]), cross, grid, mask, size)
 
+    def test_compile_blocks_preserves_packed_output(self):
+        torch.manual_seed(0)
+        model = self._model().eval()
+        latents = torch.randn(1, 16, 1, 4, 6)
+        timesteps = torch.tensor([[0.5]])
+        cross = torch.randn(1, 12, 48)
+        with torch.no_grad():
+            tokens, grid, mask, size = model.patchify_latents_to_tokens(latents)
+            ref = model.forward_packed_tokens(tokens, timesteps, cross, grid, mask, size)
+            self.assertFalse(getattr(model, "_blocks_compiled", False))
+            model.compile_blocks(backend="eager")
+            self.assertTrue(model._blocks_compiled)
+            got = model.forward_packed_tokens(tokens, timesteps, cross, grid, mask, size)
+        self.assertTrue(
+            torch.allclose(got, ref, atol=1e-4),
+            msg=f"compile changed packed output: max abs diff={float((got - ref).abs().max())}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

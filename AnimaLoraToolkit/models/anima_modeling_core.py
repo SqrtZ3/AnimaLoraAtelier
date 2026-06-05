@@ -923,7 +923,12 @@ class Block(nn.Module):
         attn_mask = None
         if token_mask is not None:
             bool_mask = token_mask.to(dtype=torch.bool)
-            if not bool(bool_mask.any(dim=1).all()):
+            # The empty-sequence validation is a data-dependent ``bool(...)`` that
+            # graph-breaks the compiled block every step (killing the speedup, and
+            # fragmenting the graph under gradient-checkpoint recompute). Skip it
+            # while tracing: under constant-token training the mask is all-valid,
+            # and eager forwards (incl. the first warmup) still run the check.
+            if not torch.compiler.is_compiling() and not bool(bool_mask.any(dim=1).all()):
                 raise ValueError("packed FiT sequence contains a sample with no valid tokens")
             key_valid = bool_mask[:, None, None, :]
             attn_mask = torch.zeros_like(key_valid, dtype=x_B_N_D.dtype)

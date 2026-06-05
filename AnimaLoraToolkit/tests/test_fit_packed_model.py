@@ -232,6 +232,22 @@ class PackedTokenModelTests(unittest.TestCase):
             msg=f"compile changed packed output: max abs diff={float((got - ref).abs().max())}",
         )
 
+    def test_compiled_block_forward_tokens_is_fullgraph_clean(self):
+        # The token hot path must be graph-break free: compiling block.forward_tokens
+        # with fullgraph=True must run without raising. A data-dependent branch
+        # (bool(mask...) / .item()) would fragment the graph (no speedup) and corrupt
+        # gradient-checkpoint recompute. Full mask exercises the constant-token path.
+        model = self._model().eval()
+        for blk in model.blocks:
+            blk.forward_tokens = torch.compile(blk.forward_tokens, fullgraph=True, backend="eager")
+        latents = torch.randn(1, 16, 1, 4, 6)
+        timesteps = torch.tensor([[0.5]])
+        cross = torch.randn(1, 12, 48)
+        tokens, grid, mask, size = model.patchify_latents_to_tokens(latents)
+        with torch.no_grad():
+            out = model.forward_packed_tokens(tokens, timesteps, cross, grid, mask, size)
+        self.assertEqual(tuple(out.shape), tuple(tokens.shape))
+
 
 if __name__ == "__main__":
     unittest.main()

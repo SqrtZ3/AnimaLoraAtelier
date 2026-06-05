@@ -141,6 +141,10 @@ def sample_t(
       - "logit_normal_low": logit-normal 但 shift 反向（推 t 偏向低噪声/细节端），适合刻画细节差的训练集。
       - "mode":         SD3 式 mode-distribution（用 sigma 形式，需要 shift）。
       - "mixed_uniform_low": 以 uniform 为主体，按 mix_low_prob 混入 logit_normal_low；
+      - "mixed_logit_low_high"（别名 ushaped/bimodal）: U 形双峰。低噪(细节)峰 logit_normal_low
+                        + 高噪(结构)峰 logit_normal，中段 t 被自然掏空 → 同时喂"细节(低t)"和
+                        "脸型/构图/氛围(高t)"两端。mix_low_prob = 路由到低噪峰的比例（0.5=对称U），
+                        flow_shift 控两峰间距（shift=3 → 峰约 t≈0.25/0.75）。
       - "laplace":      log-SNR 按 Laplace 分布采样（arxiv:2407.03297）。用 laplace_mu/laplace_b
                         控制峰位与集中度，μ>0 偏低噪声/细节端。是 detail_inv_t+mix_low+schedule_shift
                         那一堆 ad-hoc 旋钮的原理化替代。
@@ -173,6 +177,18 @@ def sample_t(
         p = min(max(float(mix_low_prob), 0.0), 1.0)
         use_logit = (torch.rand(bs, device=device) < p)
         return torch.where(use_logit, logit_t, uniform_t).clamp(1e-4, 1.0 - 1e-4)
+
+    if mode in ("mixed_logit_low_high", "ushaped", "u_shaped", "bimodal"):
+        # U 形 / 双峰：低噪(细节)峰 logit_normal_low + 高噪(结构/脸型/氛围)峰 logit_normal。
+        # 中段 t（最"易"、信息量最低）被自然掏空，两端同时获得监督。
+        # mix_low_prob = 路由到低噪(细节)峰的比例；1-p 进高噪(结构)峰。0.5 ≈ 对称 U，
+        # <0.5 偏结构端（保 v26 脸型/氛围收益），>0.5 偏细节端。
+        # flow_shift 控两峰间距（shift=3 → 峰约 t≈0.25 / 0.75；越大两峰越分开）。
+        low_t = sample_t(bs, device, mode="logit_normal_low", shift=shift)
+        high_t = sample_t(bs, device, mode="logit_normal", shift=shift)
+        p_low = min(max(float(mix_low_prob), 0.0), 1.0)
+        use_low = (torch.rand(bs, device=device) < p_low)
+        return torch.where(use_low, low_t, high_t).clamp(1e-4, 1.0 - 1e-4)
 
     # 基础 logit-normal
     u = torch.sigmoid(torch.randn(bs, device=device))

@@ -57,6 +57,53 @@ class LaplaceTimestepTests(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is required for objective tests")
+class BimodalTimestepTests(unittest.TestCase):
+    """U 形 / 双峰采样 (timestep_sampling="mixed_logit_low_high")。"""
+
+    def test_in_range_and_shape(self):
+        from trainer.objective import sample_t
+
+        torch.manual_seed(0)
+        t = sample_t(1000, "cpu", mode="mixed_logit_low_high", shift=3.0, mix_low_prob=0.5)
+        self.assertEqual(tuple(t.shape), (1000,))
+        self.assertTrue(bool((t > 0).all()) and bool((t < 1).all()))
+        self.assertTrue(bool(torch.isfinite(t).all()))
+
+    def test_is_u_shaped_middle_is_trough(self):
+        # 两端(低噪细节峰 + 高噪结构峰)质量应高于中段 → 中段是低谷。
+        from trainer.objective import sample_t
+
+        torch.manual_seed(0)
+        t = sample_t(80000, "cpu", mode="mixed_logit_low_high", shift=3.0, mix_low_prob=0.5)
+        low = float(((t >= 0.0) & (t < 0.4)).float().mean())
+        mid = float(((t >= 0.4) & (t < 0.6)).float().mean())
+        high = float(((t >= 0.6) & (t <= 1.0)).float().mean())
+        self.assertLess(mid, low)
+        self.assertLess(mid, high)
+        # 两端都要有实质质量（不是单峰）。
+        self.assertGreater(low, 0.2)
+        self.assertGreater(high, 0.2)
+
+    def test_mix_low_prob_shifts_mass(self):
+        # p_low 越大 → 更多低噪(低 t)样本 → 均值更低。
+        from trainer.objective import sample_t
+
+        torch.manual_seed(0)
+        t_lowheavy = sample_t(40000, "cpu", mode="mixed_logit_low_high", shift=3.0, mix_low_prob=0.85).mean()
+        t_highheavy = sample_t(40000, "cpu", mode="mixed_logit_low_high", shift=3.0, mix_low_prob=0.15).mean()
+        self.assertLess(float(t_lowheavy), float(t_highheavy))
+
+    def test_aliases_match(self):
+        from trainer.objective import sample_t
+
+        torch.manual_seed(123)
+        a = sample_t(40000, "cpu", mode="mixed_logit_low_high", shift=3.0, mix_low_prob=0.5).mean()
+        torch.manual_seed(123)
+        b = sample_t(40000, "cpu", mode="ushaped", shift=3.0, mix_low_prob=0.5).mean()
+        self.assertAlmostEqual(float(a), float(b), delta=1e-6)
+
+
+@unittest.skipUnless(HAS_TORCH, "torch is required for objective tests")
 class HuberSnrClampTests(unittest.TestCase):
     def test_clamp_lowers_low_t_delta(self):
         from trainer.objective import _huber_delta_for_t

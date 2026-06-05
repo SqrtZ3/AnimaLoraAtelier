@@ -499,7 +499,7 @@ def parse_args():
     p.add_argument("--no-t5-token-weights", dest="use_t5_token_weights", action="store_false")
     p.add_argument("--flow-shift", type=float, default=3.0, help="logit/timestep shift used by shifted timestep samplers")
     p.add_argument("--timestep-sampling", default="logit_normal",
-                   choices=["logit_normal", "uniform", "logit_normal_low", "mode", "mixed_uniform_low", "mixed_uniform_logit", "laplace"],
+                   choices=["logit_normal", "uniform", "logit_normal_low", "mode", "mixed_uniform_low", "mixed_uniform_logit", "mixed_logit_low_high", "ushaped", "u_shaped", "bimodal", "laplace"],
                    help="timestep sampling distribution")
     p.add_argument("--timestep-mix-low-prob", type=float, default=0.25, help="mixed_uniform_low 中低噪声样本比例")
     p.add_argument("--timestep-laplace-mu", type=float, default=0.0,

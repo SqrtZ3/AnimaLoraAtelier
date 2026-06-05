@@ -1249,6 +1249,7 @@ def main():
         bool(getattr(args, "torch_compile", False)),
         fit_packed_training,
         bool(getattr(args, "token_bucket", False)),
+        float(getattr(args, "module_dropout", 0.0) or 0.0),
     )
     if bool(getattr(args, "torch_compile", False)):
         _compile_target = model.module if hasattr(model, "module") else model

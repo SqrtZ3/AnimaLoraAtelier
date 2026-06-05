@@ -906,13 +906,15 @@ def forward_packed_with_optional_checkpoint(
 
 
 def validate_compile_requirements(torch_compile: bool, fit_packed_training: bool,
-                                  token_bucket: bool) -> None:
+                                  token_bucket: bool, module_dropout: float = 0.0) -> None:
     """Fail fast if torch_compile is requested without its prerequisites.
 
     The compiled fast path runs through the packed-token forward
     (``block.forward_tokens``), so it requires ``fit_packed_training``; and it
     only pays off when the packed sequence length is fixed, which requires
-    ``token_bucket`` (constant / N-token bucketing). No-op when compile is off.
+    ``token_bucket`` (constant / N-token bucketing). ``module_dropout`` must be 0:
+    its ``torch.rand().item()`` per-module drop is a data-dependent branch that
+    graph-breaks every block under compile. No-op when compile is off.
     """
     if not torch_compile:
         return
@@ -925,4 +927,12 @@ def validate_compile_requirements(torch_compile: bool, fit_packed_training: bool
         raise RuntimeError(
             "torch_compile=true requires token_bucket=true so the packed sequence "
             "length is fixed across the run (else torch.compile recompiles per shape)."
+        )
+    if module_dropout and float(module_dropout) > 0.0:
+        raise RuntimeError(
+            "torch_compile=true is incompatible with module_dropout>0: the per-module "
+            "drop uses torch.rand().item(), a data-dependent branch that graph-breaks "
+            "every block under compile (negating the speedup; fatal under CUDAGraph "
+            "modes). Set module_dropout: 0.0 for the compile path "
+            "(rank_dropout / lora_dropout are compile-safe and may stay)."
         )

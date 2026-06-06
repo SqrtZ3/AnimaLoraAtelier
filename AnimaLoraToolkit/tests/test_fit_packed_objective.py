@@ -125,6 +125,18 @@ class PackedForwardCheckpointTests(unittest.TestCase):
             def _packed_rope_from_grid(self, grid):
                 return None
 
+            def _build_packed_masks(self, token_mask, dtype):
+                if token_mask is None:
+                    return None, None
+                bool_mask = token_mask.to(dtype=torch.bool)
+                if not bool(bool_mask.any(dim=1).all()):
+                    raise ValueError("packed FiT sequence contains a sample with no valid tokens")
+                if bool(bool_mask.all()):
+                    return None, None
+                key_valid = bool_mask[:, None, None, :]
+                attn_mask = torch.zeros_like(key_valid, dtype=dtype).masked_fill(~key_valid, -1.0e4)
+                return attn_mask, token_mask.to(dtype=dtype).unsqueeze(-1)
+
             def _output_tokens_to_patch_tokens(self, tokens, size=None):
                 # The real model permutes within-token channels; the fake blocks use a flat
                 # token dim, so an identity passthrough keeps this checkpoint-structure test

@@ -903,6 +903,10 @@ def forward_packed_with_optional_checkpoint(
     model.crossattn_emb = cross
 
     rope_emb = model._packed_rope_from_grid(grid)
+    # Build the attention/zeroing masks once (shared with forward_packed_tokens) rather
+    # than per block — keeps this checkpoint path bit-consistent with the non-checkpoint
+    # forward and drops N_blocks redundant mask syncs/allocs per step.
+    attn_mask, token_mask_f = model._build_packed_masks(mask, x.dtype)
     for block in model.blocks:
         def custom_forward(x_in, blk=block):
             return blk.forward_tokens(
@@ -910,7 +914,8 @@ def forward_packed_with_optional_checkpoint(
                 t_embedding,
                 cross,
                 rope_emb_L_1_1_D=rope_emb,
-                token_mask=mask,
+                attn_mask=attn_mask,
+                token_mask_f=token_mask_f,
                 adaln_lora_B_T_3D=adaln_lora,
             )
 

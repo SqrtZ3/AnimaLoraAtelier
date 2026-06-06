@@ -884,9 +884,15 @@ class Block(nn.Module):
         emb_B_T_D: torch.Tensor,
         crossattn_emb: torch.Tensor,
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
-        token_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        token_mask_f: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # ``attn_mask`` (additive key-padding mask) and ``token_mask_f`` (float
+        # zeroing mask) are precomputed once per step by the caller via
+        # ``MiniTrainDIT._build_packed_masks`` — not rebuilt here per block. Both are
+        # None when every token is valid (constant-N / token-bucket), so attention
+        # takes SDPA's fast maskless path and no output zeroing is needed.
         if self.use_adaln_lora:
             assert adaln_lora_B_T_3D is not None
             shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
@@ -920,20 +926,6 @@ class Block(nn.Module):
         def _fn(_x_B_N_D, _norm_layer, _scale_B_1_D, _shift_B_1_D):
             return _norm_layer(_x_B_N_D) * (1 + _scale_B_1_D) + _shift_B_1_D
 
-        attn_mask = None
-        if token_mask is not None:
-            bool_mask = token_mask.to(dtype=torch.bool)
-            # The empty-sequence validation is a data-dependent ``bool(...)`` that
-            # graph-breaks the compiled block every step (killing the speedup, and
-            # fragmenting the graph under gradient-checkpoint recompute). Skip it
-            # while tracing: under constant-token training the mask is all-valid,
-            # and eager forwards (incl. the first warmup) still run the check.
-            if not torch.compiler.is_compiling() and not bool(bool_mask.any(dim=1).all()):
-                raise ValueError("packed FiT sequence contains a sample with no valid tokens")
-            key_valid = bool_mask[:, None, None, :]
-            attn_mask = torch.zeros_like(key_valid, dtype=x_B_N_D.dtype)
-            attn_mask = attn_mask.masked_fill(~key_valid, -1.0e4)
-
         normalized_x_B_N_D = _fn(
             x_B_N_D,
             self.layer_norm_self_attn,
@@ -965,8 +957,8 @@ class Block(nn.Module):
         )
         result_B_N_D = self.mlp(normalized_x_B_N_D)
         x_B_N_D = x_B_N_D + gate_mlp_B_1_D * result_B_N_D
-        if token_mask is not None:
-            x_B_N_D = x_B_N_D * token_mask.to(dtype=x_B_N_D.dtype).unsqueeze(-1)
+        if token_mask_f is not None:
+            x_B_N_D = x_B_N_D * token_mask_f
         return x_B_N_D
 
 
@@ -1358,6 +1350,31 @@ class MiniTrainDIT(nn.Module):
         emb = torch.cat([half_emb_t, half_emb_h, half_emb_w] * 2, dim=-1)
         return emb[:, :, None, None, :].float()
 
+    def _build_packed_masks(self, token_mask: Optional[torch.Tensor], dtype: torch.dtype):
+        """Build the additive attention mask + float zeroing mask ONCE for the whole
+        block stack, instead of rebuilding them (and re-syncing) inside every block.
+
+        Returns ``(attn_mask, token_mask_f)``. Both are None when every token is valid
+        (constant-N / token-bucket): a None ``attn_mask`` lets SDPA take its fast
+        maskless path (xformers/flash) instead of the slower additive-mask kernel, and
+        no output zeroing is needed. The empty-sequence validation and the all-valid
+        test are each a single data-dependent ``bool(...)`` GPU→CPU sync — done once
+        here rather than once per block (was N_blocks syncs/step). Skipped under
+        ``torch.compile``, where the token-bucket invariant guarantees a constant,
+        all-valid sequence (and a ``bool(...)`` would graph-break the trace)."""
+        if token_mask is None or torch.compiler.is_compiling():
+            return None, None
+        bool_mask = token_mask.to(dtype=torch.bool)
+        if not bool(bool_mask.any(dim=1).all()):
+            raise ValueError("packed FiT sequence contains a sample with no valid tokens")
+        if bool(bool_mask.all()):
+            return None, None
+        key_valid = bool_mask[:, None, None, :]
+        attn_mask = torch.zeros_like(key_valid, dtype=dtype)
+        attn_mask = attn_mask.masked_fill(~key_valid, -1.0e4)
+        token_mask_f = token_mask.to(dtype=dtype).unsqueeze(-1)
+        return attn_mask, token_mask_f
+
     def forward_packed_tokens(
         self,
         tokens_B_N_M: torch.Tensor,
@@ -1388,13 +1405,15 @@ class MiniTrainDIT(nn.Module):
         self.crossattn_emb = crossattn_emb
 
         rope_emb = self._packed_rope_from_grid(grid_B_2_N)
+        attn_mask, token_mask_f = self._build_packed_masks(mask_B_N, x_B_N_D.dtype)
         for block in self.blocks:
             x_B_N_D = block.forward_tokens(
                 x_B_N_D,
                 t_embedding_B_T_D,
                 crossattn_emb,
                 rope_emb_L_1_1_D=rope_emb,
-                token_mask=mask_B_N,
+                attn_mask=attn_mask,
+                token_mask_f=token_mask_f,
                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
             )
 

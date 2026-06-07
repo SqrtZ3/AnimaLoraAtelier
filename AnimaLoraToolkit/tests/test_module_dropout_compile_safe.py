@@ -13,7 +13,17 @@ import torch
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from trainer.lora import LoRALayer, LoKrLayer
+from trainer.lora import LoRALayer, LoKrLayer, LoRALinear
+
+
+class CountingLinear(torch.nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features)
+        self.forward_calls = 0
+
+    def forward(self, x):
+        self.forward_calls += 1
+        return super().forward(x)
 
 
 class TestModuleDropoutCompileSafe(unittest.TestCase):
@@ -100,6 +110,88 @@ class TestModuleDropoutCompileSafe(unittest.TestCase):
         torch.testing.assert_close(m(x), torch.zeros_like(ref))
         m._md_keep = torch.tensor(1.0)
         torch.testing.assert_close(m(x), ref)
+
+    def test_dora_eager_keep_one_does_not_run_extra_base_linear(self):
+        torch.manual_seed(0)
+        base = CountingLinear(8, 8)
+        m = LoRALinear(
+            base,
+            rank=2,
+            alpha=4.0,
+            use_lokr=True,
+            factor=2,
+            module_dropout=0.5,
+            lora_variant="dora",
+        )
+        m.train()
+        m.roll_module_dropout(compile_safe=False)
+        m.adapter._md_keep_bool = True
+
+        x = torch.randn(2, 8)
+        _ = m(x)
+
+        self.assertEqual(
+            base.forward_calls,
+            0,
+            "eager DoRA keep=1 should compute the DoRA linear directly, not run an extra base forward",
+        )
+
+    def test_dora_eager_keep_zero_skips_delta_materialization(self):
+        torch.manual_seed(0)
+        base = CountingLinear(8, 8)
+        m = LoRALinear(
+            base,
+            rank=2,
+            alpha=4.0,
+            use_lokr=True,
+            factor=2,
+            module_dropout=0.5,
+            lora_variant="dora",
+        )
+        m.train()
+        m.roll_module_dropout(compile_safe=False)
+        m.adapter._md_keep_bool = False
+        delta_calls = {"n": 0}
+        original_delta_weight = m.adapter.delta_weight
+
+        def counted_delta_weight(*args, **kwargs):
+            delta_calls["n"] += 1
+            return original_delta_weight(*args, **kwargs)
+
+        m.adapter.delta_weight = counted_delta_weight
+        x = torch.randn(2, 8)
+        expected = torch.nn.functional.linear(x, base.weight, base.bias)
+        out = m(x)
+
+        self.assertEqual(base.forward_calls, 1)
+        self.assertEqual(delta_calls["n"], 0)
+        torch.testing.assert_close(out, expected)
+
+    def test_dora_compile_safe_keep_zero_runs_single_linear(self):
+        torch.manual_seed(0)
+        base = CountingLinear(8, 8)
+        m = LoRALinear(
+            base,
+            rank=2,
+            alpha=4.0,
+            use_lokr=True,
+            factor=2,
+            module_dropout=0.5,
+            lora_variant="dora",
+        )
+        m.train()
+        m.adapter._md_keep = torch.tensor(0.0)
+
+        x = torch.randn(2, 8)
+        expected = torch.nn.functional.linear(x, base.weight, base.bias)
+        out = m(x)
+
+        self.assertEqual(
+            base.forward_calls,
+            0,
+            "compile-safe DoRA dropout should blend weights and avoid an extra base forward",
+        )
+        torch.testing.assert_close(out, expected)
 
 
 if __name__ == "__main__":

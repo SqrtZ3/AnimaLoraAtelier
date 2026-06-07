@@ -1968,7 +1968,9 @@ def main():
             # ★ module_dropout: 每 step 预抽 keep 标量（把 RNG 移出可能被 compile 追踪的 forward）。
             # 与 current_t 同生命周期：必须存活到 backward 之后（grad checkpoint recompute 要见同值），
             # 故 reset 同样放在 backward 之后与 NaN-continue 之前。module_dropout=0 时是空操作。
-            injector.roll_module_dropout()
+            injector.roll_module_dropout(
+                compile_safe=bool(getattr(args, "torch_compile", False))
+            )
             # ★ T-LoRA: current_t 必须存活到 backward 之后。原本在这里 finally reset
             # 是错的：grad checkpoint 在 backward 时会 recompute forward，那一刻 current_t
             # 必须和原 forward 完全一致，否则 LoRALayer 的 _apply_tlora_mask / ortho 补偿

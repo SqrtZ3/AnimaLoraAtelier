@@ -32,11 +32,10 @@ class TestValidateCompileRequirements(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "token_bucket"):
             validate_compile_requirements(True, True, False)
 
-    def test_compile_on_module_dropout_raises(self):
-        """compile=True with module_dropout>0 must raise RuntimeError mentioning
-        module_dropout (it graph-breaks every block via torch.rand().item())."""
-        with self.assertRaisesRegex(RuntimeError, "module_dropout"):
-            validate_compile_requirements(True, True, True, 0.1)
+    def test_compile_on_module_dropout_now_passes(self):
+        """module_dropout>0 is now compile-safe (keep scalar pre-drawn outside the
+        compiled region), so it must NOT raise even with compile on."""
+        self.assertIsNone(validate_compile_requirements(True, True, True, 0.1))
 
     def test_compile_on_zero_module_dropout_passes(self):
         """module_dropout=0 with all prereqs satisfied must not raise."""

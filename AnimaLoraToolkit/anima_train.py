@@ -263,6 +263,7 @@ from trainer.data import (
     collate_fn,
     collate_fn_fit_packed,
     collate_fn_cached,
+    collate_fn_cached_fit,
 )
 from trainer.progress import (
     ReferenceStepTracker,
@@ -1064,6 +1065,21 @@ def main():
         logger.info("\n%s", base_dataset.bucket_report(label="train"))
     dataset = base_dataset
 
+    # token_bucket 满覆盖前提的自检：每张图的 token 数都应落在配置的桶集合里。非桶尺寸图
+    # 会各自成组（torch_compile 下多一张编译图），并可能与 cache/aux 的满覆盖假设不一致。
+    if fit_packed_training and bool(getattr(args, "token_bucket", False)):
+        _cfg_counts = set(int(c) for c in (getattr(bucket_mgr, "token_bucket_counts", None) or []))
+        _seen_counts = set(int(c) for c in getattr(base_dataset, "token_count_for_index", []) if c)
+        _off_counts = sorted(_seen_counts - _cfg_counts)
+        if _off_counts and _cfg_counts:
+            logger.warning(
+                "[token_bucket] 检测到 %d 种不在配置桶集合 %s 内的 token 数：%s。\n"
+                "token_bucket 假设数据集已被精确重采样到桶尺寸（满覆盖）。请用数据集工具按相同 "
+                "token_bucket_counts 导出，或剔除这些图 —— 否则 compile 会多编译图、且 cache/aux "
+                "的满覆盖假设可能不成立。",
+                len(_off_counts), sorted(_cfg_counts), _off_counts[:8],
+            )
+
     # 正则数据集（Kohya 风格，防过拟合）
     reg_data_dir = getattr(args, "reg_data_dir", "") or ""
     reg_dataset = None
@@ -1104,8 +1120,19 @@ def main():
 
     # 缓存 VAE latents（在 repeat 之前）
     use_cached = getattr(args, "cache_latents", False)
-    if fit_packed_training and use_cached:
-        raise RuntimeError("fit_packed_training currently requires cache_latents=false so pixel masks stay available.")
+    _token_bucket = bool(getattr(args, "token_bucket", False))
+    if fit_packed_training and use_cached and not _token_bucket:
+        raise RuntimeError(
+            "fit_packed_training without token_bucket requires cache_latents=false so pixel "
+            "masks stay available (variable-size packing needs per-image padding masks). "
+            "Enable token_bucket=true (full-coverage exact-grid buckets) to cache latents: the "
+            "mask is then all-ones and rebuilt from latent shape."
+        )
+    if fit_packed_training and use_cached and _token_bucket:
+        logger.info(
+            "[cache] token_bucket + cache_latents：每张图填满桶 → latent_mask 全 1（从 latent 形状"
+            "重建，不存进 npz）。注意：alpha 蒙版不经此缓存路径保留；带 alpha 的数据集请走非缓存 FiT。"
+        )
     if use_cached and bool(getattr(args, "flip_augment", False)):
         # cache_latents 与 flip_augment 现已兼容（kohya 风格）：CachedLatentDataset 在缓存阶段
         # 为每张图额外编码一份"像素域水平翻转后再 encode"的 latent（VAE 非 flip-equivariant，
@@ -1174,22 +1201,40 @@ def main():
     if fit_packed_training:
         if int(getattr(args, "effective_batch_size", 0) or 0) > 0:
             raise RuntimeError("fit_packed_training currently uses token-based batches; effective_batch_size sample-window accumulation is not supported yet.")
-        max_tokens_per_batch = int(getattr(args, "fit_max_tokens_per_batch", 0) or 0)
-        if max_tokens_per_batch <= 0:
-            max_tokens_per_batch = int(getattr(args, "fit_max_tokens", 65536) or 65536)
-        batch_sampler = FitTokenBatchSampler(
-            dataset,
-            batch_size=args.batch_size,
-            max_tokens_per_batch=max_tokens_per_batch,
-            shuffle=True,
-            seed=getattr(args, "seed", 42),
-        )
-        dataloader = DataLoader(
-            dataset, batch_sampler=batch_sampler,
-            collate_fn=collate_fn_fit_packed,
-            num_workers=args.num_workers,
-            **_loader_kwargs,
-        )
+        if _token_bucket:
+            # token_bucket = 满覆盖 + 一组固定的精确桶尺寸。改用 BucketBatchSampler 按精确
+            # (h, w) 网格分批 → 每个 batch 单一网格、mask 全 1。这让 cache_latents（latent_mask
+            # 从形状重建）、aux（unpatchify 回单一网格）、torch.compile（每网格一张固定图）都干净。
+            # 代价：不再按 token 预算混合不同网格打包；在小桶集 + 满覆盖下可忽略。
+            batch_sampler = BucketBatchSampler(
+                dataset, batch_size=args.batch_size,
+                drop_last=_bucket_drop_last, shuffle=True,
+                seed=getattr(args, "seed", 42),
+            )
+            _fit_collate = collate_fn_cached_fit if use_cached else collate_fn_fit_packed
+            dataloader = DataLoader(
+                dataset, batch_sampler=batch_sampler,
+                collate_fn=_fit_collate,
+                num_workers=args.num_workers,
+                **_loader_kwargs,
+            )
+        else:
+            max_tokens_per_batch = int(getattr(args, "fit_max_tokens_per_batch", 0) or 0)
+            if max_tokens_per_batch <= 0:
+                max_tokens_per_batch = int(getattr(args, "fit_max_tokens", 65536) or 65536)
+            batch_sampler = FitTokenBatchSampler(
+                dataset,
+                batch_size=args.batch_size,
+                max_tokens_per_batch=max_tokens_per_batch,
+                shuffle=True,
+                seed=getattr(args, "seed", 42),
+            )
+            dataloader = DataLoader(
+                dataset, batch_sampler=batch_sampler,
+                collate_fn=collate_fn_fit_packed,
+                num_workers=args.num_workers,
+                **_loader_kwargs,
+            )
     elif use_cached:
         batch_sampler = BucketBatchSampler(
             dataset, batch_size=args.batch_size,
@@ -1243,8 +1288,17 @@ def main():
     # ★ 例外：若启用了 perceptual loss，训练主循环每步都要 vae.model.decode，offload
     #   到 CPU 会让每步都 swap，巨慢。这种情况下 VAE 必须常驻 GPU。
     aux_cfg = build_aux_loss_config(args)
-    if fit_packed_training and aux_cfg.any_enabled:
-        raise RuntimeError("fit_packed_training currently supports the main masked token objective only; disable aux losses for this path.")
+    if fit_packed_training and aux_cfg.any_enabled and not _token_bucket:
+        raise RuntimeError(
+            "fit_packed_training without token_bucket supports the main masked token objective "
+            "only: aux losses run on a grid x0 [B,C,H,W], which requires the single-grid batches "
+            "that token_bucket=true provides. Enable token_bucket, or disable aux losses."
+        )
+    if fit_packed_training and aux_cfg.any_enabled and _token_bucket:
+        logger.info(
+            "[aux] token_bucket FiT：packed 预测将 unpatchify 回网格 [B,C,1,h,w] 后送入 "
+            "spectral/perceptual（与非 FiT 路径同一套 aux 数学）。"
+        )
     validate_compile_requirements(
         bool(getattr(args, "torch_compile", False)),
         fit_packed_training,
@@ -1822,8 +1876,14 @@ def main():
             # ★ 用 non_blocking=True 配合 DataLoader pin_memory，让 H2D 拷贝与下个 batch overlap。
             _non_blk = bool(_loader_kwargs.get("pin_memory", False))
             pixel_mask = None
+            cached_latent_mask = None
             if use_cached:
                 latents = batch["latents"].to(device, dtype=dtype, non_blocking=_non_blk)
+                if fit_packed_training:
+                    # token_bucket 缓存路径：latent_mask 由 collate 从形状重建（满覆盖→全 1）。
+                    cached_latent_mask = batch["latent_mask"].to(
+                        device, dtype=torch.float32, non_blocking=_non_blk
+                    )
             else:
                 pixels = batch["pixel_values"].to(device, dtype=dtype, non_blocking=_non_blk)
                 if fit_packed_training:
@@ -1880,11 +1940,15 @@ def main():
 
             latent_mask = None
             if fit_packed_training:
-                latent_mask = F.interpolate(
-                    pixel_mask.float(),
-                    size=latents.shape[-2:],
-                    mode="nearest",
-                )
+                if cached_latent_mask is not None:
+                    # 缓存路径：mask 已是 latent 分辨率（[B,1,h,w]），直接用。
+                    latent_mask = cached_latent_mask
+                else:
+                    latent_mask = F.interpolate(
+                        pixel_mask.float(),
+                        size=latents.shape[-2:],
+                        mode="nearest",
+                    )
 
             # 前向
             # ★ pad_mask 是全零张量，每步都 zeros 分配 → ARB 多 bucket 时
@@ -1901,6 +1965,10 @@ def main():
             # 内按 r(t) 应用 rank mask；其它 variant 该调用是空操作。完成后 reset 避免
             # 跨 step 残留（采样 / eval / 其它前向不应受影响）。
             injector.set_current_t(t.float().detach())
+            # ★ module_dropout: 每 step 预抽 keep 标量（把 RNG 移出可能被 compile 追踪的 forward）。
+            # 与 current_t 同生命周期：必须存活到 backward 之后（grad checkpoint recompute 要见同值），
+            # 故 reset 同样放在 backward 之后与 NaN-continue 之前。module_dropout=0 时是空操作。
+            injector.roll_module_dropout()
             # ★ T-LoRA: current_t 必须存活到 backward 之后。原本在这里 finally reset
             # 是错的：grad checkpoint 在 backward 时会 recompute forward，那一刻 current_t
             # 必须和原 forward 完全一致，否则 LoRALayer 的 _apply_tlora_mask / ortho 补偿
@@ -1994,10 +2062,17 @@ def main():
 
                 if _any_below_gate:
                     _aux_idx = _aux_active.nonzero(as_tuple=False).flatten()
+                    # fit_packed 路径下 pred 是 patch-token；aux 需要网格 x0，先 unpatchify
+                    # 回 [B,C,1,h,w]（token_bucket 单一网格满足 unpatchify_tokens 的 uniform-grid
+                    # 前提）。非 fit 路径 pred 本就是网格。仅在过 t-gate 时才 unpatchify，省高 t 步的分配。
+                    _pred_grid = (
+                        model.unpatchify_tokens(pred, fit_size)
+                        if fit_packed_training else pred
+                    )
                     x0_pred = recover_x0_from_velocity(
                         noisy.index_select(0, _aux_idx),
                         t.index_select(0, _aux_idx),
-                        pred.index_select(0, _aux_idx),
+                        _pred_grid.index_select(0, _aux_idx),
                     )
                     x0_target = latents.index_select(0, _aux_idx).float()
                     t_aux = t.index_select(0, _aux_idx)
@@ -2092,6 +2167,7 @@ def main():
                         pending_reference_batches = 0
                         accum_clean = True
                 injector.set_current_t(None)  # T-LoRA: 本 micro-batch 跳过 backward，立即 reset
+                injector.clear_module_dropout()
                 # ★ 显式释放本 micro-batch 的 forward autograd 图。否则同周期内
                 # 后续 micro-batch 的图会累积（pred / per_sample / loss 都还被 closure 引用），
                 # 持续 NaN 时显存会迅速被这些"死图"占满 → OOM。
@@ -2140,6 +2216,7 @@ def main():
             # T-LoRA: backward 完成后才能 reset，否则 grad checkpoint recompute 会看到
             # current_t=None，与原 forward 走的分支不一致 → CheckpointError
             injector.set_current_t(None)
+            injector.clear_module_dropout()
 
             if step_boundary:
                 if sample_accum_enabled and sample_accum_pending != effective_batch_size:

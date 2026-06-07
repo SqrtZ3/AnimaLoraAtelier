@@ -933,10 +933,15 @@ def validate_compile_requirements(torch_compile: bool, fit_packed_training: bool
     The compiled fast path runs through the packed-token forward
     (``block.forward_tokens``), so it requires ``fit_packed_training``; and it
     only pays off when the packed sequence length is fixed, which requires
-    ``token_bucket`` (constant / N-token bucketing). ``module_dropout`` must be 0:
-    its ``torch.rand().item()`` per-module drop is a data-dependent branch that
-    graph-breaks every block under compile. No-op when compile is off.
+    ``token_bucket`` (constant / N-token bucketing).
+
+    ``module_dropout`` is now compile-safe: its keep scalar is pre-drawn once per
+    step outside the compiled region (``LoRAInjector.roll_module_dropout``) and the
+    forward only multiplies by it, so there is no longer a data-dependent
+    ``torch.rand().item()`` branch to graph-break. The parameter is kept for
+    call-site compatibility but no longer gates compile. No-op when compile is off.
     """
+    del module_dropout  # compile-safe now; kept only for signature stability
     if not torch_compile:
         return
     if not fit_packed_training:
@@ -948,12 +953,4 @@ def validate_compile_requirements(torch_compile: bool, fit_packed_training: bool
         raise RuntimeError(
             "torch_compile=true requires token_bucket=true so the packed sequence "
             "length is fixed across the run (else torch.compile recompiles per shape)."
-        )
-    if module_dropout and float(module_dropout) > 0.0:
-        raise RuntimeError(
-            "torch_compile=true is incompatible with module_dropout>0: the per-module "
-            "drop uses torch.rand().item(), a data-dependent branch that graph-breaks "
-            "every block under compile (negating the speedup; fatal under CUDAGraph "
-            "modes). Set module_dropout: 0.0 for the compile path "
-            "(rank_dropout / lora_dropout are compile-safe and may stay)."
         )

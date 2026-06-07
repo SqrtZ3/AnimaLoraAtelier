@@ -1814,6 +1814,40 @@ def collate_fn(batch):
     return {"pixel_values": pixels, "captions": captions, "images": images}
 
 
+def collate_fn_cached_fit(batch):
+    """Collate cached latents for the token-bucket FiT path.
+
+    Used only with ``token_bucket`` (full coverage): every image fills its bucket
+    exactly, so batches are routed through :class:`BucketBatchSampler` (one exact
+    grid per batch) and the latent mask is all-ones — rebuilt here from the latent
+    spatial shape rather than stored in the ``.npz``. Alpha masks are therefore NOT
+    preserved through the latent cache in this mode (warned at setup); for
+    alpha-masked datasets use the non-cached FiT path.
+    """
+    shapes = [tuple(b["latent"].shape) for b in batch]
+    if len(set(shapes)) > 1:
+        details = [
+            f"  - {b.get('image', '?')}: latent_shape={tuple(b['latent'].shape)}"
+            for b in batch
+        ]
+        raise RuntimeError(
+            "[collate_fn_cached_fit] 同一 batch 出现不同 latent 尺寸，token_bucket 的"
+            "单一网格分批失效（应由 BucketBatchSampler 按精确桶尺寸分组）。\nBatch 内容:\n"
+            + "\n".join(details)
+        )
+    latents = torch.stack([b["latent"] for b in batch])  # [B, C, T, h, w]
+    h, w = int(latents.shape[-2]), int(latents.shape[-1])
+    latent_mask = torch.ones(len(batch), 1, h, w, dtype=torch.float32)
+    captions = [b["caption"] for b in batch]
+    images = [b.get("image", "") for b in batch]
+    return {
+        "latents": latents,
+        "latent_mask": latent_mask,
+        "captions": captions,
+        "images": images,
+    }
+
+
 def collate_fn_fit_packed(batch):
     """Collate native FiT image batches by padding pixels and masks.
 

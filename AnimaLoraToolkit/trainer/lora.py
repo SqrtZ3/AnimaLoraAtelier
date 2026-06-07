@@ -114,6 +114,10 @@ class LoRALayer(torch.nn.Module):
         else:
             self.r_min = rank
         self.current_t: torch.Tensor | None = None
+        # Module-dropout 的 keep 标量（0./1.）。每 step 由 roll_module_dropout() 在 forward
+        # 之外预抽，forward 只读它做乘法 —— 把 RNG 移出可能被 torch.compile 追踪的区域，
+        # 避免 torch.rand().item() 的数据依赖分支逐 block 打断编译图。None=不丢弃（推理/未抽）。
+        self._md_keep: torch.Tensor | None = None
 
         # 初始化 + 可选 Ortho-LoRA + 初始 delta 补偿 buffer
         if self.tlora_enabled and self.tlora_init == "ortho":
@@ -134,6 +138,18 @@ class LoRALayer(torch.nn.Module):
     def set_current_t(self, t):
         """由训练循环 / 采样循环在 model.forward 前调用。t 可为 None（重置）。"""
         self.current_t = t
+
+    def roll_module_dropout(self):
+        """每 step 在 forward 前预抽 module-dropout 的 keep 标量（见 __init__ 注释）。"""
+        if self.training and self.module_dropout > 0:
+            dev = self.lora_up.weight.device
+            self._md_keep = (torch.rand((), device=dev) >= self.module_dropout).float()
+        else:
+            self._md_keep = None
+
+    def clear_module_dropout(self):
+        """forward 完成后重置，避免 keep=0 残留进后续采样/eval 前向。"""
+        self._md_keep = None
 
     def _apply_tlora_mask(self, h):
         """对 lora_down 的输出 h: (..., rank) 应用 per-sample T-LoRA mask。"""
@@ -158,13 +174,9 @@ class LoRALayer(torch.nn.Module):
         return h * mask_view, mask
 
     def forward(self, x):
-        # Module dropout: 整个模块以 p 概率跳过（训练时）
-        # 用 torch.rand(1).item()：默认 CPU device 不触发 GPU 同步，且 rng state 被
-        # torch.utils.checkpoint 自动 fork+restore，recompute 时返回同一值，分支一致。
-        if self.training and self.module_dropout > 0:
-            if torch.rand(1).item() < self.module_dropout:
-                return torch.zeros(*x.shape[:-1], self.lora_up.out_features,
-                                   device=x.device, dtype=x.dtype)
+        # Module dropout 见文件末 roll_module_dropout：keep 标量在 forward 外预抽，
+        # 这里只在末尾乘一次。keep=0 时输出整体置零（等价旧的「整模块跳过」），keep=1/None 不变。
+        # 不再用 torch.rand().item() 的早返回分支 —— 那是数据依赖的，会在 torch.compile 下打断图。
         x_drop = self.dropout(x)
         h = self.lora_down(x_drop)
 
@@ -215,6 +227,8 @@ class LoRALayer(torch.nn.Module):
                 h_init = h_init.to(dtype=self.lora_up_init.dtype)
             out = out - F.linear(h_init, self.lora_up_init) * self.scaling
 
+        if self._md_keep is not None:
+            out = out * self._md_keep.to(out.dtype)
         return out
 
 
@@ -269,6 +283,8 @@ class LoKrLayer(torch.nn.Module):
         else:
             self.r_min = self.rank
         self.current_t: torch.Tensor | None = None
+        # Module-dropout keep 标量；语义同 LoRALayer._md_keep。
+        self._md_keep: torch.Tensor | None = None
 
         # ★ w1 用小 std 正态分布，配合 w2_b=0 初始时 ΔW=0；训练后 ΔW 量级由 scaling 控制
         torch.nn.init.normal_(self.lokr_w1, mean=0.0, std=0.1)
@@ -302,6 +318,18 @@ class LoKrLayer(torch.nn.Module):
         """由训练循环 / 采样循环在 model.forward 前调用。t 可为 None（重置）。"""
         self.current_t = t
 
+    def roll_module_dropout(self):
+        """每 step 在 forward 前预抽 module-dropout 的 keep 标量（见 __init__ 注释）。"""
+        if self.training and self.module_dropout > 0:
+            dev = self.lokr_w1.device
+            self._md_keep = (torch.rand((), device=dev) >= self.module_dropout).float()
+        else:
+            self._md_keep = None
+
+    def clear_module_dropout(self):
+        """forward 完成后重置，避免 keep=0 残留进后续采样/eval 前向。"""
+        self._md_keep = None
+
     def _apply_tlora_mask_kron(self, tmp_flat, x_orig_shape):
         """对 kron-bypass 中间 tensor `tmp_flat` (P, factor, rank) 应用 per-sample mask。
         P = prod(x_orig_shape[:-1]) = B * prod(中间维)。返回 (tmp_after_mask, mask_BR or None).
@@ -327,13 +355,8 @@ class LoKrLayer(torch.nn.Module):
         return tmp_flat * mask_view, mask_BR
 
     def forward(self, x):
-        # Module dropout: 整个模块以 p 概率跳过（训练时）
-        # 用 torch.rand（详见 LoRALayer.forward 同名注释）：CPU rng，无设备同步，且
-        # 被 grad checkpoint 保护，recompute 与原 forward 走同一分支。
-        if self.training and self.module_dropout > 0:
-            if torch.rand(1).item() < self.module_dropout:
-                return torch.zeros(*x.shape[:-1], self.out_features,
-                                   device=x.device, dtype=x.dtype)
+        # Module dropout 见 roll_module_dropout：keep 标量在 forward 外预抽，末尾乘一次。
+        # 不再用 torch.rand().item() 早返回 —— 数据依赖分支会在 torch.compile 下打断图。
 
         # ★ Training 路径：bf16 下 kron 容易数值放大，统一转 fp32 中间运算（必要）。
         # ★ Inference (eval + no_grad) 路径：可直接用原 dtype（通常 bf16），跳过 3 个 fp32 副本。
@@ -409,7 +432,10 @@ class LoKrLayer(torch.nn.Module):
 
         # reshape 回 (..., out_features)
         y = y.reshape(*orig_shape[:-1], self.factor * self.out_dim)
-        return y.to(dtype=x.dtype) * self.scaling
+        out = y.to(dtype=x.dtype) * self.scaling
+        if self._md_keep is not None:
+            out = out * self._md_keep.to(out.dtype)
+        return out
 
     def delta_weight(self, apply_rank_dropout: bool = False) -> torch.Tensor:
         """Materialize ΔW for DoRA weight decomposition and export checks."""
@@ -487,23 +513,30 @@ class LoRALinear(torch.nn.Module):
         """转发给底层 adapter，使其在 forward 时能拿到当前 timestep。"""
         self.adapter.set_current_t(t)
 
+    def roll_module_dropout(self):
+        """转发给底层 adapter；每 step forward 前由 injector 调用。"""
+        self.adapter.roll_module_dropout()
+
+    def clear_module_dropout(self):
+        """转发给底层 adapter；forward 完成后由 injector 调用。"""
+        self.adapter.clear_module_dropout()
+
     def forward(self, x):
         if self.use_dora:
             adapter = self.adapter
-            if self.training and adapter.module_dropout > 0:
-                # 用 torch.rand(1).item()（CPU device 默认）：既不触发 GPU 同步，
-                # 又被 grad checkpoint 自动保护，recompute 一致。旧实现
-                # torch.rand(1, device=x.device).item() 才会触发 GPU 同步，已去掉。
-                if torch.rand(1).item() < adapter.module_dropout:
-                    return self.original(x)
-
             delta = adapter.delta_weight(apply_rank_dropout=True).to(device=self.original.weight.device)
             base_w = self.original.weight.float()
             merged = base_w + delta
             denom = merged.norm(dim=1, keepdim=True).clamp(min=1e-6)
             scale = self.dora_scale.float().view(-1, 1) / denom
             dora_w = (merged * scale).to(dtype=self.original.weight.dtype)
-            return F.linear(x, dora_w, self.original.bias)
+            out = F.linear(x, dora_w, self.original.bias)
+            # Module dropout: keep=0 时退回 base 权重输出（等价旧的「跳过 DoRA reparam」）。
+            # keep 标量在 forward 外预抽，blend 写法是 compile 安全的（无数据依赖分支）。
+            if adapter._md_keep is not None:
+                base_out = self.original(x)
+                out = base_out + adapter._md_keep.to(out.dtype) * (out - base_out)
+            return out
         return self.original(x) + self.adapter(x)
 
     @property
@@ -769,6 +802,24 @@ class LoRAInjector:
             return
         for lora in self.injected.values():
             lora.set_current_t(t)
+
+    def roll_module_dropout(self):
+        """每个训练 step 在 model.forward 前调用：为每个注入层预抽 module-dropout 的 keep 标量。
+
+        把 RNG 从 forward（可能被 torch.compile 追踪的 block.forward_tokens）里外提到编译区域
+        之外，使 compile 下不再被 torch.rand().item() 的数据依赖分支逐 block 打断图。forward
+        完成后调用 clear_module_dropout() 重置，避免 keep=0 残留进采样/eval 前向。"""
+        if self.module_dropout <= 0:
+            return
+        for lora in self.injected.values():
+            lora.roll_module_dropout()
+
+    def clear_module_dropout(self):
+        """forward + backward 完成后调用，重置每层的 keep 标量。"""
+        if self.module_dropout <= 0:
+            return
+        for lora in self.injected.values():
+            lora.clear_module_dropout()
 
     def get_param_groups(self, weight_decay, base_lr: float = 1.0, loraplus_lr_ratio=None):
         """获取参数组（支持 LoRA+、模块级 lr、LoKr w1 排除 weight_decay）"""

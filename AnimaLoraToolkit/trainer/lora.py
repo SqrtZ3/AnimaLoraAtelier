@@ -114,11 +114,14 @@ class LoRALayer(torch.nn.Module):
         else:
             self.r_min = rank
         self.current_t: torch.Tensor | None = None
-        # Module-dropout 的 keep 标量（0./1.）。每 step 由 roll_module_dropout() 在 forward
-        # 之外预抽，forward 只读它做乘法 —— 把 RNG 移出可能被 torch.compile 追踪的区域，
-        # 避免 torch.rand().item() 的数据依赖分支逐 block 打断编译图。None=不丢弃（推理/未抽）。
+        # Module-dropout 两条路径，由 _md_compile_safe 选择（setup 时一次性设定）：
+        #  - eager（torch_compile 关，默认 _md_compile_safe=False）：forward 内直接
+        #    torch.rand().item() 懒抽签、命中即早返回，与最初实现逐字节一致、零额外每步开销；
+        #    此模式下 roll/clear 根本不会被调用（injector 层短路）。
+        #  - compile-safe（torch_compile 开）：keep 标量由 roll_module_dropout() 在 forward 外
+        #    预抽，forward 只读它做乘法 —— 把数据依赖的 RNG 分支移出编译区域，避免逐 block 打断图。
         self._md_keep: torch.Tensor | None = None
-        self._md_keep_bool: bool | None = None
+        self._md_compile_safe: bool = False
 
         # 初始化 + 可选 Ortho-LoRA + 初始 delta 补偿 buffer
         if self.tlora_enabled and self.tlora_init == "ortho":
@@ -140,24 +143,24 @@ class LoRALayer(torch.nn.Module):
         """由训练循环 / 采样循环在 model.forward 前调用。t 可为 None（重置）。"""
         self.current_t = t
 
-    def roll_module_dropout(self, compile_safe: bool = True):
-        """每 step 在 forward 前预抽 module-dropout 的 keep 标量（见 __init__ 注释）。"""
-        if self.training and self.module_dropout > 0:
-            if compile_safe:
-                dev = self.lora_up.weight.device
-                self._md_keep = (torch.rand((), device=dev) >= self.module_dropout).float()
-                self._md_keep_bool = None
-            else:
-                self._md_keep = None
-                self._md_keep_bool = bool((torch.rand(()) >= self.module_dropout).item())
+    def set_module_dropout_compile_safe(self, flag):
+        """setup 时设定一次：True=走 compile-safe（forward 外预抽 keep 标量）；
+        False=走 eager 懒抽签（forward 内 rand 早返回，零额外每步开销）。"""
+        self._md_compile_safe = bool(flag)
+        if not self._md_compile_safe:
+            self._md_keep = None
+
+    def roll_module_dropout(self):
+        """compile-safe 模式下每 step 在 forward 前预抽 keep 标量；eager 模式不会被调用。"""
+        if self._md_compile_safe and self.training and self.module_dropout > 0:
+            dev = self.lora_up.weight.device
+            self._md_keep = (torch.rand((), device=dev) >= self.module_dropout).float()
         else:
             self._md_keep = None
-            self._md_keep_bool = None
 
     def clear_module_dropout(self):
         """forward 完成后重置，避免 keep=0 残留进后续采样/eval 前向。"""
         self._md_keep = None
-        self._md_keep_bool = None
 
     def _apply_tlora_mask(self, h):
         """对 lora_down 的输出 h: (..., rank) 应用 per-sample T-LoRA mask。"""
@@ -182,12 +185,15 @@ class LoRALayer(torch.nn.Module):
         return h * mask_view, mask
 
     def forward(self, x):
-        if self._md_keep_bool is False:
+        # Module dropout 两路（见 __init__ 注释）：
+        #  - eager：原版懒抽签早返回，零额外开销（torch.rand().item() 被 grad-checkpoint 的
+        #    RNG fork/restore 保护，recompute 走同一分支）；
+        #  - compile-safe：keep 标量在 forward 外预抽，仅末尾乘一次。compile 时
+        #    `not self._md_compile_safe` 是常量 False → 整条 and 短路 → torch.rand 不进图。
+        if (self.training and self.module_dropout > 0 and not self._md_compile_safe
+                and torch.rand(1).item() < self.module_dropout):
             return torch.zeros(*x.shape[:-1], self.lora_up.out_features,
                                device=x.device, dtype=x.dtype)
-        # Module dropout 见文件末 roll_module_dropout：keep 标量在 forward 外预抽，
-        # 这里只在末尾乘一次。keep=0 时输出整体置零（等价旧的「整模块跳过」），keep=1/None 不变。
-        # 不再用 torch.rand().item() 的早返回分支 —— 那是数据依赖的，会在 torch.compile 下打断图。
         x_drop = self.dropout(x)
         h = self.lora_down(x_drop)
 
@@ -294,9 +300,9 @@ class LoKrLayer(torch.nn.Module):
         else:
             self.r_min = self.rank
         self.current_t: torch.Tensor | None = None
-        # Module-dropout keep 标量；语义同 LoRALayer._md_keep。
+        # Module-dropout keep 标量；语义同 LoRALayer._md_keep / _md_compile_safe。
         self._md_keep: torch.Tensor | None = None
-        self._md_keep_bool: bool | None = None
+        self._md_compile_safe: bool = False
 
         # ★ w1 用小 std 正态分布，配合 w2_b=0 初始时 ΔW=0；训练后 ΔW 量级由 scaling 控制
         torch.nn.init.normal_(self.lokr_w1, mean=0.0, std=0.1)
@@ -330,24 +336,23 @@ class LoKrLayer(torch.nn.Module):
         """由训练循环 / 采样循环在 model.forward 前调用。t 可为 None（重置）。"""
         self.current_t = t
 
-    def roll_module_dropout(self, compile_safe: bool = True):
-        """每 step 在 forward 前预抽 module-dropout 的 keep 标量（见 __init__ 注释）。"""
-        if self.training and self.module_dropout > 0:
-            if compile_safe:
-                dev = self.lokr_w1.device
-                self._md_keep = (torch.rand((), device=dev) >= self.module_dropout).float()
-                self._md_keep_bool = None
-            else:
-                self._md_keep = None
-                self._md_keep_bool = bool((torch.rand(()) >= self.module_dropout).item())
+    def set_module_dropout_compile_safe(self, flag):
+        """语义同 LoRALayer.set_module_dropout_compile_safe。"""
+        self._md_compile_safe = bool(flag)
+        if not self._md_compile_safe:
+            self._md_keep = None
+
+    def roll_module_dropout(self):
+        """compile-safe 模式下每 step 在 forward 前预抽 keep 标量；eager 模式不会被调用。"""
+        if self._md_compile_safe and self.training and self.module_dropout > 0:
+            dev = self.lokr_w1.device
+            self._md_keep = (torch.rand((), device=dev) >= self.module_dropout).float()
         else:
             self._md_keep = None
-            self._md_keep_bool = None
 
     def clear_module_dropout(self):
         """forward 完成后重置，避免 keep=0 残留进后续采样/eval 前向。"""
         self._md_keep = None
-        self._md_keep_bool = None
 
     def _apply_tlora_mask_kron(self, tmp_flat, x_orig_shape):
         """对 kron-bypass 中间 tensor `tmp_flat` (P, factor, rank) 应用 per-sample mask。
@@ -374,11 +379,12 @@ class LoKrLayer(torch.nn.Module):
         return tmp_flat * mask_view, mask_BR
 
     def forward(self, x):
-        if self._md_keep_bool is False:
+        # Module dropout 两路（见 LoRALayer.__init__ 注释）：eager 懒抽签早返回（零开销）；
+        # compile-safe 末尾乘 keep 标量。compile 时 `not self._md_compile_safe` 常量 False → 短路。
+        if (self.training and self.module_dropout > 0 and not self._md_compile_safe
+                and torch.rand(1).item() < self.module_dropout):
             return torch.zeros(*x.shape[:-1], self.out_features,
                                device=x.device, dtype=x.dtype)
-        # Module dropout 见 roll_module_dropout：keep 标量在 forward 外预抽，末尾乘一次。
-        # 不再用 torch.rand().item() 早返回 —— 数据依赖分支会在 torch.compile 下打断图。
 
         # ★ Training 路径：bf16 下 kron 容易数值放大，统一转 fp32 中间运算（必要）。
         # ★ Inference (eval + no_grad) 路径：可直接用原 dtype（通常 bf16），跳过 3 个 fp32 副本。
@@ -535,9 +541,13 @@ class LoRALinear(torch.nn.Module):
         """转发给底层 adapter，使其在 forward 时能拿到当前 timestep。"""
         self.adapter.set_current_t(t)
 
-    def roll_module_dropout(self, compile_safe: bool = True):
-        """转发给底层 adapter；每 step forward 前由 injector 调用。"""
-        self.adapter.roll_module_dropout(compile_safe=compile_safe)
+    def set_module_dropout_compile_safe(self, flag):
+        """转发给底层 adapter；setup 时由 injector 一次性设定。"""
+        self.adapter.set_module_dropout_compile_safe(flag)
+
+    def roll_module_dropout(self):
+        """转发给底层 adapter；compile-safe 模式下每 step forward 前由 injector 调用。"""
+        self.adapter.roll_module_dropout()
 
     def clear_module_dropout(self):
         """转发给底层 adapter；forward 完成后由 injector 调用。"""
@@ -546,7 +556,9 @@ class LoRALinear(torch.nn.Module):
     def forward(self, x):
         if self.use_dora:
             adapter = self.adapter
-            if adapter._md_keep_bool is False:
+            # eager：原版懒抽签，命中即退回 base（不材料化 delta）。compile-safe 走下面的权重 blend。
+            if (self.training and adapter.module_dropout > 0 and not adapter._md_compile_safe
+                    and torch.rand(1).item() < adapter.module_dropout):
                 return self.original(x)
             delta = adapter.delta_weight(apply_rank_dropout=True).to(device=self.original.weight.device)
             base_w = self.original.weight.float()
@@ -663,6 +675,9 @@ class LoRAInjector:
         self.targets = targets or self.DEFAULT_TARGETS
         self.rank_dropout = float(rank_dropout or 0.0)
         self.module_dropout = float(module_dropout or 0.0)
+        # module-dropout 路径：默认 eager（False）。setup 时由 set_module_dropout_compile_safe
+        # 按 torch_compile 设定；eager 下 roll/clear 短路，零额外每步开销。
+        self._md_compile_safe = False
         self.loraplus_lr_ratio = max(float(loraplus_lr_ratio or 1.0), 1.0)
 
         # ── Regex 模块选择 ──────────────────────────────────────────────
@@ -827,20 +842,30 @@ class LoRAInjector:
         for lora in self.injected.values():
             lora.set_current_t(t)
 
-    def roll_module_dropout(self, compile_safe: bool = True):
-        """每个训练 step 在 model.forward 前调用：为每个注入层预抽 module-dropout 的 keep 标量。
+    def set_module_dropout_compile_safe(self, flag):
+        """setup 时一次性设定 module-dropout 路径：
 
-        把 RNG 从 forward（可能被 torch.compile 追踪的 block.forward_tokens）里外提到编译区域
-        之外，使 compile 下不再被 torch.rand().item() 的数据依赖分支逐 block 打断图。forward
-        完成后调用 clear_module_dropout() 重置，避免 keep=0 残留进采样/eval 前向。"""
+        - flag=True（torch_compile 开）：走 compile-safe，每 step roll 预抽 keep 标量，
+          forward 只读它做乘法，把 RNG 移出可能被 compile 追踪的 block.forward_tokens。
+        - flag=False（默认/eager）：走原版懒抽签，forward 内 rand 早返回；此时 roll/clear
+          在本类直接短路返回，不再每步遍历所有注入层 —— eager 路径零额外每步开销。"""
+        self._md_compile_safe = bool(flag)
         if self.module_dropout <= 0:
             return
         for lora in self.injected.values():
-            lora.roll_module_dropout(compile_safe=compile_safe)
+            lora.set_module_dropout_compile_safe(flag)
+
+    def roll_module_dropout(self):
+        """compile-safe 模式下每个训练 step 在 model.forward 前调用，为每个注入层预抽 keep 标量。
+        eager 模式（默认）直接短路 —— dropout 由 forward 内懒抽签处理，无需每步遍历。"""
+        if not self._md_compile_safe or self.module_dropout <= 0:
+            return
+        for lora in self.injected.values():
+            lora.roll_module_dropout()
 
     def clear_module_dropout(self):
-        """forward + backward 完成后调用，重置每层的 keep 标量。"""
-        if self.module_dropout <= 0:
+        """compile-safe 模式下 forward + backward 完成后调用，重置每层 keep 标量。eager 直接短路。"""
+        if not self._md_compile_safe or self.module_dropout <= 0:
             return
         for lora in self.injected.values():
             lora.clear_module_dropout()

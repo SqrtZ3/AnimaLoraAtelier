@@ -1305,6 +1305,9 @@ def main():
         bool(getattr(args, "token_bucket", False)),
         float(getattr(args, "module_dropout", 0.0) or 0.0),
     )
+    # module-dropout 路径一次性定档：torch_compile 开 → compile-safe（预抽 keep 标量）；
+    # 关 → eager 懒抽签（与最初实现等价，roll/clear 每步短路、零额外开销）。
+    injector.set_module_dropout_compile_safe(bool(getattr(args, "torch_compile", False)))
     if bool(getattr(args, "torch_compile", False)):
         _compile_target = model.module if hasattr(model, "module") else model
         _compile_target.compile_blocks(mode=getattr(args, "compile_mode", None))
@@ -1965,12 +1968,11 @@ def main():
             # 内按 r(t) 应用 rank mask；其它 variant 该调用是空操作。完成后 reset 避免
             # 跨 step 残留（采样 / eval / 其它前向不应受影响）。
             injector.set_current_t(t.float().detach())
-            # ★ module_dropout: 每 step 预抽 keep 标量（把 RNG 移出可能被 compile 追踪的 forward）。
-            # 与 current_t 同生命周期：必须存活到 backward 之后（grad checkpoint recompute 要见同值），
-            # 故 reset 同样放在 backward 之后与 NaN-continue 之前。module_dropout=0 时是空操作。
-            injector.roll_module_dropout(
-                compile_safe=bool(getattr(args, "torch_compile", False))
-            )
+            # ★ module_dropout: compile-safe 模式下每 step 预抽 keep 标量（把 RNG 移出被 compile
+            # 追踪的 forward）；与 current_t 同生命周期，必须存活到 backward 之后（grad checkpoint
+            # recompute 要见同值），故 reset 放在 backward 之后与 NaN-continue 之前。
+            # eager 模式（torch_compile 关，默认）本调用在 injector 层直接短路，零额外每步开销。
+            injector.roll_module_dropout()
             # ★ T-LoRA: current_t 必须存活到 backward 之后。原本在这里 finally reset
             # 是错的：grad checkpoint 在 backward 时会 recompute forward，那一刻 current_t
             # 必须和原 forward 完全一致，否则 LoRALayer 的 _apply_tlora_mask / ortho 补偿

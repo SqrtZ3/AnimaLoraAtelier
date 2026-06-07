@@ -19,6 +19,7 @@
 但实际是 no-op。
 """
 import json
+import sys
 import threading
 import time
 from collections import deque
@@ -609,7 +610,31 @@ class MonitorHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, output_dir=None, **kwargs):
         self.output_dir = output_dir or Path("./output")
         super().__init__(*args, **kwargs)
-    
+
+    def handle_one_request(self):
+        """吞掉客户端中途断开导致的连接异常，避免污染训练日志。
+
+        长采样（step N 出图：denoise + VAE decode + 存 PNG/LoRA 可达数分钟）期间，
+        训练与采样都跑在**主线程**，HTTP worker 线程被饿死；浏览器每秒轮询的 fetch
+        等不到响应而主动断连。采样结束 worker 恢复、再 wfile.write 时对端已关闭，
+        抛 BrokenPipeError/ConnectionResetError（均为 ConnectionError 子类）。
+
+        这类异常对训练**完全无害**——训练在主线程，handler 是 daemon worker 线程，
+        互不影响；但 socketserver 默认会把整条 traceback 打到 stderr，看着像崩溃。
+        这里按异常类型精确拦截：标记关闭连接、安静返回，不冒泡到 handle_error。
+        """
+        try:
+            super().handle_one_request()
+        except ConnectionError:
+            self.close_connection = True
+
+    def finish(self):
+        """兜底：finally 阶段 flush/close 若再撞断连，同样静默（不掩盖其它异常）。"""
+        try:
+            super().finish()
+        except ConnectionError:
+            pass
+
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":
             self.send_response(200)
@@ -683,6 +708,22 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         pass  # 静默日志
 
 
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """监控服务器：把客户端断连（ConnectionError 系）的 traceback 静音。
+
+    ``MonitorHandler.handle_one_request`` / ``finish`` 已拦掉请求生命周期里常见的断连
+    路径；这里在 socketserver 的统一错误出口 ``handle_error`` 再兜一层 —— setup /
+    shutdown_request 等边角阶段漏出的断连异常也会经此打印整条 traceback，独立兜底后
+    无论哪条路径断连都不会污染训练日志。非连接类异常仍照常上报（不掩盖真实 bug）。
+    """
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, ConnectionError):
+            return
+        super().handle_error(request, client_address)
+
+
 def start_monitor_server(port=8765, host="0.0.0.0", output_dir=None, open_browser=True, max_port_retries=5):
     """启动监控服务器。
 
@@ -703,7 +744,7 @@ def start_monitor_server(port=8765, host="0.0.0.0", output_dir=None, open_browse
     for attempt in range(max(int(max_port_retries), 1)):
         try_port = port + attempt
         try:
-            server = ThreadingHTTPServer((host, try_port), handler)
+            server = _QuietThreadingHTTPServer((host, try_port), handler)
             actual_port = try_port
             break
         except OSError as e:

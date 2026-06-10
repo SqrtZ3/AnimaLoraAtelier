@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from trainer.objective import (  # noqa: E402
     sample_t, sample_t_stratified, apply_t_range,
+    lwd_saliency_mask, per_sample_loss,
 )
 from trainer.lora_one import kpsvd_lokr_factors, lora_one_kpsvd_init  # noqa: E402
 
@@ -120,6 +121,44 @@ def test_lora_one_init_end_to_end():
     # merged_weight 与 W0+ΔW 一致
     merged = lora.merged_weight().float()
     assert torch.allclose(merged, W0 + delta, rtol=1e-3, atol=1e-5)
+
+
+def test_lwd_saliency_mask_gating():
+    torch.manual_seed(0)
+    # 左半棋盘格（高频）、右半纯平：显著图应左高右低
+    lat = torch.zeros(2, 4, 1, 16, 16)
+    checker = (torch.arange(16).view(-1, 1) + torch.arange(16).view(1, -1)) % 2
+    lat[:, :, :, :, :8] = checker[:, :8].float() * 2 - 1
+
+    # t=0.6 > floor=0.3：平坦区（显著度≈0）被门掉，高频区保留
+    m_mid = lwd_saliency_mask(lat, torch.tensor([0.6, 0.6]), floor=0.3)
+    assert m_mid.shape == (2, 1, 1, 16, 16)
+    assert m_mid[..., :, :8].mean().item() > 0.9   # 高频半边几乎全保留
+    assert m_mid[..., :, 10:].mean().item() < 0.1  # 平坦半边几乎全被门掉
+    # t=0.2 < floor：全图受监督
+    m_low = lwd_saliency_mask(lat, torch.tensor([0.2, 0.2]), floor=0.3)
+    assert m_low.min().item() == 1.0
+    # 纯平图 + 高 t：空 mask 兜底回退全 1
+    flat = torch.zeros(1, 4, 1, 16, 16)
+    m_flat = lwd_saliency_mask(flat, torch.tensor([0.99]), floor=0.3)
+    assert m_flat.min().item() == 1.0
+
+
+def test_per_sample_loss_weight_map():
+    torch.manual_seed(0)
+    pred = torch.randn(2, 4, 1, 8, 8)
+    target = torch.randn(2, 4, 1, 8, 8)
+    # 全 1 权重 == 不加权
+    ones = torch.ones(2, 1, 1, 8, 8)
+    a = per_sample_loss(pred, target, loss_type="mse", weight_map=ones)
+    b = per_sample_loss(pred, target, loss_type="mse")
+    assert torch.allclose(a, b, rtol=1e-5)
+    # 只保留左半：等于左半的均值
+    half = torch.zeros(2, 1, 1, 8, 8)
+    half[..., :4] = 1.0
+    c = per_sample_loss(pred, target, loss_type="mse", weight_map=half)
+    expected = (pred - target)[..., :4].float().square().reshape(2, -1).mean(dim=1)
+    assert torch.allclose(c, expected, rtol=1e-5)
 
 
 def test_lora_one_global_eta_preserves_relative_magnitudes():

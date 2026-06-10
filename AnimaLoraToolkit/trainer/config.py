@@ -183,6 +183,9 @@ YAML_TO_ARGS = {
     # LoRA-One 谱对齐初始化 (arXiv 2502.01235, KPSVD→LoKr)
     "lora_one_init_steps": "lora_one_init_steps",
     "lora_one_init_scale": "lora_one_init_scale",
+    # LWD 小波显著性 time-gated 掩码 (arXiv 2506.00433)
+    "lwd_mask_enabled": "lwd_mask_enabled",
+    "lwd_mask_floor": "lwd_mask_floor",
     "adaptive_timestep": "adaptive_timestep",
     "adaptive_timestep_metric": "adaptive_timestep_metric",
     "adaptive_timestep_highfreq_weight": "adaptive_timestep_highfreq_weight",
@@ -384,6 +387,8 @@ DEFAULTS = {
     "timestep_stratified": False,
     "lora_one_init_steps": 0,
     "lora_one_init_scale": 0.01,
+    "lwd_mask_enabled": False,
+    "lwd_mask_floor": 0.3,
     "adaptive_timestep": False,
     "adaptive_timestep_metric": "raw",
     "adaptive_timestep_highfreq_weight": 0.25,

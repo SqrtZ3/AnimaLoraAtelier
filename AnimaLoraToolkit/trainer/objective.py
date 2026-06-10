@@ -91,6 +91,14 @@ class LossConfig:
     #   per_sample ← per_sample - λ·||v_pred - v_另一样本||²，反"回归条件均值→发灰发雾"。
     #   零额外前向；0=关闭，论文甜点 0.05，≥0.15 会分布塌缩。
     dfm_lambda: float = 0.0
+    # LWD 小波显著性 time-gated 掩码（arXiv 2506.00433）。对 clean latent 做单级
+    # Haar DWT，LH/HL/HH 能量归一化为显著图 A∈[0,1]；mask = 1{A+floor ≥ t}：
+    # 高细节区域在更多 timestep 段受监督，平坦区域只在低噪段受监督。
+    # 论文在 Flux/SD3/PixArt 上微调既有模型、只改 loss：FID -7%、纹理指标最佳。
+    # 零额外模型/前向。仅作用于主 loss（ΔFM 负样本项不掩码）；dense 路径限定。
+    # 与 detail_inv_t / 频域 aux loss 功能有重叠，开启时建议互斥消融。
+    lwd_enabled: bool = False
+    lwd_floor: float = 0.3      # ℓ：平坦区的保底监督下限（论文默认 0.3）
 
 
 @dataclass(frozen=True)
@@ -135,6 +143,8 @@ def build_training_objective_config(args) -> TrainingObjectiveConfig:
             detail_inv_t_max=float(getattr(args, "detail_inv_t_max", 5.0) or 5.0),
             huber_snr_clamp_max=float(getattr(args, "huber_snr_clamp_max", 10.0) or 10.0),
             dfm_lambda=float(getattr(args, "dfm_lambda", 0.0) or 0.0),
+            lwd_enabled=bool(getattr(args, "lwd_mask_enabled", False)),
+            lwd_floor=float(getattr(args, "lwd_mask_floor", 0.3) or 0.3),
         ),
         aux=build_aux_loss_config(args),
     )
@@ -566,11 +576,58 @@ def _huber_delta_for_t(t: torch.Tensor | None, huber_c: float, schedule: str,
     return delta
 
 
+def lwd_saliency_mask(latents: torch.Tensor, t: torch.Tensor, floor: float = 0.3) -> torch.Tensor:
+    """LWD（arXiv 2506.00433）小波能量显著性 time-gated 掩码。
+
+    latents: clean x0 latent，(B,C,H,W) 或 (B,C,T,H,W)。
+    返回与 latents 空间维对齐的二值 mask（B,1,[1,]H,W）：
+      1. 单级 Haar DWT 取 LH/HL/HH 能量、跨通道平均 → 显著图（H/2,W/2）
+      2. 每样本 min-max 归一化到 [0,1]，nearest 上采样回 (H,W)
+      3. mask = 1{A + floor ≥ t}：t 越高（噪声越大）只保留越高显著度的区域；
+         t < floor 时全图受监督。
+    某样本 mask 全空（纯平图 + 高 t）时回退全 1，避免除零/丢监督。
+    """
+    x = latents.float()
+    squeeze_t = x.ndim == 5
+    if squeeze_t:
+        b, c, tt, h, w = x.shape
+        x = x.reshape(b, c * tt, h, w)
+    b, _, h, w = x.shape
+    h2, w2 = (h // 2) * 2, (w // 2) * 2
+    xe = x[..., :h2, :w2]
+    a = xe[..., 0::2, 0::2]
+    bb = xe[..., 0::2, 1::2]
+    cc = xe[..., 1::2, 0::2]
+    dd = xe[..., 1::2, 1::2]
+    lh = (a + bb - cc - dd) * 0.5
+    hl = (a - bb + cc - dd) * 0.5
+    hh = (a - bb - cc + dd) * 0.5
+    energy = (lh.square() + hl.square() + hh.square()).mean(dim=1, keepdim=True)
+    flat = energy.flatten(1)
+    mn = flat.min(dim=1).values.view(b, 1, 1, 1)
+    mx = flat.max(dim=1).values.view(b, 1, 1, 1)
+    sal = (energy - mn) / (mx - mn).clamp(min=1e-12)
+    sal = F.interpolate(sal, size=(h, w), mode="nearest")
+    t_b = t.float().to(sal.device).view(b, 1, 1, 1)
+    mask = ((sal + float(floor)) >= t_b).float()
+    empty = mask.flatten(1).sum(dim=1) <= 0
+    if bool(empty.any()):
+        mask[empty] = 1.0
+    if squeeze_t:
+        mask = mask.unsqueeze(2)  # (B,1,1,H,W)
+    return mask
+
+
 def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "mse",
                     huber_c: float = 0.1, huber_schedule: str = "constant",
                     t: torch.Tensor | None = None,
-                    huber_snr_clamp_max: float = 10.0) -> torch.Tensor:
-    """Return per-sample loss for tensors shaped (B, C, T, H, W)."""
+                    huber_snr_clamp_max: float = 10.0,
+                    weight_map: torch.Tensor | None = None) -> torch.Tensor:
+    """Return per-sample loss for tensors shaped (B, C, T, H, W).
+
+    weight_map: 可选的空间权重图（如 LWD 掩码，形状可广播到 loss map）。
+    提供时按加权平均归约：sum(loss·w)/sum(w)，权重全零样本由上游兜底保证不出现。
+    """
     pred_f = pred.float()
     target_f = target.float()
     loss_type = (loss_type or "mse").lower()
@@ -601,6 +658,12 @@ def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "
     else:
         logger.warning(f"Unknown loss_type={loss_type!r}; falling back to mse")
         loss_map = F.mse_loss(pred_f, target_f, reduction="none")
+
+    if weight_map is not None:
+        w = weight_map.to(dtype=loss_map.dtype, device=loss_map.device).expand_as(loss_map)
+        num = (loss_map * w).reshape(loss_map.shape[0], -1).sum(dim=1)
+        den = w.reshape(loss_map.shape[0], -1).sum(dim=1).clamp(min=1.0)
+        return num / den
 
     return loss_map.view(loss_map.shape[0], -1).mean(dim=1)
 

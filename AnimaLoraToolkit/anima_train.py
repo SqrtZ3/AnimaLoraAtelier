@@ -232,6 +232,7 @@ from trainer.objective import (
     make_noise_from_config,
     _huber_delta_for_t,
     per_sample_loss,
+    lwd_saliency_mask,
     contrastive_flow_matching_neg,
     per_sample_highfreq_loss,
     adaptive_timestep_metric_signal,
@@ -525,6 +526,11 @@ def parse_args():
                    help="LoRA-One 谱对齐初始化（arXiv 2502.01235→LoKr KPSVD 版）：训练前累积 N 个 batch "
                         "的全参梯度做 SVD 初始化 LoKr 因子，加速前几百步收敛。0=关闭。"
                         "需要 fit_packed_training=false；建议 8-16。")
+    p.add_argument("--lwd-mask-enabled", action="store_true",
+                   help="LWD 小波显著性 time-gated 掩码（arXiv 2506.00433）：高细节区在更多 t 段受监督、"
+                        "平坦区只在低噪段受监督。零额外开销；dense 路径限定；与 detail_inv_t/频域 aux 建议互斥。")
+    p.add_argument("--lwd-mask-floor", type=float, default=0.3,
+                   help="LWD 平坦区保底监督下限 ℓ（论文默认 0.3；t<ℓ 时全图受监督）。")
     p.add_argument("--lora-one-init-scale", type=float, default=0.01,
                    help="LoRA-One 初始 ΔW 的 Frobenius 范数相对 ||W0|| 的比例；成品画风 LoKr 通常在 "
                         "1-5%% 量级，0.01=保守。")
@@ -1866,6 +1872,10 @@ def main():
     # ARB 多 bucket 时大概会有 5-20 个 unique shape，cache 几 KB 内存换掉每步的 cudaMalloc。
     _pad_mask_cache: dict = {}
 
+    # LWD 掩码目前只在 dense 路径实现（packed token 路径需要 token 级掩码，未做）
+    if objective_cfg.loss.lwd_enabled and fit_packed_training:
+        raise RuntimeError("lwd_mask_enabled 目前仅支持 dense 路径（fit_packed_training=false）")
+
     # ── LoRA-One (arXiv:2502.01235) 谱对齐初始化 ─────────────────────────────
     # 训练正式开始前：累积 N 个 batch 的全参梯度 → KPSVD → 初始化 LoKr 因子。
     # 只在全新训练（global_step==0）执行；resume 时跳过（因子已是训练后状态）。
@@ -2127,6 +2137,11 @@ def main():
                         model, noisy, t.view(-1, 1), cross, pad_mask,
                         use_checkpoint=args.grad_checkpoint
                     )
+                    # LWD 掩码从 clean latents 计算（与噪声无关），只作用于主 loss；
+                    # ΔFM 负样本项保持全图（其量级由 λ 单独控制）。
+                    lwd_w = None
+                    if objective_cfg.loss.lwd_enabled:
+                        lwd_w = lwd_saliency_mask(latents, t, objective_cfg.loss.lwd_floor)
                     per_sample = per_sample_loss(
                         pred,
                         target,
@@ -2135,6 +2150,7 @@ def main():
                         huber_schedule=objective_cfg.loss.huber_schedule,
                         t=t.float(),
                         huber_snr_clamp_max=objective_cfg.loss.huber_snr_clamp_max,
+                        weight_map=lwd_w,
                     )
 
                 # ── ΔFM: Contrastive Flow Matching（默认关闭，dfm_lambda=0）──

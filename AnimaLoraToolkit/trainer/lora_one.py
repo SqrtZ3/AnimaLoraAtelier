@@ -61,13 +61,25 @@ def kpsvd_lokr_factors(G: torch.Tensor, factor: int, rank: int):
 
 
 @torch.no_grad()
-def lora_one_kpsvd_init(injector, grads: dict, scale_rel: float = 0.01) -> str:
+def lora_one_kpsvd_init(injector, grads: dict, scale_rel: float = 0.01,
+                        min_energy_capture: float = 0.05) -> str:
     """对 injector 中每个 LoKr 模块用累积梯度做谱对齐初始化。
 
     grads: {module_name: fp32 grad tensor (out,in)}（已对 batch 数取均值）。
-    返回摘要字符串（applied/skipped/平均能量捕获率）。
+    返回摘要字符串（applied/skipped/全局步长/扰动比分布/平均能量捕获率）。
+
+    ★ 全局单一步长（与 LoRA-One 原文一致）：ΔW_m = -η · Ĝ_m，η 对所有模块相同，
+    按"扰动最大的模块恰好达到 scale_rel·‖W0_m‖_F"标定。
+    早期版本曾做过"每模块归一化到 scale_rel·‖W0‖"——那是错的：梯度近零的模块
+    （loss 几乎不依赖它们）也会被推满 scale_rel，方向以噪声为主，且各层扰动方向
+    相关、跨 28 block 复合放大，实测一次性把模型打成纯噪声输出。全局 η 保留了
+    模块间的相对梯度幅度：loss 不想动的模块几乎不动。
+
+    min_energy_capture: KPSVD rank-(1×r) 近似捕获的梯度能量比下限；低于它说明
+    该模块的"方向"基本是噪声，跳过（保持默认零初始化）。
     """
-    applied = 0
+    # ── pass 1：算每个模块的 KPSVD 近似与梯度幅度，确定全局 η ──────────────
+    prepared = {}   # name -> (lora, w1, w2_a, w2_b, an, W0_norm)
     skipped = []
     capture_sum = 0.0
     for name, lora in injector.injected.items():
@@ -84,32 +96,46 @@ def lora_one_kpsvd_init(injector, grads: dict, scale_rel: float = 0.01) -> str:
             continue
 
         w1, w2_a, w2_b = kpsvd_lokr_factors(G, int(ad.factor), int(ad.rank))
-
-        # 当前近似的 ΔW（含 layer scaling），用于范数标定与能量捕获统计
         approx = torch.kron(w1, w2_a @ w2_b)
-        an = approx.norm().clamp_min(1e-12)
-        capture_sum += float(an / gn)  # rank-(1×r) Kronecker 近似捕获的梯度能量比
+        an = float(approx.norm().clamp_min(1e-20))
+        capture = an / float(gn)
+        if capture < float(min_energy_capture):
+            skipped.append(name)
+            continue
+        capture_sum += capture
+        W0_norm = float(lora.original.weight.detach().float().norm())
+        prepared[name] = (lora, w1, w2_a, w2_b, an, W0_norm)
 
-        W0 = lora.original.weight.detach().float()
-        target_norm = float(scale_rel) * float(W0.norm())
-        # ΔW_layer = scaling·kron(w1, w2a@w2b)；把"负号 + 范数标定 ÷ scaling"全部吸收进 w2_a
-        coef = -(target_norm / (float(ad.scaling) * float(an)))
-        w2_a = w2_a * coef
+    if not prepared:
+        return f"applied=0 skipped={len(skipped)} (no usable gradients)"
 
+    # ratio_m(η=1) = scaling·an_m / ‖W0_m‖；η 让 max_m ratio = scale_rel
+    unit_ratios = {n: float(p[0].adapter.scaling) * p[4] / max(p[5], 1e-12)
+                   for n, p in prepared.items()}
+    eta = float(scale_rel) / max(unit_ratios.values())
+
+    # ── pass 2：写入因子（把 -η 吸收进 w2_a）+ DoRA 幅度重算 ────────────────
+    applied = 0
+    for name, (lora, w1, w2_a, w2_b, an, W0_norm) in prepared.items():
+        ad = lora.adapter
+        w2_a = w2_a * (-eta)
         ad.lokr_w1.data.copy_(w1.to(dtype=ad.lokr_w1.dtype, device=ad.lokr_w1.device))
         ad.lokr_w2_a.data.copy_(w2_a.to(dtype=ad.lokr_w2_a.dtype, device=ad.lokr_w2_a.device))
         ad.lokr_w2_b.data.copy_(w2_b.to(dtype=ad.lokr_w2_b.dtype, device=ad.lokr_w2_b.device))
 
         if getattr(lora, "use_dora", False):
+            W0 = lora.original.weight.detach().float()
             delta = ad.delta_weight(apply_rank_dropout=False).float().to(W0.device)
             m = (W0 + delta).norm(dim=1).clamp(min=1e-6)
             lora.dora_scale.data.copy_(m.to(dtype=lora.dora_scale.dtype,
                                             device=lora.dora_scale.device))
         applied += 1
 
+    ratios = torch.tensor([eta * r for r in unit_ratios.values()])
     cap = capture_sum / max(applied, 1)
     if skipped:
-        logger.info("[lora-one] skipped %d modules (non-lokr/tlora/no-grad): %s%s",
+        logger.info("[lora-one] skipped %d modules (non-lokr/tlora/no-grad/low-capture): %s%s",
                     len(skipped), ", ".join(skipped[:5]), " ..." if len(skipped) > 5 else "")
-    return (f"applied={applied} skipped={len(skipped)} "
-            f"scale_rel={scale_rel} mean_energy_capture={cap:.3f}")
+    return (f"applied={applied} skipped={len(skipped)} eta={eta:.3e} "
+            f"dW/W0 max={ratios.max():.4f} median={ratios.median():.4f} "
+            f"min={ratios.min():.2e} mean_energy_capture={cap:.3f}")

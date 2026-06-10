@@ -122,6 +122,39 @@ def test_lora_one_init_end_to_end():
     assert torch.allclose(merged, W0 + delta, rtol=1e-3, atol=1e-5)
 
 
+def test_lora_one_global_eta_preserves_relative_magnitudes():
+    """全局单一步长：梯度小 10× 的模块，初始 ΔW 也必须小 10×（防止每模块归一化
+    把零梯度模块推满扰动 → 模型纯噪声的事故回归测试）。"""
+    torch.manual_seed(1)
+    from trainer.lora import LoRALinear
+
+    base_a = torch.nn.Linear(64, 64, bias=False)
+    base_b = torch.nn.Linear(64, 64, bias=False)
+    lora_a = LoRALinear(base_a, rank=8, alpha=8.0, use_lokr=True, factor=4, lora_variant="dora")
+    lora_b = LoRALinear(base_b, rank=8, alpha=8.0, use_lokr=True, factor=4, lora_variant="dora")
+
+    class FakeInjector:
+        injected = {"m.a": lora_a, "m.b": lora_b}
+
+    G = torch.randn(64, 64)
+    scale_rel = 0.02
+    stats = lora_one_kpsvd_init(FakeInjector(), {"m.a": G, "m.b": 0.1 * G},
+                                scale_rel=scale_rel)
+    assert "applied=2" in stats, stats
+
+    da = lora_a.adapter.delta_weight(apply_rank_dropout=False).float()
+    db = lora_b.adapter.delta_weight(apply_rank_dropout=False).float()
+    # 相对幅度保持：‖ΔW_b‖/‖ΔW_a‖ = 梯度比 0.1（同方向、同 η）
+    ratio = (db.norm() / da.norm()).item()
+    assert abs(ratio - 0.1) < 1e-3, ratio
+    # 扰动最大的模块（a）恰好达到 scale_rel·‖W0_a‖
+    W0a = base_a.weight.detach().float()
+    assert abs(da.norm().item() - scale_rel * W0a.norm().item()) / (scale_rel * W0a.norm().item()) < 2e-2
+    # b 远低于 scale_rel（这正是旧实现做不到的）
+    W0b = base_b.weight.detach().float()
+    assert db.norm().item() < 0.05 * scale_rel * W0b.norm().item() * 10
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

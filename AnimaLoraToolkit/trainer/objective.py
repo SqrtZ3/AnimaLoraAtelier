@@ -44,6 +44,21 @@ class TimestepConfig:
     # 建议与 schedule_shift=1.0 + adaptive_timestep=false 搭配做干净对照（避免二次偏移）。
     laplace_mu: float = 0.0
     laplace_b: float = 0.5
+    # ── Style-Friendly SNR sampler (arXiv 2411.14793)——mode="logsnr" / mixed 高噪峰 ──
+    # logSNR λ ~ N(μ, σ)，t = sigmoid(-λ/2)。论文画风微调甜点 μ=-6, σ=2（t 峰≈0.95）；
+    # μ=-4 实测不够激进。仅 mode 含 "logsnr" 时生效。
+    logsnr_mu: float = -6.0
+    logsnr_sigma: float = 2.0
+    # ── t 值域截断 ──
+    # t_min: 低噪端下界。arXiv 2509.20952 证 t→0 时 velocity 回归条件数发散（高方差梯度
+    # 噪声），细节端采样建议截断在 0.05 左右。0 = 沿用历史 1e-4。
+    # t_max: 高噪端上界（极少用）。1.0 = 沿用历史 1-1e-4。
+    t_min: float = 0.0
+    t_max: float = 1.0
+    # ── 分层采样（VDM arXiv 2107.00630 低差异思想）──
+    # batch 内 t 按分位数分层取样，消除"全 batch 撞同一噪声段"的梯度噪声尖峰。
+    # 小 batch（≤8）下方差削减最明显；与任意 mode（含 U 形/混合分布）兼容。
+    stratified: bool = False
 
 
 @dataclass(frozen=True)
@@ -96,6 +111,11 @@ def build_training_objective_config(args) -> TrainingObjectiveConfig:
             schedule_shift=float(getattr(args, "schedule_shift", 1.0) or 1.0),
             laplace_mu=float(getattr(args, "timestep_laplace_mu", 0.0) or 0.0),
             laplace_b=float(getattr(args, "timestep_laplace_b", 0.5) or 0.5),
+            logsnr_mu=float(getattr(args, "timestep_logsnr_mu", -6.0) if getattr(args, "timestep_logsnr_mu", None) is not None else -6.0),
+            logsnr_sigma=float(getattr(args, "timestep_logsnr_sigma", 2.0) or 2.0),
+            t_min=float(getattr(args, "timestep_t_min", 0.0) or 0.0),
+            t_max=float(getattr(args, "timestep_t_max", 1.0) or 1.0),
+            stratified=bool(getattr(args, "timestep_stratified", False)),
         ),
         noise=NoiseConfig(
             offset=float(getattr(args, "noise_offset", 0.0) or 0.0),
@@ -132,6 +152,8 @@ def sample_t(
     mix_low_prob: float = 0.25,
     laplace_mu: float = 0.0,
     laplace_b: float = 0.5,
+    logsnr_mu: float = -6.0,
+    logsnr_sigma: float = 2.0,
 ):
     """采样 Flow Matching 时间步 t ∈ (0, 1)。
 
@@ -152,6 +174,26 @@ def sample_t(
     mode = (mode or "logit_normal").lower()
     if mode == "uniform":
         return torch.rand(bs, device=device).clamp(1e-4, 1.0 - 1e-4)
+
+    if mode == "logsnr":
+        # Style-Friendly SNR sampler (arXiv 2411.14793)：logSNR λ ~ N(μ, σ)，
+        # FM CONST 调度 SNR=((1-t)/t)² ⇒ t = sigmoid(-λ/2)。
+        # μ=-6 → t 峰≈0.95（画风写入区）；σ=2 保多样性。
+        lam = float(logsnr_mu) + float(logsnr_sigma) * torch.randn(bs, device=device)
+        t = torch.sigmoid(-0.5 * lam)
+        return t.clamp(1e-4, 1.0 - 1e-4)
+
+    if mode in ("mixed_logsnr_low_high", "ushaped_sf"):
+        # U 形升级版：低噪(细节)峰沿用 logit_normal_low(shift)，高噪(画风)峰换成
+        # Style-Friendly logsnr(μ,σ)。mix_low_prob = 路由到低噪峰的比例。
+        # 相比 mixed_logit_low_high，高噪峰从 t≈0.75 (shift=3) 推到 t≈0.95 (μ=-6)，
+        # 对齐"style 在去噪前 10% 步写入"的实证。
+        low_t = sample_t(bs, device, mode="logit_normal_low", shift=shift)
+        high_t = sample_t(bs, device, mode="logsnr",
+                          logsnr_mu=logsnr_mu, logsnr_sigma=logsnr_sigma)
+        p_low = min(max(float(mix_low_prob), 0.0), 1.0)
+        use_low = (torch.rand(bs, device=device) < p_low)
+        return torch.where(use_low, low_t, high_t).clamp(1e-4, 1.0 - 1e-4)
 
     if mode == "laplace":
         # u ~ U(0,1) 作为分位点；λ = log-SNR 按 Laplace(μ, b) 逆 CDF 采样。
@@ -216,6 +258,35 @@ def apply_timestep_schedule_shift(t: torch.Tensor, schedule_shift: float) -> tor
     if sched_shift > 0 and abs(sched_shift - 1.0) > 1e-6:
         t = (t * sched_shift) / (1 + (sched_shift - 1) * t)
     return t.clamp(1e-4, 1.0 - 1e-4)
+
+
+def apply_t_range(t: torch.Tensor, t_min: float = 0.0, t_max: float = 1.0) -> torch.Tensor:
+    """t 值域截断。t_min>0 时截掉病态低噪端（arXiv 2509.20952：t→0 velocity 目标
+    条件数发散）；clamp 会在边界留一个小质量尖峰，对 logit_normal_low(shift=3)
+    （t<0.05 质量很小）可忽略。0/1 = 维持历史 1e-4 行为。"""
+    lo = max(float(t_min or 0.0), 1e-4)
+    hi = min(float(t_max or 1.0), 1.0 - 1e-4)
+    if lo > hi:
+        lo, hi = hi, lo
+    return t.clamp(lo, hi)
+
+
+def sample_t_stratified(bs, device, oversample: int = 32, **kw):
+    """分位数分层 t 采样（VDM arXiv 2107.00630 低差异思想的免逆 CDF 通用实现）。
+
+    从同一分布超采 bs×oversample 个候选并排序，再在每个分位层内随机取一个 —— 保证
+    batch 的 t 在分位空间均匀覆盖（消除"4 个 t 全撞同一噪声段"的梯度噪声尖峰），
+    同时边际分布与原分布一致。对任意 mode（含 U 形混合分布）无需解析逆 CDF 即正确。
+    注意这是"经验分位"分层：双峰分布下候选池的峰间二项波动会让池内边界相对真分位
+    轻微漂移，因此不保证每个 batch 严格占满所有真分位段，但批内组合方差仍被大幅
+    削减（bs=4 实测批均值 t 的 std 降至 iid 的 ~1/3）。返回前随机重排，避免 batch
+    位置与 t 大小相关。"""
+    n = bs * max(int(oversample), 2)
+    cand, _ = torch.sort(sample_t(n, device, **kw))
+    per = n // bs
+    offs = torch.randint(0, per, (bs,), device=device)
+    picked = cand[torch.arange(bs, device=device) * per + offs]
+    return picked[torch.randperm(bs, device=device)]
 
 
 class AdaptiveTimestepSampler:
@@ -326,9 +397,16 @@ class AdaptiveTimestepSampler:
     def sample(self, bs, device, *, mode: str, shift: float, mix_low_prob: float,
                schedule_shift: float = 1.0,
                laplace_mu: float = 0.0, laplace_b: float = 0.5,
+               logsnr_mu: float = -6.0, logsnr_sigma: float = 2.0,
+               stratified: bool = False,
                global_step: int) -> torch.Tensor:
-        base_t = sample_t(bs, device, mode=mode, shift=shift, mix_low_prob=mix_low_prob,
-                          laplace_mu=laplace_mu, laplace_b=laplace_b)
+        kw = dict(mode=mode, shift=shift, mix_low_prob=mix_low_prob,
+                  laplace_mu=laplace_mu, laplace_b=laplace_b,
+                  logsnr_mu=logsnr_mu, logsnr_sigma=logsnr_sigma)
+        # 分层只作用于 base 采样（含 adaptive 模式下的 base_mix 份额）；
+        # adaptive 份额由 loss-aware 重加权多项式抽样决定，分层在那里无意义。
+        base_t = (sample_t_stratified(bs, device, **kw) if stratified
+                  else sample_t(bs, device, **kw))
         if (not self.enabled) or global_step < self.burn_in_steps or not self.ready:
             return base_t
 
@@ -337,8 +415,7 @@ class AdaptiveTimestepSampler:
             return base_t
 
         candidates_n = max(adaptive_count * self.candidate_mult, adaptive_count)
-        candidates = sample_t(candidates_n, device, mode=mode, shift=shift, mix_low_prob=mix_low_prob,
-                              laplace_mu=laplace_mu, laplace_b=laplace_b)
+        candidates = sample_t(candidates_n, device, **kw)
         candidates_final = apply_timestep_schedule_shift(candidates, schedule_shift)
         candidate_bins = torch.clamp((candidates_final.float() * self.bins).long(), 0, self.bins - 1)
         weights = self.factors().to(device=candidates.device)[candidate_bins]

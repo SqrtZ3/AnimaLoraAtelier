@@ -224,7 +224,9 @@ from trainer.objective import (
     TrainingObjectiveConfig,
     build_training_objective_config,
     sample_t,
+    sample_t_stratified,
     apply_timestep_schedule_shift,
+    apply_t_range,
     AdaptiveTimestepSampler,
     make_noise,
     make_noise_from_config,
@@ -500,13 +502,32 @@ def parse_args():
     p.add_argument("--no-t5-token-weights", dest="use_t5_token_weights", action="store_false")
     p.add_argument("--flow-shift", type=float, default=3.0, help="logit/timestep shift used by shifted timestep samplers")
     p.add_argument("--timestep-sampling", default="logit_normal",
-                   choices=["logit_normal", "uniform", "logit_normal_low", "mode", "mixed_uniform_low", "mixed_uniform_logit", "mixed_logit_low_high", "ushaped", "u_shaped", "bimodal", "laplace"],
+                   choices=["logit_normal", "uniform", "logit_normal_low", "mode", "mixed_uniform_low", "mixed_uniform_logit", "mixed_logit_low_high", "ushaped", "u_shaped", "bimodal", "laplace", "logsnr", "mixed_logsnr_low_high", "ushaped_sf"],
                    help="timestep sampling distribution")
     p.add_argument("--timestep-mix-low-prob", type=float, default=0.25, help="mixed_uniform_low 中低噪声样本比例")
     p.add_argument("--timestep-laplace-mu", type=float, default=0.0,
                    help="Laplace 噪声调度（timestep_sampling=laplace）log-SNR 峰位 μ；>0 偏低噪声/细节端，<0 偏高噪。")
     p.add_argument("--timestep-laplace-b", type=float, default=0.5,
                    help="Laplace 噪声调度的尺度 b（越小越集中在 μ 附近）。论文 256→0.5、512→0.75。")
+    p.add_argument("--timestep-logsnr-mu", type=float, default=-6.0,
+                   help="Style-Friendly logSNR 采样峰位 μ（arXiv 2411.14793）；-6 → t峰≈0.95 画风写入区。"
+                        "仅 timestep_sampling=logsnr / mixed_logsnr_low_high 生效。")
+    p.add_argument("--timestep-logsnr-sigma", type=float, default=2.0,
+                   help="Style-Friendly logSNR 采样宽度 σ；论文 σ<2 损失多样性。")
+    p.add_argument("--timestep-t-min", type=float, default=0.0,
+                   help="t 下界截断；arXiv 2509.20952 证 t→0 velocity 目标病态，细节端建议 0.05。0=历史行为(1e-4)。")
+    p.add_argument("--timestep-t-max", type=float, default=1.0,
+                   help="t 上界截断。1.0=历史行为(1-1e-4)。")
+    p.add_argument("--timestep-stratified", action="store_true",
+                   help="batch 内 t 分位数分层采样（VDM 低差异思想）：消除小 batch 撞同一噪声段的"
+                        "梯度噪声尖峰，对任意采样分布零开销生效。")
+    p.add_argument("--lora-one-init-steps", type=int, default=0,
+                   help="LoRA-One 谱对齐初始化（arXiv 2502.01235→LoKr KPSVD 版）：训练前累积 N 个 batch "
+                        "的全参梯度做 SVD 初始化 LoKr 因子，加速前几百步收敛。0=关闭。"
+                        "需要 fit_packed_training=false；建议 8-16。")
+    p.add_argument("--lora-one-init-scale", type=float, default=0.01,
+                   help="LoRA-One 初始 ΔW 的 Frobenius 范数相对 ||W0|| 的比例；成品画风 LoKr 通常在 "
+                        "1-5%% 量级，0.01=保守。")
     p.add_argument("--adaptive-timestep", action="store_true",
                    help="启用保守自适应 timestep：按 per-timestep raw loss 重采样，不改变 loss 权重。")
     p.add_argument("--adaptive-timestep-metric", choices=["raw", "highfreq", "mixed", "entropy_rate"], default="raw",
@@ -1845,6 +1866,99 @@ def main():
     # ARB 多 bucket 时大概会有 5-20 个 unique shape，cache 几 KB 内存换掉每步的 cudaMalloc。
     _pad_mask_cache: dict = {}
 
+    # ── LoRA-One (arXiv:2502.01235) 谱对齐初始化 ─────────────────────────────
+    # 训练正式开始前：累积 N 个 batch 的全参梯度 → KPSVD → 初始化 LoKr 因子。
+    # 只在全新训练（global_step==0）执行；resume 时跳过（因子已是训练后状态）。
+    # 显存注意：目标模块的 base 权重要临时挂 grad（fp32 累积 ≈ 模型规模 ×4B），
+    # 96GB 卡无压力；24GB 级卡慎开。
+    _lora_one_steps = int(getattr(args, "lora_one_init_steps", 0) or 0)
+    if _lora_one_steps > 0 and global_step == 0:
+        from trainer.lora_one import lora_one_kpsvd_init
+        if fit_packed_training:
+            raise RuntimeError("lora_one_init_steps 目前仅支持 dense 路径（fit_packed_training=false）")
+        emit(f"[lora-one] 收集 {_lora_one_steps} 个 batch 的全参梯度用于谱对齐初始化...")
+        _lo_targets = dict(injector.injected)
+        for _l in _lo_targets.values():
+            _l.original.weight.requires_grad_(True)
+        _lo_grads: dict = {}
+        model.eval()  # 关 dropout/module_dropout 拿干净梯度；grad checkpoint 在 eval 下照常工作
+        _lo_iter = iter(dataloader)
+        _lo_done = 0
+        while _lo_done < _lora_one_steps:
+            try:
+                _lb = next(_lo_iter)
+            except StopIteration:
+                _lo_iter = iter(dataloader)
+                continue
+            _lcaps = _lb["captions"]
+            if use_cached:
+                _llat = _lb["latents"].to(device, dtype=dtype)
+            else:
+                with torch.no_grad():
+                    _lpx = _lb["pixel_values"].to(device, dtype=dtype)
+                    _llat = vae.model.encode(_lpx.unsqueeze(2), vae.scale).to(dtype)
+            with torch.no_grad():
+                _lq_texts = [_build_qwen_text_from_prompt(c) for c in _lcaps]
+                _lq_emb, _lq_attn = encode_qwen(qwen_model, qwen_tok, _lq_texts, device)
+                _lt5_ids, _lt5_attn, _lt5_w = tokenize_t5_weighted(t5_tok, _lcaps, max_length=512)
+                _lcross = model.preprocess_text_embeds(
+                    _lq_emb, _lt5_ids.to(device), _lt5_attn.to(device), _lq_attn)
+                if (getattr(args, "use_t5_token_weights", True)
+                        and getattr(model, "llm_adapter", None) is not None
+                        and _lcross.shape[1] == _lt5_w.shape[1]):
+                    _lcross = _lcross * _lt5_w.to(device, dtype=torch.float32).to(_lcross.dtype).unsqueeze(-1)
+                if _lcross.shape[1] < 512:
+                    _lcross = F.pad(_lcross, (0, 0, 0, 512 - _lcross.shape[1]))
+            _lbs = _llat.shape[0]
+            # 用配置的 t 分布采样（梯度子空间应反映真实训练目标），分层进一步降估计方差
+            _lt = sample_t_stratified(
+                _lbs, device, mode=objective_cfg.timestep.mode,
+                shift=objective_cfg.timestep.flow_shift,
+                mix_low_prob=objective_cfg.timestep.mix_low_prob,
+                laplace_mu=objective_cfg.timestep.laplace_mu,
+                laplace_b=objective_cfg.timestep.laplace_b,
+                logsnr_mu=objective_cfg.timestep.logsnr_mu,
+                logsnr_sigma=objective_cfg.timestep.logsnr_sigma,
+            )
+            _lt = apply_timestep_schedule_shift(_lt, objective_cfg.timestep.schedule_shift)
+            _lt = apply_t_range(_lt, objective_cfg.timestep.t_min, objective_cfg.timestep.t_max)
+            _lnoise = make_noise_from_config(_llat, objective_cfg.noise)
+            _lte = _lt.view(-1, 1, 1, 1, 1)
+            _lnoisy = (1 - _lte) * _llat + _lte * _lnoise
+            _ltarget = _lnoise - _llat
+            _lpad = torch.zeros(_lbs, 1, _llat.shape[-2], _llat.shape[-1], device=device, dtype=dtype)
+            with torch.autocast("cuda", dtype=dtype):
+                _lpred = forward_with_optional_checkpoint(
+                    model, _lnoisy, _lt.view(-1, 1), _lcross, _lpad,
+                    use_checkpoint=bool(args.grad_checkpoint))
+                _lloss = per_sample_loss(_lpred, _ltarget, loss_type="mse").mean()
+            _lloss.backward()
+            for _n, _l in _lo_targets.items():
+                _g = _l.original.weight.grad
+                if _g is None:
+                    continue
+                if _n in _lo_grads:
+                    _lo_grads[_n] += _g.detach().float()
+                else:
+                    _lo_grads[_n] = _g.detach().float().clone()
+            model.zero_grad(set_to_none=True)
+            _lo_done += 1
+            emit(f"[lora-one] grad batch {_lo_done}/{_lora_one_steps} loss={float(_lloss):.4f}")
+        for _n in _lo_grads:
+            _lo_grads[_n] /= float(_lora_one_steps)
+        _lo_stats = lora_one_kpsvd_init(
+            injector, _lo_grads,
+            scale_rel=float(getattr(args, "lora_one_init_scale", 0.01) or 0.01))
+        emit(f"[lora-one] 初始化完成: {_lo_stats}")
+        for _l in _lo_targets.values():
+            _l.original.weight.requires_grad_(False)
+        model.zero_grad(set_to_none=True)
+        _lo_grads.clear()
+        del _lo_targets, _lo_iter
+        model.train()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     for epoch in range(start_epoch, args.epochs):
         current_epoch = epoch
         if hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_epoch"):
@@ -1927,12 +2041,17 @@ def main():
                 mix_low_prob=mix_low_prob, schedule_shift=sched_shift,
                 laplace_mu=objective_cfg.timestep.laplace_mu,
                 laplace_b=objective_cfg.timestep.laplace_b,
+                logsnr_mu=objective_cfg.timestep.logsnr_mu,
+                logsnr_sigma=objective_cfg.timestep.logsnr_sigma,
+                stratified=objective_cfg.timestep.stratified,
                 global_step=global_step,
             )
 
             # SD3 式 σ schedule shift：作用于所有模式的 t（含 uniform / mixed_*），
             # 把噪声混合用的 sigma 整体偏向高噪声端。1.0=禁用，向后兼容。
             t = apply_timestep_schedule_shift(t, sched_shift)
+            # t 值域截断（timestep_t_min/t_max；默认 0/1 = 历史 1e-4 行为）
+            t = apply_t_range(t, objective_cfg.timestep.t_min, objective_cfg.timestep.t_max)
 
             t_exp = t.view(-1, 1, 1, 1, 1)
 

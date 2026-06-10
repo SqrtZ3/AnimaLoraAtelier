@@ -1943,7 +1943,7 @@ def main():
                     _lo_grads[_n] = _g.detach().float().clone()
             model.zero_grad(set_to_none=True)
             _lo_done += 1
-            emit(f"[lora-one] grad batch {_lo_done}/{_lora_one_steps} loss={float(_lloss):.4f}")
+            emit(f"[lora-one] grad batch {_lo_done}/{_lora_one_steps} loss={float(_lloss.detach()):.4f}")
         for _n in _lo_grads:
             _lo_grads[_n] /= float(_lora_one_steps)
         _lo_stats = lora_one_kpsvd_init(

@@ -772,10 +772,19 @@ class LoRAInjector:
                     _key = (_label, tuple(p for p, _ in _hits))
                     if _key not in self._reg_conflict_warned:
                         self._reg_conflict_warned.add(_key)
-                        logger.warning(
-                            "[%s] 模块 %s 同时命中 %s，按首个 %r=%s 生效，其余被遮蔽；"
-                            "若想让更特定的模式生效，请把它移到 dict 更前面。",
-                            _label, name, _hits, _hits[0][0], _hits[0][1])
+                        # 危险型 = 更长（更特定）的模式被排在后面遮蔽（adaln-48 事故型）→ WARNING；
+                        # 预期型 = 特定模式刻意放前面压过通用兜底（块段倾斜的正常写法）→ INFO。
+                        _danger = any(len(p) > len(_hits[0][0]) for p, _ in _hits[1:])
+                        if _danger:
+                            logger.warning(
+                                "[%s] 模块 %s 同时命中 %s，按首个 %r=%s 生效——但有更特定的模式"
+                                "被遮蔽！若这不是有意为之，把更特定的模式移到 dict 更前面。",
+                                _label, name, _hits, _hits[0][0], _hits[0][1])
+                        else:
+                            logger.info(
+                                "[%s] %s: 特定模式 %r=%s 覆盖通用兜底 %s（预期优先级顺序）。",
+                                _label, name, _hits[0][0], _hits[0][1],
+                                [(p, v) for p, v in _hits[1:]])
 
             lora_linear = LoRALinear(
                 module, rank=mod_rank, alpha=mod_alpha,

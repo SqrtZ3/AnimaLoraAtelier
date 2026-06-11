@@ -536,6 +536,17 @@ def parse_args():
     p.add_argument("--eval-t-grid", default="0.1,0.3,0.5,0.7,0.9",
                    help="eval 的固定 timestep 网格（逗号分隔）。")
     p.add_argument("--eval-seed", type=int, default=1234, help="eval 固定噪声种子（CPU RNG，跨机器一致）。")
+    p.add_argument("--tread-enabled", action="store_true",
+                   help="TREAD token 路由（arXiv 2501.04765）：训练期让随机 ratio 的 token 绕过中段 blocks，"
+                        "省 20-40% 算力，推理完全不变。dense 路径限定。")
+    p.add_argument("--tread-ratio", type=float, default=0.3,
+                   help="路由段内被绕过的 token 比例。LoRA 微调 >0.35 可能伤收敛（SimpleTuner 经验），"
+                        "保守 0.3 起步。")
+    p.add_argument("--tread-start-layer", type=int, default=3,
+                   help="路由段起始 block 索引（含；支持负索引）。")
+    p.add_argument("--tread-end-layer", type=int, default=-4,
+                   help="路由段结束 block 索引（不含；支持负索引）。28 blocks 时 3→-4 = 路由 blocks 3..23，"
+                        "首 3 尾 4 个 block 全量计算。")
     p.add_argument("--timestep-stratified", action="store_true",
                    help="batch 内 t 分位数分层采样（VDM 低差异思想）：消除小 batch 撞同一噪声段的"
                         "梯度噪声尖峰，对任意采样分布零开销生效。")
@@ -1893,6 +1904,24 @@ def main():
     if objective_cfg.loss.lwd_enabled and fit_packed_training:
         raise RuntimeError("lwd_mask_enabled 目前仅支持 dense 路径（fit_packed_training=false）")
 
+    # ── TREAD token 路由（arXiv 2501.04765，训练期省算力）────────────────────
+    _tread_ratio = (float(getattr(args, "tread_ratio", 0.0) or 0.0)
+                    if bool(getattr(args, "tread_enabled", False)) else 0.0)
+    _tread_start = int(getattr(args, "tread_start_layer", 3) or 0)
+    _tread_end = int(getattr(args, "tread_end_layer", -4) or 0)
+    if _tread_ratio > 0.0:
+        if fit_packed_training:
+            raise RuntimeError("tread_enabled 目前仅支持 dense 路径（fit_packed_training=false）")
+        if not (0.0 < _tread_ratio <= 0.9):
+            raise ValueError(f"tread_ratio 须在 (0, 0.9] 内，当前 {_tread_ratio}")
+        _tnb = len(model.blocks)
+        _tts = _tread_start if _tread_start >= 0 else _tnb + _tread_start
+        _tte = _tread_end if _tread_end > 0 else _tnb + _tread_end
+        if not (0 <= _tts < _tte <= _tnb):
+            raise ValueError(f"TREAD 路由段非法: blocks[{_tts}:{_tte}) / {_tnb} blocks")
+        emit(f"[tread] token 路由启用: ratio={_tread_ratio} blocks[{_tts}:{_tte})/{_tnb}"
+             f"（仅训练前向生效，采样/eval/推理不受影响）")
+
     # ── inv_loss_ema 加权（EDM2 解析变体）：与 adaptive_timestep 互斥 ────────────
     loss_bin_ema = None
     if objective_cfg.loss.weighting_scheme == "inv_loss_ema":
@@ -2240,7 +2269,10 @@ def main():
                 else:
                     pred = forward_with_optional_checkpoint(
                         model, noisy, t.view(-1, 1), cross, pad_mask,
-                        use_checkpoint=args.grad_checkpoint
+                        use_checkpoint=args.grad_checkpoint,
+                        tread_ratio=_tread_ratio,
+                        tread_start=_tread_start,
+                        tread_end=_tread_end,
                     )
                     # LWD 掩码从 clean latents 计算（与噪声无关），只作用于主 loss；
                     # ΔFM 负样本项保持全图（其量级由 λ 单独控制）。

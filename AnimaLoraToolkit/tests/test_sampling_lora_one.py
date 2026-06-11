@@ -240,6 +240,112 @@ def test_lora_one_global_eta_preserves_relative_magnitudes():
     assert db.norm().item() < 0.05 * scale_rel * W0b.norm().item() * 10
 
 
+def _make_tread_model(n_blocks=4, head_dim=2):
+    """模拟 Cosmos block 接口的最小模型：forward(grid) 与 forward_tokens 同为 +add。"""
+    from trainer.objective import forward_with_optional_checkpoint  # noqa: F401
+
+    class Block(torch.nn.Module):
+        def __init__(self, add):
+            super().__init__()
+            self.add = float(add)
+            self.seen_rope_shapes = []
+
+        def forward(self, x, emb, cross, padding_mask=None, rope_emb_L_1_1_D=None,
+                    adaln_lora_B_T_3D=None, extra_per_block_pos_emb=None):
+            return x + self.add
+
+        def forward_tokens(self, x, emb, cross, rope_emb_L_1_1_D=None,
+                           attn_mask=None, token_mask_f=None, adaln_lora_B_T_3D=None):
+            if rope_emb_L_1_1_D is not None:
+                self.seen_rope_shapes.append(tuple(rope_emb_L_1_1_D.shape))
+            return x + self.add
+
+    class FinalLayer:
+        def __call__(self, x, emb, adaln_lora_B_T_3D=None):
+            return x
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([Block(10.0 ** i) for i in range(n_blocks)])
+            self.t_embedding_norm = torch.nn.Identity()
+            self.final_layer = FinalLayer()
+            self.head_dim = head_dim
+
+        def t_embedder(self, ts):
+            return torch.zeros(ts.shape[0], 1, 4), None
+
+        def prepare_embedded_sequence(self, latents, fps=None, padding_mask=None):
+            x = latents.permute(0, 2, 3, 4, 1).contiguous()  # (B,T,H,W,C)
+            n = x.shape[1] * x.shape[2] * x.shape[3]
+            rope = torch.zeros(n, 1, 1, self.head_dim)
+            return x, rope, None
+
+        def unpatchify(self, x):
+            return x
+
+    return Model()
+
+
+def test_tread_routing_bypass_and_shapes():
+    """TREAD：被丢 token 恒等旁路路由段、保留 token 正常过段、段外全量计算。
+
+    blocks 加数为 1/10/100/1000，路由段 [1,3)：
+      保留 token: x +1 +10 +100 +1000 = +1111；被丢 token: x +1 +1000 = +1001。
+    """
+    from trainer.objective import forward_with_optional_checkpoint
+    torch.manual_seed(0)
+    for use_ckpt in (False, True):
+        model = _make_tread_model(n_blocks=4)
+        model.train()
+        lat = torch.randn(2, 3, 1, 4, 4)            # 16 token/样本
+        base = lat.permute(0, 2, 3, 4, 1).contiguous()
+        out = forward_with_optional_checkpoint(
+            model, lat, torch.tensor([0.5, 0.5]), None, None,
+            use_checkpoint=use_ckpt, tread_ratio=0.5, tread_start=1, tread_end=3)
+        delta = (out - base).reshape(2, 16, 3)
+        kept = torch.isclose(delta, torch.full_like(delta, 1111.0)).all(dim=-1)
+        dropped = torch.isclose(delta, torch.full_like(delta, 1001.0)).all(dim=-1)
+        assert bool((kept | dropped).all()), "每个 token 必须恰为保留(+1111)或旁路(+1001)"
+        assert kept.sum(dim=1).tolist() == [8, 8]   # ratio=0.5 → 每样本保留 8 个
+        # 两个样本的保留集应（大概率）不同 = 逐样本独立路由
+        assert not torch.equal(kept[0], kept[1])
+        # 路由段内 block 看到的 rope 子集形状 (B, N_keep, 1, 1, Dh)
+        assert model.blocks[1].seen_rope_shapes == [(2, 8, 1, 1, 2)]
+        # 段外 block 不走 token 路径
+        assert model.blocks[0].seen_rope_shapes == []
+
+
+def test_tread_disabled_paths():
+    from trainer.objective import forward_with_optional_checkpoint
+    torch.manual_seed(0)
+    lat = torch.randn(1, 3, 1, 4, 4)
+    base = lat.permute(0, 2, 3, 4, 1).contiguous()
+    # eval 模式：即使传了 ratio 也强制全量（双保险）
+    model = _make_tread_model(n_blocks=4)
+    model.eval()
+    out = forward_with_optional_checkpoint(
+        model, lat, torch.tensor([0.5]), None, None,
+        use_checkpoint=True, tread_ratio=0.5, tread_start=1, tread_end=3)
+    assert torch.allclose(out - base, torch.full_like(out, 1111.0))
+    # ratio=0：训练模式下也等于全量（且 checkpoint 路径不回归）
+    model2 = _make_tread_model(n_blocks=4)
+    model2.train()
+    out2 = forward_with_optional_checkpoint(
+        model2, lat, torch.tensor([0.5]), None, None, use_checkpoint=True)
+    assert torch.allclose(out2 - base, torch.full_like(out2, 1111.0))
+    # 非法路由段报错
+    model3 = _make_tread_model(n_blocks=4)
+    model3.train()
+    try:
+        forward_with_optional_checkpoint(
+            model3, lat, torch.tensor([0.5]), None, None,
+            tread_ratio=0.5, tread_start=3, tread_end=2)
+        assert False, "应抛 ValueError"
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

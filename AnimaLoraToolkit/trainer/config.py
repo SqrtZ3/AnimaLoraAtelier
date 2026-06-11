@@ -186,6 +186,11 @@ YAML_TO_ARGS = {
     # LWD 小波显著性 time-gated 掩码 (arXiv 2506.00433)
     "lwd_mask_enabled": "lwd_mask_enabled",
     "lwd_mask_floor": "lwd_mask_floor",
+    # TREAD token 路由 (arXiv 2501.04765)
+    "tread_enabled": "tread_enabled",
+    "tread_ratio": "tread_ratio",
+    "tread_start_layer": "tread_start_layer",
+    "tread_end_layer": "tread_end_layer",
     # 三峰采样高噪路由 / VeCoR 负样本 / 固定网格 eval
     "timestep_mix_high_prob": "timestep_mix_high_prob",
     "dfm_mode": "dfm_mode",
@@ -398,6 +403,10 @@ DEFAULTS = {
     "lwd_mask_floor": 0.3,
     "timestep_mix_high_prob": 0.25,
     "dfm_mode": "batch",
+    "tread_enabled": False,
+    "tread_ratio": 0.3,
+    "tread_start_layer": 3,
+    "tread_end_layer": -4,
     "eval_every": 0,
     "eval_count": 4,
     "eval_t_grid": "0.1,0.3,0.5,0.7,0.9",

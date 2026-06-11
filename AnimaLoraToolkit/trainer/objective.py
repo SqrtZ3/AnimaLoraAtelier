@@ -1086,22 +1086,42 @@ def _block_accepts_padding_mask(block) -> bool:
     return bool(accepts)
 
 
-def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_mask, use_checkpoint=False):
-    """带可选梯度检查点的前向传播（per-block checkpoint 策略）。
+def tread_route_indices(bs: int, n_tokens: int, ratio: float, device) -> torch.Tensor:
+    """TREAD（arXiv 2501.04765）的逐样本随机保留索引。
 
-    ⚠ 关于策略选择的历史教训：
+    返回 (B, N_keep) 已升序排序的 token 索引，N_keep = round(N·(1-ratio))。
+    每个样本独立抽取（与论文一致）；排序保持原 token 顺序，便于 RoPE 子集对齐。
+    """
+    n_keep = max(int(round(n_tokens * (1.0 - float(ratio)))), 1)
+    scores = torch.rand(bs, n_tokens, device=device)
+    idx = scores.argsort(dim=1)[:, :n_keep]
+    return idx.sort(dim=1).values
+
+
+def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_mask, use_checkpoint=False,
+                                     tread_ratio: float = 0.0, tread_start: int = 0, tread_end: int = 0):
+    """带可选梯度检查点的前向传播（per-block checkpoint 策略）+ 可选 TREAD token 路由。
+
+    ⚠ 关于 checkpoint 策略选择的历史教训：
     曾经一版实现把整个 `model.forward` 包进**单个** checkpoint 调用，理由是简单且永远不漏参数。
     后来发现对于大模型这意味着 backward 时要一次性重放整个 forward 的所有激活 →
     峰值显存 ≈ N × (单 block 激活)，把训练显存推到无法接受的高度（实测 10GB → 70GB 量级）。
+    本实现是 per-block checkpoint：峰值激活 ≈ 1 × (单 block 激活)。
+    ★ block 是否接受 padding_mask kwarg 用 inspect 一次性 introspect 并 cache。
 
-    本实现回退到 per-block checkpoint：每个 transformer block 单独 checkpoint，峰值激活
-    ≈ 1 × (单 block 激活)。同时把 `padding_mask` 显式透传给每个 block —— 这是上一版整体
-    checkpoint 当初引入的本意（旧 per-block 实现漏传了 padding_mask）。
-
-    ★ block 是否接受 padding_mask kwarg 用 inspect 一次性 introspect 并 cache，
-       不再每个 forward 都 try/except TypeError。
+    TREAD（arXiv 2501.04765，训练期专用 token 路由，省 20-40% 算力，推理不变）：
+    tread_ratio>0 且 model.training 时，blocks[tread_start:tread_end)（负索引按
+    python 语义解析，end 为开区间）改走 token 路径：
+      1. 段首把网格 hidden (B,T,H,W,D) 展平成 token (B,N,D)，每样本独立随机抽
+         N·(1-ratio) 个保留 token（gather），RoPE 同步取子集 → (B,N_keep,1,1,Dh)；
+      2. 段内用 block.forward_tokens 只算保留 token（与网格 forward 已验证逐 bit
+         等价的路径；attn_mask/token_mask_f=None 走 SDPA 无掩码快路径）；
+      3. 段尾把处理后的 token scatter 回原位 —— 被丢 token 恒等旁路（保持段首值）。
+    约束：仅 dense 路径；要求 extra_per_block_pos_emb 为 None（Anima rope 配置满足，
+    非 None 显式报错）；采样/eval 调用方不传 tread 参数 + model.eval() 双保险关闭。
     """
-    if not use_checkpoint:
+    use_tread = float(tread_ratio) > 0.0 and bool(getattr(model, "training", False))
+    if not use_checkpoint and not use_tread:
         return model(latents, timesteps, cross, padding_mask=padding_mask)
     x_B_T_H_W_D, rope_emb, extra_pos_emb = model.prepare_embedded_sequence(
         latents, fps=None, padding_mask=padding_mask,
@@ -1117,15 +1137,61 @@ def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_m
         "extra_per_block_pos_emb": extra_pos_emb,
     }
 
-    for block in model.blocks:
-        accepts_pad = _block_accepts_padding_mask(block)
-        if accepts_pad:
-            def custom_forward(x, blk=block):
-                return blk(x, t_embedding, cross, padding_mask=padding_mask, **block_kwargs)
+    n_blocks = len(model.blocks)
+    seg_s = seg_e = -1
+    x_tok_full = x_keep = gather_idx = rope_keep = grid_shape = None
+    if use_tread:
+        if extra_pos_emb is not None:
+            raise RuntimeError(
+                "TREAD 路由段不支持 extra_per_block_pos_emb（学习型逐块位置嵌入）；"
+                "请关闭 tread 或使用 rope-only 位置编码。")
+        seg_s = tread_start if tread_start >= 0 else n_blocks + tread_start
+        seg_e = tread_end if tread_end > 0 else n_blocks + tread_end
+        if not (0 <= seg_s < seg_e <= n_blocks):
+            raise ValueError(f"非法 TREAD 路由段: blocks[{seg_s}:{seg_e}) / n_blocks={n_blocks}")
+
+    def _run_grid(blk, x):
+        if _block_accepts_padding_mask(blk):
+            def fwd(x_in, _b=blk):
+                return _b(x_in, t_embedding, cross, padding_mask=padding_mask, **block_kwargs)
         else:
-            def custom_forward(x, blk=block):
-                return blk(x, t_embedding, cross, **block_kwargs)
-        x_B_T_H_W_D = checkpoint(custom_forward, x_B_T_H_W_D, use_reentrant=False)
+            def fwd(x_in, _b=blk):
+                return _b(x_in, t_embedding, cross, **block_kwargs)
+        if use_checkpoint:
+            return checkpoint(fwd, x, use_reentrant=False)
+        return fwd(x)
+
+    def _run_tokens(blk, x_t):
+        def fwd(x_in, _b=blk):
+            return _b.forward_tokens(x_in, t_embedding, cross, rope_emb_L_1_1_D=rope_keep,
+                                     attn_mask=None, token_mask_f=None,
+                                     adaln_lora_B_T_3D=adaln_lora)
+        if use_checkpoint:
+            return checkpoint(fwd, x_t, use_reentrant=False)
+        return fwd(x_t)
+
+    for i, block in enumerate(model.blocks):
+        if use_tread and i == seg_s:
+            b, tt, hh, ww, dd = x_B_T_H_W_D.shape
+            grid_shape = (b, tt, hh, ww, dd)
+            n_tok = tt * hh * ww
+            x_tok_full = x_B_T_H_W_D.reshape(b, n_tok, dd)
+            keep_idx = tread_route_indices(b, n_tok, tread_ratio, x_tok_full.device)
+            gather_idx = keep_idx.unsqueeze(-1).expand(-1, -1, dd)
+            x_keep = torch.gather(x_tok_full, 1, gather_idx)
+            if rope_emb is not None:
+                if rope_emb.shape[0] != n_tok:
+                    raise RuntimeError(
+                        f"rope_emb 第 0 维 ({rope_emb.shape[0]}) != token 数 ({n_tok})，"
+                        "TREAD 无法对齐 RoPE 子集")
+                rope_keep = rope_emb[keep_idx]   # (B, N_keep, 1, 1, Dh)
+        if use_tread and seg_s <= i < seg_e:
+            x_keep = _run_tokens(block, x_keep)
+            if i == seg_e - 1:
+                x_tok_full = x_tok_full.scatter(1, gather_idx, x_keep.to(x_tok_full.dtype))
+                x_B_T_H_W_D = x_tok_full.reshape(grid_shape)
+            continue
+        x_B_T_H_W_D = _run_grid(block, x_B_T_H_W_D)
 
     x_B_T_H_W_O = model.final_layer(x_B_T_H_W_D, t_embedding, adaln_lora_B_T_3D=adaln_lora)
     return model.unpatchify(x_B_T_H_W_O)

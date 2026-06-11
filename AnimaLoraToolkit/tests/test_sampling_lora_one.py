@@ -240,6 +240,20 @@ def test_lora_one_global_eta_preserves_relative_magnitudes():
     assert db.norm().item() < 0.05 * scale_rel * W0b.norm().item() * 10
 
 
+def test_anneal_mix_prob():
+    from trainer.objective import anneal_mix_prob
+    # 禁用态：end<0 或 anneal 区间非法 → 恒返 base
+    assert anneal_mix_prob(0.40, -1.0, 500, 0, 1000) == 0.40
+    assert anneal_mix_prob(0.40, 0.55, 500, 0, 0) == 0.40
+    # 起点前 / 终点后 / 中点
+    assert anneal_mix_prob(0.40, 0.55, 999, 1000, 1800) == 0.40
+    assert anneal_mix_prob(0.40, 0.55, 1800, 1000, 1800) == 0.55
+    mid = anneal_mix_prob(0.40, 0.55, 1400, 1000, 1800)
+    assert abs(mid - 0.475) < 1e-9
+    # 反向退火（降高噪份额）同样成立
+    assert abs(anneal_mix_prob(0.20, 0.12, 1400, 1000, 1800) - 0.16) < 1e-9
+
+
 def test_tag_dropout_overrides():
     import random as _r
     from trainer.data import ImageDataset

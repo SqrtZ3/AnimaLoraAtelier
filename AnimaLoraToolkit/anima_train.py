@@ -227,6 +227,7 @@ from trainer.objective import (
     sample_t_stratified,
     apply_timestep_schedule_shift,
     apply_t_range,
+    anneal_mix_prob,
     AdaptiveTimestepSampler,
     make_noise,
     make_noise_from_config,
@@ -524,6 +525,15 @@ def parse_args():
     p.add_argument("--timestep-mix-high-prob", type=float, default=0.25,
                    help="mixed_logsnr_three 的高噪(氛围)峰路由概率；低噪用 --timestep-mix-low-prob，"
                         "其余进中噪(结构)峰。v2 教训：中段(0.4-0.85)不能为空，否则形体风格学不到。")
+    p.add_argument("--timestep-mix-anneal-start", type=int, default=0,
+                   help="三峰路由概率退火的起始 step（线性插值到 anneal-end）。")
+    p.add_argument("--timestep-mix-anneal-end", type=int, default=0,
+                   help="三峰路由概率退火的结束 step；0=禁用退火。课程式：前结构后细节"
+                        "（v4 实证：绑定收紧发生在后段，末段提低噪份额=收尾重开无条件细节表达）。")
+    p.add_argument("--timestep-mix-low-prob-end", type=float, default=-1.0,
+                   help="退火终点的低噪峰概率；-1=不退火该项。")
+    p.add_argument("--timestep-mix-high-prob-end", type=float, default=-1.0,
+                   help="退火终点的高噪峰概率；-1=不退火该项。")
     p.add_argument("--dfm-mode", choices=["batch", "vecor"], default="batch",
                    help="ΔFM 负样本来源：batch=同批其它样本（原版）；vecor=对 target 做通道乱序/裁剪缩放"
                         "构造（arXiv 2511.18942 部分移植，不依赖 batch 大小，bs=1 也生效；实验性）。")
@@ -2178,8 +2188,18 @@ def main():
             # Flow Matching：t 采样、噪声生成、目标计算
             ts_mode = objective_cfg.timestep.mode
             f_shift = objective_cfg.timestep.flow_shift
-            mix_low_prob = objective_cfg.timestep.mix_low_prob
             sched_shift = objective_cfg.timestep.schedule_shift
+            # 三峰路由概率退火（timestep_mix_anneal_end=0 时为 no-op，恒返基础值）
+            _an_s = int(getattr(args, "timestep_mix_anneal_start", 0) or 0)
+            _an_e = int(getattr(args, "timestep_mix_anneal_end", 0) or 0)
+            mix_low_prob = anneal_mix_prob(
+                objective_cfg.timestep.mix_low_prob,
+                float(getattr(args, "timestep_mix_low_prob_end", -1.0)),
+                global_step, _an_s, _an_e)
+            mix_high_prob_cur = anneal_mix_prob(
+                objective_cfg.timestep.mix_high_prob,
+                float(getattr(args, "timestep_mix_high_prob_end", -1.0)),
+                global_step, _an_s, _an_e)
             t = adaptive_ts.sample(
                 bs, device, mode=ts_mode, shift=f_shift,
                 mix_low_prob=mix_low_prob, schedule_shift=sched_shift,
@@ -2187,7 +2207,7 @@ def main():
                 laplace_b=objective_cfg.timestep.laplace_b,
                 logsnr_mu=objective_cfg.timestep.logsnr_mu,
                 logsnr_sigma=objective_cfg.timestep.logsnr_sigma,
-                mix_high_prob=objective_cfg.timestep.mix_high_prob,
+                mix_high_prob=mix_high_prob_cur,
                 stratified=objective_cfg.timestep.stratified,
                 global_step=global_step,
             )

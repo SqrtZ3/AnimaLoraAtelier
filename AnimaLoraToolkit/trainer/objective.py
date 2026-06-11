@@ -293,6 +293,21 @@ def apply_timestep_schedule_shift(t: torch.Tensor, schedule_shift: float) -> tor
     return t.clamp(1e-4, 1.0 - 1e-4)
 
 
+def anneal_mix_prob(base: float, end: float, step: int,
+                    anneal_start: int, anneal_end: int) -> float:
+    """三峰路由概率的线性退火（前结构后细节的课程式调度）。
+
+    step < anneal_start 时返回 base；≥ anneal_end 时返回 end；中间线性插值。
+    end < 0 或 anneal_end <= anneal_start 视为禁用（恒返 base）。
+    动机（v4 实证）：微纹理早学早衰、条件绑定在训练后段收紧——末段提高低噪
+    份额 = 收尾阶段重开无条件细节表达；结构/氛围已成熟的波段相应让出预算。
+    """
+    if end < 0 or anneal_end <= anneal_start:
+        return float(base)
+    prog = min(max((step - anneal_start) / float(anneal_end - anneal_start), 0.0), 1.0)
+    return float(base) + (float(end) - float(base)) * prog
+
+
 def apply_t_range(t: torch.Tensor, t_min: float = 0.0, t_max: float = 1.0) -> torch.Tensor:
     """t 值域截断。t_min>0 时截掉病态低噪端（arXiv 2509.20952：t→0 velocity 目标
     条件数发散）；clamp 会在边界留一个小质量尖峰，对 logit_normal_low(shift=3)

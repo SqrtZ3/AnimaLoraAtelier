@@ -14,6 +14,7 @@ Anima 推荐的 shift=3 让推理过程在结构步上花更多算力。
 from __future__ import annotations
 
 import logging
+import math
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +54,52 @@ def _flow_sigmas_simple(steps: int, *, shift: float = 3.0, timesteps: int = 1000
     # ComfyUI offset_first_sigma_for_snr: CONST 下避免 sigma=1 导致 logit inf
     if sigmas.numel() > 0 and sigmas[0] >= 1.0:
         sigmas[0] = float(_time_snr_shift(float(shift), torch.tensor(1.0 - 1e-4, device=device, dtype=torch.float32)))
+    return sigmas
+
+
+def _beta_ppf(q: torch.Tensor, alpha: float, beta: float, grid: int = 4096) -> torch.Tensor:
+    """Beta(α,β) 分位函数的免 scipy 数值实现（云端 venv 无 scipy）。
+
+    经 x = sin²θ 换元后，pdf ∝ sin^{2α-1}θ · cos^{2β-1}θ 在 [0, π/2] 上有界光滑
+    （α,β ≥ 0.5 时），梯形积分构造 CDF 再线性插值取逆。对 ComfyUI beta scheduler
+    的用途（ppf×999 后取整）精度绰绰有余（vs scipy 误差 ~1e-4 量级）。
+    """
+    theta = torch.linspace(0.0, math.pi / 2, grid, dtype=torch.float64)
+    g = torch.sin(theta).clamp(min=1e-12) ** (2 * alpha - 1) * torch.cos(theta).clamp(min=1e-12) ** (2 * beta - 1)
+    cdf = torch.cumulative_trapezoid(g, theta, dim=0)
+    cdf = torch.cat([torch.zeros(1, dtype=torch.float64), cdf])
+    cdf = cdf / cdf[-1]
+    q64 = q.to(torch.float64).clamp(0.0, 1.0)
+    idx = torch.searchsorted(cdf, q64, right=True).clamp(1, grid - 1)
+    c0, c1 = cdf[idx - 1], cdf[idx]
+    th0, th1 = theta[idx - 1], theta[idx]
+    frac = ((q64 - c0) / (c1 - c0).clamp(min=1e-18)).clamp(0.0, 1.0)
+    th = th0 + frac * (th1 - th0)
+    return torch.sin(th).square().to(q.dtype)
+
+
+def _flow_sigmas_beta(steps: int, *, shift: float = 3.0, alpha: float = 0.6, beta: float = 0.6,
+                      timesteps: int = 1000, device: str = "cpu") -> torch.Tensor:
+    """复刻 ComfyUI beta_scheduler（默认 α=β=0.6）+ ModelSamplingDiscreteFlow。
+
+    步位按 Beta 分位数集中到两端（首尾步更密、中段更稀），与 ComfyUI 推理工作流
+    的 scheduler="beta" 对齐 —— 用于让训练内预览与外部评图的 sigma 调度一致。
+    重复 timestep 折叠与 ComfyUI 行为一致（返回长度可能 < steps+1）。
+    """
+    ts_full = torch.arange(1, timesteps + 1, dtype=torch.float32) / float(timesteps)
+    sigmas_full = _time_snr_shift(float(shift), ts_full)  # 升序，索引 t-1 对应时间步 t
+    qs = 1.0 - torch.linspace(0.0, 1.0, steps + 1, dtype=torch.float32)[:-1]  # endpoint=False
+    t_idx = torch.round(_beta_ppf(qs, float(alpha), float(beta)) * (timesteps - 1)).to(torch.long)
+    sigs = []
+    last = -1
+    for t in t_idx.tolist():
+        if t != last:
+            sigs.append(float(sigmas_full[int(t)]))
+            last = t
+    sigs.append(0.0)
+    sigmas = torch.tensor(sigs, device=device, dtype=torch.float32)
+    if sigmas.numel() > 0 and sigmas[0] >= 1.0:
+        sigmas[0] = float(_time_snr_shift(float(shift), torch.tensor(1.0 - 1e-4, dtype=torch.float32)))
     return sigmas
 
 
@@ -247,9 +294,15 @@ def sample_image(
 
         # sigmas（对齐 ComfyUI supported_models.Anima: shift=3.0, multiplier=1.0）
         lat_h, lat_w = height // 8, width // 8
-        if str(scheduler).lower() != "simple":
-            logger.warning(f"采样 scheduler={scheduler} 未实现，回退 simple")
-        sigmas = _flow_sigmas_simple(steps, shift=3.0, device=device)
+        _sched = str(scheduler).lower()
+        if _sched == "beta":
+            # 与 ComfyUI 推理工作流 scheduler="beta" 对齐（评图常用 beta，
+            # simple/beta 的步位分配差异是"预览像、推理不像"的口径嫌疑之一）
+            sigmas = _flow_sigmas_beta(steps, shift=3.0, device=device)
+        else:
+            if _sched != "simple":
+                logger.warning(f"采样 scheduler={scheduler} 未实现，回退 simple")
+            sigmas = _flow_sigmas_simple(steps, shift=3.0, device=device)
 
         # 初始化噪声（ComfyUI CONST.noise_scaling: x = sigma*noise + (1-sigma)*latent_image；txt2img latent_image=0）
         x = torch.randn(1, 16, 1, lat_h, lat_w, device=device, dtype=torch.float32) * float(sigmas[0])

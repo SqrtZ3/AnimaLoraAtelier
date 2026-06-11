@@ -240,6 +240,28 @@ def test_lora_one_global_eta_preserves_relative_magnitudes():
     assert db.norm().item() < 0.05 * scale_rel * W0b.norm().item() * 10
 
 
+def test_beta_ppf_and_beta_sigmas():
+    import math as _m
+    from trainer.sampling import _beta_ppf, _flow_sigmas_beta, _flow_sigmas_simple
+    # Beta(0.5,0.5) 分位函数有闭式解 sin²(πq/2)，校验数值逆的精度
+    q = torch.linspace(0.01, 0.99, 50)
+    expected = torch.sin(_m.pi * q / 2).square()
+    got = _beta_ppf(q, 0.5, 0.5)
+    assert (got - expected).abs().max().item() < 2e-3
+    # beta sigmas：首项 <1、严格递减、以 0 收尾、长度 ≤ steps+1
+    sig = _flow_sigmas_beta(30, shift=3.0)
+    assert sig[-1].item() == 0.0
+    assert sig[0].item() < 1.0
+    assert bool((sig[:-1][1:] < sig[:-1][:-1]).all())
+    assert sig.numel() <= 31
+    # 两端步距比中段更密（beta α=β=0.6 的特征）：首段差 < 中段最大差
+    diffs = (sig[:-2][:-1] - sig[:-2][1:])
+    assert diffs[0].item() < diffs.max().item()
+    # simple 同步数对照仍可用
+    sig_s = _flow_sigmas_simple(30, shift=3.0)
+    assert sig_s.numel() == 31 and sig_s[-1].item() == 0.0
+
+
 def _make_tread_model(n_blocks=4, head_dim=2):
     """模拟 Cosmos block 接口的最小模型：forward(grid) 与 forward_tokens 同为 +add。"""
     from trainer.objective import forward_with_optional_checkpoint  # noqa: F401

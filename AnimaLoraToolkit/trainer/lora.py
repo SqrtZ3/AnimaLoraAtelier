@@ -693,6 +693,7 @@ class LoRAInjector:
         self.reg_dims = dict(reg_dims) if reg_dims else {}
         self.reg_alphas = dict(reg_alphas) if reg_alphas else {}
         self.reg_lrs = dict(reg_lrs) if reg_lrs else {}
+        self._reg_conflict_warned: set = set()
 
         self.injected = {}
         self._module_ranks = {}
@@ -758,6 +759,23 @@ class LoRAInjector:
             mod_rank = self._get_reg_dim(name)
             mod_alpha = self._get_reg_alpha(name)
             mod_lr = self._get_reg_lr(name)
+
+            # ── reg_dims/reg_alphas 多模式命中审计 ──────────────────────────
+            # 首个 fullmatch 生效（kohya 语义，顺序即优先级），但静默遮蔽曾导致
+            # 实际 bug：".*self_attn.*" 抢先命中 "blocks.N.adaln_modulation_self_attn.1"，
+            # adaln 拿到 48 而不是配置在后面的 8。这里把"多模式命中且取值不同"显式
+            # 告警（按命中组合去重，避免 84 个 adaln 模块刷屏）。
+            for _tbl, _label, _used in ((self.reg_dims, "lora_reg_dims", mod_rank),
+                                        (self.reg_alphas, "lora_reg_alphas", mod_alpha)):
+                _hits = [(p, v) for p, v in _tbl.items() if re.fullmatch(p, name)]
+                if len(_hits) > 1 and any(float(v) != float(_used) for _, v in _hits[1:]):
+                    _key = (_label, tuple(p for p, _ in _hits))
+                    if _key not in self._reg_conflict_warned:
+                        self._reg_conflict_warned.add(_key)
+                        logger.warning(
+                            "[%s] 模块 %s 同时命中 %s，按首个 %r=%s 生效，其余被遮蔽；"
+                            "若想让更特定的模式生效，请把它移到 dict 更前面。",
+                            _label, name, _hits, _hits[0][0], _hits[0][1])
 
             lora_linear = LoRALinear(
                 module, rank=mod_rank, alpha=mod_alpha,

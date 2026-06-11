@@ -186,6 +186,9 @@ YAML_TO_ARGS = {
     # LWD 小波显著性 time-gated 掩码 (arXiv 2506.00433)
     "lwd_mask_enabled": "lwd_mask_enabled",
     "lwd_mask_floor": "lwd_mask_floor",
+    # 按 tag 覆盖 dropout 概率（YAML dict，仅 TXT caption 路径），如
+    # tag_dropout_overrides: {"close-up": 0.5} —— 解开"特征绑定到条件 tag"
+    "tag_dropout_overrides": "tag_dropout_overrides",
     # TREAD token 路由 (arXiv 2501.04765)
     "tread_enabled": "tread_enabled",
     "tread_ratio": "tread_ratio",
@@ -403,6 +406,7 @@ DEFAULTS = {
     "lwd_mask_floor": 0.3,
     "timestep_mix_high_prob": 0.25,
     "dfm_mode": "batch",
+    "tag_dropout_overrides": None,
     "tread_enabled": False,
     "tread_ratio": 0.3,
     "tread_start_layer": 3,

@@ -399,6 +399,7 @@ class ImageDataset(Dataset):
     def __init__(self, data_dir, resolution=1024, bucket_mgr=None,
                  shuffle_caption=False, keep_tokens=0, flip_augment=False,
                  tag_dropout=0.0, prefer_json=True, caption_override=None,
+                 tag_dropout_overrides=None,
                  freq_balanced_dropout_strength=0.0,
                  fit_packed=False, fit_max_tokens=65536,
                  fit_warn_tokens=16384, fit_min_tokens=16,
@@ -413,6 +414,14 @@ class ImageDataset(Dataset):
         self.keep_tokens = keep_tokens
         self.flip_augment = flip_augment
         self.tag_dropout = tag_dropout
+        # 按 tag 覆盖丢弃概率（仅 TXT caption 路径）：{"close-up": 0.5} 表示该 tag 以
+        # 0.5 概率被丢（替代通用 tag_dropout，不叠加）。用途：解开"特征绑定到条件 tag"
+        # ——如纹理特写集的纹理被 close-up 门控、正常尺度不表达时，提高该 tag 的
+        # dropout 让特征向无条件/触发词泄漏。keep_tokens 内的 tag 不受影响。
+        self.tag_dropout_overrides = {
+            str(k).strip().lower(): float(v)
+            for k, v in (tag_dropout_overrides or {}).items()
+        }
         self.prefer_json = prefer_json
         self.caption_override = caption_override  # 正则集：统一 caption，如 "1girl, solo"
         self.fit_packed = bool(fit_packed)
@@ -764,14 +773,16 @@ class ImageDataset(Dataset):
             random.shuffle(rest)
 
         dropout = float(self.tag_dropout or 0.0)
+        overrides = getattr(self, "tag_dropout_overrides", None) or {}
         freq_strength = float(getattr(self, "freq_balanced_dropout_strength", 0.0) or 0.0)
         tag_freq = getattr(self, "tag_freq", {}) or {}
 
-        if rest and (dropout > 0.0 or (freq_strength > 0.0 and tag_freq)):
+        if rest and (dropout > 0.0 or overrides or (freq_strength > 0.0 and tag_freq)):
             survivors = []
             for t in rest:
-                # 通用 dropout
-                if dropout > 0.0 and random.random() < dropout:
+                # 通用 dropout；tag_dropout_overrides 命中时按覆盖概率（替代非叠加）
+                p_drop = overrides.get(t.strip().lower(), dropout)
+                if p_drop > 0.0 and random.random() < p_drop:
                     continue
                 # ★ v5 ② 频率加权 dropout
                 # 触发词在 kept 里完全免疫；这里只对 rest 起作用。

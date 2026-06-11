@@ -240,6 +240,32 @@ def test_lora_one_global_eta_preserves_relative_magnitudes():
     assert db.norm().item() < 0.05 * scale_rel * W0b.norm().item() * 10
 
 
+def test_tag_dropout_overrides():
+    import random as _r
+    from trainer.data import ImageDataset
+    ds = object.__new__(ImageDataset)  # 只测 _process_caption_txt，绕过目录扫描
+    ds.shuffle_caption = False
+    ds.keep_tokens = 1
+    ds.tag_dropout = 0.0
+    ds.freq_balanced_dropout_strength = 0.0
+    ds.tag_freq = {}
+    ds.tag_dropout_overrides = {"close-up": 1.0}
+    _r.seed(0)
+    out = ds._process_caption_txt("@trig, close-up, stocking, fine fabric")
+    assert "close-up" not in out          # 覆盖 p=1.0 → 必丢
+    assert "@trig" in out and "stocking" in out and "fine fabric" in out  # 其余 p=0 必留
+    # keep_tokens 免疫：tag 落在 kept 段则不受覆盖影响
+    ds.keep_tokens = 2
+    out2 = ds._process_caption_txt("@trig, close-up, stocking")
+    assert "close-up" in out2
+    # 概率语义：p=0.5 时多次采样应既有保留也有丢弃
+    ds.keep_tokens = 1
+    ds.tag_dropout_overrides = {"close-up": 0.5}
+    hits = sum("close-up" in ds._process_caption_txt("@trig, close-up, stocking")
+               for _ in range(200))
+    assert 50 < hits < 150, hits
+
+
 def test_beta_ppf_and_beta_sigmas():
     import math as _m
     from trainer.sampling import _beta_ppf, _flow_sigmas_beta, _flow_sigmas_simple

@@ -1102,6 +1102,7 @@ def main():
         keep_tokens=args.keep_tokens,
         flip_augment=args.flip_augment,
         tag_dropout=args.tag_dropout,
+        tag_dropout_overrides=getattr(args, "tag_dropout_overrides", None),
         prefer_json=args.prefer_json,
         freq_balanced_dropout_strength=float(getattr(args, "freq_balanced_dropout_strength", 0.0) or 0.0),
         fit_packed=fit_packed_training,

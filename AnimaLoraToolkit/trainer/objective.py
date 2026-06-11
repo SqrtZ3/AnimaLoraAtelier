@@ -49,6 +49,8 @@ class TimestepConfig:
     # μ=-4 实测不够激进。仅 mode 含 "logsnr" 时生效。
     logsnr_mu: float = -6.0
     logsnr_sigma: float = 2.0
+    # mixed_logsnr_three 的高噪峰路由概率（低噪用 mix_low_prob，其余进中噪峰）
+    mix_high_prob: float = 0.25
     # ── t 值域截断 ──
     # t_min: 低噪端下界。arXiv 2509.20952 证 t→0 时 velocity 回归条件数发散（高方差梯度
     # 噪声），细节端采样建议截断在 0.05 左右。0 = 沿用历史 1e-4。
@@ -121,6 +123,7 @@ def build_training_objective_config(args) -> TrainingObjectiveConfig:
             laplace_b=float(getattr(args, "timestep_laplace_b", 0.5) or 0.5),
             logsnr_mu=float(getattr(args, "timestep_logsnr_mu", -6.0) if getattr(args, "timestep_logsnr_mu", None) is not None else -6.0),
             logsnr_sigma=float(getattr(args, "timestep_logsnr_sigma", 2.0) or 2.0),
+            mix_high_prob=float(getattr(args, "timestep_mix_high_prob", 0.25) or 0.0),
             t_min=float(getattr(args, "timestep_t_min", 0.0) or 0.0),
             t_max=float(getattr(args, "timestep_t_max", 1.0) or 1.0),
             stratified=bool(getattr(args, "timestep_stratified", False)),
@@ -164,6 +167,7 @@ def sample_t(
     laplace_b: float = 0.5,
     logsnr_mu: float = -6.0,
     logsnr_sigma: float = 2.0,
+    mix_high_prob: float = 0.25,
 ):
     """采样 Flow Matching 时间步 t ∈ (0, 1)。
 
@@ -191,6 +195,25 @@ def sample_t(
         # μ=-6 → t 峰≈0.95（画风写入区）；σ=2 保多样性。
         lam = float(logsnr_mu) + float(logsnr_sigma) * torch.randn(bs, device=device)
         t = torch.sigmoid(-0.5 * lam)
+        return t.clamp(1e-4, 1.0 - 1e-4)
+
+    if mode in ("mixed_logsnr_three", "three_band"):
+        # 三峰采样（v2 实验教训的修正版）：
+        #   低噪峰 logit_normal_low(shift)  → 纹理/微细节（峰约 t≈0.25）
+        #   中噪峰 logit_normal(shift)      → 结构/形体风格语言/脸型（峰约 t≈0.75）
+        #   高噪峰 logsnr(μ,σ)              → 氛围/配色/全局滤镜（峰约 t≈0.95）
+        # v2 实测：把高噪峰从 0.75 直接挪到 0.95 后中段(0.4-0.85)零监督 →
+        # 氛围拟合极快但人体风格化结构完全没学到。三峰恢复中段覆盖。
+        # 路由概率：mix_low_prob → 低噪；mix_high_prob → 高噪；其余 → 中噪。
+        p_low = min(max(float(mix_low_prob), 0.0), 1.0)
+        p_high = min(max(float(mix_high_prob), 0.0), 1.0 - p_low)
+        low_t = sample_t(bs, device, mode="logit_normal_low", shift=shift)
+        mid_t = sample_t(bs, device, mode="logit_normal", shift=shift)
+        high_t = sample_t(bs, device, mode="logsnr",
+                          logsnr_mu=logsnr_mu, logsnr_sigma=logsnr_sigma)
+        r = torch.rand(bs, device=device)
+        t = torch.where(r < p_low, low_t,
+                        torch.where(r < p_low + p_high, high_t, mid_t))
         return t.clamp(1e-4, 1.0 - 1e-4)
 
     if mode in ("mixed_logsnr_low_high", "ushaped_sf"):
@@ -408,11 +431,13 @@ class AdaptiveTimestepSampler:
                schedule_shift: float = 1.0,
                laplace_mu: float = 0.0, laplace_b: float = 0.5,
                logsnr_mu: float = -6.0, logsnr_sigma: float = 2.0,
+               mix_high_prob: float = 0.25,
                stratified: bool = False,
                global_step: int) -> torch.Tensor:
         kw = dict(mode=mode, shift=shift, mix_low_prob=mix_low_prob,
                   laplace_mu=laplace_mu, laplace_b=laplace_b,
-                  logsnr_mu=logsnr_mu, logsnr_sigma=logsnr_sigma)
+                  logsnr_mu=logsnr_mu, logsnr_sigma=logsnr_sigma,
+                  mix_high_prob=mix_high_prob)
         # 分层只作用于 base 采样（含 adaptive 模式下的 base_mix 份额）；
         # adaptive 份额由 loss-aware 重加权多项式抽样决定，分层在那里无意义。
         base_t = (sample_t_stratified(bs, device, **kw) if stratified
@@ -750,6 +775,107 @@ def contrastive_flow_matching_neg(pred: torch.Tensor, target: torch.Tensor,
         pred, target_neg, loss_type=loss_type, huber_c=huber_c,
         huber_schedule=huber_schedule, t=t, huber_snr_clamp_max=huber_snr_clamp_max,
     )
+
+
+def vecor_contrastive_neg(pred: torch.Tensor, target: torch.Tensor,
+                          t: torch.Tensor | None = None, loss_type: str = "mse",
+                          huber_c: float = 0.1, huber_schedule: str = "constant",
+                          huber_snr_clamp_max: float = 10.0) -> torch.Tensor:
+    """VeCoR（arXiv 2511.18942）风格的增强负样本 per-sample loss。
+
+    与 ΔFM 的 batch 内负样本不同：负目标由对 target 自身做破坏性增强构造——
+    每步随机二选一：① 通道乱序（latent channel shuffle）② 随机裁剪后拉回原尺寸。
+    不依赖 batch 大小（bs=1 也成立），这是 ΔFM 在 batch=4 下的短板修正。
+    训练时 per_sample ← per_sample - λ·(本函数返回值)。
+    注意：论文还有正向 EMA 参考项，此处未实现（部分移植，实验性）。
+    仅支持 dense 网格 latent（B,C,[T,]H,W）。
+    """
+    tgt = target.float()
+    squeeze_t = tgt.ndim == 5
+    if squeeze_t:
+        b, c, tt, h, w = tgt.shape
+        flat = tgt.reshape(b, c * tt, h, w)
+    else:
+        b, c, h, w = tgt.shape
+        flat = tgt
+    if torch.rand(()) < 0.5:
+        # 通道乱序（保证非恒等）
+        ch = flat.shape[1]
+        perm = torch.randperm(ch, device=flat.device)
+        if bool((perm == torch.arange(ch, device=flat.device)).all()):
+            perm = torch.roll(perm, shifts=1)
+        neg = flat[:, perm]
+    else:
+        # 随机裁剪 60-90% 区域后 resize 回原尺寸
+        ratio = 0.6 + 0.3 * float(torch.rand(()))
+        ch_, cw_ = max(int(h * ratio), 2), max(int(w * ratio), 2)
+        top = int(torch.randint(0, h - ch_ + 1, ()).item())
+        left = int(torch.randint(0, w - cw_ + 1, ()).item())
+        crop = flat[..., top:top + ch_, left:left + cw_]
+        neg = F.interpolate(crop, size=(h, w), mode="bilinear", align_corners=False)
+    if squeeze_t:
+        neg = neg.reshape(b, c, tt, h, w)
+    return per_sample_loss(
+        pred, neg.to(dtype=pred.dtype), loss_type=loss_type, huber_c=huber_c,
+        huber_schedule=huber_schedule, t=t, huber_snr_clamp_max=huber_snr_clamp_max,
+    )
+
+
+class LossBinEMA:
+    """EDM2 learned uncertainty weighting（arXiv 2312.02696）的免学习解析变体。
+
+    EDM2 用小网络 u(σ) 学 log E[L|σ]，loss 改为 L/exp(u)+u —— 收敛解是把各噪声级
+    的 loss 贡献归一化为同量级。短训（几百步）下 NN 头收敛太慢，本类直接用按 t 分桶
+    的 loss EMA 做解析等价：w(t) = mean(EMA)/EMA[bin(t)]，clamp 到 [min_w, max_w]。
+    高 loss 噪声段降权、低 loss 段升权 = 均衡化（方向与已证伪的 min-SNR 相反）。
+
+    burn-in 期间（或仍有空桶时）返回全 1。resume 后需要 ~burn_in 步重新热身
+    （状态不持久化，代价可接受）。
+    ⚠ 与 adaptive_timestep 重采样互斥（一个改采样一个改权重 = 双重补偿会打架），
+    启用本权重时训练脚本会强制要求 adaptive_timestep=false。
+    """
+
+    def __init__(self, bins: int = 8, decay: float = 0.97, burn_in: int = 100,
+                 min_w: float = 0.25, max_w: float = 4.0):
+        self.bins = max(int(bins), 2)
+        self.decay = min(max(float(decay), 0.0), 0.999)
+        self.burn_in = max(int(burn_in), 0)
+        self.min_w = float(min_w)
+        self.max_w = float(max_w)
+        self.ema = torch.zeros(self.bins, dtype=torch.float32)
+        self.counts = torch.zeros(self.bins, dtype=torch.long)
+        self.updates = 0
+
+    def _bin(self, t: torch.Tensor) -> torch.Tensor:
+        return torch.clamp((t.float().detach().cpu() * self.bins).long(), 0, self.bins - 1)
+
+    @property
+    def ready(self) -> bool:
+        return self.updates >= self.burn_in and bool((self.counts > 0).all())
+
+    def update(self, t: torch.Tensor, per_sample: torch.Tensor) -> None:
+        vals = per_sample.detach().float().cpu()
+        if not bool(torch.isfinite(vals).all()):
+            return
+        idx = self._bin(t)
+        for k in range(self.bins):
+            m = idx == k
+            if not bool(m.any()):
+                continue
+            v = vals[m].mean()
+            if self.counts[k] == 0:
+                self.ema[k] = v
+            else:
+                self.ema[k] = self.decay * self.ema[k] + (1.0 - self.decay) * v
+            self.counts[k] += int(m.sum())
+        self.updates += 1
+
+    def weight(self, t: torch.Tensor) -> torch.Tensor:
+        if not self.ready:
+            return torch.ones_like(t, dtype=torch.float32)
+        ema = self.ema.clamp(min=1e-8)
+        w_bins = (ema.mean() / ema).clamp(self.min_w, self.max_w)
+        return w_bins.to(device=t.device)[self._bin(t).to(t.device)]
 
 
 def per_sample_highfreq_loss(pred: torch.Tensor, target: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:

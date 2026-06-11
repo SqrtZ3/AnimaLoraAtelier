@@ -233,6 +233,8 @@ from trainer.objective import (
     _huber_delta_for_t,
     per_sample_loss,
     lwd_saliency_mask,
+    vecor_contrastive_neg,
+    LossBinEMA,
     contrastive_flow_matching_neg,
     per_sample_highfreq_loss,
     adaptive_timestep_metric_signal,
@@ -503,7 +505,7 @@ def parse_args():
     p.add_argument("--no-t5-token-weights", dest="use_t5_token_weights", action="store_false")
     p.add_argument("--flow-shift", type=float, default=3.0, help="logit/timestep shift used by shifted timestep samplers")
     p.add_argument("--timestep-sampling", default="logit_normal",
-                   choices=["logit_normal", "uniform", "logit_normal_low", "mode", "mixed_uniform_low", "mixed_uniform_logit", "mixed_logit_low_high", "ushaped", "u_shaped", "bimodal", "laplace", "logsnr", "mixed_logsnr_low_high", "ushaped_sf"],
+                   choices=["logit_normal", "uniform", "logit_normal_low", "mode", "mixed_uniform_low", "mixed_uniform_logit", "mixed_logit_low_high", "ushaped", "u_shaped", "bimodal", "laplace", "logsnr", "mixed_logsnr_low_high", "ushaped_sf", "mixed_logsnr_three", "three_band"],
                    help="timestep sampling distribution")
     p.add_argument("--timestep-mix-low-prob", type=float, default=0.25, help="mixed_uniform_low 中低噪声样本比例")
     p.add_argument("--timestep-laplace-mu", type=float, default=0.0,
@@ -519,6 +521,21 @@ def parse_args():
                    help="t 下界截断；arXiv 2509.20952 证 t→0 velocity 目标病态，细节端建议 0.05。0=历史行为(1e-4)。")
     p.add_argument("--timestep-t-max", type=float, default=1.0,
                    help="t 上界截断。1.0=历史行为(1-1e-4)。")
+    p.add_argument("--timestep-mix-high-prob", type=float, default=0.25,
+                   help="mixed_logsnr_three 的高噪(氛围)峰路由概率；低噪用 --timestep-mix-low-prob，"
+                        "其余进中噪(结构)峰。v2 教训：中段(0.4-0.85)不能为空，否则形体风格学不到。")
+    p.add_argument("--dfm-mode", choices=["batch", "vecor"], default="batch",
+                   help="ΔFM 负样本来源：batch=同批其它样本（原版）；vecor=对 target 做通道乱序/裁剪缩放"
+                        "构造（arXiv 2511.18942 部分移植，不依赖 batch 大小，bs=1 也生效；实验性）。")
+    p.add_argument("--eval-every", type=int, default=0,
+                   help="每 N 步跑一次固定网格 eval loss（0=关）。固定样本+固定噪声+固定 t 网格 → "
+                        "跨 run 可比的确定性曲线，写入 output_dir/eval_loss.csv。")
+    p.add_argument("--eval-count", type=int, default=4,
+                   help="eval 用的样本数（取数据集前 N 个；不从训练集中剔除——小画风集剔除代价更大，"
+                        "曲线含义=拟合度而非泛化）。")
+    p.add_argument("--eval-t-grid", default="0.1,0.3,0.5,0.7,0.9",
+                   help="eval 的固定 timestep 网格（逗号分隔）。")
+    p.add_argument("--eval-seed", type=int, default=1234, help="eval 固定噪声种子（CPU RNG，跨机器一致）。")
     p.add_argument("--timestep-stratified", action="store_true",
                    help="batch 内 t 分位数分层采样（VDM 低差异思想）：消除小 batch 撞同一噪声段的"
                         "梯度噪声尖峰，对任意采样分布零开销生效。")
@@ -1876,6 +1893,93 @@ def main():
     if objective_cfg.loss.lwd_enabled and fit_packed_training:
         raise RuntimeError("lwd_mask_enabled 目前仅支持 dense 路径（fit_packed_training=false）")
 
+    # ── inv_loss_ema 加权（EDM2 解析变体）：与 adaptive_timestep 互斥 ────────────
+    loss_bin_ema = None
+    if objective_cfg.loss.weighting_scheme == "inv_loss_ema":
+        if adaptive_ts.enabled:
+            raise RuntimeError(
+                "loss_weighting_scheme=inv_loss_ema 与 adaptive_timestep 互斥"
+                "（一个改采样分布、一个改 loss 权重，叠加=双重补偿互相打架）。二选一。")
+        loss_bin_ema = LossBinEMA(bins=8, decay=0.97, burn_in=100, min_w=0.25, max_w=4.0)
+        emit("[inv_loss_ema] EDM2 解析式按-t loss 均衡加权已启用（burn-in 100 步）")
+
+    # ── 固定网格 eval loss（确定性曲线，跨 run 可比）───────────────────────────
+    _eval_every = int(getattr(args, "eval_every", 0) or 0)
+    _eval_set = []          # [(latents_1xC1HW_gpu, cross_1xLxD_gpu)]
+    _eval_t_grid = []
+    if _eval_every > 0:
+        _eval_t_grid = [float(s) for s in str(getattr(args, "eval_t_grid", "0.1,0.3,0.5,0.7,0.9")).split(",") if s.strip()]
+        _eval_n = max(int(getattr(args, "eval_count", 4) or 4), 1)
+        emit(f"[eval] 收集 {_eval_n} 个固定样本，t 网格 {_eval_t_grid} ...")
+        with torch.no_grad():
+            for _eb in dataloader:
+                if len(_eval_set) >= _eval_n:
+                    break
+                if use_cached:
+                    _elat = _eb["latents"].to(device, dtype=dtype)
+                else:
+                    _epx = _eb["pixel_values"].to(device, dtype=dtype)
+                    _elat = vae.model.encode(_epx.unsqueeze(2), vae.scale).to(dtype)
+                for _bi in range(_elat.shape[0]):
+                    if len(_eval_set) >= _eval_n:
+                        break
+                    _ecap = _eb["captions"][_bi]
+                    _eq_emb, _eq_attn = encode_qwen(qwen_model, qwen_tok,
+                                                    [_build_qwen_text_from_prompt(_ecap)], device)
+                    _et5_ids, _et5_attn, _et5_w = tokenize_t5_weighted(t5_tok, [_ecap], max_length=512)
+                    _ecross = model.preprocess_text_embeds(
+                        _eq_emb, _et5_ids.to(device), _et5_attn.to(device), _eq_attn)
+                    if (getattr(args, "use_t5_token_weights", True)
+                            and getattr(model, "llm_adapter", None) is not None
+                            and _ecross.shape[1] == _et5_w.shape[1]):
+                        _ecross = _ecross * _et5_w.to(device, dtype=torch.float32).to(_ecross.dtype).unsqueeze(-1)
+                    if _ecross.shape[1] < 512:
+                        _ecross = F.pad(_ecross, (0, 0, 0, 512 - _ecross.shape[1]))
+                    _eval_set.append((_elat[_bi:_bi + 1].clone(), _ecross.clone()))
+        emit(f"[eval] 固定 eval 集就绪：{len(_eval_set)} 个样本")
+
+    def run_eval_loss(step):
+        """固定样本 × 固定噪声 × 固定 t 网格的确定性 MSE eval。
+
+        loss 统一用 MSE（与训练 loss_type 无关），保证跨配置可比；
+        schedule-free 必须切 optimizer.eval() 测平均序列权重。
+        结果 emit 一行 + 追加 output_dir/eval_loss.csv。
+        """
+        if not _eval_set:
+            return
+        model.eval()
+        if hasattr(optimizer, "eval"):
+            optimizer.eval()
+        eval_seed = int(getattr(args, "eval_seed", 1234) or 1234)
+        per_t_sums = [0.0] * len(_eval_t_grid)
+        with torch.no_grad():
+            for _i, (_lat, _cross) in enumerate(_eval_set):
+                _pm = torch.zeros(1, 1, _lat.shape[-2], _lat.shape[-1], device=device, dtype=dtype)
+                for _j, _tv in enumerate(_eval_t_grid):
+                    _g = torch.Generator(device="cpu").manual_seed(eval_seed + 1000 * _i + _j)
+                    _nz = torch.randn(_lat.shape, generator=_g, dtype=torch.float32).to(device=device, dtype=dtype)
+                    _tt = torch.full((1,), float(_tv), device=device)
+                    _noisy = (1 - _tv) * _lat + _tv * _nz
+                    _tgt = _nz - _lat
+                    with torch.autocast("cuda", dtype=dtype):
+                        _pr = forward_with_optional_checkpoint(
+                            model, _noisy, _tt.view(-1, 1), _cross, _pm, use_checkpoint=False)
+                    per_t_sums[_j] += float(per_sample_loss(_pr, _tgt, loss_type="mse").item())
+        n = max(len(_eval_set), 1)
+        per_t = [s / n for s in per_t_sums]
+        mean_v = sum(per_t) / max(len(per_t), 1)
+        emit(f"[eval] step {step} mean={mean_v:.6f} " +
+             " ".join(f"t{tv:g}={v:.6f}" for tv, v in zip(_eval_t_grid, per_t)))
+        csv_path = output_dir / "eval_loss.csv"
+        write_header = not csv_path.exists()
+        with open(csv_path, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write("step,mean," + ",".join(f"t{tv:g}" for tv in _eval_t_grid) + "\n")
+            f.write(f"{step},{mean_v:.6f}," + ",".join(f"{v:.6f}" for v in per_t) + "\n")
+        if hasattr(optimizer, "train"):
+            optimizer.train()
+        model.train()
+
     # ── LoRA-One (arXiv:2502.01235) 谱对齐初始化 ─────────────────────────────
     # 训练正式开始前：累积 N 个 batch 的全参梯度 → KPSVD → 初始化 LoKr 因子。
     # 只在全新训练（global_step==0）执行；resume 时跳过（因子已是训练后状态）。
@@ -2053,6 +2157,7 @@ def main():
                 laplace_b=objective_cfg.timestep.laplace_b,
                 logsnr_mu=objective_cfg.timestep.logsnr_mu,
                 logsnr_sigma=objective_cfg.timestep.logsnr_sigma,
+                mix_high_prob=objective_cfg.timestep.mix_high_prob,
                 stratified=objective_cfg.timestep.stratified,
                 global_step=global_step,
             )
@@ -2153,11 +2258,29 @@ def main():
                         weight_map=lwd_w,
                     )
 
+                # ── inv_loss_ema：EDM2 不确定性加权的解析变体（loss_weighting_scheme）──
+                # 先用原始 per_sample 更新 bin-EMA，再乘权重（ΔFM 项之后单独按 λ 控制）。
+                if loss_bin_ema is not None:
+                    loss_bin_ema.update(t.float(), per_sample)
+                    per_sample = per_sample * loss_bin_ema.weight(t.float()).to(per_sample.dtype)
+
                 # ── ΔFM: Contrastive Flow Matching（默认关闭，dfm_lambda=0）──
                 # per_sample ← per_sample - λ·||v_pred - v_另一样本target||²，反"回归条件均值→发灰发雾"。
                 # 不改噪声分布、零额外前向 → 不会重演 Immiscible 的推理斑块问题。
+                # dfm_mode=vecor：负样本改为对 target 的破坏性增强（通道乱序/裁剪缩放），
+                # 不依赖 batch 大小（VeCoR arXiv 2511.18942 部分移植）；dense 路径限定。
                 _dfm_lambda = float(objective_cfg.loss.dfm_lambda or 0.0)
-                if _dfm_lambda > 0.0 and bs > 1:
+                _dfm_mode = str(getattr(args, "dfm_mode", "batch") or "batch")
+                if _dfm_lambda > 0.0 and _dfm_mode == "vecor" and not fit_packed_training:
+                    per_sample_neg = vecor_contrastive_neg(
+                        pred, target, t.float(),
+                        loss_type=objective_cfg.loss.loss_type,
+                        huber_c=objective_cfg.loss.huber_c,
+                        huber_schedule=objective_cfg.loss.huber_schedule,
+                        huber_snr_clamp_max=objective_cfg.loss.huber_snr_clamp_max,
+                    )
+                    per_sample = per_sample - _dfm_lambda * per_sample_neg
+                elif _dfm_lambda > 0.0 and bs > 1:
                     per_sample_neg = contrastive_flow_matching_neg(
                         pred, target, t.float(),
                         loss_type=objective_cfg.loss.loss_type,
@@ -2555,6 +2678,10 @@ def main():
                 elif save_by_ref:
                     ref_tag = int(ref_step)
                     save_lora_checkpoint(f"refstep{ref_tag}_step{global_step}")
+
+                # 固定网格 eval loss（确定性曲线；eval_every=0 时 no-op）
+                if _eval_every > 0 and global_step % _eval_every == 0:
+                    run_eval_loss(global_step)
 
                 # 定期保存训练状态（断点续训）
                 save_state_every = getattr(args, "save_state_every", 0)

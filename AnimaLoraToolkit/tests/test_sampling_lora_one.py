@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from trainer.objective import (  # noqa: E402
     sample_t, sample_t_stratified, apply_t_range,
     lwd_saliency_mask, per_sample_loss,
+    vecor_contrastive_neg, LossBinEMA,
 )
 from trainer.lora_one import kpsvd_lokr_factors, lora_one_kpsvd_init  # noqa: E402
 
@@ -121,6 +122,51 @@ def test_lora_one_init_end_to_end():
     # merged_weight 与 W0+ΔW 一致
     merged = lora.merged_weight().float()
     assert torch.allclose(merged, W0 + delta, rtol=1e-3, atol=1e-5)
+
+
+def test_mixed_logsnr_three_bands():
+    torch.manual_seed(0)
+    t = sample_t(30000, "cpu", mode="mixed_logsnr_three", shift=3.0,
+                 mix_low_prob=0.40, mix_high_prob=0.25,
+                 logsnr_mu=-6.0, logsnr_sigma=2.0)
+    low = (t < 0.45).float().mean().item()       # 低噪峰（峰约 0.25）
+    high = (t > 0.88).float().mean().item()      # 高噪峰（峰约 0.95）
+    mid = ((t >= 0.45) & (t <= 0.88)).float().mean().item()  # 中噪峰（峰约 0.75）
+    assert 0.33 < low < 0.48, low
+    assert 0.15 < high < 0.32, high
+    assert mid > 0.25, mid                       # 中段不再空洞（v2 教训）
+
+
+def test_loss_bin_ema_weighting():
+    ema = LossBinEMA(bins=4, decay=0.9, burn_in=5, min_w=0.25, max_w=4.0)
+    t_lo = torch.full((8,), 0.1)   # bin 0：高 loss
+    t_hi = torch.full((8,), 0.9)   # bin 3：低 loss
+    t_all = torch.tensor([0.1, 0.35, 0.6, 0.9] * 2)
+    # burn-in 前权重恒 1
+    assert ema.weight(t_lo).min().item() == 1.0
+    for _ in range(20):
+        ema.update(t_all, torch.tensor([4.0, 2.0, 2.0, 1.0] * 2))
+    assert ema.ready
+    w_lo = ema.weight(t_lo)[0].item()
+    w_hi = ema.weight(t_hi)[0].item()
+    assert w_lo < 1.0 < w_hi, (w_lo, w_hi)       # 高 loss 段降权、低 loss 段升权（均衡化）
+    assert 0.25 <= w_lo and w_hi <= 4.0
+    # NaN 批次不污染 EMA
+    before = ema.ema.clone()
+    ema.update(t_all, torch.tensor([float("nan")] * 8))
+    assert torch.allclose(ema.ema, before)
+
+
+def test_vecor_contrastive_neg():
+    torch.manual_seed(0)
+    pred = torch.randn(1, 4, 1, 16, 16)          # bs=1 也成立（vs ΔFM 的 batch 依赖）
+    target = torch.randn(1, 4, 1, 16, 16)
+    for _ in range(8):                            # 覆盖两种增强分支
+        neg = vecor_contrastive_neg(pred, target, loss_type="mse")
+        assert neg.shape == (1,)
+        assert torch.isfinite(neg).all() and neg.item() > 0
+        pos = per_sample_loss(pred, target, loss_type="mse")
+        assert abs(neg.item() - pos.item()) > 1e-8  # 负目标 != 原目标
 
 
 def test_lwd_saliency_mask_gating():

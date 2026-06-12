@@ -466,10 +466,19 @@ class LoKrLayer(torch.nn.Module):
         return out
 
     def delta_weight(self, apply_rank_dropout: bool = False) -> torch.Tensor:
-        """Materialize ΔW for DoRA weight decomposition and export checks."""
+        """Materialize 净 ΔW for DoRA weight decomposition and export checks.
+
+        Ortho init（tlora_lokr_ortho_init）时训练 forward 的有效 delta 是
+        kron(w1, w2a@w2b)·s − kron(w1_init, w2a_init@w2b_init)·s（init 贡献被补偿减去），
+        这里同步减 init 项，merged_weight / diff / merged_model 导出才与训练语义一致。
+        两个 kron 之差无法合并成单组标准 LoKr key —— native 导出模式在 LoRAInjector
+        构造时已被 raise 拦下。
+        """
         w1 = self.lokr_w1.float()
         w2_a = self.lokr_w2_a.float()
         w2_b = self.lokr_w2_b.float()
+        w2b_init = (self.lokr_w2_b_init.float()
+                    if self.lokr_w2_b_init is not None else None)
 
         if apply_rank_dropout and self.training and self.rank_dropout > 0:
             mask = torch.bernoulli(
@@ -477,9 +486,17 @@ class LoKrLayer(torch.nn.Module):
             )
             scale = 1.0 / (1.0 - self.rank_dropout + 1e-6)
             w2_b = w2_b * (mask.unsqueeze(1) * scale)
+            # 与 forward 一致：同一 rd_mask 同时作用两支，保 step-0 净 delta=0
+            if w2b_init is not None:
+                w2b_init = w2b_init * (mask.unsqueeze(1) * scale)
 
-        w2 = torch.matmul(w2_a, w2_b)
-        return torch.kron(w1, w2) * self.scaling
+        delta = torch.kron(w1, torch.matmul(w2_a, w2_b))
+        if w2b_init is not None and self.lokr_w2_a_init is not None:
+            delta = delta - torch.kron(
+                self.lokr_w1_init.float(),
+                torch.matmul(self.lokr_w2_a_init.float(), w2b_init),
+            )
+        return delta * self.scaling
 
 
 class LoRALinear(torch.nn.Module):
@@ -672,6 +689,21 @@ class LoRAInjector:
         self.dora_export_mode = (dora_export_mode or "native").lower()
         if self.dora_export_mode not in ("native", "diff", "merged_model"):
             raise ValueError(f"Unknown dora_export_mode: {dora_export_mode}")
+
+        # Ortho init 的净 ΔW = kron(w1,w2a@w2b) − kron(w1_init,w2a_init@w2b_init)，
+        # 两个 Kronecker 积之差数学上无法合并成单组标准 LoKr key（lokr_w1/w2_a/w2_b）
+        # → native 导出必然与训练语义不一致。在构造期 fail-fast，别等训练完才发现。
+        if (self.lora_variant == "tlora" and self.use_lokr
+                and self.tlora_lokr_ortho_init and self.dora_export_mode == "native"):
+            raise ValueError(
+                "tlora_lokr_ortho_init=true 与 dora_export_mode='native' 不兼容：\n"
+                "ortho 补偿的净 ΔW 是两个 Kronecker 积之差，无法表达为标准 LoKr key，"
+                "native 导出会把 init 贡献错误地烘焙进权重。可选：\n"
+                "  1) tlora_lokr_ortho_init: false（推荐：w2_b=0 起步天然 ΔW=0，"
+                "native 导出严格自洽，ComfyUI 标准 loader 直载）；\n"
+                "  2) dora_export_mode: 'diff' 或 'merged_model'（全矩阵导出，"
+                "可精确补偿 init 项）。"
+            )
         self.targets = targets or self.DEFAULT_TARGETS
         self.rank_dropout = float(rank_dropout or 0.0)
         self.module_dropout = float(module_dropout or 0.0)
@@ -1006,6 +1038,16 @@ class LoRAInjector:
                     if export_for_comfy:
                         dora_scale = dora_scale.view(-1, 1)
                     sd[f"{base}.dora_scale"] = dora_scale
+                # T-LoRA ortho init buffers（persistent=False，不存的话 resume 会重新
+                # 随机 _ortho_lora_init → 补偿基准漂移，续训语义偏离原 run）。
+                # native ComfyUI 导出在构造期已被 raise 拦下，这些 key 只出现在
+                # 训练 checkpoint / diff / merged_model 配置的 run 里。
+                ad = lora.adapter
+                if (getattr(ad, "lokr_w2_a_init", None) is not None
+                        and getattr(ad, "lokr_w2_b_init", None) is not None):
+                    sd[f"{base}.lokr_w1_init"] = ad.lokr_w1_init.data.clone().bfloat16().cpu()
+                    sd[f"{base}.lokr_w2_a_init"] = ad.lokr_w2_a_init.data.clone().bfloat16().cpu()
+                    sd[f"{base}.lokr_w2_b_init"] = ad.lokr_w2_b_init.data.clone().bfloat16().cpu()
             else:
                 if self.lora_variant == "tlora":
                     # LyCORIS-style key 命名，兼容 bghira/ComfyUI-T-LoRA loader
@@ -1164,6 +1206,7 @@ class LoRAInjector:
         返回成功加载的层数。
         """
         loaded_count = 0
+        lokr_init_missing = 0
         for name, lora in self.injected.items():
             base = "lora_unet_" + name.replace(".", "_")
 
@@ -1180,6 +1223,18 @@ class LoRAInjector:
                     if getattr(lora, "use_dora", False) and dora_key in sd:
                         dora_scale = sd[dora_key].reshape(-1)
                         lora.dora_scale.data.copy_(dora_scale.to(device=lora.dora_scale.device, dtype=lora.dora_scale.dtype))
+                    # T-LoRA ortho init buffers：恢复补偿基准，保证续训语义与原 run
+                    # 一致（语义同 plain-LoRA 分支的 q_layer_init/p_layer_init）
+                    ad = lora.adapter
+                    if getattr(ad, "lokr_w2_a_init", None) is not None:
+                        init_keys = (f"{base}.lokr_w1_init", f"{base}.lokr_w2_a_init",
+                                     f"{base}.lokr_w2_b_init")
+                        if all(k in sd for k in init_keys):
+                            for buf, k in zip((ad.lokr_w1_init, ad.lokr_w2_a_init,
+                                               ad.lokr_w2_b_init), init_keys):
+                                buf.copy_(sd[k].to(device=buf.device, dtype=buf.dtype))
+                        else:
+                            lokr_init_missing += 1
                     loaded_count += 1
                 elif w1_key in sd and w2_old_key in sd:
                     logger.warning(f"跳过旧格式 lokr_w2 全矩阵层: {name}（需重新训练）")
@@ -1213,6 +1268,12 @@ class LoRAInjector:
                         ))
                     loaded_count += 1
 
+        if lokr_init_missing:
+            logger.warning(
+                f"⚠ {lokr_init_missing} 层启用了 tlora_lokr_ortho_init，但 {label} 中没有 "
+                f"lokr_*_init buffers（修复前的旧 checkpoint？）——这些层的 ortho 补偿基准"
+                f"已重新随机生成，续训语义会偏离原 run。"
+            )
         logger.info(f"从 {label} 加载了 {loaded_count}/{len(self.injected)} 层 LoRA 权重")
         return loaded_count
 

@@ -214,8 +214,11 @@ class GafGhostHooks:
         if not torch.is_tensor(a) or a.shape[0] != self.bs:
             return
         a = a.detach().reshape(self.bs, -1, a.shape[-1]).float()
-        Pa = _proj_matrix(a.shape[-1], self.k, "a", self._cache, self.seed).to(a.device, a.dtype)
-        self._stash[module] = a @ Pa                  # [B, T, k]，小
+        Pa = _proj_matrix(a.shape[-1], self.k, "a", self._cache, self.seed).to(a.device, torch.float32)
+        # 外层 autocast 会把 matmul 降 bf16 → 与反向(无 autocast)的 float32 pg 撞 dtype；
+        # 显式关 autocast 让投影恒 float32。
+        with torch.autocast(device_type=a.device.type, enabled=False):
+            self._stash[module] = (a @ Pa).float()    # [B, T, k]，float32，小
 
     def _bwd(self, module, grad_input, grad_output):
         if not self.active:
@@ -227,9 +230,9 @@ class GafGhostHooks:
         g = g.detach().reshape(self.bs, -1, g.shape[-1]).float()
         if g.shape[1] != pa.shape[1]:                 # token 数不一致（异常路径）→ 跳过
             return
-        Pg = _proj_matrix(g.shape[-1], self.k, "g", self._cache, self.seed).to(g.device, g.dtype)
-        pg = g @ Pg                                   # [B, T, k]
-        s = torch.einsum("bti,btj->bij", pg, pa).reshape(self.bs, -1)  # [B, k*k]
+        Pg = _proj_matrix(g.shape[-1], self.k, "g", self._cache, self.seed).to(g.device, torch.float32)
+        pg = (g @ Pg).float()                         # [B, T, k]，float32
+        s = torch.einsum("bti,btj->bij", pg, pa.float()).reshape(self.bs, -1)  # [B, k*k]
         self._sketch[module] = s.detach()
 
     def begin(self) -> None:

@@ -274,6 +274,17 @@ YAML_TO_ARGS = {
     "aux_perceptual_cache_dir": "aux_perceptual_cache_dir",
     "aux_perceptual_use_checkpoint": "aux_perceptual_use_checkpoint",
     "aux_perceptual_lpips_size": "aux_perceptual_lpips_size",
+    # ── GAF 梯度一致性过滤（脏数据鲁棒性 B1；默认关）──
+    "gaf_enabled": "gaf_enabled",
+    "gaf_every": "gaf_every",
+    "gaf_warmup": "gaf_warmup",
+    "gaf_mode": "gaf_mode",
+    "gaf_threshold": "gaf_threshold",
+    "gaf_temp": "gaf_temp",
+    "gaf_floor": "gaf_floor",
+    "gaf_min_keep": "gaf_min_keep",
+    "gaf_trust_decay": "gaf_trust_decay",
+    "gaf_log_path": "gaf_log_path",
 }
 
 
@@ -484,6 +495,17 @@ DEFAULTS = {
     "aux_perceptual_cache_dir": "",
     "aux_perceptual_use_checkpoint": True,
     "aux_perceptual_lpips_size": 0,
+    # GAF 梯度一致性过滤（默认关 → 完全 no-op）
+    "gaf_enabled": False,
+    "gaf_every": 4,
+    "gaf_warmup": 100,
+    "gaf_mode": "soft",
+    "gaf_threshold": 0.0,
+    "gaf_temp": 0.15,
+    "gaf_floor": 0.3,
+    "gaf_min_keep": 2,
+    "gaf_trust_decay": 0.9,
+    "gaf_log_path": "",
 }
 
 

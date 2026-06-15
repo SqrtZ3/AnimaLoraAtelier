@@ -249,6 +249,7 @@ from trainer.objective import (
     validate_compile_requirements,
 )
 from trainer.lora import LoRALayer, LoKrLayer, LoRALinear, LoRAInjector
+from trainer.gaf import GafController
 from trainer.aux_losses import (
     build_aux_loss_config,
     recover_x0_from_velocity,
@@ -1943,6 +1944,30 @@ def main():
         loss_bin_ema = LossBinEMA(bins=8, decay=0.97, burn_in=100, min_w=0.25, max_w=4.0)
         emit("[inv_loss_ema] EDM2 解析式按-t loss 均衡加权已启用（burn-in 100 步）")
 
+    # ── GAF（梯度一致性过滤，脏数据鲁棒性 B1；默认关，零影响）──────────────────────
+    # 按梯度方向（非 loss 大小）降权"与 batch 共识方向不合"的脏样本：高细节干净图方向对
+    # 不被罚、脏图方向歪被压。周期摊销（every 步评估一次）+ 每步施加缓存信任 → ~1.x× 成本。
+    gaf_ctrl = None
+    if bool(getattr(args, "gaf_enabled", False)):
+        _gaf_log = str(getattr(args, "gaf_log_path", "") or "").strip()
+        if not _gaf_log:
+            _gaf_log = os.path.join(args.output_dir, f"{args.output_name}_gaf_trust.csv")
+        gaf_ctrl = GafController(
+            [p for _, p in trainable_named_params],
+            enabled=True,
+            every=int(getattr(args, "gaf_every", 4) or 4),
+            warmup=int(getattr(args, "gaf_warmup", 100) or 100),
+            mode=str(getattr(args, "gaf_mode", "soft") or "soft"),
+            threshold=float(getattr(args, "gaf_threshold", 0.0) or 0.0),
+            temp=float(getattr(args, "gaf_temp", 0.15) or 0.15),
+            floor=float(getattr(args, "gaf_floor", 0.3) or 0.3),
+            min_keep=int(getattr(args, "gaf_min_keep", 2) or 2),
+            trust_decay=float(getattr(args, "gaf_trust_decay", 0.9) or 0.9),
+            log_path=_gaf_log,
+        )
+        emit(f"[gaf] 梯度一致性过滤已启用：every={gaf_ctrl.every} warmup={gaf_ctrl.warmup} "
+             f"mode={gaf_ctrl.mode} floor={gaf_ctrl.floor}（按方向降权脏样本；信任日志→{_gaf_log}）")
+
     # ── 固定网格 eval loss（确定性曲线，跨 run 可比）───────────────────────────
     _eval_every = int(getattr(args, "eval_every", 0) or 0)
     _eval_set = []          # [(latents_1xC1HW_gpu, cross_1xLxD_gpu)]
@@ -2311,6 +2336,12 @@ def main():
                         weight_map=lwd_w,
                     )
 
+                # GAF（B1）：GAF 步抽每样本梯度→方向信任，更新逐图 EMA。用 ΔFM 之前的干净主
+                # 重建 per_sample；autograd.grad 不污染 .grad、retain_graph 保后续主 backward。
+                # 仅每 gaf_every 步触发（周期摊销）；warmup 内不介入。
+                if gaf_ctrl is not None and gaf_ctrl.should_run(global_step):
+                    gaf_ctrl.update_trust(per_sample, batch.get("images"), global_step)
+
                 # ── inv_loss_ema：EDM2 不确定性加权的解析变体（loss_weighting_scheme）──
                 # 先用原始 per_sample 更新 bin-EMA，再乘权重（ΔFM 项之后单独按 λ 控制）。
                 if loss_bin_ema is not None:
@@ -2343,6 +2374,14 @@ def main():
                         mask=fit_mask if fit_packed_training else None,
                     )
                     per_sample = per_sample - _dfm_lambda * per_sample_neg
+
+                # GAF：把逐图方向信任当逐样本 loss 乘子（detached=按方向缩放该样本梯度贡献）。
+                # 每步施加（未建档样本=1.0=不动）；高细节干净图≈1，方向常年不合的脏图被压。
+                if gaf_ctrl is not None:
+                    _gaf_w = gaf_ctrl.weight_for_batch(
+                        batch.get("images"), device=per_sample.device, dtype=per_sample.dtype)
+                    if _gaf_w is not None:
+                        per_sample = per_sample * _gaf_w
 
                 if sample_accum_enabled:
                     main_loss_per_sample = apply_loss_weighting_per_sample(
@@ -2866,6 +2905,11 @@ def main():
 
     emit(f"Saved final LoRA: {final_path}")
     logger.info("训练完成!")
+
+    # ★ GAF：收尾 dump 逐图信任日志（低信任在前=脏样本提名表）。
+    if gaf_ctrl is not None:
+        gaf_ctrl.dump()
+        emit(f"[gaf] {gaf_ctrl.summary()}；信任日志 → {gaf_ctrl.log_path}")
 
     # ★ 优雅关闭监控 server，让端口在训练结束后立即被释放（否则连续重启会撞端口）。
     if monitor_server is not None:

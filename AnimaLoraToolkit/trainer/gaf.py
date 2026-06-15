@@ -161,19 +161,117 @@ def extract_per_sample_grads(per_sample_loss: torch.Tensor, params) -> torch.Ten
     return torch.stack(rows, dim=0)  # [B, P]
 
 
+# ============================================================================
+# 抽取后端 ②：ghost 随机投影 sketch（~1×，TRAK 式；在主 backward 内一次完成）
+# ============================================================================
+
+def _proj_matrix(dim: int, k: int, role: str, cache, seed: int):
+    """按 (role, dim, k) 缓存的单个随机投影矩阵 [dim, k]（CPU 种子生成，用时搬设备）。
+    a/g 独立投影 → 前向只需 in_dim、反向只需 out_dim，互不依赖；便于"前向就把 a 投影掉"省显存。"""
+    key = (role, int(dim), int(k))
+    if key not in cache:
+        g = torch.Generator(device="cpu").manual_seed(
+            int(seed) + (1009 if role == "g" else 0) + dim * 131 + k)
+        cache[key] = torch.randn(dim, k, generator=g) * (1.0 / float(k) ** 0.5)
+    return cache[key]
+
+
+class GafGhostHooks:
+    """在注入的 LoRALinear 边界捕获每样本 (输入 a, 输出梯度 g)，随机投影成 sketch
+    s_i = Σ_t (Pg·g_i,t) ⊗ (Pa·a_i,t) ∈ R^{k×k}，拼接各层 → 每样本"功能梯度"方向向量。
+
+    参数化无关（不碰 LoKr 因子 / DoRA；a/g 是真实激活与反向梯度，天然含 DoRA+dropout）；
+    cosine 对每样本 trust 缩放不变（trust 只缩 g 的幅度不改方向）→ 可在 trust 加权的主
+    backward 内捕获 → 一次 backward 完成 = ~1×。active=False 时 hook 立即返回（非 GAF 步零开销）。
+    """
+
+    def __init__(self, batch_size: int, proj_dim: int = 16, seed: int = 1234):
+        self.bs = int(batch_size)
+        self.k = max(int(proj_dim), 2)
+        self.seed = int(seed)
+        self._cache: dict = {}
+        self._stash: dict = {}     # module -> 输入 a
+        self._sketch: dict = {}    # module -> [B, k*k]
+        self.active = False
+        self.handles = []
+
+    def register(self, modules) -> int:
+        n = 0
+        for m in modules:
+            if not hasattr(m, "register_full_backward_hook"):
+                continue
+            self.handles.append(m.register_forward_hook(self._fwd))
+            self.handles.append(m.register_full_backward_hook(self._bwd))
+            n += 1
+        return n
+
+    def _fwd(self, module, inp, out):
+        # ★ 关键省显存：前向就把输入投影成小的 pa=[B,T,k] 存下来，**不持有完整激活 a**
+        #   （否则 hook 会 hold 住所有层输入、抵消 grad_checkpoint，1024 下必 OOM）。
+        if not self.active:
+            return
+        a = inp[0] if isinstance(inp, (tuple, list)) else inp
+        if not torch.is_tensor(a) or a.shape[0] != self.bs:
+            return
+        a = a.detach().reshape(self.bs, -1, a.shape[-1]).float()
+        Pa = _proj_matrix(a.shape[-1], self.k, "a", self._cache, self.seed).to(a.device, a.dtype)
+        self._stash[module] = a @ Pa                  # [B, T, k]，小
+
+    def _bwd(self, module, grad_input, grad_output):
+        if not self.active:
+            return
+        pa = self._stash.pop(module, None)
+        g = grad_output[0] if isinstance(grad_output, (tuple, list)) else grad_output
+        if pa is None or not torch.is_tensor(g) or g.shape[0] != self.bs:
+            return
+        g = g.detach().reshape(self.bs, -1, g.shape[-1]).float()
+        if g.shape[1] != pa.shape[1]:                 # token 数不一致（异常路径）→ 跳过
+            return
+        Pg = _proj_matrix(g.shape[-1], self.k, "g", self._cache, self.seed).to(g.device, g.dtype)
+        pg = g @ Pg                                   # [B, T, k]
+        s = torch.einsum("bti,btj->bij", pg, pa).reshape(self.bs, -1)  # [B, k*k]
+        self._sketch[module] = s.detach()
+
+    def begin(self) -> None:
+        self._stash.clear()
+        self._sketch.clear()
+        self.active = True
+
+    def collect(self):
+        """返回 [B, D] 拼接 sketch（固定 id 顺序）；无捕获返回 None。同时关闭 active。"""
+        self.active = False
+        if not self._sketch:
+            return None
+        mods = sorted(self._sketch.keys(), key=id)
+        out = torch.cat([self._sketch[m] for m in mods], dim=1)
+        self._stash.clear()
+        self._sketch.clear()
+        return out
+
+    def remove(self) -> None:
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+
+
 class GafController:
     """GAF 全流程编排（默认关；enabled=False 时所有方法即时返回，零影响）。
 
-    周期摊销：每 `every` 步做一次"逐样本梯度→方向信任"评估（昂贵的 B 次回传），更新逐图
-    信任 EMA；**每步**都把信任当逐样本 loss 乘子施加（便宜）。GAF 步可同步刷新+施加（不延迟）。
-    warmup 内不介入，让训练先稳定。所有 kernel 参数透传给 gaf_weights。
+    两个抽取后端：
+      - backend="autograd"（稳，~3×/GAF步）：GAF 步对每样本 loss 逐个 autograd.grad，精确；
+        靠 `every` 周期摊销。需在主 backward 前调 update_autograd。
+      - backend="ghost"（~1×，TRAK 投影 sketch）：在主 backward 内 hook 捕获 (a,g) 投影成
+        方向 sketch，参数化无关、近似但 cosine 够用。before_forward 开捕获、after_backward 收集。
+
+    两后端共用：每步把信任当逐样本 loss 乘子施加（weight_for_batch，便宜）；warmup 内不介入。
     """
 
-    def __init__(self, params, *, enabled=False, every=4, warmup=100,
+    def __init__(self, *, backend="autograd", params=None, modules=None,
+                 batch_size=1, proj_dim=16, enabled=False, every=4, warmup=100,
                  mode="soft", threshold=0.0, temp=0.15, floor=0.3, min_keep=2,
-                 trust_decay=0.9, log_path=""):
-        self.params = [p for p in params if getattr(p, "requires_grad", False)]
-        self.enabled = bool(enabled) and len(self.params) > 0
+                 trust_decay=0.9, log_path="", proj_seed=1234):
+        self.backend = str(backend or "autograd").lower()
+        self.params = [p for p in (params or []) if getattr(p, "requires_grad", False)]
         self.every = max(int(every or 1), 1)
         self.warmup = max(int(warmup or 0), 0)
         self.mode = str(mode or "soft")
@@ -185,26 +283,52 @@ class GafController:
         self.state = GafTrustState(decay=trust_decay)
         self.runs = 0
         self.last_info = None
+        self.hooks = None
+        self.n_hooked = 0
+
+        self.enabled = bool(enabled)
+        if self.backend == "autograd":
+            self.enabled = self.enabled and len(self.params) > 0
+        elif self.backend == "ghost":
+            if self.enabled:
+                self.hooks = GafGhostHooks(batch_size, proj_dim, seed=proj_seed)
+                self.n_hooked = self.hooks.register(list(modules or []))
+                self.enabled = self.enabled and self.n_hooked > 0
 
     def should_run(self, step: int) -> bool:
         return self.enabled and step >= self.warmup and (int(step) % self.every == 0)
 
-    def update_trust(self, per_sample_loss: torch.Tensor, keys, step: int) -> None:
-        """GAF 步：抽每样本梯度→算方向信任→更新逐图 EMA。需在主 backward 前、graph 完好时调。"""
-        if not self.enabled or keys is None:
+    def _score(self, matrix, keys) -> None:
+        if matrix is None or keys is None or not bool(torch.isfinite(matrix).all()):
             return
-        if not bool(torch.isfinite(per_sample_loss).all()):
-            return
-        grads = extract_per_sample_grads(per_sample_loss, self.params)
-        _, info = gaf_weights(
-            grads, mode=self.mode, threshold=self.threshold, temp=self.temp,
-            floor=self.floor, min_keep=self.min_keep,
-        )
+        _, info = gaf_weights(matrix, mode=self.mode, threshold=self.threshold,
+                              temp=self.temp, floor=self.floor, min_keep=self.min_keep)
         self.state.update(keys, info["weights"], info["accepted"])
         self.last_info = info
         self.runs += 1
         if self.log_path and self.runs % 25 == 0:
             self.state.dump(self.log_path)
+
+    # ── ghost 后端：主 forward 前开捕获、主 backward 后收集 ──
+    def before_forward(self, step: int) -> None:
+        if self.backend != "ghost" or self.hooks is None:
+            return
+        if self.should_run(step):
+            self.hooks.begin()
+        else:
+            self.hooks.active = False   # 非 GAF 步显式关闭，避免上一步 NaN-skip 残留 active
+
+    def after_backward(self, keys, step: int) -> None:
+        if self.backend == "ghost" and self.hooks is not None and self.should_run(step):
+            self._score(self.hooks.collect(), keys)
+
+    # ── autograd 后端：主 backward 前，对每样本 loss 抽梯度 ──
+    def update_autograd(self, per_sample_loss: torch.Tensor, keys, step: int) -> None:
+        if self.backend != "autograd" or not self.should_run(step) or keys is None:
+            return
+        if not bool(torch.isfinite(per_sample_loss).all()):
+            return
+        self._score(extract_per_sample_grads(per_sample_loss, self.params), keys)
 
     def weight_for_batch(self, keys, *, device, dtype) -> "torch.Tensor | None":
         """每步：从信任 EMA 取本 batch 的逐样本乘子（未建档样本=1.0=不动）。"""
@@ -217,9 +341,14 @@ class GafController:
         if self.enabled and self.log_path:
             self.state.dump(self.log_path)
 
+    def remove_hooks(self) -> None:
+        if self.hooks is not None:
+            self.hooks.remove()
+
     def summary(self) -> str:
         if not self.enabled:
             return "gaf: disabled"
         n = len(self.state.trust)
         lo = min(self.state.trust.values()) if n else 1.0
-        return f"gaf: {n} 图已建档, GAF评估 {self.runs} 次, 最低信任={lo:.3f}"
+        extra = f" backend={self.backend}" + (f" hooked={self.n_hooked}" if self.hooks else "")
+        return f"gaf: {n} 图已建档, GAF评估 {self.runs} 次, 最低信任={lo:.3f}{extra}"

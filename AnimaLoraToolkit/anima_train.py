@@ -1953,7 +1953,11 @@ def main():
         if not _gaf_log:
             _gaf_log = os.path.join(args.output_dir, f"{args.output_name}_gaf_trust.csv")
         gaf_ctrl = GafController(
-            [p for _, p in trainable_named_params],
+            backend=str(getattr(args, "gaf_backend", "autograd") or "autograd"),
+            params=[p for _, p in trainable_named_params],
+            modules=list(injector.injected.values()),
+            batch_size=int(getattr(args, "batch_size", 1) or 1),
+            proj_dim=int(getattr(args, "gaf_proj_dim", 16) or 16),
             enabled=True,
             every=int(getattr(args, "gaf_every", 4) or 4),
             warmup=int(getattr(args, "gaf_warmup", 100) or 100),
@@ -1965,8 +1969,9 @@ def main():
             trust_decay=float(getattr(args, "gaf_trust_decay", 0.9) or 0.9),
             log_path=_gaf_log,
         )
-        emit(f"[gaf] 梯度一致性过滤已启用：every={gaf_ctrl.every} warmup={gaf_ctrl.warmup} "
-             f"mode={gaf_ctrl.mode} floor={gaf_ctrl.floor}（按方向降权脏样本；信任日志→{_gaf_log}）")
+        emit(f"[gaf] 已启用 backend={gaf_ctrl.backend} every={gaf_ctrl.every} "
+             f"warmup={gaf_ctrl.warmup} mode={gaf_ctrl.mode} floor={gaf_ctrl.floor} "
+             f"hooked={gaf_ctrl.n_hooked}（按方向降权脏样本；信任日志→{_gaf_log}）")
 
     # ── 固定网格 eval loss（确定性曲线，跨 run 可比）───────────────────────────
     _eval_every = int(getattr(args, "eval_every", 0) or 0)
@@ -2287,6 +2292,9 @@ def main():
             # 必须和原 forward 完全一致，否则 LoRALayer 的 _apply_tlora_mask / ortho 补偿
             # 分支会变，autograd 图保存的张量数对不上（torch.utils.checkpoint.CheckpointError）。
             # reset 已移到 backward 之后，以及 NaN-loss continue 路径之前。
+            # GAF(ghost 后端)：主 forward 前开捕获，让 _fwd hook stash 各层输入（autograd 后端 no-op）
+            if gaf_ctrl is not None:
+                gaf_ctrl.before_forward(global_step)
             with torch.autocast("cuda", dtype=dtype):
                 if fit_packed_training:
                     noisy_tokens, fit_grid, fit_mask, fit_size = model.patchify_latents_to_tokens(noisy, latent_mask)
@@ -2339,8 +2347,8 @@ def main():
                 # GAF（B1）：GAF 步抽每样本梯度→方向信任，更新逐图 EMA。用 ΔFM 之前的干净主
                 # 重建 per_sample；autograd.grad 不污染 .grad、retain_graph 保后续主 backward。
                 # 仅每 gaf_every 步触发（周期摊销）；warmup 内不介入。
-                if gaf_ctrl is not None and gaf_ctrl.should_run(global_step):
-                    gaf_ctrl.update_trust(per_sample, batch.get("images"), global_step)
+                if gaf_ctrl is not None:
+                    gaf_ctrl.update_autograd(per_sample, batch.get("images"), global_step)
 
                 # ── inv_loss_ema：EDM2 不确定性加权的解析变体（loss_weighting_scheme）──
                 # 先用原始 per_sample 更新 bin-EMA，再乘权重（ΔFM 项之后单独按 λ 控制）。
@@ -2571,6 +2579,9 @@ def main():
             # current_t=None，与原 forward 走的分支不一致 → CheckpointError
             injector.set_current_t(None)
             injector.clear_module_dropout()
+            # GAF(ghost)：主 backward 已捕获 sketch → 收集并更新逐图信任（autograd 后端 no-op）
+            if gaf_ctrl is not None:
+                gaf_ctrl.after_backward(batch.get("images"), global_step)
 
             if step_boundary:
                 if sample_accum_enabled and sample_accum_pending != effective_batch_size:
@@ -2909,6 +2920,7 @@ def main():
     # ★ GAF：收尾 dump 逐图信任日志（低信任在前=脏样本提名表）。
     if gaf_ctrl is not None:
         gaf_ctrl.dump()
+        gaf_ctrl.remove_hooks()
         emit(f"[gaf] {gaf_ctrl.summary()}；信任日志 → {gaf_ctrl.log_path}")
 
     # ★ 优雅关闭监控 server，让端口在训练结束后立即被释放（否则连续重启会撞端口）。

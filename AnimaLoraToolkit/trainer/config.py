@@ -285,6 +285,8 @@ YAML_TO_ARGS = {
     "gaf_min_keep": "gaf_min_keep",
     "gaf_trust_decay": "gaf_trust_decay",
     "gaf_log_path": "gaf_log_path",
+    "gaf_backend": "gaf_backend",
+    "gaf_proj_dim": "gaf_proj_dim",
 }
 
 
@@ -506,6 +508,8 @@ DEFAULTS = {
     "gaf_min_keep": 2,
     "gaf_trust_decay": 0.9,
     "gaf_log_path": "",
+    "gaf_backend": "autograd",
+    "gaf_proj_dim": 16,
 }
 
 

@@ -287,6 +287,25 @@ YAML_TO_ARGS = {
     "gaf_log_path": "gaf_log_path",
     "gaf_backend": "gaf_backend",
     "gaf_proj_dim": "gaf_proj_dim",
+    # ── Linear-DPO 偏好放大（in-loop, on-policy；默认关）见 trainer/dpo.py ──
+    "dpo_enabled": "dpo_enabled",
+    "dpo_beta": "dpo_beta",
+    "dpo_eta": "dpo_eta",
+    "dpo_ref_ema": "dpo_ref_ema",
+    "dpo_regen_every": "dpo_regen_every",
+    "dpo_loser_steps": "dpo_loser_steps",
+    "dpo_loser_cfg": "dpo_loser_cfg",
+    "dpo_loser_subset": "dpo_loser_subset",
+    "dpo_sft_anchor_lambda": "dpo_sft_anchor_lambda",
+    "dpo_share_noise": "dpo_share_noise",
+    "dpo_log_path": "dpo_log_path",
+    # ── LeapAlign 两步跳跃自蒸馏（SFT 主目标增强；默认关）见 trainer/leap.py ──
+    "leap_enabled": "leap_enabled",
+    "leap_ratio": "leap_ratio",
+    "leap_nested_grad_coe": "leap_nested_grad_coe",
+    "leap_min_gap": "leap_min_gap",
+    "leap_traj_sim_weighting": "leap_traj_sim_weighting",
+    "leap_traj_sim_min": "leap_traj_sim_min",
 }
 
 
@@ -510,6 +529,27 @@ DEFAULTS = {
     "gaf_log_path": "",
     "gaf_backend": "autograd",
     "gaf_proj_dim": 16,
+    # Linear-DPO 偏好放大（默认关 → 完全 no-op）。dpo_beta / dpo_regen_every 每 run 由用户调：
+    # beta 起小（0.1），regen_every ≈ 一个 epoch 的步数（依 batch/数据集大小，3–5 轮）。
+    "dpo_enabled": False,
+    "dpo_beta": 0.1,
+    "dpo_eta": 0.01,
+    "dpo_ref_ema": 1.0,
+    "dpo_regen_every": 1000,
+    "dpo_loser_steps": 14,
+    "dpo_loser_cfg": 1.0,
+    "dpo_loser_subset": 1.0,
+    "dpo_sft_anchor_lambda": 0.0,
+    "dpo_share_noise": True,
+    "dpo_log_path": "",
+    # LeapAlign 两步跳跃自蒸馏（默认关）。leap_ratio<1.0 = hybrid（非 leap 步保留三峰/
+    # adaptive/aux/ΔFM，leap 步做轨迹蒸馏）；=1.0 = 纯 leap（adaptive_timestep 会变惰性）。
+    "leap_enabled": False,
+    "leap_ratio": 1.0,
+    "leap_nested_grad_coe": 0.3,
+    "leap_min_gap": 0.1,
+    "leap_traj_sim_weighting": False,
+    "leap_traj_sim_min": 0.1,
 }
 
 

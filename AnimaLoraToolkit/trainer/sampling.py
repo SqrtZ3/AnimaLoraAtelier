@@ -4,7 +4,9 @@
 - `_time_snr_shift` / `_flow_sigmas_simple` —— ComfyUI ModelSamplingDiscreteFlow + simple_scheduler 的等价实现
 - `_default_noise_sampler` —— 与 ComfyUI k_diffusion_sampling.default_noise_sampler 一致
 - `_sample_er_sde_const_x0` —— ER-SDE-Solver-3 在 CONST flow schedule 下的去 ModelPatcher 化实现
-- `sample_image` —— 训练循环中按 step / epoch 出预览图的入口
+- `_encode_text` —— 单条 prompt → cross_cond 编码（cond/uncond/DPO 共用）
+- `sample_latent` —— 跑完采样返回训练 latent（不 decode）；DPO loser 生成 + sample_image 共用
+- `sample_image` —— 训练循环中按 step / epoch 出预览图的入口（= sample_latent + VAE decode）
 
 注意：训练时采样的 `shift=3.0` 是固定值（对齐 ComfyUI Anima supported_models 默认），
 **与训练 t 分布的 `flow_shift` 不相关**。训练 t 分布默认更接近 uniform；采样时仍按
@@ -203,6 +205,138 @@ def _sample_er_sde_const_x0(
     return x
 
 
+def _encode_text(
+    model, qwen_model, qwen_tokenizer, t5_tokenizer, prompt, device,
+    *, use_t5_token_weights: bool = True,
+) -> torch.Tensor:
+    """编码单条 prompt -> cross_cond（[1, ≥512, D]，已 pad 到 512）。
+
+    抽自 `sample_image` 的编码路径，cond / uncond 共用同一逻辑；DPO loser 生成也复用
+    本函数（只编码正向 prompt，no-CFG 时无需 uncond）。
+    """
+    qwen_text = _build_qwen_text_from_prompt(prompt)
+    qwen_embeds, qwen_attn = encode_qwen(qwen_model, qwen_tokenizer, [qwen_text], device)
+    t5_ids, t5_attn, t5_w = tokenize_t5_weighted(t5_tokenizer, [prompt], max_length=512)
+    t5_ids = t5_ids.to(device)
+    t5_attn = t5_attn.to(device)
+    t5_w = t5_w.to(device, dtype=torch.float32)
+    cross = model.preprocess_text_embeds(qwen_embeds, t5_ids, t5_attn, qwen_attn)
+    if (
+        use_t5_token_weights
+        and getattr(model, "llm_adapter", None) is not None
+        and cross.shape[1] == t5_w.shape[1]
+    ):
+        cross = cross * t5_w.to(cross.dtype).unsqueeze(-1)
+    if cross.shape[1] < 512:
+        cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
+    return cross
+
+
+@torch.no_grad()
+def sample_latent(
+    model,
+    cross_cond,
+    cross_uncond=None,
+    *,
+    height: int = 1024,
+    width: int = 1024,
+    steps: int = 25,
+    cfg_scale: float = 4.0,
+    sampler_name: str = "er_sde",
+    scheduler: str = "simple",
+    device="cuda",
+    dtype=torch.bfloat16,
+    injector=None,
+    seed: int | None = None,
+) -> torch.Tensor:
+    """运行 ER-SDE CONST 采样并返回训练 latent（`[1,16,1,h//8,w//8]`，float32），**不做 VAE decode**。
+
+    `sample_image` = 本函数 + VAE decode。DPO loser 生成直接调用本函数，全程留在 latent
+    空间（loser pool 存的就是返回值，与训练加噪管线直接兼容）。
+
+    - **no-CFG 分支**：`cfg_scale == 1.0` 或 `cross_uncond is None` 时每步只做一次条件前向
+      （CFG 公式在 cfg=1 时恒等于 v_cond），用于 `dpo_loser_cfg=1.0`，每步前向数减半、loser
+      自然更弱。
+    - **RNG 隔离**：传入 `seed` 时初始噪声与 ER-SDE 随机项都用独立 `Generator`，不污染训练
+      噪声流（DPO in-loop 采样要求）。`seed=None`（预览路径）时维持旧行为（全局 RNG）。
+    - `model.train()/eval()` 由本函数 try/finally 守护，中途抛错也能恢复。
+    """
+    _orig_training = bool(model.training)
+    model.eval()
+    try:
+        lat_h, lat_w = height // 8, width // 8
+        _sched = str(scheduler).lower()
+        if _sched == "beta":
+            sigmas = _flow_sigmas_beta(steps, shift=3.0, device=device)
+        else:
+            if _sched != "simple":
+                logger.warning(f"采样 scheduler={scheduler} 未实现，回退 simple")
+            sigmas = _flow_sigmas_simple(steps, shift=3.0, device=device)
+
+        # 初始化噪声（ComfyUI CONST.noise_scaling: x = sigma*noise + (1-sigma)*latent_image；txt2img latent_image=0）
+        if seed is not None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(seed))
+            x = torch.randn(1, 16, 1, lat_h, lat_w, device=device, dtype=torch.float32, generator=gen) * float(sigmas[0])
+        else:
+            x = torch.randn(1, 16, 1, lat_h, lat_w, device=device, dtype=torch.float32) * float(sigmas[0])
+        logger.info(f"[Debug] Latents init: {x.shape}, mean={x.mean().item():.4f}, std={x.std().item():.4f}")
+
+        pad_mask = torch.zeros(1, 1, lat_h, lat_w, device=device, dtype=dtype)
+        device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+        use_cfg = (cross_uncond is not None) and (float(cfg_scale) != 1.0)
+
+        def denoise_fn(x_in: torch.Tensor, sigma_in: torch.Tensor) -> torch.Tensor:
+            if not torch.is_tensor(sigma_in):
+                sigma_in = torch.tensor(float(sigma_in), device=x_in.device, dtype=torch.float32)
+            sigma_b = sigma_in.view(1, 1).to(device=x_in.device, dtype=dtype)
+            sigma_5d = sigma_in.view(1, 1, 1, 1, 1).to(device=x_in.device, dtype=torch.float32)
+
+            # T-LoRA：把当前 σ 写到 LoRA adapter（B=1 here）。其它 variant 自动跳过。
+            # 在 try/finally 内确保即便 forward 抛错也能 reset，避免污染后续 step。
+            if injector is not None:
+                injector.set_current_t(sigma_in.view(-1).to(device=x_in.device, dtype=torch.float32))
+            try:
+                with torch.autocast(device_type=device_type, dtype=dtype):
+                    v_cond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_cond, padding_mask=pad_mask)
+                    if use_cfg:
+                        v_uncond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_uncond, padding_mask=pad_mask)
+                        v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                    else:
+                        v = v_cond
+            finally:
+                if injector is not None:
+                    injector.set_current_t(None)
+
+            if torch.isnan(v).any():
+                raise RuntimeError("v contains NaN during sampling")
+
+            # CONST(flow): denoised x0 = x - sigma * v
+            return x_in - sigma_5d * v.float()
+
+        sampler_name_l = str(sampler_name).lower().strip()
+        logger.info(f"[Debug] Sampler={sampler_name_l}, Scheduler={_sched}, steps={steps}, cfg={cfg_scale}, cfg_branch={'on' if use_cfg else 'off'}")
+
+        if sampler_name_l == "er_sde":
+            x = _sample_er_sde_const_x0(denoise_fn, x, sigmas, seed=seed, s_noise=1.0, max_stage=3)
+        else:
+            # fallback: 简化 Euler ODE（deterministic），与 flow 兼容
+            for i in range(len(sigmas) - 1):
+                sigma = float(sigmas[i])
+                sigma_next = float(sigmas[i + 1])
+                denoised = denoise_fn(x, sigmas[i])
+                d = (x - denoised) / max(sigma, 1e-6)
+                x = x + d * (sigma_next - sigma)
+
+        return x
+    finally:
+        # 不论是否抛错都恢复 model train/eval 模式。
+        if _orig_training:
+            model.train()
+        else:
+            model.eval()
+
+
 @torch.no_grad()
 def sample_image(
     model, vae, qwen_model, qwen_tokenizer, t5_tokenizer,
@@ -250,105 +384,28 @@ def sample_image(
                 "logo, signature, username, artist name, copyright name"
             )
 
-        # 文本编码
+        # 文本编码（cond + uncond，复用 _encode_text）
         try:
-            # 有条件 (positive prompt)
-            qwen_text = _build_qwen_text_from_prompt(prompt)
-            qwen_embeds, qwen_attn = encode_qwen(qwen_model, qwen_tokenizer, [qwen_text], device)
-            logger.info(f"[Debug] Qwen embeds: {qwen_embeds.shape}, mean={qwen_embeds.mean().item():.4f}")
-
-            t5_ids, t5_attn, t5_w = tokenize_t5_weighted(t5_tokenizer, [prompt], max_length=512)
-            t5_ids = t5_ids.to(device)
-            t5_attn = t5_attn.to(device)
-            t5_w = t5_w.to(device, dtype=torch.float32)
-            cross_cond = model.preprocess_text_embeds(qwen_embeds, t5_ids, t5_attn, qwen_attn)
-            if (
-                use_t5_token_weights
-                and getattr(model, "llm_adapter", None) is not None
-                and cross_cond.shape[1] == t5_w.shape[1]
-            ):
-                cross_cond = cross_cond * t5_w.to(cross_cond.dtype).unsqueeze(-1)
-            if cross_cond.shape[1] < 512:
-                cross_cond = F.pad(cross_cond, (0, 0, 0, 512 - cross_cond.shape[1]))
-
-            # 无条件/负面提示词 (negative prompt)
-            qwen_text_uncond = _build_qwen_text_from_prompt(negative_prompt)
-            qwen_embeds_uncond, qwen_attn_uncond = encode_qwen(qwen_model, qwen_tokenizer, [qwen_text_uncond], device)
-            t5_ids_uncond, t5_attn_uncond, t5_w_uncond = tokenize_t5_weighted(t5_tokenizer, [negative_prompt], max_length=512)
-            t5_ids_uncond = t5_ids_uncond.to(device)
-            t5_attn_uncond = t5_attn_uncond.to(device)
-            t5_w_uncond = t5_w_uncond.to(device, dtype=torch.float32)
-            cross_uncond = model.preprocess_text_embeds(qwen_embeds_uncond, t5_ids_uncond, t5_attn_uncond, qwen_attn_uncond)
-            if (
-                use_t5_token_weights
-                and getattr(model, "llm_adapter", None) is not None
-                and cross_uncond.shape[1] == t5_w_uncond.shape[1]
-            ):
-                cross_uncond = cross_uncond * t5_w_uncond.to(cross_uncond.dtype).unsqueeze(-1)
-            if cross_uncond.shape[1] < 512:
-                cross_uncond = F.pad(cross_uncond, (0, 0, 0, 512 - cross_uncond.shape[1]))
-
+            cross_cond = _encode_text(
+                model, qwen_model, qwen_tokenizer, t5_tokenizer, prompt, device,
+                use_t5_token_weights=use_t5_token_weights,
+            )
+            cross_uncond = _encode_text(
+                model, qwen_model, qwen_tokenizer, t5_tokenizer, negative_prompt, device,
+                use_t5_token_weights=use_t5_token_weights,
+            )
         except Exception as e:
             logger.error(f"[Debug] Encoding failed: {e}")
             raise
 
-        # sigmas（对齐 ComfyUI supported_models.Anima: shift=3.0, multiplier=1.0）
-        lat_h, lat_w = height // 8, width // 8
-        _sched = str(scheduler).lower()
-        if _sched == "beta":
-            # 与 ComfyUI 推理工作流 scheduler="beta" 对齐（评图常用 beta，
-            # simple/beta 的步位分配差异是"预览像、推理不像"的口径嫌疑之一）
-            sigmas = _flow_sigmas_beta(steps, shift=3.0, device=device)
-        else:
-            if _sched != "simple":
-                logger.warning(f"采样 scheduler={scheduler} 未实现，回退 simple")
-            sigmas = _flow_sigmas_simple(steps, shift=3.0, device=device)
-
-        # 初始化噪声（ComfyUI CONST.noise_scaling: x = sigma*noise + (1-sigma)*latent_image；txt2img latent_image=0）
-        x = torch.randn(1, 16, 1, lat_h, lat_w, device=device, dtype=torch.float32) * float(sigmas[0])
-        logger.info(f"[Debug] Latents init: {x.shape}, mean={x.mean().item():.4f}, std={x.std().item():.4f}")
-
-        pad_mask = torch.zeros(1, 1, lat_h, lat_w, device=device, dtype=dtype)
-        device_type = "cuda" if str(device).startswith("cuda") else "cpu"
-
-        def denoise_fn(x_in: torch.Tensor, sigma_in: torch.Tensor) -> torch.Tensor:
-            if not torch.is_tensor(sigma_in):
-                sigma_in = torch.tensor(float(sigma_in), device=x_in.device, dtype=torch.float32)
-            sigma_b = sigma_in.view(1, 1).to(device=x_in.device, dtype=dtype)
-            sigma_5d = sigma_in.view(1, 1, 1, 1, 1).to(device=x_in.device, dtype=torch.float32)
-
-            # T-LoRA：把当前 σ 写到 LoRA adapter（B=1 here）。其它 variant 自动跳过。
-            # 在 try/finally 内确保即便 forward 抛错也能 reset，避免污染后续 step。
-            if injector is not None:
-                injector.set_current_t(sigma_in.view(-1).to(device=x_in.device, dtype=torch.float32))
-            try:
-                with torch.autocast(device_type=device_type, dtype=dtype):
-                    v_cond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_cond, padding_mask=pad_mask)
-                    v_uncond = model(x_in.to(device=x_in.device, dtype=dtype), sigma_b, cross_uncond, padding_mask=pad_mask)
-                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
-            finally:
-                if injector is not None:
-                    injector.set_current_t(None)
-
-            if torch.isnan(v).any():
-                raise RuntimeError("v contains NaN during sampling")
-
-            # CONST(flow): denoised x0 = x - sigma * v
-            return x_in - sigma_5d * v.float()
-
-        sampler_name_l = str(sampler_name).lower().strip()
-        logger.info(f"[Debug] Sampler={sampler_name_l}, Scheduler=simple, steps={steps}, cfg={cfg_scale}")
-
-        if sampler_name_l == "er_sde":
-            x = _sample_er_sde_const_x0(denoise_fn, x, sigmas, seed=None, s_noise=1.0, max_stage=3)
-        else:
-            # fallback: 简化 Euler ODE（deterministic），与 flow 兼容
-            for i in range(len(sigmas) - 1):
-                sigma = float(sigmas[i])
-                sigma_next = float(sigmas[i + 1])
-                denoised = denoise_fn(x, sigmas[i])
-                d = (x - denoised) / max(sigma, 1e-6)
-                x = x + d * (sigma_next - sigma)
+        # 采样（sigmas / 噪声初始化 / ER-SDE 求解，全部下放到 sample_latent；预览路径 seed=None
+        # 维持旧的全局 RNG 行为，cfg!=1 走原 CFG 双前向分支，结果与重构前一致）
+        x = sample_latent(
+            model, cross_cond, cross_uncond,
+            height=height, width=width, steps=steps, cfg_scale=cfg_scale,
+            sampler_name=sampler_name, scheduler=scheduler,
+            device=device, dtype=dtype, injector=injector, seed=None,
+        )
 
         # VAE 解码
         latents = x.to(device=device, dtype=dtype)

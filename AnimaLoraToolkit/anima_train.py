@@ -215,6 +215,8 @@ from trainer.sampling import (
     _flow_sigmas_simple,
     _default_noise_sampler,
     _sample_er_sde_const_x0,
+    _encode_text,
+    sample_latent,
     sample_image,
 )
 from trainer.objective import (
@@ -250,6 +252,8 @@ from trainer.objective import (
 )
 from trainer.lora import LoRALayer, LoKrLayer, LoRALinear, LoRAInjector
 from trainer.gaf import GafController
+from trainer.dpo import DpoController
+from trainer.leap import sample_two_timesteps, leap_training_step
 from trainer.aux_losses import (
     build_aux_loss_config,
     recover_x0_from_velocity,
@@ -1973,6 +1977,198 @@ def main():
              f"warmup={gaf_ctrl.warmup} mode={gaf_ctrl.mode} floor={gaf_ctrl.floor} "
              f"hooked={gaf_ctrl.n_hooked}（按方向降权脏样本；信任日志→{_gaf_log}）")
 
+    # ── Linear-DPO 偏好放大（in-loop, on-policy；默认关，零影响）──────────────────
+    # 续训已收敛 LoRA 的短偏好精修：赢家=真图(latents)、输家=当前策略自生成(latent 空间、粗轮
+    # 重生成)、参考=冻结收敛快照(.data 交换)。损失复用 per_sample_loss 当 L_θ。详见 trainer/dpo.py。
+    dpo_ctrl = None
+    dpo_items = []            # [(image_key, (caption, h_px, w_px))]，供粗轮重生成输家
+    _dpo_last_regen = -1
+    if bool(getattr(args, "dpo_enabled", False)):
+        if fit_packed_training:
+            raise RuntimeError(
+                "dpo_enabled 暂仅支持 dense 路径（fit_packed_training=false）："
+                "输家由 sample_latent 生成的是 dense latent，与 token-bucket 打包不配对。")
+        if sample_accum_enabled:
+            raise RuntimeError(
+                "dpo_enabled 暂不支持 sample 累积（effective_batch_size>0）：DPO 损失是配对均值、"
+                "非逐样本和。请关闭 effective_batch_size（grad_accum 仍可用）。")
+        if _tread_ratio > 0.0:
+            emit("[dpo] 警告：TREAD 与 DPO 同开会让策略/参考前向 token 路由不一致 → "
+                 "本阶段 DPO 的赢/输/参考前向已强制关闭 TREAD（建议 DPO 阶段 tread_enabled=false）。")
+        _dpo_log = str(getattr(args, "dpo_log_path", "") or "").strip()
+        if not _dpo_log:
+            _dpo_log = os.path.join(args.output_dir, f"{args.output_name}_dpo.csv")
+        dpo_ctrl = DpoController(
+            enabled=True,
+            beta=float(getattr(args, "dpo_beta", 0.1) or 0.1),
+            eta=float(getattr(args, "dpo_eta", 0.01) or 0.01),
+            ref_ema=float(getattr(args, "dpo_ref_ema", 1.0) or 1.0),
+            regen_every=int(getattr(args, "dpo_regen_every", 1000) or 1000),
+            loser_steps=int(getattr(args, "dpo_loser_steps", 14) or 14),
+            loser_cfg=float(getattr(args, "dpo_loser_cfg", 1.0) or 1.0),
+            loser_subset=float(getattr(args, "dpo_loser_subset", 1.0) or 1.0),
+            sft_anchor_lambda=float(getattr(args, "dpo_sft_anchor_lambda", 0.0) or 0.0),
+            share_noise=bool(getattr(args, "dpo_share_noise", True)),
+            log_path=_dpo_log,
+            params=[p for _, p in trainable_named_params],
+            seed=int(getattr(args, "seed", 0) or 0) + 777,
+        )
+        if not dpo_ctrl.enabled:
+            emit("[dpo] 无可训 adapter 参数，DPO 已降级为关。")
+            dpo_ctrl = None
+        else:
+            # 预扫一遍 dataloader 收集每样本 (caption, bucket 像素尺寸)，供粗轮重生成输家。
+            # 只读 batch 的 captions/images 与张量形状，不需要 VAE / 模型前向。
+            _items = {}
+            try:
+                for _b in dataloader:
+                    _caps = _b.get("captions", [])
+                    _imgs = _b.get("images", [])
+                    if "latents" in _b:
+                        _h = int(_b["latents"].shape[-2]) * 8
+                        _w = int(_b["latents"].shape[-1]) * 8
+                    else:
+                        _h = int(_b["pixel_values"].shape[-2])
+                        _w = int(_b["pixel_values"].shape[-1])
+                    for _k, _c in zip(_imgs, _caps):
+                        _k = str(_k)
+                        if _k and _k not in _items:
+                            _items[_k] = (_c, _h, _w)
+            except Exception as _e:
+                raise RuntimeError(f"[dpo] 预扫数据集构建输家清单失败: {_e}")
+            dpo_items = list(_items.items())
+            _dpo_neg_default = (
+                "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, "
+                "bad anatomy, bad hands, bad feet, missing fingers, extra fingers, text, watermark, "
+                "logo, signature, username, artist name, copyright name"
+            )
+
+            def _dpo_sample_fn(key, payload):
+                """生成一张输家 latent（当前策略、eval、latent 空间、独立 RNG seed）。"""
+                import zlib
+                caption, _h, _w = payload
+                cross_c = _encode_text(
+                    model, qwen_model, qwen_tok, t5_tok, caption, device,
+                    use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                )
+                cross_u = None
+                if float(dpo_ctrl.loser_cfg) != 1.0:
+                    _neg = str(getattr(args, "sample_negative_prompt", "") or "") or _dpo_neg_default
+                    cross_u = _encode_text(
+                        model, qwen_model, qwen_tok, t5_tok, _neg, device,
+                        use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
+                    )
+                _seed = (zlib.crc32(str(key).encode("utf-8")) + int(dpo_ctrl.rounds)) & 0x7fffffff
+                latent = sample_latent(
+                    model, cross_c, cross_u,
+                    height=int(_h), width=int(_w),
+                    steps=int(dpo_ctrl.loser_steps), cfg_scale=float(dpo_ctrl.loser_cfg),
+                    sampler_name=str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde"),
+                    scheduler=str(getattr(args, "sample_scheduler", "simple") or "simple"),
+                    device=device, dtype=dtype, injector=injector, seed=_seed,
+                )
+                return latent.detach()
+
+            def _dpo_compute_loss(per_sample_w, target, noisy, t, t_exp, noise, cross, pad_mask, batch):
+                """配对 L_DPO：复用赢家 per_sample(=L_θ(赢)) + 输家策略前向(共享 t,ε) + 两次参考前向。
+                返回 (loss_scalar, per_sample_placeholder)。无可用输家时回退零损失（本 micro-batch 不更新）。"""
+                keys = [str(k) for k in (batch.get("images") or [])]
+                losers = [dpo_ctrl.pool.get(k) for k in keys]
+                present = [
+                    i for i, l in enumerate(losers)
+                    if l is not None and tuple(l.shape[-2:]) == tuple(noisy.shape[-2:])
+                ]
+                if not present:
+                    return per_sample_w.sum() * 0.0, per_sample_w.detach()
+                idx = torch.tensor(present, device=noisy.device, dtype=torch.long)
+                x0_l = torch.cat(
+                    [losers[i].to(device=noisy.device, dtype=noisy.dtype) for i in present], dim=0)
+                t_p = t.index_select(0, idx)
+                te_p = t_exp.index_select(0, idx)
+                noise_p = noise.index_select(0, idx)
+                cross_p = cross.index_select(0, idx)
+                pad_p = pad_mask.index_select(0, idx) if pad_mask is not None else None
+                noisy_w = noisy.index_select(0, idx)
+                target_w = target.index_select(0, idx)
+                noisy_l = (1 - te_p) * x0_l + te_p * noise_p
+                target_l = noise_p - x0_l
+
+                _loss_kw = dict(
+                    loss_type=objective_cfg.loss.loss_type, huber_c=objective_cfg.loss.huber_c,
+                    huber_schedule=objective_cfg.loss.huber_schedule,
+                    huber_snr_clamp_max=objective_cfg.loss.huber_snr_clamp_max,
+                )
+                l_theta_w = per_sample_w.index_select(0, idx)        # 赢家策略损失（带梯度）
+                injector.set_current_t(t_p.float().detach())
+                pred_l = forward_with_optional_checkpoint(
+                    model, noisy_l, t_p.view(-1, 1), cross_p, pad_p,
+                    use_checkpoint=args.grad_checkpoint,
+                    tread_ratio=0.0, tread_start=_tread_start, tread_end=_tread_end,
+                )
+                l_theta_l = per_sample_loss(pred_l, target_l, t=t_p.float(), **_loss_kw)
+                with torch.no_grad(), dpo_ctrl.reference_mode():
+                    pred_ref_w = forward_with_optional_checkpoint(
+                        model, noisy_w, t_p.view(-1, 1), cross_p, pad_p,
+                        use_checkpoint=False, tread_ratio=0.0,
+                        tread_start=_tread_start, tread_end=_tread_end,
+                    )
+                    l_ref_w = per_sample_loss(pred_ref_w, target_w, t=t_p.float(), **_loss_kw)
+                    pred_ref_l = forward_with_optional_checkpoint(
+                        model, noisy_l, t_p.view(-1, 1), cross_p, pad_p,
+                        use_checkpoint=False, tread_ratio=0.0,
+                        tread_start=_tread_start, tread_end=_tread_end,
+                    )
+                    l_ref_l = per_sample_loss(pred_ref_l, target_l, t=t_p.float(), **_loss_kw)
+                injector.set_current_t(t.float().detach())          # 还原全 batch t（赢家 forward 用过）
+                loss, _info = dpo_ctrl.dpo_loss(l_theta_w, l_theta_l, l_ref_w, l_ref_l)
+                return loss, per_sample_w.detach()
+
+            emit(f"[dpo] 已启用 beta={dpo_ctrl.beta} eta={dpo_ctrl.eta} ref_ema={dpo_ctrl.reference.ema} "
+                 f"regen_every={dpo_ctrl.regen_every} loser(steps={dpo_ctrl.loser_steps},"
+                 f"cfg={dpo_ctrl.loser_cfg},subset={dpo_ctrl.loser_subset}) 样本清单={len(dpo_items)} "
+                 f"日志→{_dpo_log}")
+    dpo_active = dpo_ctrl is not None
+
+    # ── LeapAlign 两步跳跃自蒸馏（SFT 主目标增强；默认关，零影响）──────────────────
+    # 逼多步轨迹落到真实 x0（而非条件均值）→ 反"发灰/平均风格"，打根因。详见 trainer/leap.py。
+    leap_active = bool(getattr(args, "leap_enabled", False))
+    leap_ratio = float(getattr(args, "leap_ratio", 1.0) or 1.0)
+    leap_min_gap = float(getattr(args, "leap_min_gap", 0.1) or 0.1)
+    leap_nested_grad_coe = float(getattr(args, "leap_nested_grad_coe", 0.3) or 0.3)
+    leap_traj_sim_weighting = bool(getattr(args, "leap_traj_sim_weighting", False))
+    leap_traj_sim_min = float(getattr(args, "leap_traj_sim_min", 0.1) or 0.1)
+    if leap_active:
+        if fit_packed_training:
+            raise RuntimeError(
+                "leap_enabled 暂仅支持 dense 路径（fit_packed_training=false）："
+                "两步跳跃在 dense latent 上做，token-bucket 打包路径未接入。")
+        if dpo_active:
+            raise RuntimeError(
+                "leap_enabled 与 dpo_enabled 不能同 run：leap 是 SFT 主目标、DPO 是收敛后偏好精修，"
+                "属于不同阶段，一个 run 只开一个。")
+        if sample_accum_enabled:
+            raise RuntimeError(
+                "leap_enabled 暂不支持 sample 累积（effective_batch_size>0）；grad_accum 仍可用。")
+        if str(getattr(args, "loss_weighting_scheme", "none") or "none").lower() != "none":
+            emit("[leap] 警告：leap 步用未加权 per-sample 均值，loss_weighting_scheme!=none 只作用在"
+                 "非 leap 步 → 两类步加权不一致，建议 DPO/leap 阶段设 none。")
+        if leap_ratio >= 1.0 and bool(getattr(args, "adaptive_timestep", False)):
+            emit("[leap] 警告：leap_ratio=1.0（纯 leap）下 adaptive_timestep/entropy_rate(InfoNoise) 永不"
+                 "被有效更新 → 惰性失效。想保留 InfoNoise 请用 hybrid（leap_ratio<1.0）。")
+
+        def _leap_fwd(x, t_col, cross_, pad_):
+            """leap 单跳前向：设 T-LoRA current_t、强制关 TREAD（策略两跳路由须一致）。"""
+            injector.set_current_t(t_col.view(-1).float().detach())
+            return forward_with_optional_checkpoint(
+                model, x, t_col, cross_, pad_,
+                use_checkpoint=args.grad_checkpoint,
+                tread_ratio=0.0, tread_start=_tread_start, tread_end=_tread_end,
+            )
+
+        emit(f"[leap] 已启用 ratio={leap_ratio}（{'纯 leap' if leap_ratio >= 1.0 else 'hybrid'}）"
+             f" nested_grad_coe={leap_nested_grad_coe} min_gap={leap_min_gap} "
+             f"traj_sim={leap_traj_sim_weighting}（两步自蒸馏逼真 x0，反平均风格；leap 步关 TREAD）")
+
     # ── 固定网格 eval loss（确定性曲线，跨 run 可比）───────────────────────────
     _eval_every = int(getattr(args, "eval_every", 0) or 0)
     _eval_set = []          # [(latents_1xC1HW_gpu, cross_1xLxD_gpu)]
@@ -2166,6 +2362,18 @@ def main():
                 batch_reference_batches = dataloader.batch_sampler.reference_batches_for_batch_index(batch_idx)
             pending_reference_batches += int(batch_reference_batches)
 
+            # ── DPO 粗轮：到轮边界用当前策略重生成输家池（latent 空间，eval+no_grad）。
+            # sample_latent 自管 eval/train 守护并隔离 RNG；每轮边界只触发一次。
+            if dpo_active and dpo_ctrl.should_regen(global_step) and global_step != _dpo_last_regen:
+                _dpo_t0 = time.perf_counter()
+                _dpo_n = dpo_ctrl.regen_losers(_dpo_sample_fn, dpo_items)
+                _dpo_last_regen = global_step
+                emit(f"[dpo] round {dpo_ctrl.rounds} @step {global_step}: 重生成 {_dpo_n} 个输家 "
+                     f"(池={len(dpo_ctrl.pool)}, {time.perf_counter() - _dpo_t0:.1f}s)")
+                model.train()
+                if hasattr(optimizer, "train"):
+                    optimizer.train()
+
             captions = batch["captions"]
 
             # caption dropout：随机把 caption 替换为空字符串，提升 CFG 服从度（Anima 主要靠 CFG 出图）
@@ -2255,6 +2463,13 @@ def main():
             noisy = (1 - t_exp) * latents + t_exp * noise
             target = noise - latents
 
+            # ── LeapAlign：本 micro-batch 是否走两步跳跃（hybrid 按 leap_ratio 抽）──
+            # 用训练 RNG；leap 步用自己的 (t_k,t_j)，复用上面的 noise，不走标准单步 forward。
+            use_leap_this_step = leap_active and (float(torch.rand(1).item()) < leap_ratio)
+            t_k = t_j = None
+            if use_leap_this_step:
+                t_k, t_j = sample_two_timesteps(bs, device, min_gap=leap_min_gap, dtype=torch.float32)
+
             latent_mask = None
             if fit_packed_training:
                 if cached_latent_mask is not None:
@@ -2320,11 +2535,21 @@ def main():
                         t=t.float(),
                         huber_snr_clamp_max=objective_cfg.loss.huber_snr_clamp_max,
                     )
+                elif use_leap_this_step:
+                    # LeapAlign：两步跳跃自蒸馏（共享 noise，自己的 t_k/t_j，关 TREAD）。
+                    # 替换标准单步 forward+per_sample_loss；pred=None（下游 aux/adaptive 已门控跳过）。
+                    per_sample = leap_training_step(
+                        _leap_fwd, latents, noise, cross, pad_mask, t_k, t_j,
+                        nested_grad_coe=leap_nested_grad_coe,
+                        traj_sim_weighting=leap_traj_sim_weighting,
+                        traj_sim_min=leap_traj_sim_min,
+                    )
+                    pred = None
                 else:
                     pred = forward_with_optional_checkpoint(
                         model, noisy, t.view(-1, 1), cross, pad_mask,
                         use_checkpoint=args.grad_checkpoint,
-                        tread_ratio=_tread_ratio,
+                        tread_ratio=(0.0 if dpo_active else _tread_ratio),
                         tread_start=_tread_start,
                         tread_end=_tread_end,
                     )
@@ -2344,15 +2569,25 @@ def main():
                         weight_map=lwd_w,
                     )
 
+                # ── DPO：用干净的赢家 per_sample(=L_θ(赢)) 直接算配对损失；下方 SFT 额外项/加权全部跳过 ──
+                _dpo_loss = None
+                if dpo_active:
+                    _dpo_loss, per_sample = _dpo_compute_loss(
+                        per_sample, target, noisy, t, t_exp, noise, cross, pad_mask, batch)
+
+                # DPO / leap 都走"特殊主损失"路径：跳过下方所有 SFT 逐样本额外项与 t-加权
+                # （per_sample 已是最终值：DPO=配对损失占位，leap=两步自蒸馏 MSE）。
+                _skip_main_extras = dpo_active or use_leap_this_step
+
                 # GAF（B1）：GAF 步抽每样本梯度→方向信任，更新逐图 EMA。用 ΔFM 之前的干净主
                 # 重建 per_sample；autograd.grad 不污染 .grad、retain_graph 保后续主 backward。
                 # 仅每 gaf_every 步触发（周期摊销）；warmup 内不介入。
-                if gaf_ctrl is not None:
+                if gaf_ctrl is not None and not _skip_main_extras:
                     gaf_ctrl.update_autograd(per_sample, batch.get("images"), global_step)
 
                 # ── inv_loss_ema：EDM2 不确定性加权的解析变体（loss_weighting_scheme）──
                 # 先用原始 per_sample 更新 bin-EMA，再乘权重（ΔFM 项之后单独按 λ 控制）。
-                if loss_bin_ema is not None:
+                if loss_bin_ema is not None and not _skip_main_extras:
                     loss_bin_ema.update(t.float(), per_sample)
                     per_sample = per_sample * loss_bin_ema.weight(t.float()).to(per_sample.dtype)
 
@@ -2361,7 +2596,7 @@ def main():
                 # 不改噪声分布、零额外前向 → 不会重演 Immiscible 的推理斑块问题。
                 # dfm_mode=vecor：负样本改为对 target 的破坏性增强（通道乱序/裁剪缩放），
                 # 不依赖 batch 大小（VeCoR arXiv 2511.18942 部分移植）；dense 路径限定。
-                _dfm_lambda = float(objective_cfg.loss.dfm_lambda or 0.0)
+                _dfm_lambda = 0.0 if _skip_main_extras else float(objective_cfg.loss.dfm_lambda or 0.0)
                 _dfm_mode = str(getattr(args, "dfm_mode", "batch") or "batch")
                 if _dfm_lambda > 0.0 and _dfm_mode == "vecor" and not fit_packed_training:
                     per_sample_neg = vecor_contrastive_neg(
@@ -2385,13 +2620,21 @@ def main():
 
                 # GAF：把逐图方向信任当逐样本 loss 乘子（detached=按方向缩放该样本梯度贡献）。
                 # 每步施加（未建档样本=1.0=不动）；高细节干净图≈1，方向常年不合的脏图被压。
-                if gaf_ctrl is not None:
+                if gaf_ctrl is not None and not _skip_main_extras:
                     _gaf_w = gaf_ctrl.weight_for_batch(
                         batch.get("images"), device=per_sample.device, dtype=per_sample.dtype)
                     if _gaf_w is not None:
                         per_sample = per_sample * _gaf_w
 
-                if sample_accum_enabled:
+                if dpo_active:
+                    # DPO 损失已是配对均值标量；不过 SFT 的 t-加权 / sample 累积路径。
+                    main_loss_per_sample = None
+                    loss = _dpo_loss
+                elif use_leap_this_step:
+                    # leap：per_sample 是两步自蒸馏 MSE，不过 t-加权（scheme 假设 none）；未加权均值。
+                    main_loss_per_sample = None
+                    loss = per_sample.mean()
+                elif sample_accum_enabled:
                     main_loss_per_sample = apply_loss_weighting_per_sample(
                         per_sample, t, objective_cfg.loss, normalize_weights=False
                     )
@@ -2409,7 +2652,7 @@ def main():
             x0_pred = None
             x0_target = None
             aux_total = None
-            if objective_cfg.aux.any_enabled:
+            if objective_cfg.aux.any_enabled and not _skip_main_extras:
                 # Early t-gate：若 batch 内所有样本的 t 都 >= 最大 gate，
                 # 跳过 x₀ recovery（~1.5GB fp32 分配）和全部 aux forward。
                 # 若只有部分样本命中 gate，则只恢复这些样本的 x₀，避免高 t 样本
@@ -2486,8 +2729,8 @@ def main():
                         float(noise.float().std().detach().cpu()),
                         float(target.float().mean().detach().cpu()),
                         float(target.float().std().detach().cpu()),
-                        float(pred.float().mean().detach().cpu()),
-                        float(pred.float().std().detach().cpu()),
+                        (float(pred.float().mean().detach().cpu()) if pred is not None else float("nan")),
+                        (float(pred.float().std().detach().cpu()) if pred is not None else float("nan")),
                         ts_mode,
                         f_shift,
                         sched_shift,
@@ -2508,11 +2751,13 @@ def main():
                     logger.warning(f"debug_first_batches logging failed: {_debug_e}")
 
             if not torch.isfinite(loss):
+                _pred_stats = (
+                    f"pred stats: min={pred.float().min().item():.3e} max={pred.float().max().item():.3e}"
+                    if pred is not None else "pred=None (leap step)"
+                )
                 logger.warning(
                     f"[step {global_step}] Non-finite loss detected ({loss.item()}), "
-                    f"skipping this micro-batch. "
-                    f"pred stats: min={pred.float().min().item():.3e} "
-                    f"max={pred.float().max().item():.3e}"
+                    f"skipping this micro-batch. {_pred_stats}"
                 )
                 # 不要 zero_grad！保留同周期内其他 micro-batch 的梯度，整周期边界统一丢弃。
                 accum_clean = False
@@ -2546,9 +2791,9 @@ def main():
                     del aux_total
                 continue
 
-            if adaptive_ts.enabled and fit_packed_training:
+            if adaptive_ts.enabled and not _skip_main_extras and fit_packed_training:
                 adaptive_ts.update(t.float(), per_sample.detach().float())
-            elif adaptive_ts.enabled:
+            elif adaptive_ts.enabled and not _skip_main_extras:
                 adaptive_signal = adaptive_timestep_metric_signal(
                     per_sample,
                     pred,
@@ -2671,6 +2916,9 @@ def main():
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                # DPO 参考 EMA follow-up：ref_ema<1.0 时朝策略缓慢跟踪；v1（ref_ema=1.0 固定）为 no-op。
+                if dpo_ctrl is not None:
+                    dpo_ctrl.update_reference_ema()
 
                 # ★ 守护 3：优化器状态污染检测（Prodigy 内部 d 变 NaN 会连锁崩溃）
                 if opt_type == "prodigyplus" and global_step % 50 == 0:
@@ -2922,6 +3170,11 @@ def main():
         gaf_ctrl.dump()
         gaf_ctrl.remove_hooks()
         emit(f"[gaf] {gaf_ctrl.summary()}；信任日志 → {gaf_ctrl.log_path}")
+
+    # ★ DPO：收尾 dump 每步 ω'/Δ/margin 诊断 CSV。
+    if dpo_ctrl is not None:
+        dpo_ctrl.dump()
+        emit(f"[dpo] {dpo_ctrl.summary()}；诊断日志 → {dpo_ctrl.log_path}")
 
     # ★ 优雅关闭监控 server，让端口在训练结束后立即被释放（否则连续重启会撞端口）。
     if monitor_server is not None:

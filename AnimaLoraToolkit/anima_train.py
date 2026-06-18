@@ -235,6 +235,7 @@ from trainer.objective import (
     make_noise_from_config,
     _huber_delta_for_t,
     per_sample_loss,
+    eisbach_barrier_weight,
     lwd_saliency_mask,
     vecor_contrastive_neg,
     LossBinEMA,
@@ -254,6 +255,12 @@ from trainer.lora import LoRALayer, LoKrLayer, LoRALinear, LoRAInjector
 from trainer.gaf import GafController
 from trainer.dpo import DpoController
 from trainer.leap import sample_two_timesteps, leap_training_step
+from trainer.ncp import (
+    perceptual_features,
+    ncp_perceptual_loss,
+    reverse_step_latent,
+    frozen_params,
+)
 from trainer.aux_losses import (
     build_aux_loss_config,
     recover_x0_from_velocity,
@@ -609,6 +616,10 @@ def parse_args():
     p.add_argument("--dfm-lambda", type=float, default=0.0,
                    help="Contrastive Flow Matching（ΔFM, arxiv:2506.05350）排斥项权重。0=关闭；"
                         "论文甜点 0.05，≥0.15 易分布塌缩。反'回归条件均值→发灰发雾'，零额外前向。")
+    p.add_argument("--eisbach-lambda", type=float, default=0.0,
+                   help="Eisbach log-barrier（arXiv 2606.07207）逐样本结构置信度加权强度 λ。0=关闭；"
+                        "论文甜点 0.3–0.7，>0.8 多样性崩。从 velocity 输出空间能量熵导出 detached "
+                        "权重（高熵/平坦样本压梯度），sample 轴，与三峰/adaptive 正交，零额外前向、图盲。")
     p.add_argument("--loss-weighting-scheme", default="none",
                    choices=["none", "min_snr", "max_snr_inv", "logit_normal", "sigma_sqrt", "sigma_sqrt_sd3", "detail_inv_t", "cosmap"],
                    help="per-sample loss weighting scheme")
@@ -2013,6 +2024,11 @@ def main():
             params=[p for _, p in trainable_named_params],
             seed=int(getattr(args, "seed", 0) or 0) + 777,
         )
+        # NCP-DPO（arXiv 2406.17636）：把逐样本 latent-MSE 换成冻结 DiT 编码栈特征空间感知距离。
+        # dpo_loss_space=perceptual 开启；沿用 Linear-DPO 包装（仅升级损失空间）。详见 trainer/ncp.py。
+        _ncp_enabled = str(getattr(args, "dpo_loss_space", "latent") or "latent").lower() == "perceptual"
+        _ncp_tap_block = int(getattr(args, "ncp_tap_block", -1))
+        _ncp_dt = float(getattr(args, "ncp_dt", 0.05) or 0.05)
         if not dpo_ctrl.enabled:
             emit("[dpo] 无可训 adapter 参数，DPO 已降级为关。")
             dpo_ctrl = None
@@ -2069,9 +2085,11 @@ def main():
                 )
                 return latent.detach()
 
-            def _dpo_compute_loss(per_sample_w, target, noisy, t, t_exp, noise, cross, pad_mask, batch):
+            def _dpo_compute_loss(per_sample_w, pred_w_full, target, noisy, t, t_exp, noise, cross, pad_mask, batch):
                 """配对 L_DPO：复用赢家 per_sample(=L_θ(赢)) + 输家策略前向(共享 t,ε) + 两次参考前向。
-                返回 (loss_scalar, per_sample_placeholder)。无可用输家时回退零损失（本 micro-batch 不更新）。"""
+                返回 (loss_scalar, per_sample_placeholder)。无可用输家时回退零损失（本 micro-batch 不更新）。
+
+                pred_w_full = 赢家全 batch velocity（主前向 pred）；NCP-DPO(perceptual)需要它建反演 latent。"""
                 keys = [str(k) for k in (batch.get("images") or [])]
                 losers = [dpo_ctrl.pool.get(k) for k in keys]
                 present = [
@@ -2119,6 +2137,37 @@ def main():
                         tread_start=_tread_start, tread_end=_tread_end,
                     )
                     l_ref_l = per_sample_loss(pred_ref_l, target_l, t=t_p.float(), **_loss_kw)
+
+                # ── NCP-DPO（perceptual）：把四个 latent-MSE 项换成冻结编码栈特征空间感知距离 ──
+                # 反演到 t'=t−ncp_dt，过冻结参考前 K block 取中间激活，逐样本特征 MSE 当 L_θ/L_ref。
+                # θ 项梯度经输入回流（frozen_params + 非 no_grad）；真值锚/ref 项 no_grad。详见 trainer/ncp.py。
+                if _ncp_enabled:
+                    pred_w = pred_w_full.index_select(0, idx)
+                    t_prime = (t_p - _ncp_dt).clamp(min=1e-4)
+                    dt_ncp = (t_p - t_prime)
+                    _ncp_params = dpo_ctrl.reference.params
+
+                    def _ncp_feat(x):
+                        return perceptual_features(
+                            model, x, t_prime.view(-1, 1), cross_p, pad_p, _ncp_tap_block)
+
+                    injector.set_current_t(t_prime.float().detach())
+                    with torch.no_grad(), dpo_ctrl.reference_mode():
+                        feat_true_w = _ncp_feat(reverse_step_latent(noisy_w, target_w, dt_ncp)).detach()
+                        feat_true_l = _ncp_feat(reverse_step_latent(noisy_l, target_l, dt_ncp)).detach()
+                        pl_ref_w, _ = ncp_perceptual_loss(
+                            _ncp_feat, noisy_w, pred_ref_w, target_w, dt_ncp, feat_true=feat_true_w)
+                        pl_ref_l, _ = ncp_perceptual_loss(
+                            _ncp_feat, noisy_l, pred_ref_l, target_l, dt_ncp, feat_true=feat_true_l)
+                    with dpo_ctrl.reference_mode(), frozen_params(_ncp_params):
+                        pl_theta_w, _ = ncp_perceptual_loss(
+                            _ncp_feat, noisy_w, pred_w, target_w, dt_ncp, feat_true=feat_true_w)
+                        pl_theta_l, _ = ncp_perceptual_loss(
+                            _ncp_feat, noisy_l, pred_l, target_l, dt_ncp, feat_true=feat_true_l)
+                    injector.set_current_t(t.float().detach())
+                    loss, _info = dpo_ctrl.dpo_loss(pl_theta_w, pl_theta_l, pl_ref_w, pl_ref_l)
+                    return loss, per_sample_w.detach()
+
                 injector.set_current_t(t.float().detach())          # 还原全 batch t（赢家 forward 用过）
                 loss, _info = dpo_ctrl.dpo_loss(l_theta_w, l_theta_l, l_ref_w, l_ref_l)
                 return loss, per_sample_w.detach()
@@ -2127,6 +2176,9 @@ def main():
                  f"regen_every={dpo_ctrl.regen_every} loser(steps={dpo_ctrl.loser_steps},"
                  f"cfg={dpo_ctrl.loser_cfg},subset={dpo_ctrl.loser_subset}) 样本清单={len(dpo_items)} "
                  f"日志→{_dpo_log}")
+            if _ncp_enabled:
+                emit(f"[dpo] NCP-DPO 感知特征空间已启用：tap_block={_ncp_tap_block}(-1=中间块) "
+                     f"ncp_dt={_ncp_dt}（每 DPO 步额外 ~2 个 full-forward 等价的截断编码栈前向）。")
     dpo_active = dpo_ctrl is not None
 
     # ── LeapAlign 两步跳跃自蒸馏（SFT 主目标增强；默认关，零影响）──────────────────
@@ -2569,11 +2621,18 @@ def main():
                         weight_map=lwd_w,
                     )
 
+                # ── InfoNoise(adaptive entropy_rate) 的纯净信号：在任何 sample 轴乘子
+                # (bin_ema / ΔFM / GAF / Eisbach) 之前快照原始重建 per_sample。InfoNoise
+                # (arXiv 2602.18647) 的 conditional-entropy-rate profile 必须从**纯 denoising
+                # loss(MMSE)** 估计；喂被乘过的 per_sample 会腐蚀 I-MMSE 估计。leap/dpo 步此值
+                # 是特殊主损失，但它们 _skip_main_extras → 下方 adaptive_ts.update 本就跳过，无害。
+                _adaptive_raw = per_sample.detach().float()
+
                 # ── DPO：用干净的赢家 per_sample(=L_θ(赢)) 直接算配对损失；下方 SFT 额外项/加权全部跳过 ──
                 _dpo_loss = None
                 if dpo_active:
                     _dpo_loss, per_sample = _dpo_compute_loss(
-                        per_sample, target, noisy, t, t_exp, noise, cross, pad_mask, batch)
+                        per_sample, pred, target, noisy, t, t_exp, noise, cross, pad_mask, batch)
 
                 # DPO / leap 都走"特殊主损失"路径：跳过下方所有 SFT 逐样本额外项与 t-加权
                 # （per_sample 已是最终值：DPO=配对损失占位，leap=两步自蒸馏 MSE）。
@@ -2625,6 +2684,15 @@ def main():
                         batch.get("images"), device=per_sample.device, dtype=per_sample.dtype)
                     if _gaf_w is not None:
                         per_sample = per_sample * _gaf_w
+
+                # ── Eisbach log-barrier（arXiv 2606.07207；默认关 eisbach_lambda=0）──
+                # 从模型 velocity 输出的空间能量熵导出 detached 逐样本权重（sample 轴）：
+                # 高熵(平坦/均值化)样本压梯度、低对比(有结构)样本保。零额外前向、图盲。
+                # 与三峰(t 轴)/adaptive(t 桶重采)正交。dense 路径限定（pred 为网格张量）；
+                # leap/dpo 步 pred=None / 走特殊主损失 → 由 _skip_main_extras 跳过。
+                _eis_lambda = 0.0 if _skip_main_extras else float(objective_cfg.loss.eisbach_lambda or 0.0)
+                if _eis_lambda > 0.0 and pred is not None and not fit_packed_training:
+                    per_sample = per_sample * eisbach_barrier_weight(pred, _eis_lambda).to(per_sample.dtype)
 
                 if dpo_active:
                     # DPO 损失已是配对均值标量；不过 SFT 的 t-加权 / sample 累积路径。
@@ -2792,10 +2860,11 @@ def main():
                 continue
 
             if adaptive_ts.enabled and not _skip_main_extras and fit_packed_training:
-                adaptive_ts.update(t.float(), per_sample.detach().float())
+                # 纯净重建 per_sample（multiplier 之前的快照），不受 ΔFM/Eisbach/GAF/bin_ema 污染
+                adaptive_ts.update(t.float(), _adaptive_raw)
             elif adaptive_ts.enabled and not _skip_main_extras:
                 adaptive_signal = adaptive_timestep_metric_signal(
-                    per_sample,
+                    _adaptive_raw,
                     pred,
                     target,
                     metric=adaptive_ts.metric,

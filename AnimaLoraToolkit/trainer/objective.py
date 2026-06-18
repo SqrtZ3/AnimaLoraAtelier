@@ -101,6 +101,13 @@ class LossConfig:
     # 与 detail_inv_t / 频域 aux loss 功能有重叠，开启时建议互斥消融。
     lwd_enabled: bool = False
     lwd_floor: float = 0.3      # ℓ：平坦区的保底监督下限（论文默认 0.3）
+    # Eisbach log-barrier（arXiv 2606.07207）逐样本结构置信度加权（sample 轴）。
+    #   从模型 velocity 输出的空间能量分布熵导出 detached 权重：高熵(平坦/均值化)样本压
+    #   梯度、低熵(高对比/有细节)样本保。L ← L·((1-λ)+λ·w)，w=1/(1+(-log(1-H_norm)))。
+    #   论证：监督扩散梯度方向锁死真值 → 置信度只缩步长不改方向(图盲安全)。与三峰/min_snr
+    #   (t 轴重加权)正交可叠加；与我们 adaptive 的 entropy_rate(逐 t 桶重采 t 轴)正交。
+    #   0=关；论文甜点 λ≈0.3–0.7，λ>0.8 多样性崩。零额外前向、纯 latent 标量(图盲)。
+    eisbach_lambda: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -148,6 +155,7 @@ def build_training_objective_config(args) -> TrainingObjectiveConfig:
             dfm_lambda=float(getattr(args, "dfm_lambda", 0.0) or 0.0),
             lwd_enabled=bool(getattr(args, "lwd_mask_enabled", False)),
             lwd_floor=float(getattr(args, "lwd_mask_floor", 0.3) or 0.3),
+            eisbach_lambda=float(getattr(args, "eisbach_lambda", 0.0) or 0.0),
         ),
         aux=build_aux_loss_config(args),
     )
@@ -706,6 +714,53 @@ def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "
         return num / den
 
     return loss_map.view(loss_map.shape[0], -1).mean(dim=1)
+
+
+def eisbach_barrier_weight(pred: torch.Tensor, lam: float,
+                           mask: torch.Tensor | None = None,
+                           eps: float = 1e-6) -> torch.Tensor:
+    """Eisbach log-barrier 逐样本权重（arXiv 2606.07207，sample 轴结构置信度门）。
+
+    pred: 模型 velocity 输出，dense 形状 (B, C, T, H, W)。把音频域的"时间能量分布"换成
+    图像域的"空间能量分布"（论文 §10 标注为开放问题，由 λ 旋钮承担尺度敏感性）：
+
+      e   = (1/C)·Σ_c pred²            # 逐空间位置能量谱   (Eq.1)
+      p   = softmax(e)                 # 信念分布 over 位置  (Eq.2)
+      H   = -Σ p·log p / log(M)        # 归一化熵 ∈ [0,1]   (Eq.3)
+      w   = 1/(1 + (-log(1-H)))        # 障碍 → 权重 ∈ (0,1] (Eq.4)
+      out = (1-λ) + λ·w                # 缩放因子           (Eq.5)
+
+    H→0(尖锐/有结构) → w→1(全梯度)；H→1(弥散/平坦) → w→0(阻尼)。**整体 detach**：
+    它只缩 step size、不改梯度方向（监督扩散方向锁死真值 → 安全），所以是逐样本 loss 乘子。
+    `(1-λ)` 是论文的插值地板，保证再平坦的样本也有保底监督、训练早期不停滞。
+
+    mask: 可选 (B,1,T,H,W) / 可广播；只在有效位置上算能量分布（FiT/掩码场景；默认全图）。
+    返回逐样本权重向量 [B]（detached，无梯度）。
+    """
+    lam = float(lam)
+    o = pred.detach().float()
+    b = o.shape[0]
+    e = o.pow(2).mean(dim=1)                      # (B, T, H, W) 通道折叠成能量谱
+    e = e.reshape(b, -1)                          # (B, M)
+    if mask is not None:
+        m = mask.detach().float()
+        # 折叠通道后与 e 对齐：取任一通道的掩码（mask 在通道上恒定）
+        if m.shape[1] != 1 and m.ndim == o.ndim:
+            m = m[:, :1]
+        m = m.reshape(b, -1).expand_as(e)
+        # 无效位置不参与 softmax：减大常数 → exp≈0
+        e = e.masked_fill(m <= 0, float("-inf"))
+        m_cnt = (m > 0).reshape(b, -1).sum(dim=1).clamp(min=2.0)
+    else:
+        m_cnt = torch.full((b,), float(e.shape[1]), device=e.device, dtype=e.dtype)
+    p = torch.softmax(e, dim=1)                   # (B, M)
+    log_p = torch.log(p.clamp_min(eps))
+    ent = -(p * log_p).sum(dim=1)                 # 自然对数熵
+    h_norm = (ent / torch.log(m_cnt.clamp_min(2.0))).clamp(0.0, 1.0)
+    barrier = -torch.log((1.0 - h_norm).clamp_min(eps))   # [0, ∞)
+    w = 1.0 / (1.0 + barrier)                     # (0, 1]
+    out = (1.0 - lam) + lam * w
+    return out.detach()
 
 
 def masked_token_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,

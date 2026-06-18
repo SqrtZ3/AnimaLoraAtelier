@@ -227,6 +227,7 @@ YAML_TO_ARGS = {
     "huber_schedule": "huber_schedule",
     "huber_snr_clamp_max": "huber_snr_clamp_max",
     "dfm_lambda": "dfm_lambda",
+    "eisbach_lambda": "eisbach_lambda",
     "noise_offset": "noise_offset",
     "noise_offset_min": "noise_offset_min",
     "noise_offset_random_strength": "noise_offset_random_strength",
@@ -299,6 +300,10 @@ YAML_TO_ARGS = {
     "dpo_sft_anchor_lambda": "dpo_sft_anchor_lambda",
     "dpo_share_noise": "dpo_share_noise",
     "dpo_log_path": "dpo_log_path",
+    # NCP-DPO（arXiv 2406.17636）：感知特征空间损失（默认 latent = 原 Linear-DPO）见 trainer/ncp.py
+    "dpo_loss_space": "dpo_loss_space",
+    "ncp_tap_block": "ncp_tap_block",
+    "ncp_dt": "ncp_dt",
     # ── LeapAlign 两步跳跃自蒸馏（SFT 主目标增强；默认关）见 trainer/leap.py ──
     "leap_enabled": "leap_enabled",
     "leap_ratio": "leap_ratio",
@@ -476,6 +481,7 @@ DEFAULTS = {
     "huber_schedule": "constant",
     "huber_snr_clamp_max": 10.0,
     "dfm_lambda": 0.0,
+    "eisbach_lambda": 0.0,
     "noise_offset": 0.0,
     "noise_offset_min": 0.0,
     "noise_offset_random_strength": False,
@@ -542,6 +548,12 @@ DEFAULTS = {
     "dpo_sft_anchor_lambda": 0.0,
     "dpo_share_noise": True,
     "dpo_log_path": "",
+    # NCP-DPO（默认 latent = 原 Linear-DPO，零改动）。perceptual = 冻结编码栈特征空间。
+    # ncp_tap_block: 取第几个 block 后的中间激活当感知特征；-1=自动取中间块 n//2。
+    # ncp_dt: flow-matching 一步反演步长 t−t'（论文 t'=t−1 的连续类比）。
+    "dpo_loss_space": "latent",
+    "ncp_tap_block": -1,
+    "ncp_dt": 0.05,
     # LeapAlign 两步跳跃自蒸馏（默认关）。leap_ratio<1.0 = hybrid（非 leap 步保留三峰/
     # adaptive/aux/ΔFM，leap 步做轨迹蒸馏）；=1.0 = 纯 leap（adaptive_timestep 会变惰性）。
     "leap_enabled": False,

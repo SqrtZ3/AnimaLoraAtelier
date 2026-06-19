@@ -266,6 +266,11 @@ YAML_TO_ARGS = {
     "aux_spectral_use_wavelet": "aux_spectral_use_wavelet",
     "aux_spectral_wavelet_lambda": "aux_spectral_wavelet_lambda",
     "aux_spectral_t_gate": "aux_spectral_t_gate",
+    "aux_self_perceptual_enabled": "aux_self_perceptual_enabled",
+    "aux_self_perceptual_lambda": "aux_self_perceptual_lambda",
+    "aux_self_perceptual_t_gate": "aux_self_perceptual_t_gate",
+    "aux_self_perceptual_tap_block": "aux_self_perceptual_tap_block",
+    "aux_self_perceptual_encode_t": "aux_self_perceptual_encode_t",
     "aux_perceptual_enabled": "aux_perceptual_enabled",
     "aux_perceptual_lambda_lpips": "aux_perceptual_lambda_lpips",
     "aux_perceptual_lambda_dino": "aux_perceptual_lambda_dino",
@@ -522,6 +527,15 @@ DEFAULTS = {
     "aux_perceptual_cache_dir": "",
     "aux_perceptual_use_checkpoint": True,
     "aux_perceptual_lpips_size": 0,
+    # Self-Perceptual SFT（arXiv 2401.00110，默认关 → no-op）。冻结 DiT 编码栈特征空间距离，
+    # 罚"糊/不像"（均值回归）比 latent-MSE 狠。复用 ncp.perceptual_features（编码器=当前模型、
+    # adapter 冻梯度）；λ 起 0.05–0.1 且开训看日志标定（特征空间量纲未知，目标 ≈ 主 loss 的 10–30%）。
+    # ★与 eisbach 的低 t 偏置有交互：t_gate 偏低会和 Eisbach 一起往低 t 堆 → 盯构图丰富度别被压回。
+    "aux_self_perceptual_enabled": False,
+    "aux_self_perceptual_lambda": 0.1,
+    "aux_self_perceptual_t_gate": 0.5,
+    "aux_self_perceptual_tap_block": -1,
+    "aux_self_perceptual_encode_t": 0.05,
     # GAF 梯度一致性过滤（默认关 → 完全 no-op）
     "gaf_enabled": False,
     "gaf_every": 4,

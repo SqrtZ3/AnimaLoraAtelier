@@ -77,9 +77,21 @@ class AuxLossConfig:
     #   捕获纹理/细节相似度，对 1024 原图的差异不明显。
     perceptual_lpips_size: int = 0
 
+    # ---- Self-Perceptual SFT (arXiv 2401.00110) ----
+    # 冻结 DiT 编码栈特征空间距离 ‖f(x0_pred) − f(x0_target)‖²，当带 t_gate 的 SFT 辅助项叠进
+    # 主 loss。复用 trainer/ncp.py:perceptual_features（编码器=当前模型、adapter 冻梯度），
+    # 零外部模型/无 VAE decode（图盲、廉价：每步 +1~2 截断编码栈前向）。罚均值回归（"不够像"）。
+    self_perceptual_enabled: bool = False
+    self_perceptual_lambda: float = 0.1
+    self_perceptual_t_gate: float = 0.5
+    # tap_block：<0 自动取中间块 n//2（画风带）。越小越浅 = 更省/更偏结构-几何；越大 = 更画风特异。
+    self_perceptual_tap_block: int = -1
+    # encode_t：编码 clean x0 时喂给 DiT 的 timestep（贴数据端、留在训练域 [t_min,1] 内，默认 0.05）。
+    self_perceptual_encode_t: float = 0.05
+
     @property
     def any_enabled(self) -> bool:
-        return self.spectral_enabled or self.perceptual_enabled
+        return self.spectral_enabled or self.perceptual_enabled or self.self_perceptual_enabled
 
     @property
     def needs_vae_decoder(self) -> bool:
@@ -103,6 +115,11 @@ def build_aux_loss_config(args) -> AuxLossConfig:
         perceptual_cache_dir=str(getattr(args, "aux_perceptual_cache_dir", "") or ""),
         perceptual_use_checkpoint=bool(getattr(args, "aux_perceptual_use_checkpoint", True)),
         perceptual_lpips_size=int(getattr(args, "aux_perceptual_lpips_size", 0) or 0),
+        self_perceptual_enabled=bool(getattr(args, "aux_self_perceptual_enabled", False)),
+        self_perceptual_lambda=float(getattr(args, "aux_self_perceptual_lambda", 0.1) or 0.0),
+        self_perceptual_t_gate=float(getattr(args, "aux_self_perceptual_t_gate", 0.5) or 0.5),
+        self_perceptual_tap_block=int(getattr(args, "aux_self_perceptual_tap_block", -1)),
+        self_perceptual_encode_t=float(getattr(args, "aux_self_perceptual_encode_t", 0.05) or 0.05),
     )
 
 
@@ -575,5 +592,12 @@ def summary_aux_loss_config(cfg: AuxLossConfig) -> str:
             f"λ_dino={cfg.perceptual_lambda_dino:.3f},"
             f"gate={cfg.perceptual_t_gate:.2f},"
             f"net={cfg.perceptual_lpips_net})"
+        )
+    if cfg.self_perceptual_enabled:
+        parts.append(
+            f"self_perceptual(λ={cfg.self_perceptual_lambda:.3f},"
+            f"gate={cfg.self_perceptual_t_gate:.2f},"
+            f"tap={cfg.self_perceptual_tap_block},"
+            f"enc_t={cfg.self_perceptual_encode_t:.3f})"
         )
     return " + ".join(parts) if parts else "disabled"

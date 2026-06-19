@@ -27,6 +27,7 @@ from trainer.ncp import (  # noqa: E402
     ncp_perceptual_loss,
     frozen_params,
     resolve_tap_block,
+    self_perceptual_per_sample,
 )
 
 
@@ -141,6 +142,56 @@ def test_resolve_tap_block():
     assert resolve_tap_block(28, 0) == 0
 
 
+# --------------------------------------------------------------------------- #
+# self_perceptual_per_sample (SFT aux term, arXiv 2401.00110)
+# --------------------------------------------------------------------------- #
+def test_self_perceptual_shape_and_nonneg():
+    feat_p = torch.randn(4, 3, 8, 8)
+    feat_t = torch.randn(4, 3, 8, 8)
+    t = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    out = self_perceptual_per_sample(feat_p, feat_t, t, t_gate=0.5)
+    assert out.shape == (4,)
+    assert torch.all(out >= 0)
+    assert out.dtype == torch.float32
+
+
+def test_self_perceptual_exactness():
+    """identical features → loss ≈ 0 (validates feature_mse reuse)."""
+    feat = torch.randn(3, 16, 4, 4)
+    t = torch.tensor([0.1, 0.2, 0.3])
+    out = self_perceptual_per_sample(feat, feat.clone(), t, t_gate=0.9)
+    assert torch.allclose(out, torch.zeros(3), atol=1e-6), out
+
+
+def test_self_perceptual_t_gate_zeros_high_t():
+    """Samples with t >= t_gate contribute exactly 0; low-t ones are nonzero."""
+    feat_p = torch.randn(4, 8, 4, 4)
+    feat_t = torch.randn(4, 8, 4, 4)
+    t = torch.tensor([0.1, 0.4, 0.6, 0.9])   # gate 0.5 → first two active, last two gated
+    out = self_perceptual_per_sample(feat_p, feat_t, t, t_gate=0.5)
+    assert torch.all(out[:2] > 0)
+    assert torch.all(out[2:] == 0)
+
+
+def test_self_perceptual_all_gated():
+    feat_p = torch.randn(2, 8, 4, 4)
+    feat_t = torch.randn(2, 8, 4, 4)
+    t = torch.tensor([0.7, 0.95])
+    out = self_perceptual_per_sample(feat_p, feat_t, t, t_gate=0.5)
+    assert torch.all(out == 0)
+
+
+def test_self_perceptual_grad_only_through_pred():
+    """Gradient flows to the predicted features; the target anchor must be detached."""
+    feat_p = torch.randn(4, 8, 4, 4, requires_grad=True)
+    feat_t = torch.randn(4, 8, 4, 4, requires_grad=True)
+    t = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    out = self_perceptual_per_sample(feat_p, feat_t.detach(), t, t_gate=0.5)
+    out.sum().backward()
+    assert feat_p.grad is not None and torch.any(feat_p.grad != 0)
+    assert feat_t.grad is None
+
+
 if __name__ == "__main__":
     test_reverse_step_scalar()
     test_reverse_step_per_sample_dt()
@@ -151,4 +202,9 @@ if __name__ == "__main__":
     test_frozen_params_blocks_param_grad_keeps_input_grad()
     test_frozen_params_restores_mixed_flags()
     test_resolve_tap_block()
+    test_self_perceptual_shape_and_nonneg()
+    test_self_perceptual_exactness()
+    test_self_perceptual_t_gate_zeros_high_t()
+    test_self_perceptual_all_gated()
+    test_self_perceptual_grad_only_through_pred()
     print("test_ncp: all passed")

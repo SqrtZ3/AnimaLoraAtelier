@@ -260,6 +260,7 @@ from trainer.ncp import (
     ncp_perceptual_loss,
     reverse_step_latent,
     frozen_params,
+    self_perceptual_per_sample,
 )
 from trainer.aux_losses import (
     build_aux_loss_config,
@@ -2729,6 +2730,7 @@ def main():
                 _max_gate = max(
                     _aux.spectral_t_gate if _aux.spectral_enabled else 0.0,
                     _aux.perceptual_t_gate if _aux.perceptual_enabled else 0.0,
+                    _aux.self_perceptual_t_gate if _aux.self_perceptual_enabled else 0.0,
                 )
                 _aux_active = t.float() < _max_gate
                 _any_below_gate = _aux_active.any().item()
@@ -2769,6 +2771,57 @@ def main():
                         else:
                             l_perc = perceptual_module(x0_pred, x0_target, t_aux)
                             aux_total = aux_total + l_perc
+
+                    # ── Self-Perceptual SFT（arXiv 2401.00110）──────────────────────
+                    # 冻结编码栈特征空间度量 x0_pred ↔ 真 x0，罚"糊/不像"（forward-KL 均值回归）。
+                    # 复用 NCP 的 perceptual_features + frozen_params：编码器 = 当前模型（adapter 冻
+                    # 梯度、非 no_grad），梯度只经输入 x0_pred 回流 v_θ（不训练编码器→不能作弊）；真值锚
+                    # no_grad。clean x0 在 encode_t 处过编码栈；T-LoRA 用 set_current_t 切到 encode_t
+                    # 再还原（不 checkpoint，避免 recompute 时 current_t 错位，与 NCP 路径一致）。
+                    if _aux.self_perceptual_enabled:
+                        _sp_tap = int(_aux.self_perceptual_tap_block)
+                        _cross_aux = cross.index_select(0, _aux_idx)
+                        _pad_aux = (
+                            pad_mask.index_select(0, _aux_idx) if pad_mask is not None else None
+                        )
+                        _t_enc = torch.full(
+                            (x0_pred.shape[0],), float(_aux.self_perceptual_encode_t),
+                            device=x0_pred.device, dtype=torch.float32,
+                        )
+                        _x0p_enc = x0_pred.to(dtype)
+                        _x0t_enc = x0_target.to(dtype)
+                        _sp_params = [p for _, p in trainable_named_params]
+                        injector.set_current_t(_t_enc)
+                        try:
+                            with torch.autocast("cuda", dtype=dtype):
+                                with torch.no_grad():
+                                    _feat_t = perceptual_features(
+                                        model, _x0t_enc, _t_enc.view(-1, 1),
+                                        _cross_aux, _pad_aux, _sp_tap,
+                                    ).detach()
+                                with frozen_params(_sp_params):
+                                    _feat_p = perceptual_features(
+                                        model, _x0p_enc, _t_enc.view(-1, 1),
+                                        _cross_aux, _pad_aux, _sp_tap,
+                                    )
+                        finally:
+                            injector.set_current_t(t.float().detach())
+                        l_sp_vec = self_perceptual_per_sample(
+                            _feat_p, _feat_t, t_aux, _aux.self_perceptual_t_gate,
+                        )
+                        if sample_accum_enabled:
+                            aux_total = aux_total + (
+                                float(_aux.self_perceptual_lambda) * l_sp_vec.sum()
+                                / float(effective_batch_size)
+                            )
+                        else:
+                            _sp_denom = (
+                                (t_aux.float() < float(_aux.self_perceptual_t_gate))
+                                .sum().clamp(min=1).to(l_sp_vec.dtype)
+                            )
+                            aux_total = aux_total + (
+                                float(_aux.self_perceptual_lambda) * l_sp_vec.sum() / _sp_denom
+                            )
 
                     loss = loss + aux_total.to(loss.dtype)
 

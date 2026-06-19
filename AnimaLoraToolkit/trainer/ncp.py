@@ -53,6 +53,26 @@ def feature_mse(feat_a: torch.Tensor, feat_b: torch.Tensor) -> torch.Tensor:
     return diff.reshape(diff.shape[0], -1).pow(2).mean(dim=1)
 
 
+def self_perceptual_per_sample(feat_pred: torch.Tensor, feat_target: torch.Tensor,
+                               t: torch.Tensor, t_gate: float) -> torch.Tensor:
+    """逐样本 self-perceptual SFT 损失（arXiv 2401.00110《Diffusion Model with Perceptual Loss》）。
+
+    在**冻结 DiT 编码栈特征空间**度量 predicted x0 与真实 x0 的距离 —— 特征空间里"糊/不像"
+    （= forward-KL 均值回归的可见症状）被罚得比 latent-MSE 狠。与 NCP-DPO（同 `perceptual_features`）
+    同源，但这里是 **SFT 主损失的辅助项**而非偏好优化，不 pin 单图 → 去掉了 leap 的杀脸伤。
+
+    仅 t < t_gate 的样本参与（高 t 下 x0_pred 偏差大、特征无意义），其余置 0（与
+    `spectral_loss_per_sample` 同约定，便于上层按 active 数或 effective_batch_size 归一）。
+    feat_pred 携带梯度（经输入 x0_pred 回流到 v_θ）；feat_target 必须已 detach。返回 [B]。
+    """
+    out = feat_pred.new_zeros((feat_pred.shape[0],), dtype=torch.float32)
+    active = t.float() < float(t_gate)
+    if not bool(active.any()):
+        return out
+    pl = feature_mse(feat_pred, feat_target)  # [B], fp32
+    return torch.where(active, pl, out)
+
+
 def ncp_perceptual_loss(feature_fn, x_t, v_pred, v_true, dt, *, feat_true=None):
     """逐样本感知损失 PL = ‖f(x_t−dt·v_pred) − f(x_t−dt·v_true)‖²。
 

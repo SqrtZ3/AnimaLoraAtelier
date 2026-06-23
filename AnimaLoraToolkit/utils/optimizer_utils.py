@@ -687,33 +687,6 @@ def create_prodigyplus_optimizer(
 
 
 # =============================================================================
-# 参数分组（LoKr 专用：w1 不做 weight_decay）
-# =============================================================================
-
-def create_optimizer_grouped_parameters(
-    model: nn.Module,
-    weight_decay: float,
-    no_decay_modules: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    if no_decay_modules is None:
-        no_decay_modules = ["bias", "LayerNorm.weight", "layernorm.weight", "norm.weight"]
-
-    decay_params, no_decay_params = [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if any(pat in name for pat in no_decay_modules):
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
-
-    return [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-
-
-# =============================================================================
 # 信息查询
 # =============================================================================
 

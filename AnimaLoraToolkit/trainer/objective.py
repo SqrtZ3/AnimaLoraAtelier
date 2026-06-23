@@ -624,6 +624,26 @@ def _huber_delta_for_t(t: torch.Tensor | None, huber_c: float, schedule: str,
     return delta
 
 
+def _huber_loss_map(err: torch.Tensor, delta_t: torch.Tensor, smooth_l1: bool) -> torch.Tensor:
+    """Huber / smooth-L1 元素级 loss map（dense 与 packed-token 两条路径共用）。
+
+    smooth_l1=False → Huber：err<δ 时 0.5·err²，否则 δ·(err-0.5δ)
+    smooth_l1=True  → smooth-L1：err<δ 时 0.5·err²/δ，否则 err-0.5δ
+    两条路径的差异只在 δ 的形状准备上，这里的 torch.where 表达式逐 bit 一致。
+    """
+    if smooth_l1:
+        return torch.where(
+            err < delta_t,
+            0.5 * err.square() / delta_t,
+            err - 0.5 * delta_t,
+        )
+    return torch.where(
+        err < delta_t,
+        0.5 * err.square(),
+        delta_t * (err - 0.5 * delta_t),
+    )
+
+
 def lwd_saliency_mask(latents: torch.Tensor, t: torch.Tensor, floor: float = 0.3) -> torch.Tensor:
     """LWD（arXiv 2506.00433）小波能量显著性 time-gated 掩码。
 
@@ -691,18 +711,7 @@ def per_sample_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "
             delta_t = torch.tensor(float(delta), device=err.device, dtype=err.dtype)
         else:
             delta_t = delta.to(device=err.device, dtype=err.dtype)
-        if loss_type == "huber":
-            loss_map = torch.where(
-                err < delta_t,
-                0.5 * err.square(),
-                delta_t * (err - 0.5 * delta_t),
-            )
-        else:
-            loss_map = torch.where(
-                err < delta_t,
-                0.5 * err.square() / delta_t,
-                err - 0.5 * delta_t,
-            )
+        loss_map = _huber_loss_map(err, delta_t, loss_type == "smooth_l1")
     else:
         logger.warning(f"Unknown loss_type={loss_type!r}; falling back to mse")
         loss_map = F.mse_loss(pred_f, target_f, reduction="none")
@@ -790,18 +799,7 @@ def masked_token_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tens
             if delta_t.ndim > 1:
                 delta_t = delta_t.reshape(delta_t.shape[0], -1).mean(dim=1)
             delta_t = delta_t.view(-1, 1, 1)
-        if loss_type == "huber":
-            loss_map = torch.where(
-                err < delta_t,
-                0.5 * err.square(),
-                delta_t * (err - 0.5 * delta_t),
-            )
-        else:
-            loss_map = torch.where(
-                err < delta_t,
-                0.5 * err.square() / delta_t,
-                err - 0.5 * delta_t,
-            )
+        loss_map = _huber_loss_map(err, delta_t, loss_type == "smooth_l1")
     else:
         logger.warning(f"Unknown loss_type={loss_type!r}; falling back to mse")
         loss_map = F.mse_loss(pred_f, target_f, reduction="none")

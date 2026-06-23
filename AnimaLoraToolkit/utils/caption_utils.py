@@ -7,7 +7,6 @@ Caption 处理工具
 import json
 import random
 from pathlib import Path
-from typing import Optional
 
 
 def load_caption_json(json_path: Path) -> dict | None:

@@ -1806,19 +1806,28 @@ class CachedLatentDataset(Dataset):
         return {"latent": latent, "caption": caption, "image": str(sample["image"])}
 
 
+def _require_uniform_batch_shape(batch, key, message, detail_key="shape"):
+    """诊断守卫：同一 batch 内 ``b[key]`` 形状必须一致，否则说明分桶失效并抛出。
+
+    BucketBatchSampler 应已按 bucket 分组；出现混合尺寸时把每个样本的形状打进
+    错误信息便于定位。形状一致时直接返回，调用方继续正常 collate（行为不变）。
+    """
+    shapes = [tuple(b[key].shape) for b in batch]
+    if len(set(shapes)) <= 1:
+        return
+    details = [
+        f"  - {b.get('image', '?')}: {detail_key}={tuple(b[key].shape)}"
+        for b in batch
+    ]
+    raise RuntimeError(message + "\nBatch 内容:\n" + "\n".join(details))
+
+
 def collate_fn(batch):
     """DataLoader collate"""
-    shapes = [tuple(b["pixel_values"].shape) for b in batch]
-    if len(set(shapes)) > 1:
-        # 诊断信息：BucketBatchSampler 应该已按 bucket 分组，出现混合尺寸说明分桶失效
-        details = [
-            f"  - {b.get('image', '?')}: shape={tuple(b['pixel_values'].shape)}"
-            for b in batch
-        ]
-        raise RuntimeError(
-            "[collate_fn] 同一 batch 出现不同尺寸张量，BucketBatchSampler 分桶失效。\n"
-            "Batch 内容:\n" + "\n".join(details)
-        )
+    _require_uniform_batch_shape(
+        batch, "pixel_values",
+        "[collate_fn] 同一 batch 出现不同尺寸张量，BucketBatchSampler 分桶失效。",
+    )
     pixels = torch.stack([b["pixel_values"] for b in batch])
     captions = [b["caption"] for b in batch]
     images = [b.get("image", "") for b in batch]
@@ -1835,17 +1844,12 @@ def collate_fn_cached_fit(batch):
     preserved through the latent cache in this mode (warned at setup); for
     alpha-masked datasets use the non-cached FiT path.
     """
-    shapes = [tuple(b["latent"].shape) for b in batch]
-    if len(set(shapes)) > 1:
-        details = [
-            f"  - {b.get('image', '?')}: latent_shape={tuple(b['latent'].shape)}"
-            for b in batch
-        ]
-        raise RuntimeError(
-            "[collate_fn_cached_fit] 同一 batch 出现不同 latent 尺寸，token_bucket 的"
-            "单一网格分批失效（应由 BucketBatchSampler 按精确桶尺寸分组）。\nBatch 内容:\n"
-            + "\n".join(details)
-        )
+    _require_uniform_batch_shape(
+        batch, "latent",
+        "[collate_fn_cached_fit] 同一 batch 出现不同 latent 尺寸，token_bucket 的"
+        "单一网格分批失效（应由 BucketBatchSampler 按精确桶尺寸分组）。",
+        detail_key="latent_shape",
+    )
     latents = torch.stack([b["latent"] for b in batch])  # [B, C, T, h, w]
     h, w = int(latents.shape[-2]), int(latents.shape[-1])
     latent_mask = torch.ones(len(batch), 1, h, w, dtype=torch.float32)
@@ -1897,16 +1901,11 @@ def collate_fn_fit_packed(batch):
 
 def collate_fn_cached(batch):
     """DataLoader collate for cached latents"""
-    shapes = [tuple(b["latent"].shape) for b in batch]
-    if len(set(shapes)) > 1:
-        details = [
-            f"  - {b.get('image', '?')}: latent_shape={tuple(b['latent'].shape)}"
-            for b in batch
-        ]
-        raise RuntimeError(
-            "[collate_fn_cached] 同一 batch 出现不同 latent 尺寸，BucketBatchSampler 分桶失效。\n"
-            "Batch 内容:\n" + "\n".join(details)
-        )
+    _require_uniform_batch_shape(
+        batch, "latent",
+        "[collate_fn_cached] 同一 batch 出现不同 latent 尺寸，BucketBatchSampler 分桶失效。",
+        detail_key="latent_shape",
+    )
     latents = torch.stack([b["latent"] for b in batch])
     captions = [b["caption"] for b in batch]
     images = [b.get("image", "") for b in batch]

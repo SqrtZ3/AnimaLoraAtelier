@@ -541,6 +541,11 @@ class SOAPScheduleFree(SOAP):
         Optimizer.__init__(self, params, defaults)
         self._data_format = data_format
         self._precond_in_state = bool(precond_in_state)
+        # Opt-in telemetry: when True, step() stashes the per-param applied update
+        # norm into state["_upd_norm"] so trainer/telemetry.py can read the
+        # update:grad trust ratio without touching the hot path otherwise. Default
+        # off — costs one .norm() per param per step only when explicitly enabled.
+        self._telemetry = False
 
     # -- Schedule-Free preconditioner update: identical to SOAP's GG/Q refresh
     #    but without any exp_avg (first moment) projection, since SF has none.
@@ -683,6 +688,10 @@ class SOAPScheduleFree(SOAP):
                     )
                 if group["normalize_grads"]:
                     update = update / (update.pow(2).mean().sqrt() + 1e-30)
+
+                if self._telemetry:
+                    # Adaptive (pre-weight-decay) update norm for the trust-ratio probe.
+                    state["_upd_norm"] = float(update.detach().norm())
 
                 # Schedule-Free in-place y/z update (fp32), then cast y back to param dtype.
                 y = param.detach().float()

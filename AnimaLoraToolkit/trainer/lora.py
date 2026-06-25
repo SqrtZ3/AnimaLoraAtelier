@@ -654,6 +654,8 @@ class LoRAInjector:
         self.dropout = dropout
         self.use_lokr = use_lokr
         self.factor = factor
+        # 完整训练配置快照；save() 时整体写进 safetensors metadata（成品自描述 / 防云端 yaml 丢失）。
+        self.training_metadata: dict = {}
         self.lora_variant = (lora_variant or "base").lower()
         if self.lora_variant not in ("base", "dora", "tlora"):
             raise ValueError(f"Unknown lora_variant: {lora_variant}")
@@ -1110,13 +1112,48 @@ class LoRAInjector:
             sd[key] = tensor.detach().cpu()
         return sd
 
+    def set_training_metadata(self, config) -> None:
+        """记录完整训练配置快照（通常传 `vars(args)`）。save() 时整体写进成品 metadata。
+
+        只做浅拷贝；值的 JSON 友好降级延后到 save() 时（json.dumps default=str）。
+        以 `_` 开头的私有键跳过。无副作用，调用失败不应影响训练。
+        """
+        try:
+            self.training_metadata = {
+                str(k): v for k, v in dict(config or {}).items() if not str(k).startswith("_")
+            }
+        except Exception as e:
+            logger.warning(f"训练配置快照失败（忽略）: {e}")
+            self.training_metadata = {}
+
+    def _augment_meta_with_config(self, meta: dict) -> dict:
+        """把完整训练配置以单个 JSON 字符串写进 safetensors metadata。
+
+        key=`anima_training_config`（JSON），`anima_config_schema=v1`。safetensors 要求
+        metadata 值全为 str；非 JSON 可序列化的值由 default=str 降级。空快照时原样返回。
+        """
+        if not self.training_metadata:
+            return meta
+        import json
+        try:
+            blob = json.dumps(self.training_metadata, ensure_ascii=False,
+                              sort_keys=True, default=str)
+        except Exception as e:
+            logger.warning(f"训练配置 metadata 序列化失败，跳过全参快照: {e}")
+            return meta
+        out = dict(meta)
+        out["anima_training_config"] = blob
+        out["anima_config_schema"] = "v1"
+        return out
+
     def save(self, path, model=None):
         """保存为 safetensors (ComfyUI 兼容)"""
         from safetensors.torch import save_file
 
         if self.dora_export_mode == "merged_model":
             sd = self._merged_model_state_dict(model)
-            save_file(sd, path, metadata={"format": "anima_merged_transformer"})
+            save_file(sd, path, metadata=self._augment_meta_with_config(
+                {"format": "anima_merged_transformer"}))
             logger.info(f"合并模型保存到: {path}")
             return
 
@@ -1127,7 +1164,7 @@ class LoRAInjector:
                 "ss_network_module": "diff",
                 "anima_export_mode": "diff",
             }
-            save_file(sd, path, metadata=meta)
+            save_file(sd, path, metadata=self._augment_meta_with_config(meta))
             logger.info(f"LoRA diff 保存到: {path}")
             return
 
@@ -1185,7 +1222,7 @@ class LoRAInjector:
                         "Compatible with loaders that read lambda_layer directly."
                     )
 
-        save_file(sd, path, metadata=meta)
+        save_file(sd, path, metadata=self._augment_meta_with_config(meta))
         if self.lora_variant == "tlora" and self.use_lokr:
             logger.warning(
                 f"⚠ LoKr+T-LoRA 实验性 checkpoint 已保存到 {path}（满 rank 烘焙；"

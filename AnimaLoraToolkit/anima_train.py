@@ -570,6 +570,28 @@ def parse_args():
     p.add_argument("--timestep-stratified", action="store_true",
                    help="batch 内 t 分位数分层采样（VDM 低差异思想）：消除小 batch 撞同一噪声段的"
                         "梯度噪声尖峰，对任意采样分布零开销生效。")
+    # CSFlow（arXiv 2606.08833）：timestep_sampling=csflow 时启用；用数据集功率谱×人眼CSF 偏置 t 采样
+    p.add_argument("--csflow-rapsd-path", type=str, default="",
+                   help="CSFlow 数据集功率谱档路径（先跑 tools/compute_rapsd.py 生成）。"
+                        "timestep_sampling=csflow 时必填；零额外前向。")
+    p.add_argument("--csflow-alpha", type=float, default=1.0,
+                   help="CSFlow 权重与均匀基底的插值 α；1.0=纯 CSFlow（替换三峰 A/B 推荐），0=退化均匀。")
+    p.add_argument("--csflow-pixels-per-degree", type=float, default=50.0,
+                   help="像素→cycles/degree 映射，控制 CSF 峰落在哪个归一化频率（默认 50→峰≈中频）。")
+    # 训练内遥测总线（trainer/telemetry.py）：图盲、复用现有 forward/优化器 state、默认全关。
+    p.add_argument("--telemetry-enabled", action="store_true",
+                   help="开启训练内遥测总线（图盲）。各探针仍需各自 cadence 开关；L1/L2 频带探针随 "
+                        "eval（eval_every>0）一起跑，写 eval_freq_loss.csv / eval_slope.csv。")
+    p.add_argument("--telemetry-freq-bands", type=int, default=3,
+                   help="L1 径向频带数（残差 FFT 按径向分带），默认 3=低/中/高。")
+    p.add_argument("--telemetry-slope-window", type=int, default=6,
+                   help="L2 逐 t-bin 饱和斜率的滑窗 eval 点数（最小二乘 Δloss/step）。")
+    p.add_argument("--telemetry-optimizer-every", type=int, default=0,
+                   help="O1/O2/O3 优化器探针 cadence（步）：SF-lag/预条件 κ/逐block trust ratio → "
+                        "telemetry_optimizer.csv。0=关；建议 50-100。soap_sf 时自动开 update-norm stash。")
+    p.add_argument("--telemetry-capacity-every", type=int, default=0,
+                   help="C1 逐 block 容量探针 cadence（步）：LoKr ‖ΔW‖+有效秩 → telemetry_capacity.csv。"
+                        "0=关；带小 SVD，建议稀疏（200-400）。")
     p.add_argument("--lora-one-init-steps", type=int, default=0,
                    help="LoRA-One 谱对齐初始化（arXiv 2502.01235→LoKr KPSVD 版）：训练前累积 N 个 batch "
                         "的全参梯度做 SVD 初始化 LoKr 因子，加速前几百步收敛。0=关闭。"
@@ -1036,7 +1058,14 @@ def main():
         **injector_kwargs,
     )
     injector.inject(model)
-    
+
+    # 把完整解析后的训练配置快照进 injector → 每次 injector.save() 都把全参数写进成品
+    # safetensors metadata（key=anima_training_config）。成品自描述、防云端 yaml 丢失后无法复原。
+    try:
+        injector.set_training_metadata(vars(args))
+    except Exception as _e:
+        logger.warning(f"训练配置快照失败（不影响训练）: {_e}")
+
     # 从已有 LoRA 继续训练
     if getattr(args, "resume_lora", "") and Path(args.resume_lora).exists():
         injector.load(args.resume_lora)
@@ -1786,6 +1815,26 @@ def main():
     )
     if adaptive_ts.enabled:
         logger.info("[adaptive_timestep] enabled: %s", adaptive_ts.summary())
+
+    # CSFlow（arXiv 2606.08833）：timestep_sampling=csflow 时把 t 采样换成"数据集功率谱×人眼CSF"
+    # 推出的权重分布（替换三峰做单变量 A/B）。零额外前向；建议同 run 关 adaptive 以隔离 t 轴。
+    csflow_sampler = None
+    if str(objective_cfg.timestep.mode).lower() == "csflow":
+        from trainer.csflow import CSFlowSampler
+        _csflow_path = str(getattr(args, "csflow_rapsd_path", "") or "")
+        if not _csflow_path:
+            raise ValueError("timestep_sampling=csflow 需要 csflow_rapsd_path（先跑 tools/compute_rapsd.py）")
+        csflow_sampler = CSFlowSampler.from_profile(
+            _csflow_path,
+            alpha=float(getattr(args, "csflow_alpha", 1.0) or 1.0),
+            pixels_per_degree=float(getattr(args, "csflow_pixels_per_degree", 50.0) or 50.0),
+            t_min=float(objective_cfg.timestep.t_min or 1e-4) or 1e-4,
+            t_max=float(objective_cfg.timestep.t_max or 1.0),
+        )
+        logger.info("[csflow] enabled: %s", csflow_sampler.summary())
+        if adaptive_ts.enabled:
+            logger.warning("[csflow] adaptive_timestep 同时开着——两者都改 t 轴会双重补偿，"
+                           "A/B 隔离建议 adaptive_timestep=false。")
     logger.info(
         "[objective] timestep=%s flow_shift=%.3f schedule_shift=%.3f mix_low=%.3f "
         "noise_offset=%.4f pyramid=%d discount=%.3f loss=%s huber=%s/%.3f weight=%s cap=%.3f",
@@ -2254,6 +2303,27 @@ def main():
                     _eval_set.append((_elat[_bi:_bi + 1].clone(), _ecross.clone()))
         emit(f"[eval] 固定 eval 集就绪：{len(_eval_set)} 个样本")
 
+    # ── 训练内遥测总线（trainer/telemetry.py，图盲 opt-in default-off）──────────
+    # L1/L2 频带+斜率探针随 eval 跑；O1/O2/O3 优化器探针 + C1 容量探针挂在 optimizer.step
+    # 之后（见 run_step_telemetry）。所有探针只碰 latent 残差 / 权重 / 优化器 state。
+    _telemetry_on = bool(getattr(args, "telemetry_enabled", False))
+    _telem_opt_every = int(getattr(args, "telemetry_optimizer_every", 0) or 0)
+    _telem_cap_every = int(getattr(args, "telemetry_capacity_every", 0) or 0)
+    _telem = None
+    _freq_probe = None
+    if _telemetry_on:
+        from trainer import telemetry as _telem
+        if _eval_every > 0 and _eval_set:
+            _freq_probe = _telem.FreqEvalProbe(
+                output_dir, _eval_t_grid,
+                n_bands=int(getattr(args, "telemetry_freq_bands", 3) or 3),
+                slope_window=int(getattr(args, "telemetry_slope_window", 6) or 6),
+            )
+        if _telem_opt_every > 0 and hasattr(optimizer, "_telemetry"):
+            optimizer._telemetry = True   # 让 soap_sf 在 step 里 stash ‖update‖（trust ratio 用）
+        emit(f"[telemetry] enabled: freq={'on' if _freq_probe else 'off'} "
+             f"optimizer_every={_telem_opt_every} capacity_every={_telem_cap_every}")
+
     def run_eval_loss(step):
         """固定样本 × 固定噪声 × 固定 t 网格的确定性 MSE eval。
 
@@ -2268,6 +2338,9 @@ def main():
             optimizer.eval()
         eval_seed = int(getattr(args, "eval_seed", 1234) or 1234)
         per_t_sums = [0.0] * len(_eval_t_grid)
+        # L1：逐 (t-bin × 径向频带) 残差功率（图盲，复用同一前向的 velocity 误差）
+        _nb = _freq_probe.n_bands if _freq_probe is not None else 0
+        per_t_band_sums = [[0.0] * _nb for _ in _eval_t_grid] if _nb else None
         with torch.no_grad():
             for _i, (_lat, _cross) in enumerate(_eval_set):
                 _pm = torch.zeros(1, 1, _lat.shape[-2], _lat.shape[-1], device=device, dtype=dtype)
@@ -2281,6 +2354,10 @@ def main():
                         _pr = forward_with_optional_checkpoint(
                             model, _noisy, _tt.view(-1, 1), _cross, _pm, use_checkpoint=False)
                     per_t_sums[_j] += float(per_sample_loss(_pr, _tgt, loss_type="mse").item())
+                    if per_t_band_sums is not None:
+                        _bands = _telem.radial_band_power(_pr.float() - _tgt.float(), _nb)
+                        for _b in range(_nb):
+                            per_t_band_sums[_j][_b] += _bands[_b]
         n = max(len(_eval_set), 1)
         per_t = [s / n for s in per_t_sums]
         mean_v = sum(per_t) / max(len(per_t), 1)
@@ -2292,9 +2369,33 @@ def main():
             if write_header:
                 f.write("step,mean," + ",".join(f"t{tv:g}" for tv in _eval_t_grid) + "\n")
             f.write(f"{step},{mean_v:.6f}," + ",".join(f"{v:.6f}" for v in per_t) + "\n")
+        if per_t_band_sums is not None:
+            per_t_bands = [[s / n for s in row] for row in per_t_band_sums]
+            _freq_probe.record(step, per_t_bands, per_t_loss=per_t)
         if hasattr(optimizer, "train"):
             optimizer.train()
         model.train()
+
+    def run_step_telemetry(step):
+        """O1/O2/O3 + C1：挂在 optimizer.step() 之后、zero_grad 之前（grad 仍在）。
+        图盲：只读优化器 state / 权重 / param.grad 标量。各探针独立 cadence，失败不致命。"""
+        if not _telemetry_on:
+            return
+        if _telem_opt_every > 0 and step % _telem_opt_every == 0:
+            try:
+                agg = _telem.optimizer_report(optimizer, output_dir, step,
+                                              named_params=trainable_named_params)
+                logger.info("[telemetry] step %d optimizer sf_lag=%.3g kappa=%.3g "
+                            "trust=%.3g grad_norm=%.3g", step,
+                            agg.get("sf_lag", float("nan")), agg.get("kappa", float("nan")),
+                            agg.get("trust_ratio", float("nan")), agg.get("grad_norm", float("nan")))
+            except Exception as e:
+                logger.warning("[telemetry] optimizer_report failed: %s", e)
+        if _telem_cap_every > 0 and step % _telem_cap_every == 0:
+            try:
+                _telem.lokr_capacity_report(model, output_dir, step)
+            except Exception as e:
+                logger.warning("[telemetry] capacity_report failed: %s", e)
 
     # ── LoRA-One (arXiv:2502.01235) 谱对齐初始化 ─────────────────────────────
     # 训练正式开始前：累积 N 个 batch 的全参梯度 → KPSVD → 初始化 LoKr 因子。
@@ -2488,17 +2589,21 @@ def main():
                 objective_cfg.timestep.mix_high_prob,
                 float(getattr(args, "timestep_mix_high_prob_end", -1.0)),
                 global_step, _an_s, _an_e)
-            t = adaptive_ts.sample(
-                bs, device, mode=ts_mode, shift=f_shift,
-                mix_low_prob=mix_low_prob, schedule_shift=sched_shift,
-                laplace_mu=objective_cfg.timestep.laplace_mu,
-                laplace_b=objective_cfg.timestep.laplace_b,
-                logsnr_mu=objective_cfg.timestep.logsnr_mu,
-                logsnr_sigma=objective_cfg.timestep.logsnr_sigma,
-                mix_high_prob=mix_high_prob_cur,
-                stratified=objective_cfg.timestep.stratified,
-                global_step=global_step,
-            )
+            if csflow_sampler is not None:
+                # CSFlow 直接做 base 分布（替换三峰）；schedule_shift / t_range 仍在下方统一应用。
+                t = csflow_sampler.sample(bs, device)
+            else:
+                t = adaptive_ts.sample(
+                    bs, device, mode=ts_mode, shift=f_shift,
+                    mix_low_prob=mix_low_prob, schedule_shift=sched_shift,
+                    laplace_mu=objective_cfg.timestep.laplace_mu,
+                    laplace_b=objective_cfg.timestep.laplace_b,
+                    logsnr_mu=objective_cfg.timestep.logsnr_mu,
+                    logsnr_sigma=objective_cfg.timestep.logsnr_sigma,
+                    mix_high_prob=mix_high_prob_cur,
+                    stratified=objective_cfg.timestep.stratified,
+                    global_step=global_step,
+                )
 
             # SD3 式 σ schedule shift：作用于所有模式的 t（含 uniform / mixed_*），
             # 把噪声混合用的 sigma 整体偏向高噪声端。1.0=禁用，向后兼容。
@@ -3033,6 +3138,8 @@ def main():
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
+                # 遥测：step 后、zero_grad 前（grad/优化器 state 都新鲜）。step 号对齐 eval（+1）。
+                run_step_telemetry(global_step + 1)
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 # DPO 参考 EMA follow-up：ref_ema<1.0 时朝策略缓慢跟踪；v1（ref_ema=1.0 固定）为 no-op。
@@ -3241,6 +3348,8 @@ def main():
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
+                # 遥测：step 后、zero_grad 前（grad/优化器 state 都新鲜）。step 号对齐 eval（+1）。
+                run_step_telemetry(global_step + 1)
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 samples_seen += max(0, int(flushed_samples))

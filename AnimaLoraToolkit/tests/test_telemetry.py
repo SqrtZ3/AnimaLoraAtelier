@@ -1,0 +1,216 @@
+"""训练遥测总线 CPU 单测（无 model/VAE 依赖，注入合成张量，全程图盲）。
+
+覆盖：
+  L1 radial_band_power —— 频带能量分离（低频 vs 棋盘高频）
+  L2 FreqEvalProbe     —— CSV schema + 逐 t-bin 斜率符号
+  O1/O2/O3 optimizer_report —— 真 SOAPScheduleFree state 上的 sf_lag/kappa/update_norm/CSV
+  O2 gg_anisotropy     —— 各向同性 κ≈1 / 各向异性 κ≫1
+  C1 lokr_spectrum     —— Kronecker 谱恒等式 vs 暴力 kron SVD（核心正确性）
+  C1 spectrum_stats / lokr_capacity_report —— 有效秩 + 逐 block CSV
+"""
+
+import math
+
+import torch
+import torch.nn as nn
+
+from trainer.telemetry import (
+    _block_of,
+    _linfit_slope,
+    radial_band_power,
+    FreqEvalProbe,
+    gg_anisotropy,
+    optimizer_report,
+    lokr_spectrum,
+    spectrum_stats,
+    lokr_capacity_report,
+)
+from utils.soap_optimizer import SOAPScheduleFree
+
+
+# ───────────────────────── 小工具 ─────────────────────────
+
+def test_block_of_parses_block_id():
+    assert _block_of("net.blocks.14.self_attn.q_proj") == "14"
+    assert _block_of("blocks.0.mlp.fc1") == "0"
+    assert _block_of("final_layer.linear") == "other"
+    assert _block_of("x_embedder.proj") == "other"
+    assert _block_of("") == "other"
+
+
+def test_linfit_slope_sign():
+    steps = [0.0, 40.0, 80.0, 120.0]
+    assert _linfit_slope(steps, [1.0, 0.8, 0.6, 0.4]) < 0       # 单调降
+    assert abs(_linfit_slope(steps, [0.5, 0.5, 0.5, 0.5])) < 1e-9  # 平
+    assert _linfit_slope([1.0], [0.5]) == 0.0                   # 单点退化
+
+
+# ───────────────────────── L1 ─────────────────────────
+
+def test_radial_band_power_shape_and_nonneg():
+    err = torch.randn(2, 4, 16, 16)
+    bands = radial_band_power(err, n_bands=3)
+    assert len(bands) == 3
+    assert all(b >= 0 for b in bands)
+
+
+def test_radial_band_power_separates_low_vs_high():
+    H = W = 32
+    yy, xx = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
+
+    # 低频：单一低频正弦（沿 x 1 个周期）→ 能量应集中在最低带
+    low = torch.sin(2 * math.pi * xx.float() / W).view(1, 1, H, W)
+    lb = radial_band_power(low, n_bands=3)
+    assert lb[0] > lb[2], f"低频信号应低带占优: {lb}"
+
+    # 高频：棋盘（Nyquist）→ 能量应集中在最高带
+    checker = (((yy + xx) % 2) * 2 - 1).float().view(1, 1, H, W)
+    hb = radial_band_power(checker, n_bands=3)
+    assert hb[2] > hb[0], f"棋盘高频应高带占优: {hb}"
+
+
+# ───────────────────────── L2 ─────────────────────────
+
+def test_freq_eval_probe_csv_schema(tmp_path):
+    t_grid = [0.1, 0.5, 0.9]
+    probe = FreqEvalProbe(tmp_path, t_grid, n_bands=3, slope_window=4)
+    per_t_bands = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
+    probe.record(40, per_t_bands, per_t_loss=[0.3, 0.1, 0.12])
+    probe.record(80, per_t_bands, per_t_loss=[0.25, 0.09, 0.10])
+
+    freq_csv = (tmp_path / "eval_freq_loss.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert freq_csv[0] == "step,t0.1_fL,t0.1_fM,t0.1_fH,t0.5_fL,t0.5_fM,t0.5_fH,t0.9_fL,t0.9_fM,t0.9_fH"
+    assert len(freq_csv) == 3  # header + 2 行
+    assert freq_csv[1].startswith("40,1,2,3,4,5,6,7,8,9")
+
+    slope_csv = (tmp_path / "eval_slope.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert slope_csv[0] == "step,t0.1_slope,t0.5_slope,t0.9_slope"
+    # 第二行（step 80）每个 t-bin 都在降 → 斜率为负
+    vals = [float(x) for x in slope_csv[2].split(",")[1:]]
+    assert all(v < 0 for v in vals), f"下降序列斜率应为负: {vals}"
+
+
+# ───────────────────────── O2 gg_anisotropy ─────────────────────────
+
+def test_gg_anisotropy_isotropic_vs_anisotropic():
+    iso = torch.eye(8) * 3.0
+    k_iso, rr_iso = gg_anisotropy([iso])
+    assert abs(k_iso - 1.0) < 1e-4, f"各向同性 κ 应≈1: {k_iso}"
+    assert abs(rr_iso - 1.0) < 1e-4, f"各向同性有效秩比应≈1: {rr_iso}"
+
+    aniso = torch.diag(torch.tensor([100.0, 1.0, 0.01]))
+    k_an, rr_an = gg_anisotropy([aniso])
+    assert k_an > 1e3, f"各向异性 κ 应≫1: {k_an}"
+    assert rr_an < 0.8, f"各向异性有效秩比应明显<1: {rr_an}"
+
+    assert math.isnan(gg_anisotropy([None])[0])
+
+
+# ───────────────────────── O1/O2/O3 optimizer_report ─────────────────────────
+
+def test_optimizer_report_on_soap_sf(tmp_path):
+    torch.manual_seed(0)
+    p = nn.Parameter(torch.randn(16, 8))
+    opt = SOAPScheduleFree([p], lr=1e-2, precondition_frequency=1)
+    opt._telemetry = True   # 让 step 把 ‖update‖ stash 进 state['_upd_norm']
+
+    for _ in range(5):
+        opt.zero_grad()
+        p.grad = torch.randn(16, 8)
+        opt.step()
+
+    # grad 仍在（未 zero_grad）时调用，模拟训练循环里 step 后 / zero_grad 前的挂点
+    p.grad = torch.randn(16, 8)
+    agg = optimizer_report(opt, tmp_path, step=200,
+                           named_params=[("net.blocks.7.mlp.fc1", p)])
+
+    assert math.isfinite(agg["sf_lag"]), "SF-lag 应有限"
+    assert math.isfinite(agg["kappa"]) and agg["kappa"] >= 1.0, "κ 应≥1"
+    assert math.isfinite(agg["trust_ratio"]), "trust ratio 应有限（依赖 _upd_norm stash）"
+
+    lines = (tmp_path / "telemetry_optimizer.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert lines[0] == "step,scope,grad_norm,update_norm,trust_ratio,sf_lag,kappa,eff_rank_ratio"
+    scopes = [ln.split(",")[1] for ln in lines[1:]]
+    assert "7" in scopes and "all" in scopes, f"应有 block 7 行 + all 聚合行: {scopes}"
+
+
+def test_soap_sf_telemetry_flag_off_by_default():
+    p = nn.Parameter(torch.randn(8, 4))
+    opt = SOAPScheduleFree([p], lr=1e-2)
+    p.grad = torch.randn(8, 4)
+    opt.step()
+    # 默认不 stash（零热路径成本）
+    assert "_upd_norm" not in opt.state[p]
+
+
+# ───────────────────────── C1 lokr_spectrum / Kronecker 恒等式 ─────────────────────────
+
+def test_lokr_spectrum_matches_bruteforce_kron():
+    torch.manual_seed(1)
+    factor, out_dim, in_dim, rank = 3, 4, 5, 2
+    w1 = torch.randn(factor, factor)
+    w2_a = torch.randn(out_dim, rank)
+    w2_b = torch.randn(rank, in_dim)
+    scaling = 0.75
+
+    # 暴力：真的形成 ΔW = scaling·kron(w1, w2_a@w2_b) 再 SVD
+    w2 = w2_a @ w2_b
+    dW = scaling * torch.kron(w1, w2)
+    sv_brute = torch.linalg.svdvals(dW)
+
+    sv_fast = lokr_spectrum(w1, w2_a, w2_b, scaling=scaling)
+
+    # frob（Σσ²）必须精确一致
+    assert math.isclose(float(sv_brute.square().sum()), float(sv_fast.square().sum()), rel_tol=1e-5)
+    # 非零奇异值个数 = rank(w1)·rank(w2) = 3·2 = 6，top-6 应一致
+    top = min(6, sv_brute.numel(), sv_fast.numel())
+    assert torch.allclose(sv_brute[:top], sv_fast[:top], atol=1e-4), \
+        f"\nbrute={sv_brute[:top]}\nfast ={sv_fast[:top]}"
+
+    # 有效秩两路一致（padding 的零不影响谱熵）
+    _, er_brute, _ = spectrum_stats(sv_brute)
+    _, er_fast, _ = spectrum_stats(sv_fast)
+    assert math.isclose(er_brute, er_fast, rel_tol=1e-4)
+
+
+def test_spectrum_stats_rank1_vs_full():
+    # rank-1 谱 → 有效秩≈1
+    s1 = torch.tensor([5.0, 0.0, 0.0, 0.0])
+    _, er1, ratio1 = spectrum_stats(s1)
+    assert abs(er1 - 1.0) < 1e-3 and ratio1 < 0.3
+
+    # 均匀满谱 → 有效秩≈维数
+    sfull = torch.ones(4)
+    frob, erf, ratiof = spectrum_stats(sfull)
+    assert abs(erf - 4.0) < 1e-3 and abs(ratiof - 1.0) < 1e-3
+    assert math.isclose(frob, 2.0, rel_tol=1e-5)  # sqrt(4)
+
+
+# ───────────────────────── C1 lokr_capacity_report ─────────────────────────
+
+class _FakeLoKr(nn.Module):
+    def __init__(self, factor, out_dim, in_dim, rank, scaling):
+        super().__init__()
+        self.lokr_w1 = nn.Parameter(torch.randn(factor, factor) * 0.1)
+        self.lokr_w2_a = nn.Parameter(torch.randn(out_dim, rank))
+        self.lokr_w2_b = nn.Parameter(torch.randn(rank, in_dim))
+        self.scaling = scaling
+
+
+def test_lokr_capacity_report_writes_per_block(tmp_path):
+    root = nn.Module()
+    root.blocks = nn.ModuleDict({
+        "7": _FakeLoKr(3, 8, 6, 4, 1.0),
+        "21": _FakeLoKr(3, 8, 6, 2, 1.0),
+    })
+    summary = lokr_capacity_report(root, tmp_path, step=120)
+
+    assert set(summary.keys()) == {"7", "21"}
+    lines = (tmp_path / "telemetry_capacity.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert lines[0] == "step,block,module,frob,eff_rank,eff_rank_ratio"
+    blocks = sorted(ln.split(",")[1] for ln in lines[1:])
+    assert blocks == ["21", "7"]
+    # 所有有效秩比 ∈ (0, 1]
+    for ln in lines[1:]:
+        ratio = float(ln.split(",")[-1])
+        assert 0.0 < ratio <= 1.0 + 1e-6

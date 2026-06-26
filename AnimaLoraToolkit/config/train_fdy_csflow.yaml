@@ -196,6 +196,17 @@ eval_count: 4
 eval_t_grid: "0.1,0.3,0.5,0.7,0.9"
 eval_seed: 1234
 
+# ── 训练内遥测总线（trainer/telemetry.py）：探针 default-off，须在此显式开 ─────────
+# 纯观测：图盲（只读 latent 残差/权重/优化器 state），不进入 loss/采样/优化路径 →
+# 不改变训练动力学，A/B 单变量性质不受影响（O2 仅让 soap_sf 每步多一次 ‖update‖.norm()，
+# 不写任何优化相关 state，训练数值逐 bit 一致）。这个 A/B 里尤其值得开：L1 能把
+# 「CSFlow 把模型容量堆到哪个 (t × 频带)」直接画成数据，正面回答高 t 之争。
+telemetry_enabled: true            # master 开关；false 则下面全部 no-op
+telemetry_freq_bands: 3            # L1 径向频带数（低/中/高）→ eval_freq_loss.csv（随 eval 跑）
+telemetry_slope_window: 6          # L2 逐 t-bin 饱和斜率滑窗（最小二乘）→ eval_slope.csv（随 eval 跑）
+telemetry_optimizer_every: 40      # O1 sf_lag / O2 GG 曲率 κ+有效秩 / O3 逐 block trust ratio → telemetry_optimizer.csv（对齐 eval）
+telemetry_capacity_every: 200      # C1 逐 block LoKr ‖ΔW‖+有效秩（小 SVD，稀疏）→ telemetry_capacity.csv（对齐 save_state）
+
 # ── 输出 ──────────────────────────────────────────────────────────────────
 output_dir: "./output/csflow"
 output_name: "csflow"

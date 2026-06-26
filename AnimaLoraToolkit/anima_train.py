@@ -572,12 +572,14 @@ def parse_args():
                         "梯度噪声尖峰，对任意采样分布零开销生效。")
     # CSFlow（arXiv 2606.08833）：timestep_sampling=csflow 时启用；用数据集功率谱×人眼CSF 偏置 t 采样
     p.add_argument("--csflow-rapsd-path", type=str, default="",
-                   help="CSFlow 数据集功率谱档路径（先跑 tools/compute_rapsd.py 生成）。"
-                        "timestep_sampling=csflow 时必填；零额外前向。")
+                   help="CSFlow 数据集功率谱档路径（可选）。留空=默认落到 output_dir/rapsd.json。"
+                        "档不存在会**首跑自动从 data_dir 计算并缓存**，无需先手跑 tools/compute_rapsd.py；零额外前向。")
     p.add_argument("--csflow-alpha", type=float, default=1.0,
                    help="CSFlow 权重与均匀基底的插值 α；1.0=纯 CSFlow（替换三峰 A/B 推荐），0=退化均匀。")
     p.add_argument("--csflow-pixels-per-degree", type=float, default=50.0,
                    help="像素→cycles/degree 映射，控制 CSF 峰落在哪个归一化频率（默认 50→峰≈中频）。")
+    p.add_argument("--csflow-rapsd-max-images", type=int, default=512,
+                   help="自动计算 RAPSD 时的抽样图数上限（0=全部）。大数据集用它把首跑计算时间封顶。")
     # 训练内遥测总线（trainer/telemetry.py）：图盲、复用现有 forward/优化器 state、默认全关。
     p.add_argument("--telemetry-enabled", action="store_true",
                    help="开启训练内遥测总线（图盲）。各探针仍需各自 cadence 开关；L1/L2 频带探针随 "
@@ -1823,13 +1825,17 @@ def main():
         from trainer.csflow import CSFlowSampler
         _csflow_path = str(getattr(args, "csflow_rapsd_path", "") or "")
         if not _csflow_path:
-            raise ValueError("timestep_sampling=csflow 需要 csflow_rapsd_path（先跑 tools/compute_rapsd.py）")
+            # 没显式给路径 → 默认落到 output_dir，首跑自动计算并缓存（无需先手跑 tools/compute_rapsd.py）
+            _csflow_path = str(Path(args.output_dir) / "rapsd.json")
         csflow_sampler = CSFlowSampler.from_profile(
             _csflow_path,
             alpha=float(getattr(args, "csflow_alpha", 1.0) or 1.0),
             pixels_per_degree=float(getattr(args, "csflow_pixels_per_degree", 50.0) or 50.0),
             t_min=float(objective_cfg.timestep.t_min or 1e-4) or 1e-4,
             t_max=float(objective_cfg.timestep.t_max or 1.0),
+            data_dir=str(getattr(args, "data_dir", "") or ""),
+            res=int(getattr(args, "resolution", 1024) or 1024),
+            max_images=int(getattr(args, "csflow_rapsd_max_images", 512) or 512),
         )
         logger.info("[csflow] enabled: %s", csflow_sampler.summary())
         if adaptive_ts.enabled:

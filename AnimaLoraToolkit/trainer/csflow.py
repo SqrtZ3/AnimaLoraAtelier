@@ -90,6 +90,44 @@ def build_csflow_weight_table(
     return t_grid, w_final, cdf
 
 
+def load_or_compute_rapsd(rapsd_path: str, *, data_dir: str | None = None,
+                          res: int = 1024, max_images: int = 512) -> dict:
+    """读 RAPSD 档；**不存在则从 data_dir 源图自动计算（像素域）并缓存**到 rapsd_path。
+
+    去掉"必须先手跑 tools/compute_rapsd.py"的脚手架——trainer 本就读数据集，首跑时自己算一次、
+    落盘复用，下次直接读。只有"既无档、data_dir 又无效"时才报错。
+    图盲：只在训练进程内读源图、算聚合功率谱标量，不解码 latent、不外传（[[feedback-image-blind-nsfw]]）。
+    """
+    p = Path(rapsd_path) if rapsd_path else None
+    if p is not None and p.exists():
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if not data_dir or not Path(data_dir).exists():
+        raise FileNotFoundError(
+            f"CSFlow 需要 RAPSD：档 {rapsd_path!r} 不存在，且无法自动计算（data_dir={data_dir!r} 无效）。"
+        )
+    try:
+        from tools.compute_rapsd import compute_rapsd  # 延迟导入，避免 trainer 顶层依赖 tools
+    except Exception as e:
+        raise RuntimeError(
+            f"CSFlow 自动计算 RAPSD 失败：导入 tools.compute_rapsd 出错（{e}）；"
+            f"可手动跑 `python tools/compute_rapsd.py --data-dir {data_dir} --out {rapsd_path}`。"
+        ) from e
+    logger.info("[csflow] RAPSD 档不存在，自动从数据集计算（像素域，一次性，max_images=%d）：%s",
+                int(max_images), data_dir)
+    prof = compute_rapsd(Path(data_dir), int(res), int(max_images))
+    if p is not None:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(prof, f, ensure_ascii=False, indent=1)
+            logger.info("[csflow] RAPSD 已缓存到 %s（n_images=%d，下次直接读）",
+                        rapsd_path, int(prof.get("n_images", 0)))
+        except Exception as e:
+            logger.warning("[csflow] RAPSD 缓存写盘失败（本次用内存版继续）：%s", e)
+    return prof
+
+
 class CSFlowSampler:
     """从 CSFlow 权重表做 inverse-transform t 采样的小状态对象（替换三峰时用作 base 分布）。"""
 
@@ -105,13 +143,11 @@ class CSFlowSampler:
     @classmethod
     def from_profile(cls, rapsd_path: str, *, alpha: float = 1.0,
                      pixels_per_degree: float = 50.0,
-                     t_min: float = 1e-4, t_max: float = 1.0 - 1e-4) -> "CSFlowSampler":
-        """从 tools/compute_rapsd.py 产出的 json 档（{"rapsd": [...], ...}）构造采样器。"""
-        p = Path(rapsd_path)
-        if not p.exists():
-            raise FileNotFoundError(f"csflow_rapsd_path 不存在: {rapsd_path}（先跑 tools/compute_rapsd.py）")
-        with open(p, "r", encoding="utf-8") as f:
-            prof = json.load(f)
+                     t_min: float = 1e-4, t_max: float = 1.0 - 1e-4,
+                     data_dir: str | None = None, res: int = 1024,
+                     max_images: int = 512) -> "CSFlowSampler":
+        """从 RAPSD 档构造采样器；**档不存在时从 data_dir 自动计算并缓存**（无需先手跑工具）。"""
+        prof = load_or_compute_rapsd(rapsd_path, data_dir=data_dir, res=res, max_images=max_images)
         rapsd = torch.tensor(prof["rapsd"], dtype=torch.float32)
         t_grid, _w, cdf = build_csflow_weight_table(
             rapsd, pixels_per_degree=pixels_per_degree, alpha=alpha,

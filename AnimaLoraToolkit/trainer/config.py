@@ -184,6 +184,7 @@ YAML_TO_ARGS = {
     "csflow_rapsd_path": "csflow_rapsd_path",
     "csflow_alpha": "csflow_alpha",
     "csflow_pixels_per_degree": "csflow_pixels_per_degree",
+    "csflow_rapsd_max_images": "csflow_rapsd_max_images",
     # 训练内遥测总线（trainer/telemetry.py，图盲 opt-in default-off）
     "telemetry_enabled": "telemetry_enabled",
     "telemetry_freq_bands": "telemetry_freq_bands",
@@ -459,6 +460,7 @@ DEFAULTS = {
     "csflow_rapsd_path": "",
     "csflow_alpha": 1.0,
     "csflow_pixels_per_degree": 50.0,
+    "csflow_rapsd_max_images": 512,
     "telemetry_enabled": False,
     "telemetry_freq_bands": 3,
     "telemetry_slope_window": 6,

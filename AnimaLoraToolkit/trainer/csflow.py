@@ -149,8 +149,13 @@ class CSFlowSampler:
         """从 RAPSD 档构造采样器；**档不存在时从 data_dir 自动计算并缓存**（无需先手跑工具）。"""
         prof = load_or_compute_rapsd(rapsd_path, data_dir=data_dir, res=res, max_images=max_images)
         rapsd = torch.tensor(prof["rapsd"], dtype=torch.float32)
+        # ★ 必须把 t_min/t_max 透传给权重表，让 t_grid 与采样 clamp 边界一致。
+        # 否则权重表按默认 [1e-3, 1-1e-3] 构造，[1e-3, t_min) 区间仍分配了概率质量，
+        # inverse-transform 采样后 clamp 到 t_min 会把这部分质量堆成 t_min 边界尖峰，
+        # 集中踩进 t→0 的 velocity 条件数病态区（arXiv 2509.20952）。
         t_grid, _w, cdf = build_csflow_weight_table(
             rapsd, pixels_per_degree=pixels_per_degree, alpha=alpha,
+            t_min=t_min, t_max=t_max,
         )
         meta = {k: prof.get(k) for k in ("resolution", "n_images", "channels", "source")}
         meta.update({"alpha": alpha, "pixels_per_degree": pixels_per_degree})

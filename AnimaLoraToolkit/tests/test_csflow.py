@@ -1,14 +1,20 @@
-"""CSFlow CPU 单测（无 model/VAE 依赖）：CSF 曲线、权重表、inverse-transform 采样、档案往返。"""
+"""CSFlow CPU 单测（无 model/VAE 依赖）：CSF 曲线、权重表、inverse-transform 采样、档案往返、
+首跑自动计算 RAPSD（注入式假源，无需真实图片）。"""
 
 import json
 import os
+import shutil
+import sys
 import tempfile
+import types
 
+import pytest
 import torch
 
 from trainer.csflow import (
     mannos_csf,
     build_csflow_weight_table,
+    load_or_compute_rapsd,
     CSFlowSampler,
 )
 
@@ -76,9 +82,101 @@ def test_from_profile_roundtrip():
     os.remove(tmp)
 
 
+# --- 首跑自动计算 RAPSD 分支（commit 7aaa6e1 引入但当时漏提交测试）---------------------
+
+def _fake_profile(n=64):
+    rapsd = _toy_rapsd(n)
+    return {"rapsd": rapsd.tolist(), "resolution": 512, "n_images": 7,
+            "channels": "luma", "source": "fake-auto"}
+
+
+def _install_fake_compute_rapsd(profile):
+    """把假的 tools.compute_rapsd 注入 sys.modules（避开真实 tools 导入与真实图片）。
+
+    返回 (calls, cleanup)：calls['n'] 记录被调次数，cleanup() 还原 sys.modules。
+    """
+    calls = {"n": 0}
+
+    def fake_compute(data_dir, res, max_images):
+        calls["n"] += 1
+        return profile
+
+    saved = {k: sys.modules.get(k) for k in ("tools", "tools.compute_rapsd")}
+    pkg = types.ModuleType("tools")
+    pkg.__path__ = []  # 标记为包，允许 from tools.compute_rapsd import ...
+    mod = types.ModuleType("tools.compute_rapsd")
+    mod.compute_rapsd = fake_compute
+    sys.modules["tools"] = pkg
+    sys.modules["tools.compute_rapsd"] = mod
+
+    def cleanup():
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    return calls, cleanup
+
+
+def test_load_or_compute_raises_when_no_profile_and_no_datadir():
+    missing = os.path.join(tempfile.gettempdir(), "_csflow_nonexistent_profile.json")
+    if os.path.exists(missing):
+        os.remove(missing)
+    # 既无档、data_dir 又无效 → 明确报错（fail-fast，不静默）
+    with pytest.raises(FileNotFoundError):
+        load_or_compute_rapsd(missing, data_dir=None)
+
+
+def test_load_or_compute_auto_computes_and_caches():
+    profile = _fake_profile()
+    calls, cleanup = _install_fake_compute_rapsd(profile)
+    workdir = tempfile.mkdtemp()
+    try:
+        data_dir = os.path.join(workdir, "imgs")
+        os.makedirs(data_dir)
+        cache = os.path.join(workdir, "rapsd.json")
+        # 档不存在 → 自动从 data_dir 计算并落盘缓存
+        prof = load_or_compute_rapsd(cache, data_dir=data_dir, res=512, max_images=16)
+        assert prof["source"] == "fake-auto"
+        assert calls["n"] == 1
+        assert os.path.exists(cache)  # 已缓存
+        # 再次调用 → 命中缓存，不再触发计算
+        prof2 = load_or_compute_rapsd(cache, data_dir=data_dir)
+        assert calls["n"] == 1
+        assert prof2["n_images"] == 7
+    finally:
+        cleanup()
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_from_profile_auto_computes_when_missing():
+    profile = _fake_profile()
+    calls, cleanup = _install_fake_compute_rapsd(profile)
+    workdir = tempfile.mkdtemp()
+    try:
+        data_dir = os.path.join(workdir, "imgs")
+        os.makedirs(data_dir)
+        cache = os.path.join(workdir, "rapsd.json")
+        # from_profile 档缺失时应自动计算、构出可用采样器
+        s = CSFlowSampler.from_profile(cache, alpha=1.0, data_dir=data_dir,
+                                       res=512, max_images=16)
+        t = s.sample(64, torch.device("cpu"))
+        assert t.shape == (64,)
+        assert calls["n"] == 1
+        assert s.meta["n_images"] == 7
+        assert os.path.exists(cache)
+    finally:
+        cleanup()
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_mannos_csf_shape_and_peak()
     test_weight_table_cdf_monotone_and_normalized()
     test_sampler_in_range_and_biased()
     test_from_profile_roundtrip()
+    test_load_or_compute_raises_when_no_profile_and_no_datadir()
+    test_load_or_compute_auto_computes_and_caches()
+    test_from_profile_auto_computes_when_missing()
     print("ALL CSFLOW TESTS PASSED")

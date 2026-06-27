@@ -24,8 +24,10 @@ from trainer.telemetry import (
     lokr_spectrum,
     spectrum_stats,
     lokr_capacity_report,
+    adaptive_bin_report,
 )
 from utils.soap_optimizer import SOAPScheduleFree
+from trainer.objective import AdaptiveTimestepSampler
 
 
 # ───────────────────────── 小工具 ─────────────────────────
@@ -214,3 +216,95 @@ def test_lokr_capacity_report_writes_per_block(tmp_path):
     for ln in lines[1:]:
         ratio = float(ln.split(",")[-1])
         assert 0.0 < ratio <= 1.0 + 1e-6
+
+
+# ───────────────────────── L3 adaptive_bin_report ─────────────────────────
+
+def test_adaptive_bin_report_disabled_sampler_is_noop(tmp_path):
+    # disabled sampler → 直接返回，不写 CSV
+    s = AdaptiveTimestepSampler(enabled=False, bins=8)
+    out = adaptive_bin_report(s, tmp_path, step=40)
+    assert not (tmp_path / "telemetry_adaptive.csv").exists()
+    assert out["ready"] is False
+
+
+def test_adaptive_bin_report_not_ready_writes_all_ones(tmp_path):
+    # enabled 但未 ready（counts 有空桶）→ factors() 全 1，仍写入便于看 burn-in 结束
+    s = AdaptiveTimestepSampler(enabled=True, bins=8, metric="entropy_rate")
+    assert not s.ready
+    adaptive_bin_report(s, tmp_path, step=40)
+    lines = (tmp_path / "telemetry_adaptive.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert lines[0] == "step,ready,factor_min,factor_max,f0,f1,f2,f3,f4,f5,f6,f7"
+    vals = lines[1].split(",")
+    assert vals[0] == "40" and vals[1] == "0"   # ready=0
+    factors = [float(x) for x in vals[4:]]
+    assert all(abs(f - 1.0) < 1e-6 for f in factors), f"未 ready 应全 1: {factors}"
+
+
+def test_adaptive_bin_report_ready_clamps_to_bounds(tmp_path):
+    # 喂满每个 bin 的 loss → ready=True；factor 应被 clamp 到 [min_factor, max_factor]
+    s = AdaptiveTimestepSampler(
+        enabled=True, bins=4, metric="raw",
+        min_factor=0.5, max_factor=2.5, base_mix=0.0)
+    t = torch.tensor([0.125, 0.375, 0.625, 0.875])
+    # 各 bin 给差异极大的 loss：高 loss bin 应被抬到 max_factor
+    losses = torch.tensor([0.01, 0.01, 10.0, 0.01])
+    for _ in range(3):   # 多次 update 让 EMA 稳定
+        s.update(t, losses)
+    assert s.ready
+    out = adaptive_bin_report(s, tmp_path, step=80)
+    assert out["ready"] is True
+    assert abs(out["min"] - 0.5) < 1e-4 and abs(out["max"] - 2.5) < 1e-4, \
+        f"factor 应被 clamp 到 [0.5, 2.5]: {out}"
+    lines = (tmp_path / "telemetry_adaptive.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert lines[1].split(",")[1] == "1"   # ready=1
+
+
+# ───────────────────────── L3 adaptive_bin_report ─────────────────────────
+
+def test_adaptive_bin_report_disabled_is_noop(tmp_path):
+    # adaptive 关闭 → 不写 CSV，返回 ready=False
+    from trainer.objective import AdaptiveTimestepSampler
+    sampler = AdaptiveTimestepSampler(enabled=False, bins=8)
+    out = adaptive_bin_report(sampler, tmp_path, step=40)
+    assert out["ready"] is False
+    assert not (tmp_path / "telemetry_adaptive.csv").exists()
+
+
+def test_adaptive_bin_report_burn_in_all_ones(tmp_path):
+    # ready=False（仍有空桶）→ factors() 全 1，但仍写入（看 burn-in 何时结束）
+    from trainer.objective import AdaptiveTimestepSampler
+    sampler = AdaptiveTimestepSampler(enabled=True, bins=4, metric="raw")
+    # 没调过 update → counts 全 0 → ready=False
+    out = adaptive_bin_report(sampler, tmp_path, step=40)
+    assert out["ready"] is False
+    lines = (tmp_path / "telemetry_adaptive.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert lines[0] == "step,ready,factor_min,factor_max,f0,f1,f2,f3"
+    row = lines[1].split(",")
+    assert row[0] == "40" and row[1] == "0"
+    factors = [float(x) for x in row[4:]]
+    assert all(abs(f - 1.0) < 1e-6 for f in factors), f"burn-in 应全 1: {factors}"
+
+
+def test_adaptive_bin_report_ready_writes_factors(tmp_path):
+    # 喂满所有 bin → ready=True，factor 被 clamp 到 [min_factor, max_factor]
+    from trainer.objective import AdaptiveTimestepSampler
+    sampler = AdaptiveTimestepSampler(
+        enabled=True, bins=4, metric="raw",
+        min_factor=0.5, max_factor=2.5, ema_decay=1.0,
+    )
+    # 每个 bin 各喂一个样本，制造不均匀 loss → factor 非全 1
+    t = torch.tensor([0.05, 0.30, 0.60, 0.90])
+    per_sample = torch.tensor([10.0, 1.0, 1.0, 1.0])  # bin0 高 loss
+    sampler.update(t, per_sample)
+    assert sampler.ready
+
+    out = adaptive_bin_report(sampler, tmp_path, step=80)
+    assert out["ready"] is True
+    assert out["min"] >= 0.5 - 1e-6 and out["max"] <= 2.5 + 1e-6
+    # bin0（高 loss）的 factor 应最大
+    lines = (tmp_path / "telemetry_adaptive.csv").read_text(encoding="utf-8").strip().splitlines()
+    row = lines[-1].split(",")
+    assert row[1] == "1"  # ready
+    factors = [float(x) for x in row[4:]]
+    assert factors[0] == max(factors), f"高 loss bin 应得最大 factor: {factors}"

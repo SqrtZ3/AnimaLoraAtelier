@@ -2402,6 +2402,17 @@ def main():
                 _telem.lokr_capacity_report(model, output_dir, step)
             except Exception as e:
                 logger.warning("[telemetry] capacity_report failed: %s", e)
+        # L3：adaptive 逐 bin factor 演变（图盲，复用 factors()，零额外前向）。
+        # 与 optimizer 探针同 cadence——adaptive 预算倾斜和优化器状态同频观测最合理；
+        # adaptive 关闭时 adaptive_ts.enabled=False，函数内部直接返回，不写 CSV。
+        if _telem_opt_every > 0 and step % _telem_opt_every == 0 and adaptive_ts.enabled:
+            try:
+                _ab = _telem.adaptive_bin_report(adaptive_ts, output_dir, step)
+                logger.info("[telemetry] step %d adaptive ready=%s factor_min=%.3g "
+                            "factor_max=%.3g", step, _ab.get("ready", False),
+                            _ab.get("min", float("nan")), _ab.get("max", float("nan")))
+            except Exception as e:
+                logger.warning("[telemetry] adaptive_bin_report failed: %s", e)
 
     # ── LoRA-One (arXiv:2502.01235) 谱对齐初始化 ─────────────────────────────
     # 训练正式开始前：累积 N 个 batch 的全参梯度 → KPSVD → 初始化 LoKr 因子。

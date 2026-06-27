@@ -18,6 +18,9 @@
   O3 `optimizer_report` trust  —— 逐 block ‖update‖/‖grad‖ + grad norm（哪些 block 被饿）
   C1 `lokr_capacity_report`    —— 逐 block ‖ΔW‖ + LoKr ΔW 有效秩 → telemetry_capacity.csv
                                   （哪些 block 吃满/浪费 rank → 反调 reg_dims）
+  L3 `adaptive_bin_report`     —— adaptive_timestep 逐 bin factor 演变 → telemetry_adaptive.csv
+                                  （loss-aware 重采样把预算往哪些 t-bin 倾斜、有没有失控 →
+                                  反调 base_mix/min/max_factor；图盲，复用 factors()，零额外前向）
 
 依赖：仅 torch + 标准库（云端 venv 无 scipy/numpy 保证，见 [[environment-reference]]）。
 所有数值后处理在 fp32 CPU/GPU 上做，输出 python float。
@@ -372,3 +375,31 @@ def lokr_capacity_report(model, output_dir, step: int) -> dict:
         per_block_ratio.setdefault(block, []).append(ratio)
 
     return {b: (sum(v) / len(v) if v else float("nan")) for b, v in per_block_ratio.items()}
+
+
+# ───────────────────── L3：adaptive_timestep 逐 bin factor 演变 ─────────────────────
+
+@torch.no_grad()
+def adaptive_bin_report(adaptive_sampler, output_dir, step: int) -> dict:
+    """记录 AdaptiveTimestepSampler 各 bin 的重采样 factor → telemetry_adaptive.csv
+    （宽表：step, ready, factor_min, factor_max, f0, f1, ..., f{bins-1}）。
+
+    图盲：只读 sampler 已维护的 loss_ema / counts（detached CPU），复用 factors()，
+    零额外前向、零额外显存。回答"loss-aware 重采样把预算往哪些 t-bin 倾斜、有没有
+    失控"→ 反调 adaptive_timestep_base_mix / min_factor / max_factor。
+
+    ready=False（burn-in 或仍有空桶）时 factors() 返回全 1，仍写入以便看 burn-in 何时
+    结束。返回 {min, max, ready} 便于 console 摘要。
+    """
+    if adaptive_sampler is None or not getattr(adaptive_sampler, "enabled", False):
+        return {"min": float("nan"), "max": float("nan"), "ready": False}
+
+    bins = adaptive_sampler.bins
+    factors = adaptive_sampler.factors().tolist()
+    ready = bool(adaptive_sampler.ready)
+
+    header = ["step", "ready", "factor_min", "factor_max"] + [f"f{i}" for i in range(bins)]
+    csv_path = Path(output_dir) / "telemetry_adaptive.csv"
+    _append_csv(csv_path, header, [step, int(ready), min(factors), max(factors)] + factors)
+
+    return {"min": min(factors), "max": max(factors), "ready": ready}

@@ -192,6 +192,23 @@ def test_self_perceptual_grad_only_through_pred():
     assert feat_t.grad is None
 
 
+def test_self_perceptual_scale_invariant():
+    """归一化后 pl 只依赖相对偏差、与特征绝对尺度无关（锁 bugfix：DiT 裸激活不再爆量级）。
+
+    旧实现 pl=‖fp−ft‖² 直接用裸激活，feat 放大 100× → pl 放大 10000×，未收敛时顶到数千、
+    ×λ 爆梯度。归一化后 pl=‖fp−ft‖²/‖ft‖² 是相对能量，同比例放大 target 与 pred → pl 不变。
+    """
+    torch.manual_seed(0)
+    feat_t = torch.randn(2, 8, 4, 4)
+    feat_p = feat_t + 0.5 * torch.randn(2, 8, 4, 4)     # 固定相对偏差
+    t = torch.tensor([0.1, 0.2])
+    pl_small = self_perceptual_per_sample(feat_p, feat_t, t, t_gate=0.5)
+    pl_large = self_perceptual_per_sample(feat_p * 100.0, feat_t * 100.0, t, t_gate=0.5)
+    assert torch.allclose(pl_small, pl_large, atol=1e-4), (pl_small, pl_large)
+    # 归一化后 pl 有界（旧实现对 100× 激活会给出 ~1e4 量级）
+    assert torch.all(pl_small < 10.0), pl_small
+
+
 if __name__ == "__main__":
     test_reverse_step_scalar()
     test_reverse_step_per_sample_dt()
@@ -207,4 +224,5 @@ if __name__ == "__main__":
     test_self_perceptual_t_gate_zeros_high_t()
     test_self_perceptual_all_gated()
     test_self_perceptual_grad_only_through_pred()
+    test_self_perceptual_scale_invariant()
     print("test_ncp: all passed")

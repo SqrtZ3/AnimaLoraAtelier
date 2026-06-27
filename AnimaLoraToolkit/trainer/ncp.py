@@ -54,7 +54,8 @@ def feature_mse(feat_a: torch.Tensor, feat_b: torch.Tensor) -> torch.Tensor:
 
 
 def self_perceptual_per_sample(feat_pred: torch.Tensor, feat_target: torch.Tensor,
-                               t: torch.Tensor, t_gate: float) -> torch.Tensor:
+                               t: torch.Tensor, t_gate: float,
+                               eps: float = 1e-6) -> torch.Tensor:
     """逐样本 self-perceptual SFT 损失（arXiv 2401.00110《Diffusion Model with Perceptual Loss》）。
 
     在**冻结 DiT 编码栈特征空间**度量 predicted x0 与真实 x0 的距离 —— 特征空间里"糊/不像"
@@ -64,12 +65,28 @@ def self_perceptual_per_sample(feat_pred: torch.Tensor, feat_target: torch.Tenso
     仅 t < t_gate 的样本参与（高 t 下 x0_pred 偏差大、特征无意义），其余置 0（与
     `spectral_loss_per_sample` 同约定，便于上层按 active 数或 effective_batch_size 归一）。
     feat_pred 携带梯度（经输入 x0_pred 回流到 v_θ）；feat_target 必须已 detach。返回 [B]。
+
+    ★ 尺度归一化（bugfix，2026-06-27）：论文原版的感知距离用预训练 VGG/LPIPS，其内部
+    BatchNorm / 校准权重让特征尺度有界。本仓库复用模型自身 DiT 中间块激活（NCP 思路，
+    arXiv 2406.17636）——但 DiT 激活量级无界。直接 ‖fp−ft‖² 在模型早期未收敛时可达数万
+    → ×λ 爆梯度：实测 grad_norm~15000、训练 loss~2000、SOAP-SF κ~9600 发散，而 eval 的
+    纯 huber MSE 却正常（0.12 量级且在降）。改为用真值 target 的 per-sample 能量做尺度锚，
+    把无界 MSE 归一成有界相对能量 pl = ‖fp−ft‖² / ‖ft‖²。anchor 尺度 detach（只缩 loss、
+    不改梯度方向，与 Eisbach 同哲学）；pl 天然有界（fp=0 或 2·ft 时 pl≈1），×λ 后与主 loss
+    同量级，λ=0.05 回归设计意图。NCP-DPO 不受影响（它走 `feature_mse`，不经此归一化）。
     """
     out = feat_pred.new_zeros((feat_pred.shape[0],), dtype=torch.float32)
     active = t.float() < float(t_gate)
     if not bool(active.any()):
         return out
-    pl = feature_mse(feat_pred, feat_target)  # [B], fp32
+    fp = feat_pred.float()
+    ft = feat_target.float()
+    b = fp.shape[0]
+    diff_sq = (fp - ft).reshape(b, -1).pow(2).mean(dim=1)          # ‖fp−ft‖²，per-sample
+    # target 能量锚（detached）：把无界激活 MSE 归一成有界相对能量。target 是真值 x0 过
+    # 编码栈的激活、能量稳定正值；clamp(min=eps) 兜底近零退化。
+    scale = ft.reshape(b, -1).pow(2).mean(dim=1).clamp(min=eps)
+    pl = diff_sq / scale.detach()
     return torch.where(active, pl, out)
 
 

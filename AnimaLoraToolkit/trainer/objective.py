@@ -352,6 +352,13 @@ class AdaptiveTimestepSampler:
     再经 low_noise_gate g(t) = t^n / (t^n + c^n) 抑制 t→0 端的失控分配。这是 arxiv
     2602.18647 的核心思路在 flow-matching t-空间下的重述（线性 FM 下 σ_t = t，
     I-MMSE 等式可直接搬过来）。论文只在 EDM/DDPM 上验证过，因此该 metric 默认关。
+
+    metric=slope 时改用 **斜率感知**信号（level-free）：每个 bin 维护快/慢两条 EMA，
+    factor ∝ (slow−fast)/slow 的正部 —— 即逐 bin loss 的"分数下降速度"。还在学的 bin
+    （slope 大）被抬到 max_factor，已饱和（slope≈0）或在回升（slope<0，过拟合那段）的 bin
+    落到 min_factor。除以 slow 归一化消掉 bin 间 loss 量级差（low-t loss 大不应天然占优）。
+    与 entropy_rate/raw 的 level-based 取向正交：把预算投向"边际收益高"而非"绝对 loss 高"的 t。
+    无任何 bin 在学时退回全 1（不重采样）。同属经验性，默认关。
     """
     def __init__(
         self,
@@ -370,6 +377,8 @@ class AdaptiveTimestepSampler:
         gate_n: float = 3.0,
         gate_c: float = 0.05,
         loss_weight_fn=None,
+        # slope 模式专用：慢 EMA 衰减；<0 → 自动从 ema_decay 派生（比 fast 慢 4×）
+        slope_slow_decay: float = -1.0,
     ):
         self.enabled = bool(enabled)
         self.bins = max(int(bins or 16), 2)
@@ -380,11 +389,21 @@ class AdaptiveTimestepSampler:
         self.base_mix = min(max(float(base_mix), 0.0), 1.0)
         self.candidate_mult = max(int(candidate_mult or 1), 1)
         self.metric = (metric or "raw").lower()
-        if self.metric not in ("raw", "highfreq", "mixed", "entropy_rate"):
+        if self.metric not in ("raw", "highfreq", "mixed", "entropy_rate", "slope"):
             raise ValueError(f"Unknown adaptive_timestep_metric: {metric}")
         self.highfreq_weight = max(float(highfreq_weight or 0.0), 0.0)
         self.loss_ema = torch.zeros(self.bins, dtype=torch.float32)
         self.counts = torch.zeros(self.bins, dtype=torch.long)
+        # slope 模式：第二条更慢的 EMA，与 fast(loss_ema) 之差给出逐 bin 学习速度。
+        # 始终维护（成本可忽略，bins≤16），仅 factors() 的 slope 分支读取 → 行为中立。
+        self.loss_ema_slow = torch.zeros(self.bins, dtype=torch.float32)
+        if slope_slow_decay is None or float(slope_slow_decay) < 0.0:
+            # 自动：把 (1-fast) 放慢 4× → slow 更"记仇"，作为衡量近期下降的基线
+            self.slope_slow_decay = 1.0 - (1.0 - self.ema_decay) * 0.25
+        else:
+            self.slope_slow_decay = min(max(float(slope_slow_decay), 0.0), 0.9999)
+        # slow 不得快于 fast（decay 越大越慢）
+        self.slope_slow_decay = max(self.slope_slow_decay, self.ema_decay)
         # InfoNoise 闸门 + 损失权重补偿
         self.low_noise_gate = bool(low_noise_gate)
         self.gate_n = max(float(gate_n or 0.0), 1e-3)
@@ -412,14 +431,28 @@ class AdaptiveTimestepSampler:
             val = losses[mask].mean()
             if self.counts[idx] == 0:
                 self.loss_ema[idx] = val
+                self.loss_ema_slow[idx] = val
             else:
                 self.loss_ema[idx] = self.ema_decay * self.loss_ema[idx] + (1.0 - self.ema_decay) * val
+                d = self.slope_slow_decay
+                self.loss_ema_slow[idx] = d * self.loss_ema_slow[idx] + (1.0 - d) * val
             self.counts[idx] += int(mask.sum().item())
 
     def factors(self) -> torch.Tensor:
         if not self.ready:
             return torch.ones(self.bins, dtype=torch.float32)
         losses = self.loss_ema.clamp(min=1e-8)
+
+        if self.metric == "slope":
+            # 斜率感知：factor ∝ (slow−fast)/slow 的正部 = 逐 bin loss 的"分数下降速度"。
+            # 除以 slow 归一 → level-free，消掉 bin 间 loss 量级差。
+            fast = self.loss_ema.clamp(min=1e-8)
+            slow = self.loss_ema_slow.clamp(min=1e-8)
+            s = ((slow - fast) / slow).clamp(min=0.0)   # 饱和(≈0)/回升(<0) → 0 → 落 min_factor
+            denom = s.mean().clamp(min=1e-8)
+            if float(denom) <= 1e-8:                     # 没有 bin 在学 → 不重采样，回退 base
+                return torch.ones(self.bins, dtype=torch.float32)
+            return (s / denom).clamp(self.min_factor, self.max_factor)
 
         if self.metric == "entropy_rate":
             # InfoNoise: factor_k ∝ (mse_hat_k / t_k³) / w(t_k)

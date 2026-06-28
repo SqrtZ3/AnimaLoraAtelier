@@ -608,9 +608,12 @@ def parse_args():
                         "1-5%% 量级，0.01=保守。")
     p.add_argument("--adaptive-timestep", action="store_true",
                    help="启用保守自适应 timestep：按 per-timestep raw loss 重采样，不改变 loss 权重。")
-    p.add_argument("--adaptive-timestep-metric", choices=["raw", "highfreq", "mixed", "entropy_rate"], default="raw",
-                   help="自适应 timestep 的统计信号：raw / highfreq / mixed / entropy_rate "
-                        "（entropy_rate = InfoNoise 风格 ρ(t)/w(t)，配合 --adaptive-timestep-low-noise-gate 使用）。")
+    p.add_argument("--adaptive-timestep-metric", choices=["raw", "highfreq", "mixed", "entropy_rate", "slope"], default="raw",
+                   help="自适应 timestep 的统计信号：raw / highfreq / mixed / entropy_rate / slope "
+                        "（entropy_rate = InfoNoise 风格 ρ(t)/w(t)，配合 --adaptive-timestep-low-noise-gate 使用；"
+                        "slope = 斜率感知，把预算投向 loss 仍在下降的 bin、自动放出已饱和的低噪段）。")
+    p.add_argument("--adaptive-timestep-slope-slow-decay", type=float, default=-1.0,
+                   help="slope 模式慢 EMA 衰减；<0 → 自动从 --adaptive-timestep-ema-decay 派生（比 fast 慢 4×）。")
     p.add_argument("--adaptive-timestep-low-noise-gate", action="store_true",
                    help="InfoNoise 低噪闸门 g(t) = t^n/(t^n + c^n)；entropy_rate 模式专用。")
     p.add_argument("--adaptive-timestep-gate-n", type=float, default=3.0,
@@ -1814,6 +1817,7 @@ def main():
         gate_n=float(getattr(args, "adaptive_timestep_gate_n", 3.0) or 3.0),
         gate_c=float(getattr(args, "adaptive_timestep_gate_c", 0.05) or 0.05),
         loss_weight_fn=_loss_weight_fn,
+        slope_slow_decay=float(getattr(args, "adaptive_timestep_slope_slow_decay", -1.0)),
     )
     if adaptive_ts.enabled:
         logger.info("[adaptive_timestep] enabled: %s", adaptive_ts.summary())

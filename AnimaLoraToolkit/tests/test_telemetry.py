@@ -308,3 +308,81 @@ def test_adaptive_bin_report_ready_writes_factors(tmp_path):
     assert row[1] == "1"  # ready
     factors = [float(x) for x in row[4:]]
     assert factors[0] == max(factors), f"高 loss bin 应得最大 factor: {factors}"
+
+
+# ───────────────────────── slope metric（斜率感知重采样）─────────────────────────
+
+def _ready_slope_sampler(bins, fast, slow, **kw):
+    """构造一个已 ready 的 slope sampler，直接注入 fast/slow EMA 做 factors() 纯逻辑断言。"""
+    s = AdaptiveTimestepSampler(enabled=True, bins=bins, metric="slope",
+                                min_factor=0.5, max_factor=2.5, **kw)
+    s.counts = torch.ones(bins, dtype=torch.long)          # 标记 ready
+    s.loss_ema = torch.tensor(fast, dtype=torch.float32)
+    s.loss_ema_slow = torch.tensor(slow, dtype=torch.float32)
+    return s
+
+
+def test_slope_invests_in_learning_bin():
+    # 只有 bin1 在学（slow>fast）；饱和 bin → min，学习 bin → max
+    s = _ready_slope_sampler(4, fast=[1.0, 1.0, 1.0, 0.5], slow=[1.0, 2.0, 1.0, 0.5])
+    f = s.factors().tolist()
+    assert abs(f[1] - 2.5) < 1e-5, f"还在学的 bin 应到 max_factor: {f}"
+    assert all(abs(f[i] - 0.5) < 1e-5 for i in (0, 2, 3)), f"饱和 bin 应落 min_factor: {f}"
+
+
+def test_slope_is_level_free():
+    # bin0 绝对 loss 高但平（slow=fast=10）；bin1 绝对 loss 低但在降 → bin1 应胜出，
+    # 证明 slope 不被 loss 量级带偏（raw/entropy_rate 会把 bin0 抬最高）。
+    s = _ready_slope_sampler(2, fast=[10.0, 0.1], slow=[10.0, 0.2])
+    f = s.factors().tolist()
+    assert f[1] > f[0], f"低 loss 但在学的 bin 应赢过高 loss 但平的 bin: {f}"
+    assert abs(f[0] - 0.5) < 1e-5 and f[1] > 1.5, f"{f}"
+
+
+def test_slope_demotes_worsening_bin():
+    # bin1 loss 在回升（fast>slow → s<0）→ 与饱和同等落 min；bin2 在学 → max
+    s = _ready_slope_sampler(3, fast=[1.0, 1.5, 0.5], slow=[1.0, 1.0, 1.0])
+    f = s.factors().tolist()
+    assert abs(f[1] - 0.5) < 1e-5, f"回升(过拟合)的 bin 应落 min_factor: {f}"
+    assert abs(f[2] - 2.5) < 1e-5, f"在学的 bin 应到 max_factor: {f}"
+
+
+def test_slope_all_saturated_returns_ones():
+    # 所有 bin slow==fast → 无人在学 → 不重采样（全 1，回退 base 分布）
+    s = _ready_slope_sampler(4, fast=[1.0, 2.0, 0.5, 3.0], slow=[1.0, 2.0, 0.5, 3.0])
+    f = s.factors().tolist()
+    assert all(abs(v - 1.0) < 1e-6 for v in f), f"全饱和应返回全 1: {f}"
+
+
+def test_slope_does_not_affect_raw_metric():
+    # default-off 等价：metric=raw 时即便 slow EMA 不同，factors 仍走 level-based（用 loss_ema）
+    s = AdaptiveTimestepSampler(enabled=True, bins=4, metric="raw",
+                                min_factor=0.5, max_factor=2.5)
+    s.counts = torch.ones(4, dtype=torch.long)
+    s.loss_ema = torch.tensor([1.0, 1.0, 10.0, 1.0])      # bin2 绝对 loss 最高
+    s.loss_ema_slow = torch.tensor([5.0, 5.0, 5.0, 5.0])  # 故意与 fast 不一致
+    f = s.factors().tolist()
+    assert f[2] == max(f) and abs(f[2] - 2.5) < 1e-5, f"raw 应按 level：高 loss bin 最大: {f}"
+
+
+def test_slope_slow_decay_auto_and_clamp():
+    # 自动派生：slow = 1-(1-fast)*0.25；显式过快(<fast)被夹到 fast
+    s_auto = AdaptiveTimestepSampler(enabled=True, bins=4, metric="slope", ema_decay=0.95)
+    assert abs(s_auto.slope_slow_decay - 0.9875) < 1e-9
+    s_clamp = AdaptiveTimestepSampler(enabled=True, bins=4, metric="slope",
+                                      ema_decay=0.95, slope_slow_decay=0.90)
+    assert abs(s_clamp.slope_slow_decay - 0.95) < 1e-9, "slow 不得快于 fast"
+
+
+def test_slope_end_to_end_via_update():
+    # 走真实 update() 路径：bin1 喂持续下降 loss、其余恒定 → bin1 factor 最大
+    s = AdaptiveTimestepSampler(enabled=True, bins=4, metric="slope",
+                                min_factor=0.5, max_factor=2.5, ema_decay=0.8)
+    t = torch.tensor([0.125, 0.375, 0.625, 0.875])
+    for k in range(40):
+        decreasing = max(2.0 - 0.04 * k, 0.2)
+        per_sample = torch.tensor([1.0, decreasing, 1.0, 1.0])
+        s.update(t, per_sample)
+    assert s.ready
+    f = s.factors().tolist()
+    assert f[1] == max(f) and f[1] > f[0], f"持续下降的 bin 应得最大 factor: {f}"

@@ -230,6 +230,8 @@ YAML_TO_ARGS = {
     "adaptive_timestep_low_noise_gate": "adaptive_timestep_low_noise_gate",
     "adaptive_timestep_gate_n": "adaptive_timestep_gate_n",
     "adaptive_timestep_gate_c": "adaptive_timestep_gate_c",
+    # slope 模式专用：慢 EMA 衰减
+    "adaptive_timestep_slope_slow_decay": "adaptive_timestep_slope_slow_decay",
     "min_snr_gamma": "min_snr_gamma",
     "loss_weighting_scheme": "loss_weighting_scheme",
     "weight_cap_ratio": "weight_cap_ratio",
@@ -498,6 +500,7 @@ DEFAULTS = {
     "adaptive_timestep_low_noise_gate": False,
     "adaptive_timestep_gate_n": 3.0,
     "adaptive_timestep_gate_c": 0.05,
+    "adaptive_timestep_slope_slow_decay": -1.0,
     "min_snr_gamma": 0.0,
     "loss_weighting_scheme": "none",
     "weight_cap_ratio": 5.0,

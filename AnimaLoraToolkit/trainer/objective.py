@@ -1013,7 +1013,9 @@ def adaptive_timestep_metric_signal(
     """Build the detached per-sample signal used by AdaptiveTimestepSampler."""
     metric = (metric or "raw").lower()
     raw = per_sample.detach().float()
-    if metric in ("raw", "entropy_rate"):
+    # slope 与 raw/entropy_rate 一样透传裸重建 loss：斜率在 factors() 里由快/慢 EMA 之差算出，
+    # 不在信号变换处做（喂裸 loss 才能正确估计 per-bin 下降速度）。
+    if metric in ("raw", "entropy_rate", "slope"):
         return raw
     highfreq = per_sample_highfreq_loss(pred.detach(), target.detach())
     if metric == "highfreq":

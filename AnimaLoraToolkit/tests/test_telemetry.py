@@ -27,7 +27,7 @@ from trainer.telemetry import (
     adaptive_bin_report,
 )
 from utils.soap_optimizer import SOAPScheduleFree
-from trainer.objective import AdaptiveTimestepSampler
+from trainer.objective import AdaptiveTimestepSampler, adaptive_timestep_metric_signal
 
 
 # ───────────────────────── 小工具 ─────────────────────────
@@ -372,6 +372,16 @@ def test_slope_slow_decay_auto_and_clamp():
     s_clamp = AdaptiveTimestepSampler(enabled=True, bins=4, metric="slope",
                                       ema_decay=0.95, slope_slow_decay=0.90)
     assert abs(s_clamp.slope_slow_decay - 0.95) < 1e-9, "slow 不得快于 fast"
+
+
+def test_metric_signal_accepts_slope():
+    # 回归：非 fit_packed 训练路径经 adaptive_timestep_metric_signal 取信号；
+    # slope 必须被接受并透传裸 loss（曾因漏加白名单而 ValueError）。
+    per_sample = torch.tensor([0.3, 0.1, 0.5, 0.2])
+    pred = torch.randn(4, 4, 8, 8)
+    target = torch.randn(4, 4, 8, 8)
+    sig = adaptive_timestep_metric_signal(per_sample, pred, target, metric="slope")
+    assert torch.allclose(sig, per_sample), "slope 应透传裸 per_sample loss"
 
 
 def test_slope_end_to_end_via_update():

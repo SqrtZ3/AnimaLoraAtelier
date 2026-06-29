@@ -84,6 +84,9 @@ YAML_TO_ARGS = {
     "fit_align_mode": "fit_align_mode",
     "fit_pack_multiple_images": "fit_pack_multiple_images",
     "fit_max_tokens_per_batch": "fit_max_tokens_per_batch",
+    "navit_packing": "navit_packing",
+    "navit_token_budget": "navit_token_budget",
+    "navit_max_images_per_pack": "navit_max_images_per_pack",
     "alpha_handling": "alpha_handling",
     "alpha_background": "alpha_background",
     "alpha_threshold": "alpha_threshold",
@@ -380,6 +383,14 @@ DEFAULTS = {
     "fit_align_mode": "pad",
     "fit_pack_multiple_images": False,
     "fit_max_tokens_per_batch": 0,
+    # NaViT/Patch-n-Pack block-diagonal packing (opt-in, default-off). When enabled,
+    # heterogeneous images are packed into one block-diagonal forward up to
+    # navit_token_budget tokens (sum of per-image token counts), each with its own
+    # timestep — decouples effective batch from per-image shape. token_budget=0 means
+    # "must be set explicitly"; size it to VRAM (see docs/navit-packing.md).
+    "navit_packing": False,
+    "navit_token_budget": 0,
+    "navit_max_images_per_pack": 0,
     "alpha_handling": "none",
     "alpha_background": "neutral",
     "alpha_threshold": 0.01,

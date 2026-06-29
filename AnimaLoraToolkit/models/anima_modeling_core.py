@@ -18,7 +18,7 @@
 # limitations under the License.
 
 import math
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -40,6 +40,24 @@ def set_xformers_enabled(enabled: bool) -> bool:
     global _USE_XFORMERS
     _USE_XFORMERS = bool(enabled) and _XFORMERS_AVAILABLE
     return _USE_XFORMERS
+
+
+def _is_xformers_attn_bias(m) -> bool:
+    """True iff ``m`` is an xformers attention-bias object (e.g. ``BlockDiagonalMask``).
+
+    Used by :func:`torch_attention_op` to distinguish the NaViT/FiT block-diagonal
+    *packing* path (an ``AttentionBias`` routed through ``memory_efficient_attention``'s
+    fast varlen kernel) from the legacy *additive float mask* path (a plain
+    ``torch.Tensor`` routed through SDPA). Returns False — never raises — when xformers
+    is absent, so non-packed callers are unaffected.
+    """
+    if m is None or isinstance(m, torch.Tensor):
+        return False
+    try:
+        from xformers.ops.fmha.attn_bias import AttentionBias
+    except Exception:
+        return False
+    return isinstance(m, AttentionBias)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -140,6 +158,24 @@ def torch_attention_op(
     Returns:
         Attention output tensor with shape (batch, seq_len, n_heads * head_dim)
     """
+    # NaViT/FiT block-diagonal packing path: ``attn_mask`` is an xformers
+    # ``AttentionBias`` (e.g. ``BlockDiagonalMask``) carrying per-image seqlens, not an
+    # additive float tensor. Route it through ``memory_efficient_attention``'s fast
+    # varlen kernel so each packed image attends only to its own tokens — no
+    # cross-image leakage and no O(N²) dense mask. Requires xformers; raise loudly if
+    # a bias was requested but xformers is unavailable (silently falling back to dense
+    # SDPA would defeat the purpose and could OOM on long packed sequences).
+    if _is_xformers_attn_bias(attn_mask):
+        if xops is None:
+            raise RuntimeError(
+                "block-diagonal attention bias requires xformers, but xformers.ops "
+                "is unavailable. Disable packed/NaViT training or install xformers."
+            )
+        out = xops.memory_efficient_attention(
+            q_B_S_H_D, k_B_S_H_D, v_B_S_H_D, attn_bias=attn_mask
+        )
+        return rearrange(out, "b s h d -> b s (h d)")
+
     if attn_mask is None and _USE_XFORMERS and xops is not None:
         try:
             out = xops.memory_efficient_attention(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D)
@@ -656,7 +692,14 @@ class FinalLayer(nn.Module):
         x_B_N_D: torch.Tensor,
         emb_B_T_D: torch.Tensor,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+        token_wise_mod: bool = False,
     ):
+        # ``token_wise_mod`` is the NaViT/FiT packing path: ``emb`` (and ``adaln_lora``)
+        # are already per-token ``[1, N, *]`` — one timestep per packed image,
+        # ``repeat_interleave``-expanded across that image's tokens — so the AdaLN
+        # shift/scale must be applied per token rather than broadcast from a single
+        # ``[:, :1, :]`` slot. Default ``False`` keeps every existing caller (constant-N
+        # / token-bucket, where the whole row shares one timestep) byte-identical.
         if self.use_adaln_lora:
             assert adaln_lora_B_T_3D is not None
             shift_B_T_D, scale_B_T_D = (
@@ -665,9 +708,12 @@ class FinalLayer(nn.Module):
         else:
             shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
 
-        shift_B_1_D = shift_B_T_D[:, :1, :]
-        scale_B_1_D = scale_B_T_D[:, :1, :]
-        x_B_N_D = self.layer_norm(x_B_N_D) * (1 + scale_B_1_D) + shift_B_1_D
+        if token_wise_mod:
+            shift_mod, scale_mod = shift_B_T_D, scale_B_T_D
+        else:
+            shift_mod = shift_B_T_D[:, :1, :]
+            scale_mod = scale_B_T_D[:, :1, :]
+        x_B_N_D = self.layer_norm(x_B_N_D) * (1 + scale_mod) + shift_mod
         return self.linear(x_B_N_D)
 
 
@@ -887,12 +933,22 @@ class Block(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         token_mask_f: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+        cross_attn_mask: Optional[torch.Tensor] = None,
+        token_wise_mod: bool = False,
     ) -> torch.Tensor:
         # ``attn_mask`` (additive key-padding mask) and ``token_mask_f`` (float
         # zeroing mask) are precomputed once per step by the caller via
         # ``MiniTrainDIT._build_packed_masks`` — not rebuilt here per block. Both are
         # None when every token is valid (constant-N / token-bucket), so attention
         # takes SDPA's fast maskless path and no output zeroing is needed.
+        #
+        # NaViT/FiT packing path (``token_wise_mod=True``): ``attn_mask`` and
+        # ``cross_attn_mask`` are xformers ``BlockDiagonalMask`` biases (per-image
+        # self / cross seqlens), and ``emb_B_T_D`` / ``adaln_lora_B_T_3D`` are already
+        # per-token ``[1, N, *]`` (one timestep per packed image, repeat-interleaved over
+        # its tokens). AdaLN shift/scale/gate are then applied per token instead of
+        # broadcast from the ``[:, :1, :]`` slot. All three default to None/False, so
+        # constant-N / token-bucket callers are byte-identical.
         if self.use_adaln_lora:
             assert adaln_lora_B_T_3D is not None
             shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
@@ -913,15 +969,16 @@ class Block(nn.Module):
             ).chunk(3, dim=-1)
             shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
 
-        shift_self_attn_B_1_D = shift_self_attn_B_T_D[:, :1, :]
-        scale_self_attn_B_1_D = scale_self_attn_B_T_D[:, :1, :]
-        gate_self_attn_B_1_D = gate_self_attn_B_T_D[:, :1, :]
-        shift_cross_attn_B_1_D = shift_cross_attn_B_T_D[:, :1, :]
-        scale_cross_attn_B_1_D = scale_cross_attn_B_T_D[:, :1, :]
-        gate_cross_attn_B_1_D = gate_cross_attn_B_T_D[:, :1, :]
-        shift_mlp_B_1_D = shift_mlp_B_T_D[:, :1, :]
-        scale_mlp_B_1_D = scale_mlp_B_T_D[:, :1, :]
-        gate_mlp_B_1_D = gate_mlp_B_T_D[:, :1, :]
+        _sel = (lambda t: t) if token_wise_mod else (lambda t: t[:, :1, :])
+        shift_self_attn_B_1_D = _sel(shift_self_attn_B_T_D)
+        scale_self_attn_B_1_D = _sel(scale_self_attn_B_T_D)
+        gate_self_attn_B_1_D = _sel(gate_self_attn_B_T_D)
+        shift_cross_attn_B_1_D = _sel(shift_cross_attn_B_T_D)
+        scale_cross_attn_B_1_D = _sel(scale_cross_attn_B_T_D)
+        gate_cross_attn_B_1_D = _sel(gate_cross_attn_B_T_D)
+        shift_mlp_B_1_D = _sel(shift_mlp_B_T_D)
+        scale_mlp_B_1_D = _sel(scale_mlp_B_T_D)
+        gate_mlp_B_1_D = _sel(gate_mlp_B_T_D)
 
         def _fn(_x_B_N_D, _norm_layer, _scale_B_1_D, _shift_B_1_D):
             return _norm_layer(_x_B_N_D) * (1 + _scale_B_1_D) + _shift_B_1_D
@@ -946,7 +1003,9 @@ class Block(nn.Module):
             scale_cross_attn_B_1_D,
             shift_cross_attn_B_1_D,
         )
-        result_B_N_D = self.cross_attn(normalized_x_B_N_D, crossattn_emb, rope_emb=None)
+        result_B_N_D = self.cross_attn(
+            normalized_x_B_N_D, crossattn_emb, rope_emb=None, attn_mask=cross_attn_mask
+        )
         x_B_N_D = result_B_N_D * gate_cross_attn_B_1_D + x_B_N_D
 
         normalized_x_B_N_D = _fn(
@@ -1434,6 +1493,106 @@ class MiniTrainDIT(nn.Module):
         out = self.final_layer.forward_tokens(x_B_N_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         out = self._output_tokens_to_patch_tokens(out, size_B_1_2)
         return out * mask_B_N.to(dtype=out.dtype).unsqueeze(-1)
+
+    def forward_packed_navit(
+        self,
+        tokens_1_N_M: torch.Tensor,
+        timesteps_G: torch.Tensor,
+        crossattn_packed_1_L_D: torch.Tensor,
+        grid_1_2_N: torch.Tensor,
+        visual_seqlens: Sequence[int],
+        text_seqlens: Sequence[int],
+    ) -> torch.Tensor:
+        """NaViT/Patch-n-Pack forward: ``G`` heterogeneous images concatenated into one
+        sequence, each attending only to its own tokens (block-diagonal self-attention)
+        and only to its own caption (block-diagonal cross-attention), each carrying its
+        own sampled timestep (per-token AdaLN).
+
+        Shapes (B is fixed at 1 — the whole pack is one sequence):
+          tokens_1_N_M        [1, ΣN, M]   patch tokens, images concatenated in order
+          timesteps_G         [G] or [G,1] one timestep per packed image
+          crossattn_packed    [1, ΣL, D]   text embeddings, captions concatenated in order
+          grid_1_2_N          [1, 2, ΣN]   per-token (row, col) for RoPE (per-image grids)
+          visual_seqlens      length G     image token counts (sum == ΣN)
+          text_seqlens        length G     caption token counts (sum == ΣL)
+
+        Returns packed patch tokens ``[1, ΣN, O]`` in ``patchify_latents_to_tokens``
+        channel order; the caller slices per image (via ``visual_seqlens``) for the loss.
+        Self/cross masking uses xformers ``BlockDiagonalMask`` so attention runs the fast
+        varlen kernel — there is no O(ΣN²) dense mask and no cross-image leakage (the
+        invariant is asserted bit-for-bit in ``test_packed_block_diag_attention``).
+        """
+        try:
+            from xformers.ops.fmha import BlockDiagonalMask
+        except Exception as exc:  # pragma: no cover - exercised only without xformers
+            raise RuntimeError(
+                "forward_packed_navit requires xformers (BlockDiagonalMask) for "
+                "block-diagonal packed attention; it is unavailable."
+            ) from exc
+
+        visual_seqlens = [int(s) for s in visual_seqlens]
+        text_seqlens = [int(s) for s in text_seqlens]
+        if sum(visual_seqlens) != tokens_1_N_M.shape[1]:
+            raise ValueError(
+                f"visual_seqlens sum {sum(visual_seqlens)} != packed token count "
+                f"{tokens_1_N_M.shape[1]}"
+            )
+        if sum(text_seqlens) != crossattn_packed_1_L_D.shape[1]:
+            raise ValueError(
+                f"text_seqlens sum {sum(text_seqlens)} != packed text token count "
+                f"{crossattn_packed_1_L_D.shape[1]}"
+            )
+
+        expected = self.x_embedder.proj[1].in_features
+        if tokens_1_N_M.shape[-1] < expected:
+            tokens_1_N_M = F.pad(tokens_1_N_M, (0, expected - tokens_1_N_M.shape[-1]))
+        elif tokens_1_N_M.shape[-1] > expected:
+            raise ValueError(
+                f"packed tokens have dim={tokens_1_N_M.shape[-1]}, but x_embedder expects {expected}"
+            )
+        x_1_N_D = self.x_embedder.proj[1](tokens_1_N_M)
+
+        # Per-image timestep embedding, then repeat-interleave to per token so AdaLN
+        # modulates each image's tokens with its own timestep (token_wise_mod=True).
+        if timesteps_G.ndim == 1:
+            timesteps_G = timesteps_G.unsqueeze(1)            # [G, 1]
+        t_emb_G_1_D, adaln_lora_G_1_3D = self.t_embedder(timesteps_G)
+        t_emb_G_1_D = self.t_embedding_norm(t_emb_G_1_D)
+
+        counts = torch.tensor(visual_seqlens, device=x_1_N_D.device)
+        t_emb_tok = t_emb_G_1_D[:, 0, :].repeat_interleave(counts, dim=0).unsqueeze(0)   # [1, ΣN, D]
+        if adaln_lora_G_1_3D is not None:
+            adaln_lora_tok = adaln_lora_G_1_3D[:, 0, :].repeat_interleave(counts, dim=0).unsqueeze(0)
+        else:
+            adaln_lora_tok = None
+
+        self.affline_scale_log_info = {"t_embedding_B_T_D": t_emb_tok.detach()}
+        self.affline_emb = t_emb_tok
+        self.crossattn_emb = crossattn_packed_1_L_D
+
+        rope_emb = self._packed_rope_from_grid(grid_1_2_N)
+        self_bias = BlockDiagonalMask.from_seqlens(visual_seqlens)
+        cross_bias = BlockDiagonalMask.from_seqlens(
+            q_seqlen=visual_seqlens, kv_seqlen=text_seqlens
+        )
+
+        for block in self.blocks:
+            x_1_N_D = block.forward_tokens(
+                x_1_N_D,
+                t_emb_tok,
+                crossattn_packed_1_L_D,
+                rope_emb_L_1_1_D=rope_emb,
+                attn_mask=self_bias,
+                token_mask_f=None,
+                adaln_lora_B_T_3D=adaln_lora_tok,
+                cross_attn_mask=cross_bias,
+                token_wise_mod=True,
+            )
+
+        out = self.final_layer.forward_tokens(
+            x_1_N_D, t_emb_tok, adaln_lora_B_T_3D=adaln_lora_tok, token_wise_mod=True
+        )
+        return self._output_tokens_to_patch_tokens(out, None)
 
     def forward(
         self,

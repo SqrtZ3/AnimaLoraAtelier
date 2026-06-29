@@ -61,9 +61,13 @@ timestep”假设写的特性会语义错位。v1 的策略：
 checkpoint 保存/恢复、训练中采样出图、**aux_losses（spectral / perceptual / self-perceptual /
 ncp / dispersive 等，逐图 unpatchify 回网格后按既有 aux 数学计算）**。
 
-**互斥（同时开 → 启动即 fail-fast 报错，提示二选一）**：TREAD token 路由、LeapAlign、
-CSFlow、DPO、GAF、ARB / token_bucket 分桶、`effective_batch_size` 样本窗口累积、torch_compile
-（动态 pack 形状与固定图冲突）。这些日后可逐个适配 NaViT，不在 v1 范围。
+**互斥（同时开 → 启动即 fail-fast 报错，提示显式关掉）**：`token_bucket`/ARB 分桶、
+`effective_batch_size` 样本窗口累积、`tread_enabled`、`leap_enabled`、`gaf_enabled`、
+`dpo_enabled`、`timestep_sampling=csflow`、`torch_compile`（动态 pack 形状与固定图冲突）、
+以及 `dfm_lambda>0` / `eisbach_lambda>0` / `dispersive_enabled` / `adaptive_timestep`
+——后四个在 NaViT 路径会被 `_skip_main_extras` 跳过（它们假设批量网格 / 逐 batch 单 t /
+batch 内负样本），**为避免"开着却悄悄不生效"的隐性行为改变，一律 fail-fast 要求显式关闭**。
+这些日后可逐个适配 NaViT，不在 v1 范围。
 
 ## 4. 实现地图（已落地部分）
 

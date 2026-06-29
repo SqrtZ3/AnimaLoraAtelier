@@ -1108,18 +1108,31 @@ def main():
             _navit_conflicts.append("token_bucket")
         if int(getattr(args, "effective_batch_size", 0) or 0) > 0:
             _navit_conflicts.append("effective_batch_size")
-        if float(getattr(args, "tread_ratio", 0.0) or 0.0) > 0.0:
-            _navit_conflicts.append("tread_ratio")
+        # TREAD 只在 tread_enabled 时按 tread_ratio 生效（见 _tread_ratio 门控）；
+        # 只看 tread_ratio 会误杀"留了非零 ratio 但 tread_enabled=false"的配置。
+        if bool(getattr(args, "tread_enabled", False)) and float(getattr(args, "tread_ratio", 0.0) or 0.0) > 0.0:
+            _navit_conflicts.append("tread_enabled")
         if bool(getattr(args, "leap_enabled", False)):
             _navit_conflicts.append("leap_enabled")
         if bool(getattr(args, "gaf_enabled", False)):
             _navit_conflicts.append("gaf_enabled")
         if bool(getattr(args, "dpo_enabled", False)):
             _navit_conflicts.append("dpo_enabled")
-        if str(getattr(args, "timestep_mode", "") or "").lower() == "csflow":
-            _navit_conflicts.append("timestep_mode=csflow")
+        if str(getattr(args, "timestep_sampling", "") or "").lower() == "csflow":
+            _navit_conflicts.append("timestep_sampling=csflow")
         if bool(getattr(args, "torch_compile", False)):
             _navit_conflicts.append("torch_compile")
+        # 下面这些在 navit 路径会被 _skip_main_extras 跳过（它们都假设批量网格 / 逐 batch
+        # 单 t / batch 内负样本）。若不在此 fail-fast，它们会"开着但悄悄不生效"——对调好参的
+        # 配置是隐性行为改变。宁可报错让用户显式关掉，也不静默吞掉。
+        if float(getattr(args, "dfm_lambda", 0.0) or 0.0) > 0.0:
+            _navit_conflicts.append("dfm_lambda>0")
+        if float(getattr(args, "eisbach_lambda", 0.0) or 0.0) > 0.0:
+            _navit_conflicts.append("eisbach_lambda>0")
+        if bool(getattr(args, "dispersive_enabled", False)):
+            _navit_conflicts.append("dispersive_enabled")
+        if bool(getattr(args, "adaptive_timestep", False)):
+            _navit_conflicts.append("adaptive_timestep")
         if _navit_conflicts:
             raise RuntimeError(
                 "navit_packing(v1) 暂不支持与以下特性同时开启："

@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 _XFORMERS_AVAILABLE = False
 _USE_XFORMERS = False
@@ -1502,11 +1503,18 @@ class MiniTrainDIT(nn.Module):
         grid_1_2_N: torch.Tensor,
         visual_seqlens: Sequence[int],
         text_seqlens: Sequence[int],
+        use_checkpoint: bool = False,
     ) -> torch.Tensor:
         """NaViT/Patch-n-Pack forward: ``G`` heterogeneous images concatenated into one
         sequence, each attending only to its own tokens (block-diagonal self-attention)
         and only to its own caption (block-diagonal cross-attention), each carrying its
         own sampled timestep (per-token AdaLN).
+
+        ``use_checkpoint=True`` wraps each transformer block in a gradient checkpoint
+        (per-block, ``use_reentrant=False``) so backward recomputes one block at a time
+        — peak activation memory ≈ 1 block instead of N_blocks. The per-token timestep
+        embedding, RoPE, and the two ``BlockDiagonalMask`` biases are built once and
+        closed over, identical to the non-checkpoint path.
 
         Shapes (B is fixed at 1 — the whole pack is one sequence):
           tokens_1_N_M        [1, ΣN, M]   patch tokens, images concatenated in order
@@ -1577,17 +1585,22 @@ class MiniTrainDIT(nn.Module):
         )
 
         for block in self.blocks:
-            x_1_N_D = block.forward_tokens(
-                x_1_N_D,
-                t_emb_tok,
-                crossattn_packed_1_L_D,
-                rope_emb_L_1_1_D=rope_emb,
-                attn_mask=self_bias,
-                token_mask_f=None,
-                adaln_lora_B_T_3D=adaln_lora_tok,
-                cross_attn_mask=cross_bias,
-                token_wise_mod=True,
-            )
+            def _run(x_in, blk=block):
+                return blk.forward_tokens(
+                    x_in,
+                    t_emb_tok,
+                    crossattn_packed_1_L_D,
+                    rope_emb_L_1_1_D=rope_emb,
+                    attn_mask=self_bias,
+                    token_mask_f=None,
+                    adaln_lora_B_T_3D=adaln_lora_tok,
+                    cross_attn_mask=cross_bias,
+                    token_wise_mod=True,
+                )
+            if use_checkpoint:
+                x_1_N_D = checkpoint(_run, x_1_N_D, use_reentrant=False)
+            else:
+                x_1_N_D = _run(x_1_N_D)
 
         out = self.final_layer.forward_tokens(
             x_1_N_D, t_emb_tok, adaln_lora_B_T_3D=adaln_lora_tok, token_wise_mod=True

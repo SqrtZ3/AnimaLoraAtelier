@@ -2835,6 +2835,7 @@ def main():
                     _navit_loss, pred, _navit_info = navit_packed_forward_and_loss(
                         model, navit_latents, t, cross_packed, text_seqlens,
                         objective_cfg.noise, objective_cfg.loss,
+                        use_checkpoint=bool(getattr(args, "grad_checkpoint", False)),
                     )
                     per_sample = _navit_info["per_image_loss"]
                     fit_size = None  # navit aux unpatchifies per image below

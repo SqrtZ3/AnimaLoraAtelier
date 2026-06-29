@@ -1370,6 +1370,7 @@ def navit_packed_forward_and_loss(
     noise_cfg,
     loss_cfg,
     noise_list=None,
+    use_checkpoint=False,
 ):
     """One NaViT/Patch-n-Pack training step core: ``G`` heterogeneous images packed into
     a single block-diagonal forward, each carrying its own flow-matching timestep.
@@ -1425,7 +1426,8 @@ def navit_packed_forward_and_loss(
     grid = torch.cat(grid_list, dim=2)               # [1, 2, ΣN]
 
     pred = model.forward_packed_navit(
-        tokens, t_per_image, cross_packed, grid, vseq, [int(s) for s in text_seqlens]
+        tokens, t_per_image, cross_packed, grid, vseq, [int(s) for s in text_seqlens],
+        use_checkpoint=use_checkpoint,
     )
 
     # Per-image loss: slice the packed prediction so each image uses its own timestep for

@@ -42,15 +42,25 @@ rank、grad_checkpoint、底模大小（2048 vs 5120 通道）都会左右它，
 
 | 显存 | 起步 token_budget | 约等于（4096-token/张） |
 |---|---|---|
-| 16 GB | 8192 | ~2 张 |
-| 24 GB | 12288–16384 | ~3–4 张 |
-| 32 GB | 16384–24576 | ~4–6 张 |
-| 48 GB | 32768 | ~8 张 |
-| 80 GB | 65536 | ~16 张 |
+下表是 **`grad_checkpoint: true`（推荐，navit 已接逐块梯度检查点）** 下的保守起点——峰值激活
+≈ 1 个 block 而非 28 个 block，所以同样显存能装的 budget 比无 checkpoint 大一个量级。**不是
+实测定值**，你的卡 / rank / 底模通道（2048 vs 5120）都会左右它，**首跑看峰值显存再调**：
+
+| 显存 | 起步 token_budget（grad_checkpoint=true） | 约等于（4096-token/张） |
+|---|---|---|
+| 16 GB | 16384 | ~4 张 |
+| 24 GB | 32768 | ~8 张 |
+| 32 GB | 49152 | ~12 张 |
+| 48 GB | 65536 | ~16 张 |
+| 80 GB | 98304 | ~24 张 |
+| 96 GB | 131072 | ~32 张 |
 
 - `navit_token_budget` 必须 **≥ 最大单图 token 数**，否则那张图单独成包且可能超预算/OOM
   （sampler 会 warn）。
-- 想要更平滑的梯度但显存吃紧：调小 budget + 用 `grad_accum` 跨步累积到目标有效 batch。
+- **`grad_checkpoint: false`**：峰值激活 ≈ 28×，上表 budget 要砍到约 1/8–1/10（如 96 GB 从
+  131072 降到 ~16384）。除非要省 backward 重算的算力，否则建议保持 true。
+- 想要更平滑的梯度：用 `grad_accum` 跨步累积到目标有效 batch（navit 下 `batch_size` 被忽略，
+  每步图片数由 budget 决定）。
 
 ## 3. v1 支持范围与门控（重要）
 
@@ -58,8 +68,9 @@ NaViT 改变了 batch 语义（一包异构图、逐图 t），许多按“`[B,C
 timestep”假设写的特性会语义错位。v1 的策略：
 
 **支持**：basic flow-matching（逐图 t 采样 + 噪声 + masked token loss）、`grad_accum`、
-checkpoint 保存/恢复、训练中采样出图、**aux_losses（spectral / perceptual / self-perceptual /
-ncp / dispersive 等，逐图 unpatchify 回网格后按既有 aux 数学计算）**。
+**逐块梯度检查点（`grad_checkpoint`，与 fit-packed 同策略）**、LoRA 保存/恢复、训练中采样出图、
+**aux_losses 中的 spectral / perceptual（逐图 unpatchify 回网格后按既有 aux 数学计算）**。
+（self-perceptual 需逐图额外模型前向、尚未适配；dispersive 见下方互斥项。）
 
 **互斥（同时开 → 启动即 fail-fast 报错，提示显式关掉）**：`token_bucket`/ARB 分桶、
 `effective_batch_size` 样本窗口累积、`tread_enabled`、`leap_enabled`、`gaf_enabled`、
@@ -85,7 +96,8 @@ batch 内负样本），**为避免"开着却悄悄不生效"的隐性行为改�
 本地 GPU（CUDA + xformers 0.0.30，head_dim 64/128）+ 纯 Python 单测，**已通过**：
 
 - `test_packed_block_diag_attention`：块对角 self/cross attention ≡ 各图独立 attention 拼接（零跨图泄漏）。
-- `test_packed_navit_forward`：`forward_packed_navit` ≡ 各图单独 `forward_packed_tokens` 拼接。
+- `test_packed_navit_forward`：`forward_packed_navit` ≡ 各图单独 `forward_packed_tokens` 拼接；
+  逐块梯度检查点（`use_checkpoint=true`）≡ 非检查点输出且可反向。
 - `test_navit_pack_sampler`：打包预算/覆盖/超大图/张数上限/跨 epoch 重洗。
 - `test_navit_packed_objective`：训练步前向+loss+反向梯度有限；逐图 loss 与手算一致。
 

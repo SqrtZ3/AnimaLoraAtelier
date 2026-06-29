@@ -113,6 +113,44 @@ class PackedNavitForwardTests(unittest.TestCase):
         self.assertEqual(tuple(packed.shape), tuple(ref.shape))
         torch.testing.assert_close(packed, ref, rtol=3e-2, atol=3e-2)
 
+    def test_navit_checkpoint_matches_non_checkpoint(self):
+        """Per-block gradient checkpointing must be numerically equivalent to the plain
+        forward (same packed output), and must still backprop."""
+        set_xformers_enabled(True)
+        dtype = torch.float16
+        model = self._model(dtype)
+        D = 128
+        latent_shapes = [(4, 4), (6, 8), (4, 6)]
+        text_lens = [5, 9, 3]
+        timesteps = [0.2, 0.6, 0.9]
+
+        toks, grids, vseq, cross_list, tseq = [], [], [], [], []
+        for (h, w), L in zip(latent_shapes, text_lens):
+            lat = torch.randn(1, 16, 1, h, w, device="cuda", dtype=dtype)
+            tok, grid, _m, _s = model.patchify_latents_to_tokens(lat)
+            toks.append(tok); grids.append(grid); vseq.append(tok.shape[1])
+            cross_list.append(torch.randn(1, L, D, device="cuda", dtype=dtype)); tseq.append(L)
+        tokens = torch.cat(toks, dim=1)
+        grid = torch.cat(grids, dim=2)
+        cross = torch.cat(cross_list, dim=1)
+        ts = torch.tensor(timesteps, device="cuda", dtype=dtype)
+
+        with torch.no_grad():
+            plain = model.forward_packed_navit(tokens, ts, cross, grid, vseq, tseq,
+                                               use_checkpoint=False)
+            ckpt = model.forward_packed_navit(tokens, ts, cross, grid, vseq, tseq,
+                                              use_checkpoint=True)
+        torch.testing.assert_close(ckpt, plain, rtol=2e-3, atol=2e-3)
+
+        # checkpoint path still backprops
+        tokens_g = tokens.clone().requires_grad_(True)
+        out = model.forward_packed_navit(tokens_g, ts, cross, grid, vseq, tseq,
+                                         use_checkpoint=True)
+        out.float().pow(2).mean().backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        self.assertGreater(len(grads), 0)
+        self.assertTrue(all(torch.isfinite(g).all() for g in grads))
+
     def test_navit_rejects_seqlen_mismatch(self):
         set_xformers_enabled(True)
         model = self._model(torch.float16)

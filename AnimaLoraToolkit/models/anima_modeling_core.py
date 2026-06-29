@@ -1153,7 +1153,7 @@ class MiniTrainDIT(nn.Module):
         )
 
 
-    def compile_blocks(self, backend: str = "inductor", mode=None):
+    def compile_blocks(self, backend: str = "inductor", mode=None, dynamic=False):
         """Per-block torch.compile of the token forward path (``block.forward_tokens``).
 
         Intended for constant / N-token bucketing: when the packed sequence length is
@@ -1161,19 +1161,33 @@ class MiniTrainDIT(nn.Module):
         The eager grid ``forward`` is unaffected (only ``forward_tokens`` is wrapped).
         ``backend='eager'`` validates compile-compatibility without Inductor/Triton;
         ``backend='inductor'`` is for the real speedup on CUDA/Linux.
+
+        ``dynamic`` controls shape specialization (passed straight to ``torch.compile``):
+        - ``False`` (historical default): every distinct input shape — including each
+          distinct packed sequence length N *and* each distinct batch size B — is a
+          separate static graph. Best per-step kernels, but if the dataset has several
+          native token counts or ``bucket_drop_last=false`` produces variable-size
+          remainder batches, the graph count explodes (and past ``cache_size_limit`` it
+          recompiles/falls back every step). Use only when N and B are truly fixed.
+        - ``None`` (auto): specialize the first shape statically, then mark the varying
+          dim symbolic on the second distinct shape → one or two graphs cover all token
+          counts and batch sizes. Recommended when the dataset has multiple native token
+          counts (no resampling needed) or B varies.
+        - ``True``: compile dynamic-shape kernels from the start (one graph, no static
+          warmup specialization).
         """
         import torch._dynamo as _dynamo
         self._blocks_compiled = True
         _dynamo.config.cache_size_limit = max(_dynamo.config.cache_size_limit, 32)
-        kwargs = {"backend": backend, "dynamic": False}
+        kwargs = {"backend": backend, "dynamic": dynamic}
         if mode is not None:
             kwargs["mode"] = mode
         for block in self.blocks:
             block.forward_tokens = torch.compile(block.forward_tokens, **kwargs)
         import logging
         logging.getLogger(__name__).info(
-            "compile_blocks: compiled %d block.forward_tokens (backend=%s, mode=%s)",
-            len(self.blocks), backend, mode,
+            "compile_blocks: compiled %d block.forward_tokens (backend=%s, mode=%s, dynamic=%s)",
+            len(self.blocks), backend, mode, dynamic,
         )
 
     def prepare_embedded_sequence(

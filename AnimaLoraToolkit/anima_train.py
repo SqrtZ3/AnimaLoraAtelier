@@ -1424,11 +1424,16 @@ def main():
     injector.set_module_dropout_compile_safe(bool(getattr(args, "torch_compile", False)))
     if bool(getattr(args, "torch_compile", False)):
         _compile_target = model.module if hasattr(model, "module") else model
-        _compile_target.compile_blocks(mode=getattr(args, "compile_mode", None))
+        _compile_dynamic = getattr(args, "compile_dynamic", None)
+        _compile_target.compile_blocks(
+            mode=getattr(args, "compile_mode", None),
+            dynamic=_compile_dynamic,
+        )
         logger.info(
-            "[torch_compile] per-block token path compiled (compile_mode=%s); "
-            "first step will be slow (Inductor warmup).",
-            getattr(args, "compile_mode", None),
+            "[torch_compile] per-block token path compiled (compile_mode=%s, dynamic=%s); "
+            "first step(s) will be slow (Inductor warmup). dynamic=None/True 可吸收多个 token 数 "
+            "与变动 batch，避免每步重编译。",
+            getattr(args, "compile_mode", None), _compile_dynamic,
         )
     vae_offloaded_to_cpu = False
     keep_vae_on_gpu = bool(getattr(args, "keep_vae_on_gpu", False))

@@ -1402,6 +1402,7 @@ def navit_packed_forward_and_loss(
         raise ValueError(f"t_per_image has {t_per_image.shape[0]} entries, expected G={G}")
 
     noisy_tok_list, target_tok_list, grid_list, vseq = [], [], [], []
+    noisy_grid_list, size_list = [], []
     for i, lat in enumerate(latents_list):
         if lat.dim() == 4:
             lat = lat.unsqueeze(0)
@@ -1410,12 +1411,14 @@ def navit_packed_forward_and_loss(
         t_exp = ti.view(1, 1, 1, 1, 1)
         noisy_i = (1 - t_exp) * lat + t_exp * noise_i
         target_i = noise_i - lat
-        ntok, grid, _m, _s = model.patchify_latents_to_tokens(noisy_i)
+        ntok, grid, _m, size_i = model.patchify_latents_to_tokens(noisy_i)
         ttok, _g, _m2, _s2 = model.patchify_latents_to_tokens(target_i)
         noisy_tok_list.append(ntok)
         target_tok_list.append(ttok)
         grid_list.append(grid)
         vseq.append(int(ntok.shape[1]))
+        noisy_grid_list.append(noisy_i)     # per-image noisy latent grid (aux x0 recovery)
+        size_list.append(size_i)            # per-image token grid shape (aux unpatchify)
 
     tokens = torch.cat(noisy_tok_list, dim=1)        # [1, ΣN, M]
     target_tokens = torch.cat(target_tok_list, dim=1)
@@ -1445,7 +1448,12 @@ def navit_packed_forward_and_loss(
         off += n
     per_image = torch.cat(per_image)                 # [G]
     loss = per_image.mean()
-    info = {"visual_seqlens": vseq, "per_image_loss": per_image.detach()}
+    info = {
+        "visual_seqlens": vseq,
+        "per_image_loss": per_image.detach(),
+        "noisy_grid_list": noisy_grid_list,   # per-image [1,C,T,h,w] noisy latents
+        "size_list": size_list,               # per-image token grid shape for unpatchify
+    }
     return loss, pred, info
 
 

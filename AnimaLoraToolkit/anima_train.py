@@ -245,6 +245,7 @@ from trainer.objective import (
     compute_grad_norm,
     forward_with_optional_checkpoint,
     forward_packed_with_optional_checkpoint,
+    navit_packed_forward_and_loss,
     masked_token_loss,
     validate_compile_requirements,
 )
@@ -275,12 +276,14 @@ from trainer.data import (
     MergedDataset,
     BucketBatchSampler,
     FitTokenBatchSampler,
+    NavitPackBatchSampler,
     CachedLatentDataset,
     compute_sample_accumulation_steps,
     collate_fn,
     collate_fn_fit_packed,
     collate_fn_cached,
     collate_fn_cached_fit,
+    collate_fn_navit_pack,
 )
 from trainer.progress import (
     ReferenceStepTracker,
@@ -373,6 +376,13 @@ def parse_args():
                         "显式传该 flag 恢复旧行为（丢弃残缺桶）。")
     p.add_argument("--fit-packed-training", action="store_true",
                    help="Enable native-first FiT-style packed-token training; default preserves source pixels.")
+    p.add_argument("--navit-packing", action="store_true",
+                   help="启用 NaViT/Patch-n-Pack 块对角打包训练（异构图拼一条序列、逐图 timestep、"
+                        "块对角 self/cross attention）。需 cache_latents；与 fit_packed 互斥。见 docs/navit-packing.md。")
+    p.add_argument("--navit-token-budget", type=int, default=0,
+                   help="一个 pack 的 token 数之和上限（=各图 (W//16)*(H//16) 之和）。必须 >0，按显存设。")
+    p.add_argument("--navit-max-images-per-pack", type=int, default=0,
+                   help="单 pack 最多几张图（0=不限，仅受 token_budget 约束）。")
     p.add_argument("--fit-max-tokens", type=int, default=65536,
                    help="Maximum FiT tokens per image before applying the over-budget policy.")
     p.add_argument("--fit-warn-tokens", type=int, default=16384,
@@ -1079,6 +1089,48 @@ def main():
 
     # 数据集
     fit_packed_training = bool(getattr(args, "fit_packed_training", False))
+    # NaViT/Patch-n-Pack block-diagonal packing (opt-in). Its own dataloader (token-budget
+    # packs of heterogeneous images) and training step (per-image timestep, one
+    # block-diagonal forward) — see docs/navit-packing.md. Mutually exclusive with the
+    # FiT padding path; the two are different packing schemes.
+    navit_packing = bool(getattr(args, "navit_packing", False))
+    if navit_packing and fit_packed_training:
+        raise RuntimeError(
+            "navit_packing 与 fit_packed_training 互斥（两种不同的打包方案）。"
+            "NaViT 块对角 packing 请关掉 fit_packed_training。"
+        )
+    if navit_packing:
+        # v1 互斥特性：这些都假设 [B,C,T,h,w] 批量网格 + 逐 batch 单 timestep，
+        # 与 NaViT 的"一包异构图、逐图 t"语义错位。同时开 → fail-fast，提示二选一。
+        # （详见 docs/navit-packing.md 第 3 节；日后可逐个适配。）
+        _navit_conflicts = []
+        if bool(getattr(args, "token_bucket", False)):
+            _navit_conflicts.append("token_bucket")
+        if int(getattr(args, "effective_batch_size", 0) or 0) > 0:
+            _navit_conflicts.append("effective_batch_size")
+        if float(getattr(args, "tread_ratio", 0.0) or 0.0) > 0.0:
+            _navit_conflicts.append("tread_ratio")
+        if bool(getattr(args, "leap_enabled", False)):
+            _navit_conflicts.append("leap_enabled")
+        if bool(getattr(args, "gaf_enabled", False)):
+            _navit_conflicts.append("gaf_enabled")
+        if bool(getattr(args, "dpo_enabled", False)):
+            _navit_conflicts.append("dpo_enabled")
+        if str(getattr(args, "timestep_mode", "") or "").lower() == "csflow":
+            _navit_conflicts.append("timestep_mode=csflow")
+        if bool(getattr(args, "torch_compile", False)):
+            _navit_conflicts.append("torch_compile")
+        if _navit_conflicts:
+            raise RuntimeError(
+                "navit_packing(v1) 暂不支持与以下特性同时开启："
+                + ", ".join(_navit_conflicts)
+                + "。请关掉它们，或暂不使用 NaViT 打包。"
+            )
+        if int(getattr(args, "navit_token_budget", 0) or 0) <= 0:
+            raise RuntimeError(
+                "navit_packing 需要显式设置 navit_token_budget（>0，按显存定，"
+                "见 docs/navit-packing.md 显存对照表）。"
+            )
     if fit_packed_training:
         if bool(getattr(args, "fit_pack_multiple_images", False)):
             raise RuntimeError("fit_pack_multiple_images is reserved for a later slice; current FiT path uses one image sequence per sample.")
@@ -1313,7 +1365,31 @@ def main():
             "Sample-window accumulation: native batch_size<=%d, effective_batch_size=%d",
             int(args.batch_size), _effective_batch_size,
         )
-    if fit_packed_training:
+    if navit_packing:
+        # NaViT token-budget packs: each batch is one block-diagonal sequence of
+        # heterogeneous images (sum of token counts <= navit_token_budget). collate keeps
+        # the per-image latents as a list (shapes differ); the training loop patchifies +
+        # packs them. Requires cached latents (the packer reads token_count_for_index).
+        if not use_cached:
+            raise RuntimeError(
+                "navit_packing 目前需要 cache_latents=true（打包按 latent token 数预算分包，"
+                "依赖缓存数据集的 token_count_for_index）。"
+            )
+        batch_sampler = NavitPackBatchSampler(
+            dataset,
+            token_budget=int(getattr(args, "navit_token_budget", 0) or 0),
+            max_images_per_pack=int(getattr(args, "navit_max_images_per_pack", 0) or 0),
+            shuffle=True,
+            seed=getattr(args, "seed", 42),
+            drop_last=_bucket_drop_last,
+        )
+        dataloader = DataLoader(
+            dataset, batch_sampler=batch_sampler,
+            collate_fn=collate_fn_navit_pack,
+            num_workers=args.num_workers,
+            **_loader_kwargs,
+        )
+    elif fit_packed_training:
         if int(getattr(args, "effective_batch_size", 0) or 0) > 0:
             raise RuntimeError("fit_packed_training currently uses token-based batches; effective_batch_size sample-window accumulation is not supported yet.")
         if _token_bucket:
@@ -1403,6 +1479,16 @@ def main():
     # ★ 例外：若启用了 perceptual loss，训练主循环每步都要 vae.model.decode，offload
     #   到 CPU 会让每步都 swap，巨慢。这种情况下 VAE 必须常驻 GPU。
     aux_cfg = build_aux_loss_config(args)
+    if navit_packing and getattr(aux_cfg, "self_perceptual_enabled", False):
+        raise RuntimeError(
+            "navit_packing(v1) 的逐图 aux 暂只支持 spectral / perceptual（作用在 x0 网格上）；"
+            "self-perceptual 需要逐图额外模型前向，尚未在 NaViT 下适配。请关闭 self-perceptual。"
+        )
+    if navit_packing and aux_cfg.any_enabled:
+        logger.info(
+            "[aux] navit_packing：spectral/perceptual 将逐图 unpatchify 回网格后计算"
+            "（与非 FiT 路径同一套 aux 数学，但按 pack 内每张图独立跑）。"
+        )
     if fit_packed_training and aux_cfg.any_enabled and not _token_bucket:
         raise RuntimeError(
             "fit_packed_training without token_bucket supports the main masked token objective "
@@ -2582,7 +2668,16 @@ def main():
             _non_blk = bool(_loader_kwargs.get("pin_memory", False))
             pixel_mask = None
             cached_latent_mask = None
-            if use_cached:
+            navit_latents = None
+            if navit_packing:
+                # NaViT pack: per-image cached latents (shapes differ → kept as a list).
+                navit_latents = [
+                    l.to(device, dtype=dtype, non_blocking=_non_blk)
+                    for l in batch["navit_latents"]
+                ]
+                latents = None
+                bs = len(navit_latents)
+            elif use_cached:
                 latents = batch["latents"].to(device, dtype=dtype, non_blocking=_non_blk)
                 if fit_packed_training:
                     # token_bucket 缓存路径：latent_mask 由 collate 从形状重建（满覆盖→全 1）。
@@ -2598,7 +2693,8 @@ def main():
                     # VAE 权重已是 bf16；与 _build_cache / roundtrip 自检保持一致，
                     # 不再强转 fp32（否则 conv3d 会因 input/bias dtype 不匹配而崩）。
                     latents = vae.model.encode(pixels_5d, vae.scale).to(dtype)
-            bs = latents.shape[0]
+            if not navit_packing:
+                bs = latents.shape[0]
 
             # 文本编码
             with torch.no_grad():
@@ -2656,12 +2752,15 @@ def main():
             # t 值域截断（timestep_t_min/t_max；默认 0/1 = 历史 1e-4 行为）
             t = apply_t_range(t, objective_cfg.timestep.t_min, objective_cfg.timestep.t_max)
 
-            t_exp = t.view(-1, 1, 1, 1, 1)
+            # NaViT 自己在打包前向里逐图加噪（各图各自的 t / 形状），不走这条批量网格加噪。
+            t_exp = noise = noisy = target = None
+            if not navit_packing:
+                t_exp = t.view(-1, 1, 1, 1, 1)
 
-            noise = make_noise_from_config(latents, objective_cfg.noise)
+                noise = make_noise_from_config(latents, objective_cfg.noise)
 
-            noisy = (1 - t_exp) * latents + t_exp * noise
-            target = noise - latents
+                noisy = (1 - t_exp) * latents + t_exp * noise
+                target = noise - latents
 
             # ── LeapAlign：本 micro-batch 是否走两步跳跃（hybrid 按 leap_ratio 抽）──
             # 用训练 RNG；leap 步用自己的 (t_k,t_j)，复用上面的 noise，不走标准单步 forward。
@@ -2687,7 +2786,7 @@ def main():
             # 频繁触发 cudaMalloc/cudaFree。改成 by-shape cache，相同 shape 复用同一张量
             # （forward 内不修改它，只是把它当 attention mask 的占位）。
             pad_mask = None
-            if not fit_packed_training:
+            if not fit_packed_training and not navit_packing:
                 _pad_key = (int(bs), 1, int(latents.shape[-2]), int(latents.shape[-1]))
                 pad_mask = _pad_mask_cache.get(_pad_key)
                 if pad_mask is None or pad_mask.device != latents.device or pad_mask.dtype != dtype:
@@ -2711,7 +2810,22 @@ def main():
             if gaf_ctrl is not None:
                 gaf_ctrl.before_forward(global_step)
             with torch.autocast("cuda", dtype=dtype):
-                if fit_packed_training:
+                if navit_packing:
+                    # NaViT block-diagonal pack: per-image noise + one packed forward.
+                    # Each caption block keeps its full (padded) length; block-diagonal
+                    # cross-attn isolates each image to its own caption (padding tokens
+                    # are attended exactly as in the standard path).
+                    _G = len(navit_latents)
+                    _L = int(cross.shape[1])
+                    cross_packed = cross.reshape(1, _G * _L, cross.shape[2])
+                    text_seqlens = [_L] * _G
+                    _navit_loss, pred, _navit_info = navit_packed_forward_and_loss(
+                        model, navit_latents, t, cross_packed, text_seqlens,
+                        objective_cfg.noise, objective_cfg.loss,
+                    )
+                    per_sample = _navit_info["per_image_loss"]
+                    fit_size = None  # navit aux unpatchifies per image below
+                elif fit_packed_training:
                     noisy_tokens, fit_grid, fit_mask, fit_size = model.patchify_latents_to_tokens(noisy, latent_mask)
                     target_tokens, _target_grid, _target_mask, _target_size = model.patchify_latents_to_tokens(target, latent_mask)
                     pred = forward_packed_with_optional_checkpoint(
@@ -2784,7 +2898,9 @@ def main():
 
                 # DPO / leap 都走"特殊主损失"路径：跳过下方所有 SFT 逐样本额外项与 t-加权
                 # （per_sample 已是最终值：DPO=配对损失占位，leap=两步自蒸馏 MSE）。
-                _skip_main_extras = dpo_active or use_leap_this_step
+                # NaViT 自带逐图 loss 与逐图 aux；标准的 dfm/gaf/eisbach/aux/dispersive/
+                # adaptive 都假设批量网格 + 逐 batch 单 t，对 navit 一律跳过。
+                _skip_main_extras = dpo_active or use_leap_this_step or navit_packing
 
                 # GAF（B1）：GAF 步抽每样本梯度→方向信任，更新逐图 EMA。用 ΔFM 之前的干净主
                 # 重建 per_sample；autograd.grad 不污染 .grad、retain_graph 保后续主 backward。
@@ -2842,7 +2958,12 @@ def main():
                 if _eis_lambda > 0.0 and pred is not None and not fit_packed_training:
                     per_sample = per_sample * eisbach_barrier_weight(pred, _eis_lambda).to(per_sample.dtype)
 
-                if dpo_active:
+                if navit_packing:
+                    # per_sample 已是逐图 masked loss（每图用自己的 t 走 Huber/SNR），
+                    # loss=均值。t-加权方案（min-SNR/EDM2 等）按逐图 t 在此统一施加。
+                    main_loss_per_sample = None
+                    loss = apply_loss_weighting(per_sample, t, objective_cfg.loss)
+                elif dpo_active:
                     # DPO 损失已是配对均值标量；不过 SFT 的 t-加权 / sample 累积路径。
                     main_loss_per_sample = None
                     loss = _dpo_loss
@@ -2972,6 +3093,37 @@ def main():
 
                     loss = loss + aux_total.to(loss.dtype)
 
+            # ── NaViT aux（逐图）：标准 aux 块按 [B,C,h,w] 批量网格写、对 navit 跳过；
+            # 这里逐图把 pred 切片 unpatchify 回各自网格、recover x0，跑同一套 spectral /
+            # perceptual 数学（self-perceptual 需额外模型前向，已在 setup 处对 navit 门控）。
+            # 仅对 t < gate 的图算重路径，省高 t 步的 VAE decode / FFT 分配。
+            if navit_packing and objective_cfg.aux.any_enabled:
+                _aux = objective_cfg.aux
+                _max_gate = max(
+                    _aux.spectral_t_gate if _aux.spectral_enabled else 0.0,
+                    _aux.perceptual_t_gate if _aux.perceptual_enabled else 0.0,
+                )
+                _size_list = _navit_info["size_list"]
+                _noisy_list = _navit_info["noisy_grid_list"]
+                aux_total = torch.zeros((), device=loss.device, dtype=torch.float32)
+                _off = 0
+                _n_aux = 0
+                for _i, _n in enumerate(_navit_info["visual_seqlens"]):
+                    if float(t[_i].item()) < _max_gate:
+                        _v_grid = model.unpatchify_tokens(pred[:, _off:_off + _n, :], _size_list[_i])
+                        _t1 = t[_i:_i + 1]
+                        _x0p = recover_x0_from_velocity(_noisy_list[_i], _t1, _v_grid)
+                        _lat_i = navit_latents[_i]
+                        _x0t = (_lat_i.unsqueeze(0) if _lat_i.dim() == 4 else _lat_i).float()
+                        if _aux.spectral_enabled:
+                            aux_total = aux_total + float(_aux.spectral_lambda) * spectral_loss(_x0p, _x0t, _t1, _aux)
+                        if _aux.perceptual_enabled and perceptual_module is not None:
+                            aux_total = aux_total + perceptual_module(_x0p, _x0t, _t1)
+                        _n_aux += 1
+                    _off += _n
+                if _n_aux > 0:
+                    loss = loss + aux_total.to(loss.dtype)
+
             # ── Dispersive Loss（arXiv 2506.09027；默认关）中间表征排斥正则 ──────────
             # 独立截断前向到 tap_block（ncp.perceptual_features，不冻结 → 梯度回流 LoRA），
             # 取该 block 隐表征做"无正样本对排斥"。dense 路径、bs>1、非 leap/dpo 步才生效。
@@ -2991,8 +3143,10 @@ def main():
                 del _disp_z
 
             # ★ 守护 1：forward 结果 NaN/Inf 检查
+            # 这条 debug 遥测取 batched latent/noise/target 的均值方差；navit 路径下它们是逐图
+            # list（无单一批量张量），v1 暂跳过这条详细日志（loss/NaN 守护仍照常）。
             debug_n = int(getattr(args, "debug_first_batches", 0) or 0)
-            if debug_n > 0 and global_step < debug_n:
+            if debug_n > 0 and global_step < debug_n and not navit_packing:
                 try:
                     batch_images = batch.get("images", [])
                     preview = ", ".join(str(p) for p in batch_images[:4] if p)

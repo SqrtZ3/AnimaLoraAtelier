@@ -383,6 +383,9 @@ def parse_args():
                    help="一个 pack 的 token 数之和上限（=各图 (W//16)*(H//16) 之和）。必须 >0，按显存设。")
     p.add_argument("--navit-max-images-per-pack", type=int, default=0,
                    help="单 pack 最多几张图（0=不限，仅受 token_budget 约束）。")
+    p.add_argument("--navit-text-trim-padding", action="store_true",
+                   help="navit 块对角 cross-attn 按每图 T5 有效长度打包文本（去 512-pad），"
+                        "省掉对文本 padding 的注意力算力。默认关（保持与 512-pad 路径逐字节等价）。")
     p.add_argument("--fit-max-tokens", type=int, default=65536,
                    help="Maximum FiT tokens per image before applying the over-budget policy.")
     p.add_argument("--fit-warn-tokens", type=int, default=16384,
@@ -1136,6 +1139,12 @@ def main():
         # lora_one 预热步走批量网格前向（_llat 堆叠），未适配 navit 的逐图打包。
         if int(getattr(args, "lora_one_init_steps", 0) or 0) > 0:
             _navit_conflicts.append("lora_one_init_steps>0")
+        # T-LoRA 的 rank mask 按 h.shape[0]（batch 行）匹配 current_t（见 lora.py
+        # _apply_tlora_mask 的 batch-mismatch 断言）。navit 是 B=1 打包序列 + 逐图 t，
+        # 每图 t 落在 token 维而非 batch 维：要么触发 mismatch 报错，要么 current_t 未注入
+        # 时静默不施 mask（开着却不生效）。两种都不行，fail-fast 要求显式关闭。
+        if str(getattr(args, "lora_variant", "base") or "base").lower() == "tlora":
+            _navit_conflicts.append("lora_variant=tlora")
         if _navit_conflicts:
             raise RuntimeError(
                 "navit_packing(v1) 暂不支持与以下特性同时开启："
@@ -2837,13 +2846,27 @@ def main():
             with torch.autocast("cuda", dtype=dtype):
                 if navit_packing:
                     # NaViT block-diagonal pack: per-image noise + one packed forward.
-                    # Each caption block keeps its full (padded) length; block-diagonal
-                    # cross-attn isolates each image to its own caption (padding tokens
-                    # are attended exactly as in the standard path).
+                    # block-diagonal cross-attn isolates each image to its own caption.
                     _G = len(navit_latents)
                     _L = int(cross.shape[1])
-                    cross_packed = cross.reshape(1, _G * _L, cross.shape[2])
-                    text_seqlens = [_L] * _G
+                    if bool(getattr(args, "navit_text_trim_padding", False)):
+                        # Variable-length text packing: each image contributes only its
+                        # *valid* T5 tokens (mask sum), so block-diagonal cross-attn does
+                        # no work on the 512-pad. Valid tokens are contiguous at the front
+                        # (tokenize_t5_weighted pads at the tail), so a front slice is exact.
+                        # One GPU→CPU sync for the whole vector (not G).
+                        _tlens = t5_attn.sum(dim=1).clamp(min=1).tolist()
+                        _tlens = [min(int(n), _L) for n in _tlens]
+                        cross_packed = torch.cat(
+                            [cross[i:i + 1, :_tlens[i], :] for i in range(_G)], dim=1
+                        )
+                        text_seqlens = _tlens
+                    else:
+                        # Legacy 512-pad path: every image carries the full padded caption
+                        # (padding text positions are attended exactly like the standard
+                        # /ARB path). Byte-identical to the pre-trim behavior.
+                        cross_packed = cross.reshape(1, _G * _L, cross.shape[2])
+                        text_seqlens = [_L] * _G
                     _navit_loss, pred, _navit_info = navit_packed_forward_and_loss(
                         model, navit_latents, t, cross_packed, text_seqlens,
                         objective_cfg.noise, objective_cfg.loss,
@@ -3153,7 +3176,11 @@ def main():
                         _n_aux += 1
                     _off += _n
                 if _n_aux > 0:
-                    loss = loss + aux_total.to(loss.dtype)
+                    # ★ aux_total 是对命中 gate 的图「求和」；标准（非 navit）路径里
+                    # spectral_loss / perceptual_module 返回的是 batch 均值（self-perceptual
+                    # 也走 /_sp_denom）。这里必须除以命中数 _n_aux 还原成「均值」，否则
+                    # aux 相对主 FM loss 会被放大 _n_aux 倍（G≈32 时可达十几倍），过度压制主损失。
+                    loss = loss + (aux_total / float(_n_aux)).to(loss.dtype)
 
             # ── Dispersive Loss（arXiv 2506.09027；默认关）中间表征排斥正则 ──────────
             # 独立截断前向到 tap_block（ncp.perceptual_features，不冻结 → 梯度回流 LoRA），

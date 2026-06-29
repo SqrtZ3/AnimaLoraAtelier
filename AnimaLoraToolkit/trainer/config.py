@@ -87,6 +87,7 @@ YAML_TO_ARGS = {
     "navit_packing": "navit_packing",
     "navit_token_budget": "navit_token_budget",
     "navit_max_images_per_pack": "navit_max_images_per_pack",
+    "navit_text_trim_padding": "navit_text_trim_padding",
     "alpha_handling": "alpha_handling",
     "alpha_background": "alpha_background",
     "alpha_threshold": "alpha_threshold",
@@ -391,6 +392,13 @@ DEFAULTS = {
     "navit_packing": False,
     "navit_token_budget": 0,
     "navit_max_images_per_pack": 0,
+    # When True, pack each image's caption to its *valid* T5 length (from the T5
+    # attention mask) instead of the full 512-pad — block-diagonal cross-attn then
+    # spends no compute on padding text tokens. Default False keeps the navit text
+    # packing byte-identical to the legacy 512-pad path (which attends padding exactly
+    # like the standard/ARB path); enabling it is a small behavior change (padding text
+    # positions are no longer attended) traded for a faster cross-attention.
+    "navit_text_trim_padding": False,
     "alpha_handling": "none",
     "alpha_background": "neutral",
     "alpha_threshold": 0.01,

@@ -17,6 +17,7 @@ from trainer.data import (  # noqa: E402
     NavitPackBatchSampler,
     dataset_token_counts,
     pack_indices_by_budget,
+    pack_indices_ffd_windowed,
 )
 
 
@@ -74,6 +75,69 @@ class PackBudgetFunctionTests(unittest.TestCase):
         )
         self.assertTrue(all(len(p) <= 3 for p in packs))
         self.assertEqual(sum(len(p) for p in packs), 10)
+
+
+class FFDPackingTests(unittest.TestCase):
+    def test_full_coverage_and_budget(self):
+        counts = [10, 20, 30, 40, 15, 25, 5, 50]
+        budget = 60
+        order = list(range(len(counts)))
+        packs = pack_indices_ffd_windowed(counts, budget, order, window=0)
+        seen = [i for p in packs for i in p]
+        self.assertEqual(sorted(seen), sorted(order))           # every index once
+        for p in packs:
+            s = sum(counts[i] for i in p)
+            self.assertTrue(s <= budget or len(p) == 1, (p, s))
+
+    def test_ffd_packs_no_more_bins_than_next_fit(self):
+        # FFD should never need more packs than next-fit on the same items; on a mix that
+        # next-fit fragments, FFD packs strictly tighter.
+        counts = [40, 35, 20, 25, 30, 10, 50, 15]
+        budget = 60
+        order = list(range(len(counts)))
+        nf = pack_indices_by_budget(counts, budget, order)
+        ffd = pack_indices_ffd_windowed(counts, budget, order, window=0)
+        self.assertLessEqual(len(ffd), len(nf))
+
+    def test_oversized_image_becomes_singleton(self):
+        counts = [100, 10, 10]
+        packs = pack_indices_ffd_windowed(counts, token_budget=50, order=[0, 1, 2], window=0)
+        self.assertIn([0], packs)
+
+    def test_max_images_per_pack_cap(self):
+        counts = [1] * 10
+        packs = pack_indices_ffd_windowed(
+            counts, token_budget=1000, order=list(range(10)),
+            max_images_per_pack=3, window=0,
+        )
+        self.assertTrue(all(len(p) <= 3 for p in packs))
+        self.assertEqual(sum(len(p) for p in packs), 10)
+
+    def test_windowing_preserves_coverage(self):
+        counts = [7, 11, 13, 17, 19, 23, 29, 31, 37, 5, 8]
+        order = list(range(len(counts)))
+        packs = pack_indices_ffd_windowed(counts, token_budget=50, order=order, window=4)
+        seen = [i for p in packs for i in p]
+        self.assertEqual(sorted(seen), sorted(order))
+
+    def test_sampler_ffd_varies_across_epochs_with_window(self):
+        ds = _FakeDataset([7, 11, 13, 17, 19, 23, 29, 31, 37, 5, 8, 12])
+        sampler = NavitPackBatchSampler(
+            ds, token_budget=50, shuffle=True, seed=1,
+            strategy="ffd", ffd_window=4,
+        )
+        sampler.set_epoch(0)
+        p0 = list(sampler)
+        sampler.set_epoch(1)
+        p1 = list(sampler)
+        self.assertEqual(sorted(i for p in p0 for i in p), list(range(len(ds))))
+        self.assertEqual(sorted(i for p in p1 for i in p), list(range(len(ds))))
+        self.assertNotEqual(p0, p1)                              # windowed shuffle varies packs
+
+    def test_invalid_strategy_raises(self):
+        ds = _FakeDataset([10, 20, 30])
+        with self.assertRaises(ValueError):
+            NavitPackBatchSampler(ds, token_budget=60, strategy="bogus")
 
 
 class NavitPackBatchSamplerTests(unittest.TestCase):

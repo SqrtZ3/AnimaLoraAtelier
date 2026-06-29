@@ -31,6 +31,22 @@ navit_token_budget: 16384      # 一个 pack 的 token 数之和上限（见下�
 navit_max_images_per_pack: 0   # 单 pack 最多几张图，0=不限（仅受 token_budget 约束）
 ```
 
+### 提速/打包旋钮（均 opt-in，关时与上面的基础路径逐字节等价）
+
+```yaml
+navit_text_trim_padding: false # 块对角 cross-attn 按每图 T5 有效长度打包文本，去 512-pad。
+                               #   开启 = 不再对文本 padding 位做注意力（cross-attn 提速，
+                               #   anime tag caption 通常仅几十 token → 文本侧 token 砍约一个量级）。
+                               #   小行为改变：标准/ARB 路径本就注意 padding 文本位，开启后不再注意。
+navit_pack_strategy: next_fit  # 打包策略：next_fit（默认，顺序贪心）/ ffd（窗口内 First-Fit-
+                               #   Decreasing，包更满、step 更少）。next-fit 在"图相对 budget 很小"时
+                               #   已接近满（收尾浪费 ≤ 一张图）；ffd 主要在图尺寸异质时收益大。
+navit_pack_ffd_window: 256     # ffd 的窗口大小（张）：每 epoch 洗牌后切窗、窗内 FFD，使包仍逐 epoch
+                               #   变化（保 SGD 多样性）。0=全局窗口（最满但 epoch 间包固定）。
+navit_drop_last: false         # 是否丢弃每 epoch 最后那个未满预算的包。默认不丢（打包路径下末包
+                               #   总含真实图，丢了在小数据上是浪费）。与 bucket_drop_last 解耦。
+```
+
 token 数换算：Anima 是 VAE 下采样 8 × patch 2 = **16 px/token 轴**，所以一张 `W×H` 图的
 token 数 `N = (W//16) × (H//16)`。例：1024² ≈ 4096 token；768×1024 ≈ 3072 token。
 

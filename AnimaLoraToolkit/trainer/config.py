@@ -88,6 +88,9 @@ YAML_TO_ARGS = {
     "navit_token_budget": "navit_token_budget",
     "navit_max_images_per_pack": "navit_max_images_per_pack",
     "navit_text_trim_padding": "navit_text_trim_padding",
+    "navit_pack_strategy": "navit_pack_strategy",
+    "navit_pack_ffd_window": "navit_pack_ffd_window",
+    "navit_drop_last": "navit_drop_last",
     "alpha_handling": "alpha_handling",
     "alpha_background": "alpha_background",
     "alpha_threshold": "alpha_threshold",
@@ -399,6 +402,20 @@ DEFAULTS = {
     # like the standard/ARB path); enabling it is a small behavior change (padding text
     # positions are no longer attended) traded for a faster cross-attention.
     "navit_text_trim_padding": False,
+    # Pack-assembly strategy. "next_fit" (default) = the original order-preserving greedy
+    # packer (byte-identical to before). "ffd" = First-Fit-Decreasing within shuffled
+    # windows — packs fuller (fewer steps, less wasted budget) at the cost of some
+    # batch-composition variety; main upside when image sizes are heterogeneous.
+    "navit_pack_strategy": "next_fit",
+    # FFD window size (images). Each epoch's shuffled order is split into windows of this
+    # size and FFD runs inside each, so packs still vary across epochs. 0 = one global
+    # window (max fill but epoch-static packs). Ignored when strategy != "ffd".
+    "navit_pack_ffd_window": 256,
+    # Drop the final (under-budget) pack each epoch. Default False: for packing the last
+    # pack always holds real images, so dropping it wastes data on small datasets. This
+    # is navit-specific and decoupled from bucket_drop_last (which drops incomplete ARB
+    # batches, a different notion).
+    "navit_drop_last": False,
     "alpha_handling": "none",
     "alpha_background": "neutral",
     "alpha_threshold": 0.01,

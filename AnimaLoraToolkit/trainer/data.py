@@ -1446,6 +1446,55 @@ def pack_indices_by_budget(token_counts, token_budget, order, max_images_per_pac
     return packs
 
 
+def pack_indices_ffd_windowed(token_counts, token_budget, order,
+                              max_images_per_pack=0, window=0):
+    """First-Fit-Decreasing packing within windows of the (already-shuffled) ``order``.
+
+    Classic FFD (sort items by descending size, drop each into the first bin that fits)
+    packs fuller than next-fit — fewer, tighter packs ⇒ fewer optimizer steps and less
+    wasted token budget per step (see NeMo sequence-packing / ICLR'23 "Efficient Sequence
+    Packing"). The trade-off: a *global* decreasing sort would group the same images
+    together every epoch (size order is fixed), erasing the per-epoch shuffle that gives
+    small-data SGD its batch-composition variety.
+
+    The fix is ``window``: ``order`` is split into contiguous windows of ``window`` items
+    and FFD runs *inside each window*. Because ``order`` is reshuffled each epoch, window
+    membership (hence the grouping) changes across epochs, while the within-window
+    decreasing sort still recovers most of the fill benefit. ``window<=0`` means one
+    global window (max fill, but epoch-static packs — only sensible for single-pass data).
+
+    Covers every index in ``order`` exactly once. An image larger than the budget becomes
+    its own pack (the caller warns), matching :func:`pack_indices_by_budget`.
+    """
+    budget = int(token_budget)
+    cap = int(max_images_per_pack or 0)
+    win = int(window or 0)
+    order = list(order)
+    if win <= 0:
+        windows = [order]
+    else:
+        windows = [order[i:i + win] for i in range(0, len(order), win)]
+
+    packs = []
+    for w in windows:
+        items = sorted(w, key=lambda i: int(token_counts[i]), reverse=True)
+        bins = []  # each: [list_of_indices, summed_tokens]
+        for idx in items:
+            n = int(token_counts[idx])
+            placed = False
+            for b in bins:
+                over_count = cap > 0 and len(b[0]) >= cap
+                if (not over_count) and (b[1] + n <= budget):
+                    b[0].append(idx)
+                    b[1] += n
+                    placed = True
+                    break
+            if not placed:
+                bins.append([[idx], n])
+        packs.extend(b[0] for b in bins)
+    return packs
+
+
 def _lookup_token_count_walk(d, idx):
     """Resolve a sample's token count by walking dataset wrappers (mirror of
     :meth:`FitTokenBatchSampler._lookup_token_count`, as a free function so the NaViT
@@ -1534,13 +1583,20 @@ class NavitPackBatchSampler:
     """
 
     def __init__(self, dataset, token_budget, max_images_per_pack=0,
-                 shuffle=True, seed=42, drop_last=False):
+                 shuffle=True, seed=42, drop_last=False,
+                 strategy="next_fit", ffd_window=256):
         self.dataset = dataset
         self.token_budget = int(token_budget)
         self.max_images_per_pack = int(max_images_per_pack or 0)
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.drop_last = bool(drop_last)
+        self.strategy = str(strategy or "next_fit").lower()
+        if self.strategy not in ("next_fit", "ffd"):
+            raise ValueError(
+                f"navit pack strategy 必须是 'next_fit' 或 'ffd'，收到 {strategy!r}"
+            )
+        self.ffd_window = int(ffd_window or 0)
         self.epoch = 0
         self.token_counts = dataset_token_counts(dataset)
         self._cached_packs = None
@@ -1563,11 +1619,17 @@ class NavitPackBatchSampler:
             )
         logger.info(
             "[NavitPack] dataset_len=%d token_budget=%d max_images_per_pack=%s "
-            "(token 数范围 %d..%d)",
+            "strategy=%s ffd_window=%s (token 数范围 %d..%d)",
             len(self.token_counts), self.token_budget,
-            self.max_images_per_pack or "∞",
+            self.max_images_per_pack or "∞", self.strategy,
+            (self.ffd_window or "全局") if self.strategy == "ffd" else "-",
             min(self.token_counts) if self.token_counts else 0, mx,
         )
+        if self.strategy == "ffd" and self.ffd_window <= 0:
+            logger.warning(
+                "[NavitPack] strategy=ffd 且 ffd_window<=0（全局 FFD）：每 epoch 的包将完全相同"
+                "（按尺寸排序固定），削弱小数据 SGD 的 batch 多样性。多 epoch 训练建议设正窗口。"
+            )
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
@@ -1577,9 +1639,15 @@ class NavitPackBatchSampler:
         order = list(range(len(self.token_counts)))
         if self.shuffle:
             random.Random(self.seed + self.epoch).shuffle(order)
-        packs = pack_indices_by_budget(
-            self.token_counts, self.token_budget, order, self.max_images_per_pack
-        )
+        if self.strategy == "ffd":
+            packs = pack_indices_ffd_windowed(
+                self.token_counts, self.token_budget, order,
+                self.max_images_per_pack, self.ffd_window,
+            )
+        else:
+            packs = pack_indices_by_budget(
+                self.token_counts, self.token_budget, order, self.max_images_per_pack
+            )
         if self.drop_last and len(packs) > 1:
             last_sum = sum(self.token_counts[i] for i in packs[-1])
             if last_sum < self.token_budget:

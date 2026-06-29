@@ -386,6 +386,15 @@ def parse_args():
     p.add_argument("--navit-text-trim-padding", action="store_true",
                    help="navit 块对角 cross-attn 按每图 T5 有效长度打包文本（去 512-pad），"
                         "省掉对文本 padding 的注意力算力。默认关（保持与 512-pad 路径逐字节等价）。")
+    p.add_argument("--navit-pack-strategy", choices=["next_fit", "ffd"], default="next_fit",
+                   help="navit 打包策略：next_fit（默认，顺序贪心）/ ffd（窗口内 First-Fit-Decreasing，"
+                        "包更满、step 更少，代价是 batch 组成多样性下降，主要在图尺寸异质时收益大）。")
+    p.add_argument("--navit-pack-ffd-window", type=int, default=256,
+                   help="ffd 策略的窗口大小（张）。每 epoch 洗牌后按此切窗、窗内 FFD，使包仍逐 epoch 变化。"
+                        "0=全局窗口（最满但 epoch 间包固定）。strategy!=ffd 时忽略。")
+    p.add_argument("--navit-drop-last", action="store_true",
+                   help="丢弃每 epoch 最后一个（未满预算的）包。默认关：打包路径下末包总含真实图，"
+                        "丢了在小数据上是浪费。与 bucket_drop_last（丢残缺 ARB 批）解耦。")
     p.add_argument("--fit-max-tokens", type=int, default=65536,
                    help="Maximum FiT tokens per image before applying the over-budget policy.")
     p.add_argument("--fit-warn-tokens", type=int, default=16384,
@@ -1406,7 +1415,11 @@ def main():
             max_images_per_pack=int(getattr(args, "navit_max_images_per_pack", 0) or 0),
             shuffle=True,
             seed=getattr(args, "seed", 42),
-            drop_last=_bucket_drop_last,
+            # navit 自己的 drop_last（默认 False，保末包）；与 bucket_drop_last 解耦——
+            # 后者丢的是残缺 ARB 批，对打包路径没有同一语义。
+            drop_last=bool(getattr(args, "navit_drop_last", False)),
+            strategy=str(getattr(args, "navit_pack_strategy", "next_fit") or "next_fit"),
+            ffd_window=int(getattr(args, "navit_pack_ffd_window", 256) or 0),
         )
         dataloader = DataLoader(
             dataset, batch_sampler=batch_sampler,
@@ -3162,8 +3175,10 @@ def main():
                 aux_total = torch.zeros((), device=loss.device, dtype=torch.float32)
                 _off = 0
                 _n_aux = 0
+                # 一次性把逐图 t-gate 判定搬到 CPU（单次同步），取代循环内 G 次 .item()。
+                _below_gate = (t.float() < _max_gate).tolist()
                 for _i, _n in enumerate(_navit_info["visual_seqlens"]):
-                    if float(t[_i].item()) < _max_gate:
+                    if _below_gate[_i]:
                         _v_grid = model.unpatchify_tokens(pred[:, _off:_off + _n, :], _size_list[_i])
                         _t1 = t[_i:_i + 1]
                         _x0p = recover_x0_from_velocity(_noisy_list[_i], _t1, _v_grid)

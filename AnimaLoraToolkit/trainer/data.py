@@ -1418,6 +1418,151 @@ class FitTokenBatchSampler:
         return total
 
 
+def pack_indices_by_budget(token_counts, token_budget, order, max_images_per_pack=0):
+    """Greedy next-fit packing of sample indices into packs whose *summed* token count
+    stays within ``token_budget``.
+
+    NaViT block-diagonal packing carries no padding, so a pack's cost is the exact sum
+    of its images' token counts (unlike the padded FiT path, whose cost is
+    ``max_tokens * n_images``). ``order`` is the already-shuffled index sequence; an
+    image whose own token count exceeds the budget becomes a singleton pack (the caller
+    warns). The result covers every index in ``order`` exactly once, order-preserving.
+    """
+    packs = []
+    cur, cur_sum = [], 0
+    cap = int(max_images_per_pack or 0)
+    budget = int(token_budget)
+    for idx in order:
+        n = int(token_counts[idx])
+        over_budget = bool(cur) and (cur_sum + n > budget)
+        over_count = cap > 0 and len(cur) >= cap
+        if over_budget or over_count:
+            packs.append(cur)
+            cur, cur_sum = [], 0
+        cur.append(idx)
+        cur_sum += n
+    if cur:
+        packs.append(cur)
+    return packs
+
+
+def _lookup_token_count_walk(d, idx):
+    """Resolve a sample's token count by walking dataset wrappers (mirror of
+    :meth:`FitTokenBatchSampler._lookup_token_count`, as a free function so the NaViT
+    packer can share it without disturbing the existing sampler)."""
+    main = getattr(d, "main_dataset", None)
+    reg = getattr(d, "reg_dataset", None)
+    if main is not None and reg is not None:
+        ml = getattr(d, "_main_len", len(main))
+        if idx < ml:
+            return _lookup_token_count_walk(main, idx)
+        return _lookup_token_count_walk(reg, idx - ml)
+    inner = getattr(d, "dataset", None)
+    if inner is not None and inner is not d and not isinstance(inner, list):
+        return _lookup_token_count_walk(inner, idx % len(inner))
+    counts = getattr(d, "token_count_for_index", None)
+    if counts is not None and len(counts) > 0:
+        return int(counts[idx % len(counts)])
+    inner = getattr(d, "base_dataset", None)
+    if inner is not None and inner is not d:
+        return _lookup_token_count_walk(inner, idx % len(inner))
+    return 0
+
+
+def dataset_token_counts(dataset):
+    """Per-index token counts for ``dataset``, preferring a leaf ``token_count_for_index``
+    list and falling back to a per-index wrapper walk."""
+    counts = getattr(dataset, "token_count_for_index", None)
+    if counts is not None and len(counts) > 0:
+        try:
+            dataset_len = len(dataset)
+        except TypeError:
+            dataset_len = len(counts)
+        return [int(counts[i % len(counts)]) for i in range(dataset_len)]
+    return [int(_lookup_token_count_walk(dataset, i) or 0) for i in range(len(dataset))]
+
+
+class NavitPackBatchSampler:
+    """Yield packs of dataset indices for NaViT/Patch-n-Pack block-diagonal training.
+
+    Each yielded list is one packed training sequence: the summed token count of its
+    images stays within ``token_budget`` so the whole pack runs as a single
+    block-diagonal forward (:meth:`MiniTrainDIT.forward_packed_navit`) with zero
+    padding. This decouples "images per step" from per-image shape — unlike
+    :class:`BucketBatchSampler` (one exact ``(h, w)`` per batch) or the padded FiT
+    sampler, images of *different* token counts and aspect ratios share a pack, so a
+    small multi-resolution dataset can still fill a large effective batch.
+    """
+
+    def __init__(self, dataset, token_budget, max_images_per_pack=0,
+                 shuffle=True, seed=42, drop_last=False):
+        self.dataset = dataset
+        self.token_budget = int(token_budget)
+        self.max_images_per_pack = int(max_images_per_pack or 0)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.epoch = 0
+        self.token_counts = dataset_token_counts(dataset)
+        self._cached_packs = None
+        mx = max(self.token_counts) if self.token_counts else 0
+        if self.token_counts and self.token_budget < mx:
+            logger.warning(
+                "[NavitPack] token_budget=%d < 最大单图 token=%d：该图将单独成包，"
+                "可能超出预算并 OOM。建议 token_budget >= 最大单图 token。",
+                self.token_budget, mx,
+            )
+        logger.info(
+            "[NavitPack] dataset_len=%d token_budget=%d max_images_per_pack=%s "
+            "(token 数范围 %d..%d)",
+            len(self.token_counts), self.token_budget,
+            self.max_images_per_pack or "∞",
+            min(self.token_counts) if self.token_counts else 0, mx,
+        )
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+        self._cached_packs = None
+
+    def _build_packs(self):
+        order = list(range(len(self.token_counts)))
+        if self.shuffle:
+            random.Random(self.seed + self.epoch).shuffle(order)
+        packs = pack_indices_by_budget(
+            self.token_counts, self.token_budget, order, self.max_images_per_pack
+        )
+        if self.drop_last and len(packs) > 1:
+            last_sum = sum(self.token_counts[i] for i in packs[-1])
+            if last_sum < self.token_budget:
+                packs = packs[:-1]
+        return packs
+
+    def __iter__(self):
+        packs = self._build_packs()
+        self._cached_packs = packs
+        for pack in packs:
+            yield pack
+
+    def __len__(self):
+        if self._cached_packs is None:
+            self._cached_packs = self._build_packs()
+        return len(self._cached_packs)
+
+
+def collate_fn_navit_pack(batch):
+    """Collate one NaViT pack.
+
+    Cached latents in a pack have *different* spatial shapes, so they cannot be stacked;
+    they are kept as a list. The training loop patchifies each to tokens, concatenates
+    the tokens and per-image RoPE grids, encodes the captions and concatenates them with
+    matching ``text_seqlens``, then calls :meth:`MiniTrainDIT.forward_packed_navit`.
+    """
+    latents = [b["latent"] for b in batch]        # each [C, T, h_i, w_i]
+    captions = [b["caption"] for b in batch]
+    images = [b.get("image", "") for b in batch]
+    return {"navit_latents": latents, "captions": captions, "images": images}
+
+
 # 单次送入 VAE encode 的「总像素」软上限（含翻转份）。VAE 3D encoder 中间激活很占显存，
 # 用像素预算让大图自动减小每批张数，避免缓存阶段 OOM；真遇到 OOM 还有逐张兜底。
 # 偏保守：1024² 原图在 flip 下每批 2 张（进网络 4 张），512² 每批可达 cache_encode_batch_size。

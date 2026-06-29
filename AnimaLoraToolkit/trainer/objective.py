@@ -1361,6 +1361,94 @@ def forward_packed_with_optional_checkpoint(
     return out * mask.to(dtype=out.dtype).unsqueeze(-1)
 
 
+def navit_packed_forward_and_loss(
+    model,
+    latents_list,
+    t_per_image,
+    cross_packed,
+    text_seqlens,
+    noise_cfg,
+    loss_cfg,
+    noise_list=None,
+):
+    """One NaViT/Patch-n-Pack training step core: ``G`` heterogeneous images packed into
+    a single block-diagonal forward, each carrying its own flow-matching timestep.
+
+    Unlike the padded FiT path (one shared timestep per row, padding + key-mask), every
+    image here keeps its native shape and its own ``t`` — the whole pack is one sequence
+    with block-diagonal self/cross attention, so there is no padding and no cross-image
+    leakage (proven in ``test_packed_navit_forward`` / ``test_packed_block_diag_attention``).
+
+    Args:
+        latents_list: list of G clean latents, each ``[1,C,T,h_i,w_i]`` or ``[C,T,h_i,w_i]``.
+        t_per_image:  ``[G]`` timesteps, one per image.
+        cross_packed: ``[1, ΣL, D]`` text embeddings, captions concatenated in image order.
+        text_seqlens: list[int] length G, per-image caption token counts (sum == ΣL).
+        noise_cfg / loss_cfg: objective ``NoiseConfig`` / ``LossConfig``.
+        noise_list:   optional precomputed per-image noise (tests / shared-noise schemes).
+
+    Returns:
+        (loss, pred_tokens, info) — ``loss`` is the per-image mean of ``masked_token_loss``;
+        ``info`` carries ``visual_seqlens`` and per-image losses for telemetry.
+    """
+    G = len(latents_list)
+    if G == 0:
+        raise ValueError("navit pack is empty")
+    if len(text_seqlens) != G:
+        raise ValueError(f"text_seqlens has {len(text_seqlens)} entries, expected G={G}")
+
+    t_per_image = t_per_image.reshape(-1)
+    if t_per_image.shape[0] != G:
+        raise ValueError(f"t_per_image has {t_per_image.shape[0]} entries, expected G={G}")
+
+    noisy_tok_list, target_tok_list, grid_list, vseq = [], [], [], []
+    for i, lat in enumerate(latents_list):
+        if lat.dim() == 4:
+            lat = lat.unsqueeze(0)
+        ti = t_per_image[i].to(dtype=lat.dtype)
+        noise_i = noise_list[i] if noise_list is not None else make_noise_from_config(lat, noise_cfg)
+        t_exp = ti.view(1, 1, 1, 1, 1)
+        noisy_i = (1 - t_exp) * lat + t_exp * noise_i
+        target_i = noise_i - lat
+        ntok, grid, _m, _s = model.patchify_latents_to_tokens(noisy_i)
+        ttok, _g, _m2, _s2 = model.patchify_latents_to_tokens(target_i)
+        noisy_tok_list.append(ntok)
+        target_tok_list.append(ttok)
+        grid_list.append(grid)
+        vseq.append(int(ntok.shape[1]))
+
+    tokens = torch.cat(noisy_tok_list, dim=1)        # [1, ΣN, M]
+    target_tokens = torch.cat(target_tok_list, dim=1)
+    grid = torch.cat(grid_list, dim=2)               # [1, 2, ΣN]
+
+    pred = model.forward_packed_navit(
+        tokens, t_per_image, cross_packed, grid, vseq, [int(s) for s in text_seqlens]
+    )
+
+    # Per-image loss: slice the packed prediction so each image uses its own timestep for
+    # the Huber/SNR schedule; every token is valid so the mask is all-ones.
+    off = 0
+    per_image = []
+    for i, n in enumerate(vseq):
+        p = pred[:, off:off + n, :]
+        tg = target_tokens[:, off:off + n, :]
+        m = torch.ones(1, n, device=pred.device, dtype=pred.dtype)
+        li = masked_token_loss(
+            p, tg, m,
+            loss_type=loss_cfg.loss_type,
+            huber_c=loss_cfg.huber_c,
+            huber_schedule=loss_cfg.huber_schedule,
+            t=t_per_image[i].reshape(1).float(),
+            huber_snr_clamp_max=loss_cfg.huber_snr_clamp_max,
+        )
+        per_image.append(li)
+        off += n
+    per_image = torch.cat(per_image)                 # [G]
+    loss = per_image.mean()
+    info = {"visual_seqlens": vseq, "per_image_loss": per_image.detach()}
+    return loss, pred, info
+
+
 def validate_compile_requirements(torch_compile: bool, fit_packed_training: bool,
                                   token_bucket: bool, module_dropout: float = 0.0) -> None:
     """Fail fast if torch_compile is requested without its prerequisites.

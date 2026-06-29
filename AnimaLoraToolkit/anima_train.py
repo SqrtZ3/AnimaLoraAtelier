@@ -1133,6 +1133,9 @@ def main():
             _navit_conflicts.append("dispersive_enabled")
         if bool(getattr(args, "adaptive_timestep", False)):
             _navit_conflicts.append("adaptive_timestep")
+        # lora_one 预热步走批量网格前向（_llat 堆叠），未适配 navit 的逐图打包。
+        if int(getattr(args, "lora_one_init_steps", 0) or 0) > 0:
+            _navit_conflicts.append("lora_one_init_steps>0")
         if _navit_conflicts:
             raise RuntimeError(
                 "navit_packing(v1) 暂不支持与以下特性同时开启："
@@ -2413,14 +2416,23 @@ def main():
             for _eb in dataloader:
                 if len(_eval_set) >= _eval_n:
                     break
-                if use_cached:
+                # 统一成"逐图 latent 列表"，navit（packs，navit_latents 是列表）与标准路径共用。
+                # eval loss 走逐样本(batch=1)标准前向，navit 的打包只用于训练步，不影响这里。
+                if navit_packing:
+                    _lat_items = list(_eb["navit_latents"])     # 每个 [C,T,h,w]
+                elif use_cached:
                     _elat = _eb["latents"].to(device, dtype=dtype)
+                    _lat_items = [_elat[_i] for _i in range(_elat.shape[0])]
                 else:
                     _epx = _eb["pixel_values"].to(device, dtype=dtype)
                     _elat = vae.model.encode(_epx.unsqueeze(2), vae.scale).to(dtype)
-                for _bi in range(_elat.shape[0]):
+                    _lat_items = [_elat[_i] for _i in range(_elat.shape[0])]
+                for _bi in range(len(_lat_items)):
                     if len(_eval_set) >= _eval_n:
                         break
+                    _elat_i = _lat_items[_bi].to(device, dtype=dtype)
+                    if _elat_i.dim() == 4:
+                        _elat_i = _elat_i.unsqueeze(0)          # [1,C,T,h,w]
                     _ecap = _eb["captions"][_bi]
                     _eq_emb, _eq_attn = encode_qwen(qwen_model, qwen_tok,
                                                     [_build_qwen_text_from_prompt(_ecap)], device)
@@ -2433,7 +2445,7 @@ def main():
                         _ecross = _ecross * _et5_w.to(device, dtype=torch.float32).to(_ecross.dtype).unsqueeze(-1)
                     if _ecross.shape[1] < 512:
                         _ecross = F.pad(_ecross, (0, 0, 0, 512 - _ecross.shape[1]))
-                    _eval_set.append((_elat[_bi:_bi + 1].clone(), _ecross.clone()))
+                    _eval_set.append((_elat_i.clone(), _ecross.clone()))
         emit(f"[eval] 固定 eval 集就绪：{len(_eval_set)} 个样本")
 
     # ── 训练内遥测总线（trainer/telemetry.py，图盲 opt-in default-off）──────────

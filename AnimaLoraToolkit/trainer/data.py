@@ -1469,16 +1469,55 @@ def _lookup_token_count_walk(d, idx):
     return 0
 
 
-def dataset_token_counts(dataset):
-    """Per-index token counts for ``dataset``, preferring a leaf ``token_count_for_index``
-    list and falling back to a per-index wrapper walk."""
-    counts = getattr(dataset, "token_count_for_index", None)
-    if counts is not None and len(counts) > 0:
-        try:
-            dataset_len = len(dataset)
-        except TypeError:
-            dataset_len = len(counts)
-        return [int(counts[i % len(counts)]) for i in range(dataset_len)]
+def _walk_attr_list(dataset, attr):
+    """Find a leaf dataset's per-index list ``attr`` through single-chain wrappers
+    (RepeatDataset/CachedLatentDataset), mapped to ``len(dataset)`` via ``% len`` (the
+    RepeatDataset index semantics). Returns None for MergedDataset (two branches) or
+    when the attribute is absent everywhere."""
+    cur = dataset
+    for _ in range(12):
+        if getattr(cur, "main_dataset", None) is not None and getattr(cur, "reg_dataset", None) is not None:
+            return None  # MergedDataset: not a single chain
+        v = getattr(cur, attr, None)
+        if v is not None and len(v) > 0:
+            n = len(dataset)
+            return [v[i % len(v)] for i in range(n)]
+        nxt = getattr(cur, "dataset", None)
+        if nxt is None or nxt is cur or isinstance(nxt, list):
+            nxt = getattr(cur, "base_dataset", None)
+        if nxt is None or nxt is cur:
+            return None
+        cur = nxt
+    return None
+
+
+def dataset_token_counts(dataset, patch_spatial=2):
+    """Per-index token counts for NaViT packing.
+
+    Prefers a populated ``token_count_for_index`` (the FiT path fills it). On the NaViT /
+    non-FiT path that field is all-zero (``token_count`` is only set when an FiT plan
+    exists, see ImageDataset), so fall back to deriving the count from the cached latent
+    shape ``bucket_for_index = (h, w)`` (latent px) as ``(h // patch_spatial) * (w //
+    patch_spatial)`` — exactly what ``patchify_latents_to_tokens`` produces. Without this
+    fallback every count is 0 and the budget packer puts the *entire* dataset in one pack
+    (→ a ~500k-token sequence → OOM)."""
+    counts = _walk_attr_list(dataset, "token_count_for_index")
+    if counts is not None and any(int(c) > 0 for c in counts):
+        return [int(c) for c in counts]
+
+    shapes = _walk_attr_list(dataset, "bucket_for_index")
+    if shapes is not None:
+        ps = max(1, int(patch_spatial))
+        derived = []
+        for s in shapes:
+            if not s:
+                derived.append(0)
+                continue
+            h, w = int(s[0]), int(s[1])
+            derived.append((h // ps) * (w // ps))
+        if any(c > 0 for c in derived):
+            return derived
+
     return [int(_lookup_token_count_walk(dataset, i) or 0) for i in range(len(dataset))]
 
 
@@ -1505,6 +1544,16 @@ class NavitPackBatchSampler:
         self.epoch = 0
         self.token_counts = dataset_token_counts(dataset)
         self._cached_packs = None
+        # Fail-fast: all-zero token counts means the per-image size couldn't be resolved
+        # (neither token_count_for_index nor bucket_for_index). Without this the budget
+        # check `cur_sum + 0 > budget` never trips → the whole dataset packs into one
+        # ~500k-token sequence → OOM. Far better to stop here with a clear message.
+        if not self.token_counts or not any(int(c) > 0 for c in self.token_counts):
+            raise RuntimeError(
+                "[NavitPack] 无法解析任一样本的 token 数（token_count_for_index 与 "
+                "bucket_for_index 都不可用/全 0）。NaViT 打包需要缓存数据集 "
+                "（cache_latents=true）以拿到每图 latent 形状。"
+            )
         mx = max(self.token_counts) if self.token_counts else 0
         if self.token_counts and self.token_budget < mx:
             logger.warning(

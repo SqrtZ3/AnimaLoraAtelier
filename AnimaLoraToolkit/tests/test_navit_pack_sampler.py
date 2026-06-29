@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from trainer.data import (  # noqa: E402
     NavitPackBatchSampler,
+    dataset_token_counts,
     pack_indices_by_budget,
 )
 
@@ -27,6 +28,18 @@ class _FakeDataset:
 
     def __len__(self):
         return len(self.token_count_for_index)
+
+
+class _FakeCachedDataset:
+    """Mimics the NaViT/non-FiT path: token_count_for_index is all-zero (FiT-only field),
+    per-image size lives in bucket_for_index = (h, w) latent px."""
+
+    def __init__(self, latent_shapes):
+        self.bucket_for_index = list(latent_shapes)
+        self.token_count_for_index = [0] * len(latent_shapes)  # FiT field unset → 0
+
+    def __len__(self):
+        return len(self.bucket_for_index)
 
 
 class PackBudgetFunctionTests(unittest.TestCase):
@@ -84,6 +97,27 @@ class NavitPackBatchSamplerTests(unittest.TestCase):
         self.assertEqual(sorted(i for p in p1 for i in p), list(range(len(ds))))
         # ...but the grouping differs across epochs (reshuffle)
         self.assertNotEqual(p0, p1)
+
+    def test_token_counts_derived_from_latent_shape_when_token_count_zero(self):
+        # Regression: on the NaViT path token_count_for_index is all-zero; counts must be
+        # derived from bucket_for_index (h//2)*(w//2), else everything packs into one
+        # giant sequence → OOM.
+        ds = _FakeCachedDataset([(128, 128), (96, 160), (160, 96)])  # latent px
+        counts = dataset_token_counts(ds, patch_spatial=2)
+        self.assertEqual(counts, [64 * 64, 48 * 80, 80 * 48])
+
+    def test_pack_respects_budget_on_cached_path(self):
+        ds = _FakeCachedDataset([(128, 128)] * 5)   # 4096 tokens each
+        sampler = NavitPackBatchSampler(ds, token_budget=8192, shuffle=False)
+        packs = list(sampler)
+        for p in packs:
+            self.assertLessEqual(len(p), 2)          # 2*4096 == 8192, never 3
+        self.assertEqual(sum(len(p) for p in packs), 5)
+
+    def test_fail_fast_on_all_zero_token_counts(self):
+        ds = _FakeDataset([0, 0, 0])                 # nothing resolvable
+        with self.assertRaises(RuntimeError):
+            NavitPackBatchSampler(ds, token_budget=8192)
 
     def test_drop_last_removes_trailing_underfilled_pack(self):
         ds = _FakeDataset([60, 60, 5])

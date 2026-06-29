@@ -1448,10 +1448,14 @@ def navit_packed_forward_and_loss(
         )
         per_image.append(li)
         off += n
-    per_image = torch.cat(per_image)                 # [G]
+    per_image = torch.cat(per_image)                 # [G], grad-bearing
     loss = per_image.mean()
     info = {
         "visual_seqlens": vseq,
+        # grad-bearing per-image loss — the caller MUST build the backward loss from this
+        # (or from the returned ``loss``), not from ``per_image_loss`` (detached, telemetry
+        # only). Using the detached one silently severs the main flow-matching gradient.
+        "per_image_loss_grad": per_image,
         "per_image_loss": per_image.detach(),
         "noisy_grid_list": noisy_grid_list,   # per-image [1,C,T,h,w] noisy latents
         "size_list": size_list,               # per-image token grid shape for unpatchify

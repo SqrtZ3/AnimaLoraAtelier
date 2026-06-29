@@ -2985,10 +2985,15 @@ def main():
                     per_sample = per_sample * eisbach_barrier_weight(pred, _eis_lambda).to(per_sample.dtype)
 
                 if navit_packing:
-                    # per_sample 已是逐图 masked loss（每图用自己的 t 走 Huber/SNR），
-                    # loss=均值。t-加权方案（min-SNR/EDM2 等）按逐图 t 在此统一施加。
+                    # ★必须用带梯度的逐图 loss 组装主损失。per_sample 是 detached 版（仅
+                    # 日志/telemetry）；若拿它算 loss，主 flow-matching 梯度会被悄悄切断，
+                    # 训练只剩 aux 在带梯度（且高 t 包无 aux 时 backward 直接报 no grad）。
+                    # 逐图 masked loss 在 helper 内已按各图自己的 t 走 Huber/SNR；这里再按
+                    # 逐图 t 施加 min-SNR/EDM2 等加权方案（scheme=none 时即均值）。
                     main_loss_per_sample = None
-                    loss = apply_loss_weighting(per_sample, t, objective_cfg.loss)
+                    loss = apply_loss_weighting(
+                        _navit_info["per_image_loss_grad"], t, objective_cfg.loss
+                    )
                 elif dpo_active:
                     # DPO 损失已是配对均值标量；不过 SFT 的 t-加权 / sample 累积路径。
                     main_loss_per_sample = None
@@ -3286,6 +3291,14 @@ def main():
                 loss_to_backward = loss / args.grad_accum
                 legacy_accum_samples += int(bs)
                 step_boundary = (batch_idx + 1) % args.grad_accum == 0 or (batch_idx + 1) == len(dataloader)
+            # Fail-fast on a severed graph: a non-grad loss means no trainable param fed it
+            # (e.g. building the loss from a detached tensor). Far clearer than autograd's
+            # "element 0 ... does not require grad" raised from inside backward.
+            if not torch.is_tensor(loss_to_backward) or not loss_to_backward.requires_grad:
+                raise RuntimeError(
+                    "loss 不带梯度（requires_grad=False）：主损失可能是从 detached 张量构建的，"
+                    "没有任何可训练参数参与。请检查本步的 loss 组装路径。"
+                )
             loss_to_backward.backward()
             # T-LoRA: backward 完成后才能 reset，否则 grad checkpoint recompute 会看到
             # current_t=None，与原 forward 走的分支不一致 → CheckpointError

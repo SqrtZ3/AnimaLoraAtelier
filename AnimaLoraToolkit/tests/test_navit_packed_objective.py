@@ -82,6 +82,26 @@ class NavitPackedObjectiveTests(unittest.TestCase):
         self.assertGreater(len(grads), 0)
         self.assertTrue(all(torch.isfinite(g).all() for g in grads))
 
+    def test_info_exposes_grad_and_detached_per_image_loss(self):
+        # Contract guard for the loop wiring: the backward loss must be built from the
+        # grad-bearing per-image loss; the detached one is telemetry-only. Mixing them up
+        # silently severs the main flow-matching gradient (only aux would train).
+        set_xformers_enabled(True)
+        dtype = torch.float16
+        model = self._model(dtype)
+        lat_list, cross_packed, tseq = self._pack(dtype)
+        t = torch.tensor([0.2, 0.6, 0.9], device="cuda")
+        with torch.autocast("cuda", dtype=dtype):
+            loss, _pred, info = navit_packed_forward_and_loss(
+                model, lat_list, t, cross_packed, tseq, NoiseConfig(), LossConfig(),
+            )
+        self.assertTrue(info["per_image_loss_grad"].requires_grad)
+        self.assertFalse(info["per_image_loss"].requires_grad)
+        self.assertTrue(loss.requires_grad)
+        # the grad-bearing tensor must actually reach trainable params
+        info["per_image_loss_grad"].mean().backward()
+        self.assertTrue(any(p.grad is not None for p in model.parameters() if p.requires_grad))
+
     def test_deterministic_noise_matches_manual_first_image(self):
         """With supplied noise, the per-image loss of image 0 equals a hand-computed
         masked MSE on the (Stage-2-proven) packed prediction slice."""

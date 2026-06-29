@@ -252,6 +252,7 @@ from trainer.lora import LoRALayer, LoKrLayer, LoRALinear, LoRAInjector
 from trainer.gaf import GafController
 from trainer.dpo import DpoController
 from trainer.leap import sample_two_timesteps, leap_training_step
+from trainer.dispersive import dispersive_loss
 from trainer.ncp import (
     perceptual_features,
     ncp_perceptual_loss,
@@ -2283,6 +2284,24 @@ def main():
              f" nested_grad_coe={leap_nested_grad_coe} min_gap={leap_min_gap} "
              f"traj_sim={leap_traj_sim_weighting}（两步自蒸馏逼真 x0，反平均风格；leap 步关 TREAD）")
 
+    # ── Dispersive Loss 中间表征排斥正则（arXiv 2506.09027；默认关）见 trainer/dispersive.py ──
+    # 在某中间 block 的隐表征空间做"无正样本对的排斥"，反表征坍缩；机理与输出空间 ΔFM/VeCoR、
+    # 输出端 Eisbach 正交。接线：独立截断前向（ncp.perceptual_features，不冻结 adapter → 梯度
+    # 回流 LoRA），仅 dense 路径、leap/dpo 步与 batch<2 跳过。代价 ≈ K/N 一次部分前向+反向（K=tap
+    # 之前的 block 数，建议取早中块以省算力）；关闭(λ=0)时完全 no-op。
+    _disp_enabled = bool(getattr(args, "dispersive_enabled", False))
+    _disp_lambda = float(getattr(args, "dispersive_lambda", 0.0) or 0.0)
+    _disp_tau = float(getattr(args, "dispersive_tau", 0.5) or 0.5)
+    _disp_tap = int(getattr(args, "dispersive_tap_block", -1))
+    _disp_variant = str(getattr(args, "dispersive_variant", "infonce_l2") or "infonce_l2")
+    _disp_active = _disp_enabled and _disp_lambda > 0.0
+    if _disp_active:
+        emit(
+            f"[dispersive] 已启用 λ={_disp_lambda} τ={_disp_tau} variant={_disp_variant} "
+            f"tap_block={_disp_tap}(-1=中间块 n//2；论文建议前 1/4)（中间表征排斥，反坍缩；"
+            f"dense 路径、leap/dpo 步跳过）"
+        )
+
     # ── 固定网格 eval loss（确定性曲线，跨 run 可比）───────────────────────────
     _eval_every = int(getattr(args, "eval_every", 0) or 0)
     _eval_set = []          # [(latents_1xC1HW_gpu, cross_1xLxD_gpu)]
@@ -2952,6 +2971,24 @@ def main():
                             )
 
                     loss = loss + aux_total.to(loss.dtype)
+
+            # ── Dispersive Loss（arXiv 2506.09027；默认关）中间表征排斥正则 ──────────
+            # 独立截断前向到 tap_block（ncp.perceptual_features，不冻结 → 梯度回流 LoRA），
+            # 取该 block 隐表征做"无正样本对排斥"。dense 路径、bs>1、非 leap/dpo 步才生效。
+            # current_t 已是 t（与主前向一致，line ~2680），无需切换。
+            if _disp_active and not _skip_main_extras and not fit_packed_training and bs > 1:
+                with torch.autocast("cuda", dtype=dtype):
+                    _disp_z = perceptual_features(
+                        model, noisy, t.view(-1, 1), cross, pad_mask, _disp_tap,
+                    )
+                    _disp_l = dispersive_loss(_disp_z, variant=_disp_variant, tau=_disp_tau)
+                _disp_term = _disp_lambda * _disp_l.to(torch.float32)
+                if sample_accum_enabled:
+                    # batch 级标量按 bs/EBS 加权，跨梯度累积步等价于 mean 贡献（与主 loss 的
+                    # sum()/effective_batch_size 归一一致）。
+                    _disp_term = _disp_term * (float(bs) / float(effective_batch_size))
+                loss = loss + _disp_term.to(loss.dtype)
+                del _disp_z
 
             # ★ 守护 1：forward 结果 NaN/Inf 检查
             debug_n = int(getattr(args, "debug_first_batches", 0) or 0)

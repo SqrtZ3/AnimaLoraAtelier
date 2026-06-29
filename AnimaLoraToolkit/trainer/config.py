@@ -323,6 +323,12 @@ YAML_TO_ARGS = {
     "dpo_loss_space": "dpo_loss_space",
     "ncp_tap_block": "ncp_tap_block",
     "ncp_dt": "ncp_dt",
+    # ── Dispersive Loss 中间表征排斥正则（arXiv 2506.09027；默认关）见 trainer/dispersive.py ──
+    "dispersive_enabled": "dispersive_enabled",
+    "dispersive_lambda": "dispersive_lambda",
+    "dispersive_tau": "dispersive_tau",
+    "dispersive_tap_block": "dispersive_tap_block",
+    "dispersive_variant": "dispersive_variant",
     # ── LeapAlign 两步跳跃自蒸馏（SFT 主目标增强；默认关）见 trainer/leap.py ──
     "leap_enabled": "leap_enabled",
     "leap_ratio": "leap_ratio",
@@ -593,6 +599,18 @@ DEFAULTS = {
     "dpo_loss_space": "latent",
     "ncp_tap_block": -1,
     "ncp_dt": 0.05,
+    # Dispersive Loss 中间表征排斥（默认关 → 完全 no-op）。在某中间 block 的隐表征空间做
+    # "无正样本对的排斥"，反表征坍缩，与输出空间的 ΔFM/VeCoR、输出端 Eisbach 机理正交。
+    # 接线复用 ncp.perceptual_features 截断前向（grads on，不冻结 → 梯度回流 LoRA）；dense
+    # 路径限定，leap/dpo 步跳过。dispersive_lambda 论文默认 0.5，本仓库小数据 LoRA 起 0.05–0.1
+    # （同 spectral/self-perceptual：辅助 loss 比论文调小一个量级起跑），开训看日志标定。
+    # tap_block: -1=自动取中间块 n//2（沿用 ncp 语义）；论文建议前 1/4 ≈ n//4（28 块 → ~7），
+    # 想贴论文请显式设。variant: infonce_l2（论文最优）/ infonce_cosine（尺度无关）。
+    "dispersive_enabled": False,
+    "dispersive_lambda": 0.0,
+    "dispersive_tau": 0.5,
+    "dispersive_tap_block": -1,
+    "dispersive_variant": "infonce_l2",
     # LeapAlign 两步跳跃自蒸馏（默认关）。leap_ratio<1.0 = hybrid（非 leap 步保留三峰/
     # adaptive/aux/ΔFM，leap 步做轨迹蒸馏）；=1.0 = 纯 leap（adaptive_timestep 会变惰性）。
     "leap_enabled": False,

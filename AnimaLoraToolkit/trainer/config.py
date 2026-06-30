@@ -91,6 +91,7 @@ YAML_TO_ARGS = {
     "navit_pack_strategy": "navit_pack_strategy",
     "navit_pack_ffd_window": "navit_pack_ffd_window",
     "navit_drop_last": "navit_drop_last",
+    "navit_native_resolution": "navit_native_resolution",
     "alpha_handling": "alpha_handling",
     "alpha_background": "alpha_background",
     "alpha_threshold": "alpha_threshold",
@@ -416,6 +417,14 @@ DEFAULTS = {
     # is navit-specific and decoupled from bucket_drop_last (which drops incomplete ARB
     # batches, a different notion).
     "navit_drop_last": False,
+    # Size each packed image at its *native* resolution (only the VAE+patch 16px-multiple
+    # constraint), instead of quantizing to the ARB bucket grid. Forces floor alignment
+    # (crop down to a 16px multiple ⇒ zero padding ⇒ no per-image mask needed; the navit
+    # cached path carries no padding mask). Requires cache_latents. The longest single
+    # side is still bounded by the model's RoPE cap (max_img_h/max_img_w); when those are
+    # auto (0), they are derived from the dataset's largest image. Only meaningful with
+    # navit_packing=true; default False keeps the existing ARB-bucket sizing.
+    "navit_native_resolution": False,
     "alpha_handling": "none",
     "alpha_background": "neutral",
     "alpha_threshold": 0.01,

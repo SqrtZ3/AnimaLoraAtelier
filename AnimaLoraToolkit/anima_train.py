@@ -51,6 +51,38 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+def scan_max_image_side(data_dirs):
+    """Return the largest single image side (px) across ``data_dirs``.
+
+    Used by the navit native-resolution path to auto-derive the RoPE cap
+    (max_img_h/max_img_w) before the model is loaded. Reads only image headers
+    (PIL ``.size`` is lazy, no pixel decode), mirroring ImageDataset's EXTS, so a
+    few-thousand-image scan costs a few seconds. Returns 0 if nothing is found.
+    """
+    from PIL import Image as _PILImage
+
+    max_side = 0
+    for d in data_dirs:
+        if not d:
+            continue
+        root = Path(d)
+        if not root.exists():
+            continue
+        for img_path in root.rglob("*"):
+            if img_path.suffix.lower() not in _IMAGE_EXTS:
+                continue
+            try:
+                with _PILImage.open(img_path) as im:
+                    w, h = im.size
+                max_side = max(max_side, int(w), int(h))
+            except Exception:
+                continue
+    return max_side
+
+
 def summarize_bad_gradients(named_parameters, limit=8):
     summaries = []
     for name, p in named_parameters:
@@ -395,6 +427,11 @@ def parse_args():
     p.add_argument("--navit-drop-last", action="store_true",
                    help="丢弃每 epoch 最后一个（未满预算的）包。默认关：打包路径下末包总含真实图，"
                         "丢了在小数据上是浪费。与 bucket_drop_last（丢残缺 ARB 批）解耦。")
+    p.add_argument("--navit-native-resolution", action="store_true",
+                   help="navit 打包时按原生分辨率定尺寸（仅受 VAE+patch 的 16px 整倍数约束），"
+                        "解开 ARB 分桶对单图尺寸的量化（不再 resize/中心裁到桶尺寸）。强制 floor 对齐"
+                        "（裁到 16 整倍数、零 padding、无需 mask）；需 cache_latents。单边上限仍受模型 "
+                        "RoPE max_img_h/max_img_w 约束（为 0 时按数据集最大单边自动推）。见 docs/navit-packing.md。")
     p.add_argument("--fit-max-tokens", type=int, default=65536,
                    help="Maximum FiT tokens per image before applying the over-budget policy.")
     p.add_argument("--fit-warn-tokens", type=int, default=16384,
@@ -982,6 +1019,23 @@ def main():
     _user_max_w = getattr(args, "max_img_w", 0)
     _bucket_max = int(getattr(args, "max_bucket_reso", 2048) or 2048)
     _auto_max = max(240, ((_bucket_max // 8) + 8 + 1) // 2 * 2)
+    # navit 原生定尺寸：单图尺寸不再受 ARB 桶约束，故 RoPE 单维上限不能再按 max_bucket_reso 推，
+    # 而要覆盖数据集里最大的那张图（floor 对齐后 ≤ 源尺寸）。用户没显式设 max_img_h/w 时，
+    # 预扫一遍图片 header 取最大单边来推（latent 单位 = image/8，留 8 latent 余量 + 偶数对齐）。
+    _navit_native = (bool(getattr(args, "navit_packing", False))
+                     and bool(getattr(args, "navit_native_resolution", False)))
+    if _navit_native and not ((_user_max_h and int(_user_max_h) > 0)
+                              and (_user_max_w and int(_user_max_w) > 0)):
+        _native_max_side = scan_max_image_side([args.data_dir, getattr(args, "reg_data_dir", "") or ""])
+        if _native_max_side > 0:
+            _native_auto = max(240, ((_native_max_side // 8) + 8 + 1) // 2 * 2)
+            if _native_auto > _auto_max:
+                logger.info(
+                    "[navit-native] 数据集最大单边 %d px → 自动设 max_img_h/w=%d（latent 单位，"
+                    "RoPE 单维上限 %d px）。如需更省显存可在 YAML 显式设小并裁剪超大图。",
+                    _native_max_side, _native_auto, _native_auto * 8,
+                )
+            _auto_max = max(_auto_max, _native_auto)
     max_img_h = int(_user_max_h) if _user_max_h and int(_user_max_h) > 0 else _auto_max
     max_img_w = int(_user_max_w) if _user_max_w and int(_user_max_w) > 0 else _auto_max
     logger.info("加载 Transformer...")
@@ -1225,7 +1279,9 @@ def main():
     # 并在控制台 emit 一个清楚的错误说明 —— 否则用户会看到一个看起来像随机崩溃
     # 的 AssertionError 出现在 forward 里。
     rope_max_image_dim = max_img_h * 8  # max_img_h 在 latent 单位（已经包含 patch_spatial=2 的余量）
-    bad_buckets = [] if fit_packed_training else [
+    # navit 原生定尺寸不使用 ARB 桶定尺寸（图按 16px 整倍数原生编码），故跳过桶过滤；
+    # 单边上限改由下方对数据集实际 fit_plan 的早期校验 + 逐图 forward 的 RoPE 断言把关。
+    bad_buckets = [] if (fit_packed_training or _navit_native) else [
         (bw, bh) for (bw, bh) in bucket_mgr.buckets
         if bw > rope_max_image_dim or bh > rope_max_image_dim
     ]
@@ -1245,8 +1301,13 @@ def main():
             ", ".join(f"{w}x{h}" for w, h in bad_buckets[:5]),
         )
         bucket_mgr.buckets = good
+    # navit 原生定尺寸：复用 FiT 的原生定尺寸（plan_native_fit_image，按 16px 整倍数对齐），
+    # 但走 navit 块对角打包前向（非 fit_packed_training）。强制 floor 对齐——裁到 16 整倍数、
+    # 零 padding，从而无需 mask（navit 缓存路径不携带 padding mask）。
+    _native_sizing = fit_packed_training or _navit_native
+    _fit_align = "floor" if _navit_native else str(getattr(args, "fit_align_mode", "pad") or "pad")
     base_dataset = ImageDataset(
-        args.data_dir, args.resolution, None if fit_packed_training else bucket_mgr,
+        args.data_dir, args.resolution, None if _native_sizing else bucket_mgr,
         shuffle_caption=args.shuffle_caption,
         keep_tokens=args.keep_tokens,
         flip_augment=args.flip_augment,
@@ -1254,14 +1315,14 @@ def main():
         tag_dropout_overrides=getattr(args, "tag_dropout_overrides", None),
         prefer_json=args.prefer_json,
         freq_balanced_dropout_strength=float(getattr(args, "freq_balanced_dropout_strength", 0.0) or 0.0),
-        fit_packed=fit_packed_training,
+        fit_packed=_native_sizing,
         fit_max_tokens=int(getattr(args, "fit_max_tokens", 65536) or 65536),
         fit_warn_tokens=int(getattr(args, "fit_warn_tokens", 16384) or 0),
         fit_min_tokens=int(getattr(args, "fit_min_tokens", 16) or 0),
         fit_patch_size=int(getattr(args, "fit_patch_size", 2) or 2),
         fit_vae_downsample=int(getattr(args, "fit_vae_downsample", 8) or 8),
         fit_over_budget_strategy=str(getattr(args, "fit_over_budget_strategy", "fail") or "fail"),
-        fit_align_mode=str(getattr(args, "fit_align_mode", "pad") or "pad"),
+        fit_align_mode=_fit_align,
         alpha_handling=str(getattr(args, "alpha_handling", "none") or "none"),
         alpha_background=str(getattr(args, "alpha_background", "neutral") or "neutral"),
         alpha_threshold=float(getattr(args, "alpha_threshold", 0.01)),
@@ -1297,21 +1358,21 @@ def main():
             reg_caption = (getattr(args, "reg_caption", "") or "").strip()
             reg_repeats = max(1, int(getattr(args, "reg_repeats", 1)) or 1)
             reg_base = ImageDataset(
-                reg_data_dir, args.resolution, None if fit_packed_training else bucket_mgr,
+                reg_data_dir, args.resolution, None if _native_sizing else bucket_mgr,
                 shuffle_caption=args.shuffle_caption,
                 keep_tokens=args.keep_tokens,
                 flip_augment=args.flip_augment,
                 tag_dropout=0.0,  # 正则集通常不用 dropout
                 prefer_json=args.prefer_json,
                 caption_override=reg_caption if reg_caption else None,
-                fit_packed=fit_packed_training,
+                fit_packed=_native_sizing,
                 fit_max_tokens=int(getattr(args, "fit_max_tokens", 65536) or 65536),
                 fit_warn_tokens=int(getattr(args, "fit_warn_tokens", 16384) or 0),
                 fit_min_tokens=int(getattr(args, "fit_min_tokens", 16) or 0),
                 fit_patch_size=int(getattr(args, "fit_patch_size", 2) or 2),
                 fit_vae_downsample=int(getattr(args, "fit_vae_downsample", 8) or 8),
                 fit_over_budget_strategy=str(getattr(args, "fit_over_budget_strategy", "fail") or "fail"),
-                fit_align_mode=str(getattr(args, "fit_align_mode", "pad") or "pad"),
+                fit_align_mode=_fit_align,
                 alpha_handling=str(getattr(args, "alpha_handling", "none") or "none"),
                 alpha_background=str(getattr(args, "alpha_background", "neutral") or "neutral"),
                 alpha_threshold=float(getattr(args, "alpha_threshold", 0.01)),
@@ -1322,6 +1383,31 @@ def main():
                 logger.info("\n%s", reg_base.bucket_report(label="reg"))
             cap_preview = f", caption=\"{reg_caption[:50]}{'...' if len(reg_caption) > 50 else ''}\"" if reg_caption else ""
             logger.info(f"正则数据集: {reg_data_dir} ({len(reg_base)} 张, repeats={reg_repeats}){cap_preview}")
+
+    # navit 原生定尺寸：早期校验最大单边没超 RoPE 单维上限（否则会在缓存编码完后、训练第一步
+    # 才在 _packed_rope_from_grid 里 fail-fast，白白浪费一次全量 VAE 编码）。floor 对齐后单边
+    # ≤ 源尺寸，这里用各图 fit_plan 的实际像素尺寸。
+    if _navit_native:
+        _native_max = 0
+        for _ds in (base_dataset, reg_dataset):
+            if _ds is None:
+                continue
+            for _s in getattr(_ds, "samples", []):
+                _fp = _s.get("fit_plan")
+                if _fp is not None:
+                    _native_max = max(_native_max, int(_fp.width), int(_fp.height))
+        if _native_max > rope_max_image_dim:
+            raise RuntimeError(
+                f"[navit-native] 数据集最大单边 {_native_max}px 超过模型 RoPE 单维上限 "
+                f"{rope_max_image_dim}px（max_img_h={max_img_h} latent）。\n"
+                f"解决方案：在 YAML 提高 max_img_h / max_img_w（latent 单位，需 ≥ {(_native_max + 7) // 8}），"
+                f"或在数据集端把超大图裁到长边 ≤ {rope_max_image_dim}px。"
+            )
+        logger.info(
+            "[navit-native] 原生定尺寸已启用：floor 对齐到 16px 整倍数、零 padding；"
+            "最大单边 %dpx ≤ RoPE 上限 %dpx。单图尺寸不再被 ARB 桶量化。",
+            _native_max, rope_max_image_dim,
+        )
 
     # 缓存 VAE latents（在 repeat 之前）
     use_cached = getattr(args, "cache_latents", False)

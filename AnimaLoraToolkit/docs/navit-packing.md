@@ -45,7 +45,38 @@ navit_pack_ffd_window: 256     # ffd 的窗口大小（张）：每 epoch 洗牌
                                #   变化（保 SGD 多样性）。0=全局窗口（最满但 epoch 间包固定）。
 navit_drop_last: false         # 是否丢弃每 epoch 最后那个未满预算的包。默认不丢（打包路径下末包
                                #   总含真实图，丢了在小数据上是浪费）。与 bucket_drop_last 解耦。
+navit_native_resolution: false # 单图按原生分辨率定尺寸，只受 VAE+patch 的 16px 整倍数约束，
+                               #   解开 ARB 分桶对单图尺寸的量化（见下方“2.1 原生分辨率”）。
 ```
+
+### 2.1 原生分辨率（`navit_native_resolution`，opt-in）
+
+默认（关）时，navit 打包仍**用 ARB 桶给每张图定尺寸**：每图被 resize + 中心裁到最近的桶
+`(h,w)` 再编码 latent，打包只解耦“每步几张图”，单图尺寸仍被桶网格量化。
+
+开启 `navit_native_resolution: true` 后，单图改走**原生定尺寸**（复用 FiT 的
+`plan_native_fit_image`，对齐单元 = `patch(2) × vae_downsample(8) = 16px`）：
+
+- **不再 resize、不再按桶量化**，每张图保留自己的宽高比与近似原生尺寸；
+- **强制 `floor` 对齐**——把每边裁到 16 的下整倍数（每边丢 ≤15px），**零 gray padding**。
+  这点很关键：navit 的缓存路径（`CachedLatentDataset` / `collate_fn_navit_pack`）**不携带
+  padding mask**，floor 保证有效区填满整张 latent（mask 恒为全 1），不会把灰边当内容训练。
+  对比 `pad/ceil` 会补灰边、需要逐图 mask，v1 不走这条；
+- **需 `cache_latents: true`**（与 navit 打包本身的要求一致：打包按每图 latent token 数分包）。
+
+**仍存在的真实上界（不是 16px，而是 RoPE 单维上限）：** 每张图的单边 latent token 数必须
+≤ 模型 RoPE 的 `max_h/max_w`（即单边像素 ≤ `max_img_h × 8`）。`max_img_h/max_img_w` 为 0（自动）
+时，会**预扫数据集取最大单边自动推**；超限会在缓存编码前 fail-fast 并提示提高 `max_img_h/w`
+或在数据集端裁掉超大图。`navit_token_budget` 仍须 ≥ 最大单图 token 数。
+
+**关于 NaViT 论文的 “fractional PE（位置归一化到 [0,1]）”——本仓库不引入。** 该技巧是为
+**可学习的绝对加性位置嵌入**（固定大小 learned table 需跨分辨率插值）设计的；本模型用的是
+**RoPE3D**（`pos_emb_cls="rope3d"`，整数网格位置 + NTK 外推，见
+[`models/anima_modeling_core.py`](../models/anima_modeling_core.py) 的 `RopePosEmbed*` / `_packed_rope_from_grid`），
+本就按整数位置天然外推多分辨率，靠 NTK 系数与 `max_h/max_w` 承担，不需要归一化。且我们是在
+**冻结底模（Cosmos DiT，整数网格 RoPE 预训练）上训 LoRA**，把位置改成 [0,1] 归一化会给冻结权重喂
+OOD 的位置信号 → 大概率掉点。真正让“任意分辨率”成立的是 **原生 16px 定尺寸 + RoPE 现成的整数网格
+外推（在 max_h/w 内）**，与 fractional PE 无关。
 
 token 数换算：Anima 是 VAE 下采样 8 × patch 2 = **16 px/token 轴**，所以一张 `W×H` 图的
 token 数 `N = (W//16) × (H//16)`。例：1024² ≈ 4096 token；768×1024 ≈ 3072 token。

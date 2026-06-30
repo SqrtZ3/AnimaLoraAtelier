@@ -1134,17 +1134,21 @@ def main():
             _navit_conflicts.append("timestep_sampling=csflow")
         if bool(getattr(args, "torch_compile", False)):
             _navit_conflicts.append("torch_compile")
-        # 下面这些在 navit 路径会被 _skip_main_extras 跳过（它们都假设批量网格 / 逐 batch
-        # 单 t / batch 内负样本）。若不在此 fail-fast，它们会"开着但悄悄不生效"——对调好参的
-        # 配置是隐性行为改变。宁可报错让用户显式关掉，也不静默吞掉。
-        if float(getattr(args, "dfm_lambda", 0.0) or 0.0) > 0.0:
-            _navit_conflicts.append("dfm_lambda>0")
-        if float(getattr(args, "eisbach_lambda", 0.0) or 0.0) > 0.0:
-            _navit_conflicts.append("eisbach_lambda>0")
         if bool(getattr(args, "dispersive_enabled", False)):
             _navit_conflicts.append("dispersive_enabled")
-        if bool(getattr(args, "adaptive_timestep", False)):
-            _navit_conflicts.append("adaptive_timestep")
+        # ── 已逐图适配（navit 专用分支，见下方训练步）：eisbach / ΔFM(vecor) / adaptive ──
+        # eisbach：逐图 unpatchify pred → 空间能量障碍权重，与 dense 同数学。全模式放行。
+        # ΔFM：仅 vecor 模式自洽逐图（对自身 target 破坏性增强）；batch 模式要跨样本配对，
+        #   而一个 pack 内各图形状不同 → ||v_i - target_j||² 形状对不上 → 仍 fail-fast。
+        if float(getattr(args, "dfm_lambda", 0.0) or 0.0) > 0.0 and \
+                str(getattr(args, "dfm_mode", "batch") or "batch").lower() != "vecor":
+            _navit_conflicts.append("dfm_lambda>0 仅支持 dfm_mode=vecor（batch 模式需跨样本同形）")
+        # adaptive_timestep：采样侧 navit 本就逐图走 adaptive_ts.sample；这里补控制器 update。
+        #   raw/slope/entropy_rate 直接用干净逐图重建 loss；highfreq/mixed 需逐图高频残差网格，
+        #   v1 暂未适配 → 仅这两个 metric fail-fast。
+        if bool(getattr(args, "adaptive_timestep", False)) and \
+                str(getattr(args, "adaptive_timestep_metric", "raw") or "raw").lower() in ("highfreq", "mixed"):
+            _navit_conflicts.append("adaptive_timestep metric=highfreq/mixed（v1 仅支持 raw/slope/entropy_rate）")
         # lora_one 预热步走批量网格前向（_llat 堆叠），未适配 navit 的逐图打包。
         if int(getattr(args, "lora_one_init_steps", 0) or 0) > 0:
             _navit_conflicts.append("lora_one_init_steps>0")
@@ -3027,8 +3031,43 @@ def main():
                     # 逐图 masked loss 在 helper 内已按各图自己的 t 走 Huber/SNR；这里再按
                     # 逐图 t 施加 min-SNR/EDM2 等加权方案（scheme=none 时即均值）。
                     main_loss_per_sample = None
+                    # ── navit 逐图 ΔFM(VeCoR) / Eisbach：dense 块作用在批量网格 per_sample 上、
+                    #   对 navit 被 _skip_main_extras 跳过；这里在 apply_loss_weighting 之前，按图
+                    #   把同一套数学施加到带梯度的逐图向量上（与 dense"先改 per_sample 再加权"对称）。
+                    #   每图 unpatchify pred 回网格 → eisbach 障碍权重(detached,只缩 step) /
+                    #   vecor 负样本(带梯度,经 pred 回流)。干净逐图 loss(per_image_loss)保持不动，
+                    #   留给下方 adaptive update —— 不能喂被乘过的版本（与 dense _adaptive_raw 一致）。
+                    _navit_grad_vec = _navit_info["per_image_loss_grad"]
+                    _eis_l = float(objective_cfg.loss.eisbach_lambda or 0.0)
+                    _dfm_l = float(objective_cfg.loss.dfm_lambda or 0.0)
+                    _dfm_vecor = _dfm_l > 0.0 and \
+                        str(getattr(args, "dfm_mode", "batch") or "batch").lower() == "vecor"
+                    if _eis_l > 0.0 or _dfm_vecor:
+                        _size_l = _navit_info["size_list"]
+                        _tgt_tok = _navit_info["target_tokens"]
+                        _off2 = 0
+                        _shaped = []
+                        for _j, _nn in enumerate(_navit_info["visual_seqlens"]):
+                            _li = _navit_grad_vec[_j]
+                            _pg = model.unpatchify_tokens(pred[:, _off2:_off2 + _nn, :], _size_l[_j])
+                            if _eis_l > 0.0:
+                                _w = eisbach_barrier_weight(_pg, _eis_l)        # [1], detached
+                                _li = _li * _w[0].to(_li.dtype)
+                            if _dfm_vecor:
+                                _tg = model.unpatchify_tokens(_tgt_tok[:, _off2:_off2 + _nn, :], _size_l[_j])
+                                _neg = vecor_contrastive_neg(
+                                    _pg, _tg, t[_j:_j + 1].float(),
+                                    loss_type=objective_cfg.loss.loss_type,
+                                    huber_c=objective_cfg.loss.huber_c,
+                                    huber_schedule=objective_cfg.loss.huber_schedule,
+                                    huber_snr_clamp_max=objective_cfg.loss.huber_snr_clamp_max,
+                                )                                              # [1], grad via _pg
+                                _li = _li - _dfm_l * _neg[0].to(_li.dtype)
+                            _shaped.append(_li.reshape(1))
+                            _off2 += _nn
+                        _navit_grad_vec = torch.cat(_shaped)
                     loss = apply_loss_weighting(
-                        _navit_info["per_image_loss_grad"], t, objective_cfg.loss
+                        _navit_grad_vec, t, objective_cfg.loss
                     )
                 elif dpo_active:
                     # DPO 损失已是配对均值标量；不过 SFT 的 t-加权 / sample 累积路径。
@@ -3304,7 +3343,14 @@ def main():
                     del aux_total
                 continue
 
-            if adaptive_ts.enabled and not _skip_main_extras and fit_packed_training:
+            if adaptive_ts.enabled and navit_packing:
+                # NaViT：采样侧本就走 adaptive_ts.sample(bs=G)（逐图 t），这里补控制器 update。
+                # 信号用干净逐图重建 loss（_adaptive_raw = per_image_loss，未被 eisbach/vecor 乘过），
+                # t 是逐图 [G]。metric=raw/slope/entropy_rate 直接透传裸 loss（与
+                # adaptive_timestep_metric_signal 的这三个分支等价）；highfreq/mixed 需逐图高频残差
+                # 网格，已在 setup 处对 navit fail-fast，不会走到这里。
+                adaptive_ts.update(t.float(), _adaptive_raw)
+            elif adaptive_ts.enabled and not _skip_main_extras and fit_packed_training:
                 # 纯净重建 per_sample（multiplier 之前的快照），不受 ΔFM/Eisbach/GAF/bin_ema 污染
                 adaptive_ts.update(t.float(), _adaptive_raw)
             elif adaptive_ts.enabled and not _skip_main_extras:

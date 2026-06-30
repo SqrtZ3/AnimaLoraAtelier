@@ -88,13 +88,25 @@ timestep”假设写的特性会语义错位。v1 的策略：
 **aux_losses 中的 spectral / perceptual（逐图 unpatchify 回网格后按既有 aux 数学计算）**。
 （self-perceptual 需逐图额外模型前向、尚未适配；dispersive 见下方互斥项。）
 
+**已逐图适配（opt-in，与 dense 同数学，但按 pack 内每图独立施加）**：
+
+- **`eisbach_lambda>0`（Eisbach log-barrier）**：逐图 unpatchify pred 回网格 → 空间能量障碍
+  权重（detached，只缩 step、不改方向）→ 乘到该图带梯度的逐图 loss。全模式放行。
+- **`dfm_lambda>0`（ΔFM）——仅 `dfm_mode=vecor`**：vecor 负样本是对该图自身 target 的破坏性
+  增强（通道乱序 / 裁剪缩放），自洽逐图。**`dfm_mode=batch`（默认）在 NaViT 下仍 fail-fast**：
+  batch 模式要 `||v_i − target_j||²` 跨样本配对，而一个 pack 内各图形状不同、对不上。
+- **`adaptive_timestep`——`metric=raw/slope/entropy_rate`**：采样侧 NaViT 本就逐图走
+  `adaptive_ts.sample(bs=G)`，这里补控制器 `update(t, 干净逐图重建 loss)`（用未被 eisbach/vecor
+  乘过的 `per_image_loss`，与 dense 的 `_adaptive_raw` 快照语义一致）。**`metric=highfreq/mixed`
+  仍 fail-fast**：它们需逐图高频残差网格，v1 未适配。
+
 **互斥（同时开 → 启动即 fail-fast 报错，提示显式关掉）**：`token_bucket`/ARB 分桶、
 `effective_batch_size` 样本窗口累积、`tread_enabled`、`leap_enabled`、`gaf_enabled`、
 `dpo_enabled`、`timestep_sampling=csflow`、`torch_compile`（动态 pack 形状与固定图冲突）、
-以及 `dfm_lambda>0` / `eisbach_lambda>0` / `dispersive_enabled` / `adaptive_timestep`
-——后四个在 NaViT 路径会被 `_skip_main_extras` 跳过（它们假设批量网格 / 逐 batch 单 t /
-batch 内负样本），**为避免"开着却悄悄不生效"的隐性行为改变，一律 fail-fast 要求显式关闭**。
-这些日后可逐个适配 NaViT，不在 v1 范围。
+`dispersive_enabled`，以及 `dfm_mode=batch` 下的 `dfm_lambda>0` /
+`adaptive_timestep metric=highfreq|mixed`（见上）。这些（尚未适配的部分）在 NaViT 路径会被
+`_skip_main_extras` 跳过——**为避免"开着却悄悄不生效"的隐性行为改变，一律 fail-fast 要求显式
+关闭或切到已适配的模式**。其余日后可逐个适配 NaViT，不在 v1 范围。
 
 ## 4. 实现地图（已落地部分）
 

@@ -22,6 +22,9 @@ try:
         LossConfig,
         NoiseConfig,
         navit_packed_forward_and_loss,
+        eisbach_barrier_weight,
+        vecor_contrastive_neg,
+        apply_loss_weighting,
     )
     HAS_TORCH = True
 except ModuleNotFoundError:
@@ -129,6 +132,65 @@ class NavitPackedObjectiveTests(unittest.TestCase):
         torch.testing.assert_close(
             info["per_image_loss"][0].float(), manual0[0].float(), rtol=2e-2, atol=2e-2
         )
+
+
+    def test_target_tokens_exposed_for_vecor(self):
+        """ΔFM(VeCoR) reads per-image target grids by slicing+unpatchifying
+        info['target_tokens']; it must be present and shaped like pred."""
+        set_xformers_enabled(True)
+        dtype = torch.float16
+        model = self._model(dtype)
+        lat_list, cross_packed, tseq = self._pack(dtype)
+        t = torch.tensor([0.3, 0.5, 0.7], device="cuda")
+        with torch.autocast("cuda", dtype=dtype):
+            _loss, pred, info = navit_packed_forward_and_loss(
+                model, lat_list, t, cross_packed, tseq, NoiseConfig(), LossConfig(),
+            )
+        self.assertIn("target_tokens", info)
+        self.assertEqual(info["target_tokens"].shape, pred.shape)
+
+    def test_navit_per_image_eisbach_and_vecor_shaping(self):
+        """Mirror the training loop's per-image ΔFM(VeCoR)/Eisbach shaping of the
+        grad-bearing per-image vector: unpatchify each pred slice, scale by the eisbach
+        barrier weight and subtract λ·vecor-neg, then t-weight. Must stay finite, keep a
+        live gradient to params, and leave the clean per_image_loss (adaptive signal) intact."""
+        set_xformers_enabled(True)
+        dtype = torch.float16
+        model = self._model(dtype)
+        lat_list, cross_packed, tseq = self._pack(dtype)
+        t = torch.tensor([0.2, 0.6, 0.9], device="cuda")
+        cfg = LossConfig(loss_type="mse", eisbach_lambda=0.5, dfm_lambda=0.3)
+        with torch.autocast("cuda", dtype=dtype):
+            _loss, pred, info = navit_packed_forward_and_loss(
+                model, lat_list, t, cross_packed, tseq, NoiseConfig(), cfg,
+            )
+            clean = info["per_image_loss"].clone()       # adaptive signal: must stay clean
+            grad_vec = info["per_image_loss_grad"]
+            size_l = info["size_list"]
+            tgt_tok = info["target_tokens"]
+            off = 0
+            shaped = []
+            for j, n in enumerate(info["visual_seqlens"]):
+                li = grad_vec[j]
+                pg = model.unpatchify_tokens(pred[:, off:off + n, :], size_l[j])
+                w = eisbach_barrier_weight(pg, 0.5)
+                self.assertTrue(bool((w > 0).all()) and bool((w <= 1.0 + 1e-4).all()))
+                li = li * w[0].to(li.dtype)
+                tg = model.unpatchify_tokens(tgt_tok[:, off:off + n, :], size_l[j])
+                neg = vecor_contrastive_neg(pg, tg, t[j:j + 1].float(), loss_type="mse")
+                li = li - 0.3 * neg[0].to(li.dtype)
+                shaped.append(li.reshape(1))
+                off += n
+            shaped_vec = torch.cat(shaped)
+            loss = apply_loss_weighting(shaped_vec, t, cfg)
+        self.assertTrue(torch.isfinite(loss))
+        # clean per-image loss (fed to adaptive_ts.update) is untouched by shaping
+        torch.testing.assert_close(clean, info["per_image_loss"])
+        self.assertFalse(info["per_image_loss"].requires_grad)
+        loss.backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        self.assertGreater(len(grads), 0)
+        self.assertTrue(all(torch.isfinite(g).all() for g in grads))
 
 
 if __name__ == "__main__":

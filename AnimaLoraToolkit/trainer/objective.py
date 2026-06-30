@@ -1459,6 +1459,10 @@ def navit_packed_forward_and_loss(
         "per_image_loss": per_image.detach(),
         "noisy_grid_list": noisy_grid_list,   # per-image [1,C,T,h,w] noisy latents
         "size_list": size_list,               # per-image token grid shape for unpatchify
+        # packed velocity target tokens [1, ΣN, M]; the loop slices + unpatchifies per image
+        # when ΔFM(VeCoR) needs the per-image target grid. Cheap (one already-built tensor)
+        # and read-only, so exposing it costs nothing when ΔFM is off.
+        "target_tokens": target_tokens,
     }
     return loss, pred, info
 

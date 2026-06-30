@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .aux_losses import AuxLossConfig, build_aux_loss_config
+from .stage_timer import _NOOP_TIMER
 
 logger = logging.getLogger(__name__)
 
@@ -1371,6 +1372,7 @@ def navit_packed_forward_and_loss(
     loss_cfg,
     noise_list=None,
     use_checkpoint=False,
+    stage_timer=_NOOP_TIMER,
 ):
     """One NaViT/Patch-n-Pack training step core: ``G`` heterogeneous images packed into
     a single block-diagonal forward, each carrying its own flow-matching timestep.
@@ -1404,6 +1406,7 @@ def navit_packed_forward_and_loss(
 
     noisy_tok_list, target_tok_list, grid_list, vseq = [], [], [], []
     noisy_grid_list, size_list = [], []
+    stage_timer.start("navit_noise_patchify")
     for i, lat in enumerate(latents_list):
         if lat.dim() == 4:
             lat = lat.unsqueeze(0)
@@ -1420,20 +1423,24 @@ def navit_packed_forward_and_loss(
         vseq.append(int(ntok.shape[1]))
         noisy_grid_list.append(noisy_i)     # per-image noisy latent grid (aux x0 recovery)
         size_list.append(size_i)            # per-image token grid shape (aux unpatchify)
+    stage_timer.stop("navit_noise_patchify")
 
     tokens = torch.cat(noisy_tok_list, dim=1)        # [1, ΣN, M]
     target_tokens = torch.cat(target_tok_list, dim=1)
     grid = torch.cat(grid_list, dim=2)               # [1, 2, ΣN]
 
+    stage_timer.start("navit_model_forward")
     pred = model.forward_packed_navit(
         tokens, t_per_image, cross_packed, grid, vseq, [int(s) for s in text_seqlens],
         use_checkpoint=use_checkpoint,
     )
+    stage_timer.stop("navit_model_forward")
 
     # Per-image loss: slice the packed prediction so each image uses its own timestep for
     # the Huber/SNR schedule; every token is valid so the mask is all-ones.
     off = 0
     per_image = []
+    stage_timer.start("navit_loss_loop")
     for i, n in enumerate(vseq):
         p = pred[:, off:off + n, :]
         tg = target_tokens[:, off:off + n, :]
@@ -1448,6 +1455,7 @@ def navit_packed_forward_and_loss(
         )
         per_image.append(li)
         off += n
+    stage_timer.stop("navit_loss_loop")
     per_image = torch.cat(per_image)                 # [G], grad-bearing
     loss = per_image.mean()
     info = {

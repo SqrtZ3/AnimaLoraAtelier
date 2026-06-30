@@ -432,6 +432,13 @@ def parse_args():
                         "解开 ARB 分桶对单图尺寸的量化（不再 resize/中心裁到桶尺寸）。强制 floor 对齐"
                         "（裁到 16 整倍数、零 padding、无需 mask）；需 cache_latents。单边上限仍受模型 "
                         "RoPE max_img_h/max_img_w 约束（为 0 时按数据集最大单边自动推）。见 docs/navit-packing.md。")
+    p.add_argument("--stage-timing-every", type=int, default=0,
+                   help="训练步分阶段计时 cadence（步）；0=关（默认，零开销/行为中立）。开启后每 N 步"
+                        "用 CUDA event 计时 text_encode/forward/loss/aux/backward 等阶段、末尾一次 sync "
+                        "写 stage_timing.csv，定位 NaViT vs ARB 速度根因。仅被采样步 sync，稳态 it/s 在"
+                        "非采样步测量不受影响。")
+    p.add_argument("--stage-timing-warmup", type=int, default=10,
+                   help="分阶段计时跳过前 N 步（cudnn autotune / cache 冷），默认 10。仅 stage_timing_every>0 时生效。")
     p.add_argument("--fit-max-tokens", type=int, default=65536,
                    help="Maximum FiT tokens per image before applying the over-budget policy.")
     p.add_argument("--fit-warn-tokens", type=int, default=16384,
@@ -2581,6 +2588,30 @@ def main():
         emit(f"[telemetry] enabled: freq={'on' if _freq_probe else 'off'} "
              f"optimizer_every={_telem_opt_every} capacity_every={_telem_cap_every}")
 
+    # ── 分阶段计时（trainer/stage_timer.py，opt-in default-off）──────────────
+    # CUDA event 计时 GPU 阶段、perf_counter 计时 CPU/IO；仅被采样步 sync。定位 NaViT vs
+    # ARB 速度根因（flash varlen 已实测与 xformers 等速，attention 非瓶颈）。关闭时计时器
+    # 是 _NOOP_TIMER，零开销、行为中立。
+    from trainer.stage_timer import make_stage_timer, _NOOP_TIMER as _stage_noop_ref
+    _stage_timing_every = int(getattr(args, "stage_timing_every", 0) or 0)
+    _stage_timing_warmup = int(getattr(args, "stage_timing_warmup", 10) or 0)
+    _stage_micro_step = 0
+    _stage_sampling = False
+    _stage_G = 0  # 采样步记录的本 micro-batch 图数（navit）或 batch（arb），写 CSV 用
+    _stage_timer = _stage_noop_ref  # 非 navit/arb 主路径前的占位；循环内每 micro-batch 重选
+    if _stage_timing_every > 0:
+        from trainer.telemetry import _append_csv as _stage_append_csv
+        _stage_timing_csv = output_dir / "stage_timing.csv"
+        _stage_timing_header = [
+            "step", "mode", "grad_checkpoint", "G",
+            "data_fetch_ms", "text_encode_ms", "timestep_ms", "forward_ms",
+            "navit_noise_patchify_ms", "navit_model_forward_ms", "navit_loss_loop_ms",
+            "loss_assembly_ms", "aux_ms", "adaptive_ms", "backward_ms",
+            "optimizer_ms", "whole_step_ms",
+        ]
+        emit(f"[stage_timing] enabled: every={_stage_timing_every} warmup={_stage_timing_warmup} "
+             f"-> {_stage_timing_csv}")
+
     def run_eval_loss(step):
         """固定样本 × 固定噪声 × 固定 t 网格的确定性 MSE eval。
 
@@ -2793,6 +2824,19 @@ def main():
                 if hasattr(optimizer, "train"):
                     optimizer.train()
 
+            # ── 分阶段计时：per-micro-batch 选 real/noop 计时器（仅 stage_timing_every>0 时）。
+            # 被采样步用真实 StageTimer（记录 CUDA event + 末尾一次 sync），非采样步用 noop（零开销）。
+            # warmup 内一律 noop。whole_step 跨整个 micro-batch，交叉校验 dt_step。
+            if _stage_timing_every > 0:
+                _stage_micro_step += 1
+                _stage_sampling = (_stage_micro_step > _stage_timing_warmup
+                                   and (_stage_micro_step - _stage_timing_warmup) % _stage_timing_every == 0)
+                _stage_timer = make_stage_timer(_stage_sampling)
+            else:
+                _stage_timer = _stage_noop_ref
+            _stage_timer.start("whole_step")
+            _stage_timer.start_cpu("data_fetch")
+
             captions = batch["captions"]
 
             # caption dropout：随机把 caption 替换为空字符串，提升 CFG 服从度（Anima 主要靠 CFG 出图）
@@ -2832,8 +2876,11 @@ def main():
                     latents = vae.model.encode(pixels_5d, vae.scale).to(dtype)
             if not navit_packing:
                 bs = latents.shape[0]
+                _stage_G = bs
 
+            _stage_timer.stop_cpu("data_fetch")
             # 文本编码
+            _stage_timer.start("text_encode")
             with torch.no_grad():
                 # 参考指南/ComfyUI：Qwen 通道不传权重；T5 通道提供 token 权重
                 qwen_texts = [_build_qwen_text_from_prompt(c) for c in captions]
@@ -2851,8 +2898,10 @@ def main():
                     cross = cross * t5_w.to(cross.dtype).unsqueeze(-1)
                 if cross.shape[1] < 512:
                     cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
+            _stage_timer.stop("text_encode")
 
             # Flow Matching：t 采样、噪声生成、目标计算
+            _stage_timer.start("timestep")
             ts_mode = objective_cfg.timestep.mode
             f_shift = objective_cfg.timestep.flow_shift
             sched_shift = objective_cfg.timestep.schedule_shift
@@ -2946,11 +2995,14 @@ def main():
             # GAF(ghost 后端)：主 forward 前开捕获，让 _fwd hook stash 各层输入（autograd 后端 no-op）
             if gaf_ctrl is not None:
                 gaf_ctrl.before_forward(global_step)
+            _stage_timer.stop("timestep")
+            _stage_timer.start("forward")
             with torch.autocast("cuda", dtype=dtype):
                 if navit_packing:
                     # NaViT block-diagonal pack: per-image noise + one packed forward.
                     # block-diagonal cross-attn isolates each image to its own caption.
                     _G = len(navit_latents)
+                    _stage_G = _G
                     _L = int(cross.shape[1])
                     if bool(getattr(args, "navit_text_trim_padding", False)):
                         # Variable-length text packing: each image contributes only its
@@ -2974,6 +3026,7 @@ def main():
                         model, navit_latents, t, cross_packed, text_seqlens,
                         objective_cfg.noise, objective_cfg.loss,
                         use_checkpoint=bool(getattr(args, "grad_checkpoint", False)),
+                        stage_timer=_stage_timer,
                     )
                     per_sample = _navit_info["per_image_loss"]
                     fit_size = None  # navit aux unpatchifies per image below
@@ -3035,6 +3088,8 @@ def main():
                         weight_map=lwd_w,
                     )
 
+                _stage_timer.stop("forward")
+                _stage_timer.start("loss_assembly")
                 # ── InfoNoise(adaptive entropy_rate) 的纯净信号：在任何 sample 轴乘子
                 # (bin_ema / ΔFM / GAF / Eisbach) 之前快照原始重建 per_sample。InfoNoise
                 # (arXiv 2602.18647) 的 conditional-entropy-rate profile 必须从**纯 denoising
@@ -3289,6 +3344,7 @@ def main():
             # 这里逐图把 pred 切片 unpatchify 回各自网格、recover x0，跑同一套 spectral /
             # perceptual 数学（self-perceptual 需额外模型前向，已在 setup 处对 navit 门控）。
             # 仅对 t < gate 的图算重路径，省高 t 步的 VAE decode / FFT 分配。
+            _stage_timer.start("aux")
             if navit_packing and objective_cfg.aux.any_enabled:
                 _aux = objective_cfg.aux
                 _max_gate = max(
@@ -3429,6 +3485,8 @@ def main():
                     del aux_total
                 continue
 
+            _stage_timer.stop("aux")
+            _stage_timer.start("adaptive")
             if adaptive_ts.enabled and navit_packing:
                 # NaViT：采样侧本就走 adaptive_ts.sample(bs=G)（逐图 t），这里补控制器 update。
                 # 信号用干净逐图重建 loss（_adaptive_raw = per_image_loss，未被 eisbach/vecor 乘过），
@@ -3448,6 +3506,7 @@ def main():
                     highfreq_weight=adaptive_ts.highfreq_weight,
                 )
                 adaptive_ts.update(t.float(), adaptive_signal)
+            _stage_timer.stop("adaptive")
             if sample_accum_enabled:
                 loss_to_backward = loss
                 sample_accum_pending += int(bs)
@@ -3465,6 +3524,7 @@ def main():
                 loss_to_backward = loss / args.grad_accum
                 legacy_accum_samples += int(bs)
                 step_boundary = (batch_idx + 1) % args.grad_accum == 0 or (batch_idx + 1) == len(dataloader)
+            _stage_timer.stop("loss_assembly")
             # Fail-fast on a severed graph: a non-grad loss means no trainable param fed it
             # (e.g. building the loss from a detached tensor). Far clearer than autograd's
             # "element 0 ... does not require grad" raised from inside backward.
@@ -3473,7 +3533,9 @@ def main():
                     "loss 不带梯度（requires_grad=False）：主损失可能是从 detached 张量构建的，"
                     "没有任何可训练参数参与。请检查本步的 loss 组装路径。"
                 )
+            _stage_timer.start("backward")
             loss_to_backward.backward()
+            _stage_timer.stop("backward")
             # T-LoRA: backward 完成后才能 reset，否则 grad checkpoint recompute 会看到
             # current_t=None，与原 forward 走的分支不一致 → CheckpointError
             injector.set_current_t(None)
@@ -3565,9 +3627,11 @@ def main():
                     else:
                         optimizer_loss_val = float(loss.item() * args.grad_accum)
                     optimizer.set_loss(optimizer_loss_val)
+                _stage_timer.start("optimizer")
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
+                _stage_timer.stop("optimizer")
                 # 遥测：step 后、zero_grad 前（grad/优化器 state 都新鲜）。step 号对齐 eval（+1）。
                 run_step_telemetry(global_step + 1)
                 optimizer.zero_grad(set_to_none=True)
@@ -3717,6 +3781,33 @@ def main():
                     lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
                     injector.save(lora_path, model=model)
                     if hasattr(optimizer, "train"): optimizer.train()
+
+                # ── 分阶段计时：边界步末尾 flush（采样步触发一次 sync，写 CSV）。
+                # whole_step 跨整个 micro-batch；forward/loss/backward 每 micro-batch 都记录，
+                # optimizer/aux/adaptive 仅边界步。NaN-continue 路径不 flush（丢弃未完整采样，无副作用）。
+                if _stage_sampling:
+                    _stage_timer.stop("whole_step")
+                    try:
+                        _st = _stage_timer.flush()
+                        _mode = "navit" if navit_packing else ("fit" if fit_packed_training else "arb")
+                        _g = int(_stage_G)
+                        row = [
+                            global_step, _mode, int(bool(getattr(args, "grad_checkpoint", False))), _g,
+                            _st.get("data_fetch"), _st.get("text_encode"), _st.get("timestep"),
+                            _st.get("forward"), _st.get("navit_noise_patchify"),
+                            _st.get("navit_model_forward"), _st.get("navit_loss_loop"),
+                            _st.get("loss_assembly"), _st.get("aux"), _st.get("adaptive"),
+                            _st.get("backward"), _st.get("optimizer"), _st.get("whole_step"),
+                        ]
+                        _stage_append_csv(_stage_timing_csv, _stage_timing_header, row)
+                        # console 摘要（镜像 telemetry emit）：前 5 大阶段
+                        _top = sorted(
+                            ((k, v) for k, v in _st.items() if v is not None and v > 0),
+                            key=lambda kv: kv[1], reverse=True)[:5]
+                        emit(f"[stage_timing] step {global_step} ({_mode} G={_g}): "
+                             + " ".join(f"{k}={v:.1f}ms" for k, v in _top))
+                    except Exception as _e:
+                        logger.warning("[stage_timing] flush failed: %s", _e)
 
                 # 检查 max_steps
                 if args.max_steps and global_step >= args.max_steps:

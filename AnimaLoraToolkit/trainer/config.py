@@ -200,6 +200,10 @@ YAML_TO_ARGS = {
     "telemetry_slope_window": "telemetry_slope_window",
     "telemetry_optimizer_every": "telemetry_optimizer_every",
     "telemetry_capacity_every": "telemetry_capacity_every",
+    # 训练步分阶段计时（trainer/stage_timer.py，opt-in default-off）—定位 NaViT vs
+    # ARB 速度根因。CUDA event 计时 GPU 阶段、perf_counter 计时 CPU/IO；仅被采样步 sync。
+    "stage_timing_every": "stage_timing_every",
+    "stage_timing_warmup": "stage_timing_warmup",
     # LoRA-One 谱对齐初始化 (arXiv 2502.01235, KPSVD→LoKr)
     "lora_one_init_steps": "lora_one_init_steps",
     "lora_one_init_scale": "lora_one_init_scale",
@@ -521,6 +525,18 @@ DEFAULTS = {
     "telemetry_slope_window": 6,
     "telemetry_optimizer_every": 0,
     "telemetry_capacity_every": 0,
+    # 训练步分阶段计时 cadence（步）；0=关。开启后每 N 步用 CUDA event 计时各阶段、
+    # 末尾一次 sync 写 stage_timing.csv。warmup 步内不采样（cudnn autotune / cache 冷）。
+    "stage_timing_every": 0,
+    "stage_timing_warmup": 10,
+    # 分阶段计时：0=关（noop 计时器，零开销）；>0=每 N 步采样一步做 CUDA-event 分阶段
+    # 计时。warmup=采样前跳过的步数（cudnn autotune / cache 冷）。CSV: stage_timing.csv。
+    "stage_timing_every": 0,
+    "stage_timing_warmup": 10,
+    # 分阶段计时 cadence（步）；0=关。每 N 步在 stage_timing.csv 写一行各阶段耗时。
+    "stage_timing_every": 0,
+    # 跳过前 warmup 步不计时（cudnn autotune / cache 冷），避免冷启动污染统计。
+    "stage_timing_warmup": 10,
     "lora_one_init_steps": 0,
     "lora_one_init_scale": 0.01,
     "lwd_mask_enabled": False,

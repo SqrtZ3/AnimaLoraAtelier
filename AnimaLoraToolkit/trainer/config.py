@@ -95,6 +95,9 @@ YAML_TO_ARGS = {
     "navit_multiscale": "navit_multiscale",
     "navit_multiscale_token_ladder": "navit_multiscale_token_ladder",
     "navit_multiscale_loss_weight": "navit_multiscale_loss_weight",
+    "cache_encode_tiled": "cache_encode_tiled",
+    "cache_encode_tile_px": "cache_encode_tile_px",
+    "cache_encode_tile_overlap": "cache_encode_tile_overlap",
     "alpha_handling": "alpha_handling",
     "alpha_background": "alpha_background",
     "alpha_threshold": "alpha_threshold",
@@ -449,6 +452,17 @@ DEFAULTS = {
     # 1.0). 1.0 = equal per-image weight (default; NaViT-paper-style). <1.0 keeps the
     # native scale dominant in the gradient while still exposing small scales.
     "navit_multiscale_loss_weight": 1.0,
+    # Tiled VAE encode for the latent-cache phase (opt-in, default-off). Images whose
+    # pixel count exceeds the cache encode budget (4M px) are encoded tile-by-tile
+    # (overlapping pixel tiles → per-tile VAE encode → feather-blended latent stitch),
+    # capping the one-off cache-phase VRAM spike at ~tile_px² instead of the full
+    # native image (a 2814x4456 image is 12.5M px and can spike tens of GB when
+    # encoded whole). APPROXIMATE at tile seams (VAE conv receptive field crosses
+    # tile borders); larger overlap → smaller error. Images within the budget keep
+    # the whole-image path byte-identical. Both knobs must be 16px multiples.
+    "cache_encode_tiled": False,
+    "cache_encode_tile_px": 1024,
+    "cache_encode_tile_overlap": 128,
     "alpha_handling": "none",
     "alpha_background": "neutral",
     "alpha_threshold": 0.01,

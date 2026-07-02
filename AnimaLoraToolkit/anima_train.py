@@ -444,6 +444,14 @@ def parse_args():
     p.add_argument("--navit-multiscale-loss-weight", type=float, default=1.0,
                    help="缩放副本的逐图 loss 权重乘子（原生份恒 1.0）。1.0=逐图等权（默认）；"
                         "<1.0 让原生尺度在梯度中保持主导。")
+    p.add_argument("--cache-encode-tiled", action="store_true",
+                   help="缓存阶段对超像素预算（4M px）的大图走分块 VAE encode + latent 羽化拼接，"
+                        "把一次性缓存显存峰值封顶在 ~tile² 而非整图像素。接缝处为近似（VAE 感受野"
+                        "越界），overlap 越大误差越小；预算内的图路径不变（逐字节等价）。默认关。")
+    p.add_argument("--cache-encode-tile-px", type=int, default=1024,
+                   help="分块 encode 的块边长（像素，须 16 的整倍数）。峰值显存 ∝ 块像素数。")
+    p.add_argument("--cache-encode-tile-overlap", type=int, default=128,
+                   help="相邻块的重叠像素（须 16 的整倍数、< tile 的一半）。越大接缝误差越小、编码量越多。")
     p.add_argument("--stage-timing-every", type=int, default=0,
                    help="训练步分阶段计时 cadence（步）；0=关（默认，零开销/行为中立）。开启后每 N 步"
                         "用 CUDA event 计时 text_encode/forward/loss/aux/backward 等阶段、末尾一次 sync "
@@ -1503,11 +1511,37 @@ def main():
         _cache_dtype_map = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
         _cache_save_dtype = _cache_dtype_map.get(_cache_dtype_str, torch.bfloat16)
         _cache_encode_bs = int(getattr(args, "cache_encode_batch_size", 8) or 8)
+        # cache_encode_tiled（opt-in）：超预算大图分块 encode，封顶缓存阶段峰值显存。
+        # fail-fast 校验对齐约束（tiled_vae_encode 要求块边界落在 latent 整格上）。
+        _cache_tiled = bool(getattr(args, "cache_encode_tiled", False))
+        _cache_tile_px = int(getattr(args, "cache_encode_tile_px", 1024) or 1024)
+        _cache_tile_ov = int(getattr(args, "cache_encode_tile_overlap", 128) or 128)
+        if _cache_tiled:
+            if _cache_tile_px < 256 or _cache_tile_px % 16 != 0:
+                raise RuntimeError(
+                    f"cache_encode_tile_px={_cache_tile_px} 需为 ≥256 的 16 整倍数。"
+                )
+            if _cache_tile_ov < 16 or _cache_tile_ov % 16 != 0 or _cache_tile_ov * 2 > _cache_tile_px:
+                raise RuntimeError(
+                    f"cache_encode_tile_overlap={_cache_tile_ov} 需为 16 的整倍数、"
+                    f"≥16 且 ≤ tile 的一半（tile={_cache_tile_px}）。"
+                )
+            logger.info(
+                "[cache-tiled] 已启用：>4M px 的图分块 encode（tile=%d overlap=%d），"
+                "峰值显存 ∝ 块像素；接缝为近似（overlap 越大越准）。",
+                _cache_tile_px, _cache_tile_ov,
+            )
         dataset = CachedLatentDataset(dataset, vae, device, dtype, save_dtype=_cache_save_dtype,
-                                      encode_batch_size=_cache_encode_bs)
+                                      encode_batch_size=_cache_encode_bs,
+                                      encode_tiled=_cache_tiled,
+                                      encode_tile_px=_cache_tile_px,
+                                      encode_tile_overlap=_cache_tile_ov)
     if reg_dataset is not None and use_cached:
         reg_dataset = CachedLatentDataset(reg_dataset, vae, device, dtype, save_dtype=_cache_save_dtype,
-                                          encode_batch_size=_cache_encode_bs)
+                                          encode_batch_size=_cache_encode_bs,
+                                          encode_tiled=_cache_tiled,
+                                          encode_tile_px=_cache_tile_px,
+                                          encode_tile_overlap=_cache_tile_ov)
 
     # repeat 放在缓存之后
     if args.repeats > 1:

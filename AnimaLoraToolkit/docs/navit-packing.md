@@ -102,7 +102,28 @@ resolution-sampling 是同一思路的随机版。
   开关 multiscale 不会使原生缓存失效。
 - eval loss 的随机子集取自展开后的数据集，副本会进入 eval 分布（各尺度都被评到）。
 - 超大原生图**首次**缓存编码的 VAE 峰值显存不因此下降（原生份仍按原生编码）；
-  该问题（cache 阶段 encode spike）是独立事项。
+  解法见下方 2.3 `cache_encode_tiled`。
+
+### 2.3 缓存分块 encode（`cache_encode_tiled`，opt-in）
+
+```yaml
+cache_encode_tiled: true        # 默认 false；只影响缓存阶段，与训练步显存无关
+cache_encode_tile_px: 1024      # 块边长（16 的整倍数）；峰值显存 ∝ 块像素数
+cache_encode_tile_overlap: 128  # 相邻块重叠（16 的整倍数、≤ tile 一半）
+```
+
+**解决什么问题：** 缓存阶段的像素预算（`_CACHE_ENCODE_MAX_PIXELS`=4M px）只能"少装几张"，
+对单张超限图（如 2814×4456 = 12.5M px，flip 再 ×2）无约束力——整张过 VAE encoder 的
+全分辨率卷积激活曾实测把 80GB 卡顶满。
+
+**怎么做：** 超过 4M px 的图切成带重叠的像素块（末块贴齐边界保满块），逐块 encode 后在
+latent 网格上按线性羽化权重累加归一化拼回**完整原生分辨率 latent**——原生大图训练不受
+影响，峰值显存封顶在 ~tile²（1024² ≈ 一张普通图）。预算内的图走原路径，逐字节等价。
+
+**注意：** 接缝处是**近似**——VAE conv 感受野越过块边界的信息在分块下缺失，overlap 越大
+误差越小（默认 128px；diffusers/ComfyUI 的 VAE tiling 同理）。对窗口对齐的局部算子拼接
+≡ 整图（单测固化几何正确性）；真 VAE 的接缝误差量级**待云端首跑目检**（建议对一张大图
+对比 tiled 与整图 encode 的 latent 差异后再批量用）。
 
 **关于 NaViT 论文的 “fractional PE（位置归一化到 [0,1]）”——本仓库不引入。** 该技巧是为
 **可学习的绝对加性位置嵌入**（固定大小 learned table 需跨分辨率插值）设计的；本模型用的是

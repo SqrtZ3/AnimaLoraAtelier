@@ -47,6 +47,9 @@ navit_drop_last: false         # 是否丢弃每 epoch 最后那个未满预算�
                                #   总含真实图，丢了在小数据上是浪费）。与 bucket_drop_last 解耦。
 navit_native_resolution: false # 单图按原生分辨率定尺寸，只受 VAE+patch 的 16px 整倍数约束，
                                #   解开 ARB 分桶对单图尺寸的量化（见下方“2.1 原生分辨率”）。
+navit_multiscale: false        # 多尺度阶梯：为大图追加低 token 档等比缩小副本参与打包，
+                               #   填满大图包剩余预算 + 缓解大图训练/小图推理的尺度偏移
+                               #   （见下方“2.2 多尺度阶梯”；需 navit_native_resolution）。
 ```
 
 ### 2.1 原生分辨率（`navit_native_resolution`，opt-in）
@@ -68,6 +71,38 @@ navit_native_resolution: false # 单图按原生分辨率定尺寸，只受 VAE+
 ≤ 模型 RoPE 的 `max_h/max_w`（即单边像素 ≤ `max_img_h × 8`）。`max_img_h/max_img_w` 为 0（自动）
 时，会**预扫数据集取最大单边自动推**；超限会在缓存编码前 fail-fast 并提示提高 `max_img_h/w`
 或在数据集端裁掉超大图。`navit_token_budget` 仍须 ≥ 最大单图 token 数。
+
+### 2.2 多尺度阶梯（`navit_multiscale`，opt-in）
+
+```yaml
+navit_multiscale: true              # 需 navit_packing + navit_native_resolution；默认 false
+navit_multiscale_token_ladder: "4096"  # 副本 token 档（逗号分隔或 YAML 列表）；每档 ≤ token_budget
+navit_multiscale_loss_weight: 1.0   # 副本逐图 loss 权重（原生恒 1.0）；1.0=等权
+```
+
+**解决什么问题：** 原生大图相对 budget 很大时（如 2814×4456 ≈ 48.6k token、budget 65536），
+每包只装得下一张、尾部 ~26% 预算浪费；且 LoRA 只见过原生尺度的画风统计——小分辨率推理时
+是分布外（train-large / infer-small 尺度偏移）。NaViT 论文（arXiv 2307.06304）的
+resolution-sampling 是同一思路的随机版。
+
+**怎么做：** 对原生 token 数超过阶梯档的每张图，缓存阶段额外编码一份**等比缩小**副本
+（floor 对齐 16px、resize-cover + 中心裁剪 → 零 padding、mask 恒全 1），作为**正式数据集
+条目**参与打包。展开是**确定性**的：每图每档每 epoch 恰好出现一次（而非随机填充——可复现、
+可归因）；配合 `navit_pack_strategy: ffd` 会自然装出"1 大图 + N 小副本"的高填充包。
+**只降不升采样**：源图 token 数 ≤ 档位的条目跳过该档。副本 caption 与原生共享。
+
+**账目示例（纯 2814×4456 数据集 + budget 65536 + 阶梯 4096）：** 每图 48,650(原生) +
+~4,000(副本) token；FFD 装包 ≈ 1 原生 + 4 副本 ≈ 64.9k/包，填充率 ~99%（原 ~74%）。
+
+**注意：**
+
+- 逐图 loss 是等权的（`per_image.mean()`）——1 张大图 + 4 张副本时原生只占 1/5 梯度权重。
+  想让原生尺度主导，把 `navit_multiscale_loss_weight` 调 <1.0（只作用于副本）。
+- 缓存体积 ×(1+命中档数)（flip 再 ×2）；副本 npz 是独立 sidecar（`<stem>.ms<档>.npz`），
+  开关 multiscale 不会使原生缓存失效。
+- eval loss 的随机子集取自展开后的数据集，副本会进入 eval 分布（各尺度都被评到）。
+- 超大原生图**首次**缓存编码的 VAE 峰值显存不因此下降（原生份仍按原生编码）；
+  该问题（cache 阶段 encode spike）是独立事项。
 
 **关于 NaViT 论文的 “fractional PE（位置归一化到 [0,1]）”——本仓库不引入。** 该技巧是为
 **可学习的绝对加性位置嵌入**（固定大小 learned table 需跨分辨率插值）设计的；本模型用的是

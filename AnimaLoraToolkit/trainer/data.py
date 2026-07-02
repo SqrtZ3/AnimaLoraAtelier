@@ -24,6 +24,7 @@ import math
 import random
 import sys
 from pathlib import Path
+from typing import Optional
 
 import torch
 from torch.utils.data import Dataset
@@ -127,6 +128,60 @@ def plan_native_fit_image(
         was_padded=(planned_w != source_w or planned_h != source_h),
         was_resized=False,
         was_cropped=False,
+    )
+
+
+def plan_multiscale_copy(
+    width: int,
+    height: int,
+    target_tokens: int,
+    *,
+    patch_size: int = 2,
+    vae_downsample: int = 8,
+) -> Optional[NativeFitImagePlan]:
+    """Plan an aspect-preserving *downscaled* copy of an image for the NaViT
+    multiscale ladder (``navit_multiscale``).
+
+    Returns a plan whose token count is ≤ ``target_tokens``, whose pixel dims are
+    16px multiples, and whose ``source_* == width/height`` (the copy is produced by
+    resize-cover + center-crop, so the valid region fills the whole latent → the
+    all-ones-mask invariant of the navit cached path holds). Returns None when the
+    source is not strictly larger than the target budget — the ladder never
+    upscales and never emits a copy that duplicates the native size.
+    """
+    align = max(1, int(patch_size)) * max(1, int(vae_downsample))
+    w, h = int(width), int(height)
+    tgt = int(target_tokens)
+    if w <= 0 or h <= 0 or tgt <= 0:
+        return None
+    # 不上采样、不产出与原生同档的副本：源图（floor 对齐后）token 数必须严格大于目标档。
+    src_tokens = (w // align) * (h // align)
+    if src_tokens <= tgt:
+        return None
+    # 等比缩放系数 s 使 (w·s/align)·(h·s/align) = tgt；floor 后 token 数必 ≤ tgt
+    # （floor(a)·floor(b) ≤ a·b）。
+    s = math.sqrt(tgt * align * align / float(w * h))
+    tok_w = max(1, int(w * s) // align)
+    tok_h = max(1, int(h * s) // align)
+    # 极端长宽比下某轴被 max(1,·) 顶起时可能超预算；把另一轴压回来。
+    if tok_w * tok_h > tgt:
+        if tok_w >= tok_h:
+            tok_w = max(1, tgt // tok_h)
+        else:
+            tok_h = max(1, tgt // tok_w)
+    pw, ph = tok_w * align, tok_h * align
+    return NativeFitImagePlan(
+        source_width=pw,   # 有效区 = 整张（resize+crop 后无 padding）→ mask 恒全 1
+        source_height=ph,
+        width=pw,
+        height=ph,
+        align_unit=align,
+        token_count=tok_w * tok_h,
+        token_h=tok_h,
+        token_w=tok_w,
+        was_padded=False,
+        was_resized=True,
+        was_cropped=True,
     )
 
 
@@ -406,7 +461,7 @@ class ImageDataset(Dataset):
                  fit_patch_size=2, fit_vae_downsample=8,
                  fit_over_budget_strategy="fail", fit_align_mode="pad",
                  alpha_handling="none", alpha_background="neutral",
-                 alpha_threshold=0.01):
+                 alpha_threshold=0.01, navit_ms_token_ladder=None):
         self.data_dir = Path(data_dir)
         self.resolution = resolution
         self.bucket_mgr = bucket_mgr
@@ -435,6 +490,12 @@ class ImageDataset(Dataset):
         self.alpha_handling = str(alpha_handling or "none").lower()
         self.alpha_background = str(alpha_background or "neutral").lower()
         self.alpha_threshold = float(alpha_threshold if alpha_threshold is not None else 0.01)
+        # navit 多尺度阶梯（navit_multiscale）：每图追加低 token 档的等比缩放副本，
+        # 作为正式数据集条目参与打包（填满预算 + 缓解"只见过原生尺度"的分布偏移）。
+        # 仅在 fit_packed（navit 原生定尺寸复用该路径）下生效；空/None = 关闭（默认）。
+        self.navit_ms_token_ladder = sorted(
+            {int(x) for x in (navit_ms_token_ladder or []) if int(x) > 0}
+        )
         # ★ v5 ② frequency-balanced tag dropout
         # 0 = 关闭；>0 启用。在数据集 init 时统计 tag 频率，对在数据集中过度共现的 tag 额外提高 dropout
         # 概率，强迫模型把"风格"与"高频共现 tag"解耦。完全数据驱动，自动适配任何画师。
@@ -479,6 +540,10 @@ class ImageDataset(Dataset):
 
         # 用与 __getitem__ 完全一致的 PIL 路径填充 bucket_key
         self._finalize_bucket_keys()
+        # navit 多尺度阶梯：在 bucket_for_index / token_count_for_index 物化之前展开，
+        # 使副本与原生条目在所有 per-index 结构里同等存在（打包器/缓存按索引对齐）。
+        if self.fit_packed and self.navit_ms_token_ladder:
+            self._expand_multiscale_samples()
         self.bucket_for_index = [s["bucket_key"] for s in self.samples]
         self.token_count_for_index = [int(s.get("token_count", 0) or 0) for s in self.samples]
         # 诊断：统计 bucket 分布
@@ -600,6 +665,47 @@ class ImageDataset(Dataset):
             sample["source_size"] = source_size
             sample["fit_plan"] = fit_plan
             sample["token_count"] = int(fit_plan.token_count) if fit_plan is not None else 0
+
+    def _expand_multiscale_samples(self):
+        """navit 多尺度阶梯：为每个原生 FiT 条目追加低 token 档的等比缩放副本。
+
+        副本是普通样本（自己的 fit_plan / bucket_key / token_count + ``ms_tokens_target``
+        标记），经打包器与其它异尺寸图混包——确定性展开（每图每档每 epoch 恰见一次），
+        而非随机填充：语义可复现、可归因（见 docs/navit-packing.md）。只降不升采样：
+        源图 token 数 ≤ 目标档的条目直接跳过该档。caption 与原生共享（tag caption 不含
+        分辨率语义，无训练/推理不一致）。
+        """
+        from collections import Counter
+        added = []
+        per_target = Counter()
+        for sample in self.samples:
+            plan = sample.get("fit_plan")
+            if plan is None:
+                continue
+            src_h, src_w = sample.get("source_size", (0, 0))
+            for tgt in self.navit_ms_token_ladder:
+                ms_plan = plan_multiscale_copy(
+                    src_w, src_h, tgt,
+                    patch_size=self.fit_patch_size,
+                    vae_downsample=self.fit_vae_downsample,
+                )
+                if ms_plan is None or ms_plan.token_count >= plan.token_count:
+                    continue
+                ms = dict(sample)
+                ms["fit_plan"] = ms_plan
+                ms["bucket_key"] = (ms_plan.height, ms_plan.width)
+                ms["token_count"] = int(ms_plan.token_count)
+                ms["ms_tokens_target"] = int(tgt)
+                added.append(ms)
+                per_target[int(tgt)] += 1
+        if added:
+            self.samples.extend(added)
+        logger.info(
+            "[navit-multiscale] token 阶梯 %s：追加 %d 个缩放副本（%s），数据集 %d → %d 条",
+            self.navit_ms_token_ladder, len(added),
+            ", ".join(f"≤{t}tok×{n}" for t, n in sorted(per_target.items())) or "无",
+            len(self.samples) - len(added), len(self.samples),
+        )
 
     def bucket_report(self, limit=12, label="dataset"):
         return format_bucket_report(self.samples, limit=limit, label=label)
@@ -889,6 +995,21 @@ class ImageDataset(Dataset):
 
             if self.flip_augment and random.random() > 0.5:
                 img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+            if plan.was_resized:
+                # navit 多尺度副本：等比缩小到覆盖规划尺寸再中心裁剪（与 ARB 桶路径同法，
+                # 每轴至多裁 <16px 的对齐余量）。裁完恰为 plan 尺寸 → 下方 floor 裁剪 /
+                # padding 均为 no-op，mask 全 1（plan.source_* == plan 尺寸保证这一点）。
+                _cover = max(plan.width / img.width, plan.height / img.height)
+                _rw = max(plan.width, int(math.ceil(img.width * _cover)))
+                _rh = max(plan.height, int(math.ceil(img.height * _cover)))
+                _left = (_rw - plan.width) // 2
+                _top = (_rh - plan.height) // 2
+                img = img.resize((_rw, _rh), Image.LANCZOS).crop(
+                    (_left, _top, _left + plan.width, _top + plan.height))
+                if alpha is not None:
+                    alpha = alpha.resize((_rw, _rh), Image.LANCZOS).crop(
+                        (_left, _top, _left + plan.width, _top + plan.height))
 
             if self.fit_align_mode == "floor":
                 img = img.crop((0, 0, min(img.width, plan.width), min(img.height, plan.height)))
@@ -1677,7 +1798,15 @@ def collate_fn_navit_pack(batch):
     latents = [b["latent"] for b in batch]        # each [C, T, h_i, w_i]
     captions = [b["caption"] for b in batch]
     images = [b.get("image", "") for b in batch]
-    return {"navit_latents": latents, "captions": captions, "images": images}
+    # navit_multiscale：逐图"是否为缩放副本"标志（无副本时全 False，行为中立——
+    # 训练循环仅在 navit_multiscale_loss_weight != 1.0 且存在副本时才用它构建权重）。
+    ms_flags = [bool(int(b.get("ms_tokens_target", 0) or 0)) for b in batch]
+    return {
+        "navit_latents": latents,
+        "captions": captions,
+        "images": images,
+        "navit_ms_flags": ms_flags,
+    }
 
 
 # 单次送入 VAE encode 的「总像素」软上限（含翻转份）。VAE 3D encoder 中间激活很占显存，
@@ -1767,8 +1896,20 @@ class CachedLatentDataset(Dataset):
             return self._get_base_samples(dataset.dataset)
         return []
 
-    def _get_npz_path(self, img_path):
-        img_path = Path(img_path)
+    def _get_npz_path(self, sample_or_img_path):
+        """npz 缓存路径。接受 sample dict 或裸图片路径（向后兼容）。
+
+        navit 多尺度副本（sample 带 ``ms_tokens_target``）与原生份共享同一张源图，
+        故用独立的 sidecar 文件名 ``<stem>.ms<target>.npz``，互不覆盖；开关 multiscale
+        不会使原生 npz 失效（无需重编码原生份）。
+        """
+        if isinstance(sample_or_img_path, dict):
+            img_path = Path(sample_or_img_path["image"])
+            ms = int(sample_or_img_path.get("ms_tokens_target", 0) or 0)
+            if ms > 0:
+                return img_path.with_name(f"{img_path.stem}.ms{ms}.npz")
+        else:
+            img_path = Path(sample_or_img_path)
         return img_path.with_suffix(".npz")
 
     def _is_cache_valid(self, sample_or_img_path, npz_path):
@@ -1847,8 +1988,7 @@ class CachedLatentDataset(Dataset):
         logger.info("检查 VAE latent 缓存...")
         to_encode = []
         for i, sample in enumerate(self.samples):
-            img_path = sample["image"]
-            npz_path = self._get_npz_path(img_path)
+            npz_path = self._get_npz_path(sample)
             if not self._is_cache_valid(sample, npz_path):
                 to_encode.append(i)
 
@@ -1865,7 +2005,7 @@ class CachedLatentDataset(Dataset):
         Uses latent spatial shape (h, w) as grouping key so batches have consistent tensor sizes."""
         self.bucket_for_index = [None] * len(self.samples)
         for i in range(len(self.samples)):
-            npz_path = self._get_npz_path(self.samples[i]["image"])
+            npz_path = self._get_npz_path(self.samples[i])
             if not npz_path.exists():
                 continue
             data = self.np.load(npz_path)
@@ -1936,7 +2076,7 @@ class CachedLatentDataset(Dataset):
             # #2 后台线程：dtype 转换 + 落盘，与下一批 GPU 编码重叠。latent_cpu 已在 CPU（只读，线程安全）。
             for k in range(n):
                 lat_flip = latent_cpu[n + k] if flip else None
-                _save_one(self._get_npz_path(self.samples[batch_i[k]]["image"]),
+                _save_one(self._get_npz_path(self.samples[batch_i[k]]),
                           latent_cpu[k], lat_flip, ph, pw)
 
         def _load_batch(batch_idxs):
@@ -1999,7 +2139,7 @@ class CachedLatentDataset(Dataset):
                             logger.warning("VAE 编码产生非有限 latent，跳过缓存: %s",
                                            self.samples[batch_i[k]]["image"])
                             continue
-                        _save_one(self._get_npz_path(self.samples[batch_i[k]]["image"]),
+                        _save_one(self._get_npz_path(self.samples[batch_i[k]]),
                                   lat, lat_flip, ph, pw)
 
                 done += n
@@ -2018,7 +2158,7 @@ class CachedLatentDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        npz_path = self._get_npz_path(sample["image"])
+        npz_path = self._get_npz_path(sample)
         data = self.np.load(npz_path)
         # dtype_kind sentinel：bf16 cache 在磁盘上是 uint16 view，要 view 回 bf16；
         # fp16 / fp32 直接 from_numpy。旧 cache 无 dtype_kind，按 fp32 兼容。
@@ -2065,7 +2205,14 @@ class CachedLatentDataset(Dataset):
         if caption is None:
             caption = ""
 
-        return {"latent": latent, "caption": caption, "image": str(sample["image"])}
+        return {
+            "latent": latent,
+            "caption": caption,
+            "image": str(sample["image"]),
+            # navit 多尺度副本标记（>0 = 该条目是 ≤N token 档的缩放副本）；
+            # collate_fn_navit_pack 汇集成 per-image 标志，供逐图 loss 权重用。
+            "ms_tokens_target": int(sample.get("ms_tokens_target", 0) or 0),
+        }
 
 
 def _require_uniform_batch_shape(batch, key, message, detail_key="shape"):

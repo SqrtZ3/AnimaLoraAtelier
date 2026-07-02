@@ -432,6 +432,18 @@ def parse_args():
                         "解开 ARB 分桶对单图尺寸的量化（不再 resize/中心裁到桶尺寸）。强制 floor 对齐"
                         "（裁到 16 整倍数、零 padding、无需 mask）；需 cache_latents。单边上限仍受模型 "
                         "RoPE max_img_h/max_img_w 约束（为 0 时按数据集最大单边自动推）。见 docs/navit-packing.md。")
+    p.add_argument("--navit-multiscale", action="store_true",
+                   help="navit 多尺度阶梯（需 navit_packing + navit_native_resolution）：为原生 token 数"
+                        "超过阶梯档的每张图额外缓存一份等比缩小副本（≤该档 token），作为正式条目参与打包"
+                        "——填满大图包的剩余预算，并让 LoRA 在推理档 token 密度上见到画风（缓解大图训练/"
+                        "小图推理的尺度偏移）。确定性展开（每图每档每 epoch 恰一次）、只降不升采样。"
+                        "见 docs/navit-packing.md。")
+    p.add_argument("--navit-multiscale-token-ladder", type=str, default="4096",
+                   help="缩放副本的 token 档（逗号分隔），如 '4096'（≈1024² px）或 '4096,16384'。"
+                        "每档必须 ≤ navit_token_budget。")
+    p.add_argument("--navit-multiscale-loss-weight", type=float, default=1.0,
+                   help="缩放副本的逐图 loss 权重乘子（原生份恒 1.0）。1.0=逐图等权（默认）；"
+                        "<1.0 让原生尺度在梯度中保持主导。")
     p.add_argument("--stage-timing-every", type=int, default=0,
                    help="训练步分阶段计时 cadence（步）；0=关（默认，零开销/行为中立）。开启后每 N 步"
                         "用 CUDA event 计时 text_encode/forward/loss/aux/backward 等阶段、末尾一次 sync "
@@ -1230,6 +1242,45 @@ def main():
                 "navit_packing 需要显式设置 navit_token_budget（>0，按显存定，"
                 "见 docs/navit-packing.md 显存对照表）。"
             )
+    # ── navit 多尺度阶梯（navit_multiscale，opt-in）：解析与校验 ──
+    # 副本走 fit_plan 的 resize+crop 路径，v1 仅支持原生定尺寸（ARB 桶定尺寸下
+    # bucket 在 __getitem__ 运行时决定，副本无法经 fit_plan 挂接）。
+    _navit_ms_ladder = []
+    if bool(getattr(args, "navit_multiscale", False)):
+        if not navit_packing or not _navit_native:
+            raise RuntimeError(
+                "navit_multiscale 需要 navit_packing=true 且 navit_native_resolution=true"
+                "（副本经原生 FiT 定尺寸路径生成；ARB 桶定尺寸暂不支持）。"
+            )
+        _ladder_raw = getattr(args, "navit_multiscale_token_ladder", "4096")
+        if isinstance(_ladder_raw, str):
+            _ladder_vals = [v.strip() for v in _ladder_raw.split(",") if v.strip()]
+        else:
+            _ladder_vals = list(_ladder_raw or [])
+        _navit_ms_ladder = sorted({int(v) for v in _ladder_vals if int(v) > 0})
+        if not _navit_ms_ladder:
+            raise RuntimeError(
+                "navit_multiscale=true 但 navit_multiscale_token_ladder 为空；"
+                "请给出至少一个正整数 token 档（如 '4096'）。"
+            )
+        _budget = int(getattr(args, "navit_token_budget", 0) or 0)
+        _over = [t for t in _navit_ms_ladder if t > _budget]
+        if _over:
+            raise RuntimeError(
+                f"navit_multiscale_token_ladder 中 {_over} 超过 navit_token_budget={_budget}；"
+                "副本必须能装进一个 pack。"
+            )
+        _ms_w = float(getattr(args, "navit_multiscale_loss_weight", 1.0) or 1.0)
+        if _ms_w <= 0.0:
+            raise RuntimeError(
+                f"navit_multiscale_loss_weight 必须 >0（收到 {_ms_w}）；"
+                "0 或负值会静默丢弃/反转副本的梯度贡献。"
+            )
+        logger.info(
+            "[navit-multiscale] 已启用：token 阶梯=%s loss_weight=%.3g（确定性展开，"
+            "每图每档每 epoch 一次；只降不升采样）",
+            _navit_ms_ladder, _ms_w,
+        )
     if fit_packed_training:
         if bool(getattr(args, "fit_pack_multiple_images", False)):
             raise RuntimeError("fit_pack_multiple_images is reserved for a later slice; current FiT path uses one image sequence per sample.")
@@ -1333,6 +1384,7 @@ def main():
         alpha_handling=str(getattr(args, "alpha_handling", "none") or "none"),
         alpha_background=str(getattr(args, "alpha_background", "neutral") or "neutral"),
         alpha_threshold=float(getattr(args, "alpha_threshold", 0.01)),
+        navit_ms_token_ladder=_navit_ms_ladder,
     )
     if bool(getattr(args, "bucket_report", False)):
         logger.info("\n%s", base_dataset.bucket_report(label="train"))
@@ -1384,6 +1436,7 @@ def main():
                 alpha_background=str(getattr(args, "alpha_background", "neutral") or "neutral"),
                 alpha_threshold=float(getattr(args, "alpha_threshold", 0.01)),
                 freq_balanced_dropout_strength=0.0,  # 正则集不参与频率均衡
+                navit_ms_token_ladder=_navit_ms_ladder,  # 多尺度阶梯对正则集同语义
             )
             reg_dataset = reg_base
             if bool(getattr(args, "bucket_report", False)):
@@ -2853,12 +2906,15 @@ def main():
             pixel_mask = None
             cached_latent_mask = None
             navit_latents = None
+            navit_ms_flags = None
             if navit_packing:
                 # NaViT pack: per-image cached latents (shapes differ → kept as a list).
                 navit_latents = [
                     l.to(device, dtype=dtype, non_blocking=_non_blk)
                     for l in batch["navit_latents"]
                 ]
+                # navit_multiscale：逐图缩放副本标志（旧 collate/无副本时为 None/全 False）。
+                navit_ms_flags = batch.get("navit_ms_flags")
                 latents = None
                 bs = len(navit_latents)
             elif use_cached:
@@ -3212,6 +3268,19 @@ def main():
                             _shaped.append(_li.reshape(1))
                             _off2 += _nn
                         _navit_grad_vec = torch.cat(_shaped)
+                    # ── navit_multiscale：缩放副本的逐图 loss 权重（原生份恒 1.0）──
+                    # 放在 eisbach/vecor 之后、t-加权之前：缩放的是"该图组装完的全部
+                    # 逐图贡献"（含 vecor 负项）。默认 1.0 时不构建权重向量（行为中立，
+                    # 逐图等权 = NaViT 论文语义）。
+                    _ms_w = float(getattr(args, "navit_multiscale_loss_weight", 1.0) or 1.0)
+                    if (navit_ms_flags is not None and _ms_w != 1.0
+                            and any(navit_ms_flags)):
+                        _w_vec = torch.tensor(
+                            [_ms_w if f else 1.0 for f in navit_ms_flags],
+                            device=_navit_grad_vec.device,
+                            dtype=_navit_grad_vec.dtype,
+                        )
+                        _navit_grad_vec = _navit_grad_vec * _w_vec
                     loss = apply_loss_weighting(
                         _navit_grad_vec, t, objective_cfg.loss
                     )

@@ -92,6 +92,9 @@ YAML_TO_ARGS = {
     "navit_pack_ffd_window": "navit_pack_ffd_window",
     "navit_drop_last": "navit_drop_last",
     "navit_native_resolution": "navit_native_resolution",
+    "navit_multiscale": "navit_multiscale",
+    "navit_multiscale_token_ladder": "navit_multiscale_token_ladder",
+    "navit_multiscale_loss_weight": "navit_multiscale_loss_weight",
     "alpha_handling": "alpha_handling",
     "alpha_background": "alpha_background",
     "alpha_threshold": "alpha_threshold",
@@ -429,6 +432,23 @@ DEFAULTS = {
     # auto (0), they are derived from the dataset's largest image. Only meaningful with
     # navit_packing=true; default False keeps the existing ARB-bucket sizing.
     "navit_native_resolution": False,
+    # NaViT multiscale ladder (opt-in, default-off; requires navit_packing +
+    # navit_native_resolution). For every image whose native token count exceeds a
+    # ladder entry, cache an extra aspect-preserving *downscaled* copy at ≤ that many
+    # tokens and pack it as a regular dataset entry (deterministic: each image sees
+    # each ladder scale exactly once per epoch). Fills otherwise-wasted pack budget
+    # when native images are large relative to navit_token_budget, and exposes the
+    # LoRA to the style at inference-scale token densities (mitigates the
+    # train-large/infer-small scale shift). NaViT paper's resolution-sampling
+    # counterpart (arXiv 2307.06304). Never upscales.
+    "navit_multiscale": False,
+    # Comma list / YAML list of per-copy token budgets, e.g. "4096" (~1024² px) or
+    # "4096,16384". Each entry must be ≤ navit_token_budget.
+    "navit_multiscale_token_ladder": "4096",
+    # Per-image loss weight multiplier for the downscaled copies (native copies stay
+    # 1.0). 1.0 = equal per-image weight (default; NaViT-paper-style). <1.0 keeps the
+    # native scale dominant in the gradient while still exposing small scales.
+    "navit_multiscale_loss_weight": 1.0,
     "alpha_handling": "none",
     "alpha_background": "neutral",
     "alpha_threshold": 0.01,

@@ -1152,14 +1152,14 @@ def compute_grad_norm(parameters) -> float:
     grads = [p.grad.detach() for p in parameters if p.grad is not None]
     if not grads:
         return 0.0
-    # 任一 grad 含 NaN/Inf 直接报 inf（与旧实现语义一致）。
-    finite_check = torch.stack([torch.isfinite(g).all() for g in grads])
-    if not bool(finite_check.all()):
-        return float("inf")
     # torch._foreach_norm 在新版 PyTorch 上是融合 kernel，比 Python loop 快很多。
     per_grad_norms = torch._foreach_norm(grads, 2.0)
     total = torch.linalg.vector_norm(torch.stack([n.to(torch.float32) for n in per_grad_norms]))
-    return float(total.item())
+    val = float(total.item())
+    # NaN/Inf 会沿 norm 传染到 total —— 一次同步同时拿到范数与 finite 判定，省掉原先
+    # 对所有 grad 的 isfinite 全量预扫（等于把全部梯度多读一遍带宽）。finite 巨值在
+    # norm 里上溢成 inf 的极端情形也归入 inf 返回，对调用方语义等价（"这步梯度不可用"）。
+    return val if math.isfinite(val) else float("inf")
 
 
 _BLOCK_ACCEPTS_PAD_MASK_CACHE: "dict[int, bool]" = {}
@@ -1362,6 +1362,60 @@ def forward_packed_with_optional_checkpoint(
     return out * mask.to(dtype=out.dtype).unsqueeze(-1)
 
 
+def packed_per_image_token_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    vseq: "list[int]",
+    t_per_image: torch.Tensor,
+    loss_cfg,
+) -> torch.Tensor:
+    """Fused per-image token loss over a packed ``[1, ΣN, M]`` sequence → ``[G]``.
+
+    数学与逐图调用 ``masked_token_loss``（全 1 mask）逐段一致：elementwise loss map →
+    patch 维均值 → 图内 token 均值。区别只在执行方式——把 G 次小 kernel（每图一次
+    loss map + 全 1 mask 分配 + 加权归约）合并成一次整包 elementwise + 一次 segment
+    均值。segment 均值用 one-hot matmul（G×ΣN bool→float，G≤几十、ΣN~几万，瞬时几 MB）
+    而非 ``index_add_``：CUDA 上后者是原子加、跑间不确定，matmul 保确定性。
+    Huber/smooth_l1 的逐图 δ（依赖各图自己的 t）用 ``repeat_interleave`` 展开成
+    逐 token 向量后广播，与 masked_token_loss 里的逐样本标量 δ 同值。
+    """
+    G = len(vseq)
+    pred_f = pred.float()
+    target_f = target.float()
+    loss_type = (loss_cfg.loss_type or "mse").lower()
+    if loss_type in ("mse", "l2"):
+        loss_map = F.mse_loss(pred_f, target_f, reduction="none")
+    elif loss_type in ("l1", "mae"):
+        loss_map = F.l1_loss(pred_f, target_f, reduction="none")
+    elif loss_type in ("huber", "smooth_l1"):
+        err = (pred_f - target_f).abs()
+        delta = _huber_delta_for_t(
+            t_per_image.reshape(-1).float(), loss_cfg.huber_c,
+            loss_cfg.huber_schedule, loss_cfg.huber_snr_clamp_max,
+        )
+        if not torch.is_tensor(delta):
+            delta_t = torch.tensor(float(delta), device=err.device, dtype=err.dtype)
+        else:
+            # [G,1,1,1,1]（snr/sigma 调度）→ [G] → 逐 token [1, ΣN, 1]
+            delta_g = delta.to(device=err.device, dtype=err.dtype).reshape(G)
+            counts = torch.tensor(vseq, device=err.device)
+            delta_t = torch.repeat_interleave(delta_g, counts).view(1, -1, 1)
+        loss_map = _huber_loss_map(err, delta_t, loss_type == "smooth_l1")
+    else:
+        logger.warning(f"Unknown loss_type={loss_type!r}; falling back to mse")
+        loss_map = F.mse_loss(pred_f, target_f, reduction="none")
+
+    token_loss = loss_map.mean(dim=-1)[0]                       # [ΣN] fp32
+    counts = torch.tensor(vseq, device=token_loss.device)
+    seg_id = torch.repeat_interleave(
+        torch.arange(G, device=token_loss.device), counts
+    )
+    onehot = (
+        seg_id.unsqueeze(0) == torch.arange(G, device=token_loss.device).unsqueeze(1)
+    ).to(token_loss.dtype)                                      # [G, ΣN]
+    return (onehot @ token_loss) / counts.to(token_loss.dtype)  # [G]
+
+
 def navit_packed_forward_and_loss(
     model,
     latents_list,
@@ -1415,8 +1469,13 @@ def navit_packed_forward_and_loss(
         t_exp = ti.view(1, 1, 1, 1, 1)
         noisy_i = (1 - t_exp) * lat + t_exp * noise_i
         target_i = noise_i - lat
-        ntok, grid, _m, size_i = model.patchify_latents_to_tokens(noisy_i)
-        ttok, _g, _m2, _s2 = model.patchify_latents_to_tokens(target_i)
+        # noisy 与 target 同形，在 batch 维拼成 [2,C,T,h,w] 一次 patchify 后切片：
+        # rearrange 逐 batch 行独立 → 与分别调用逐 bit 一致，循环内 patchify 调用减半。
+        btok, bgrid, _m, bsize = model.patchify_latents_to_tokens(
+            torch.cat([noisy_i, target_i], dim=0)
+        )
+        ntok, ttok = btok[:1], btok[1:]
+        grid, size_i = bgrid[:1], bsize[:1]
         noisy_tok_list.append(ntok)
         target_tok_list.append(ttok)
         grid_list.append(grid)
@@ -1436,27 +1495,15 @@ def navit_packed_forward_and_loss(
     )
     stage_timer.stop("navit_model_forward")
 
-    # Per-image loss: slice the packed prediction so each image uses its own timestep for
-    # the Huber/SNR schedule; every token is valid so the mask is all-ones.
-    off = 0
-    per_image = []
+    # Per-image loss: fused over the whole pack (packed_per_image_token_loss)，每图仍
+    # 按各自的 t 走 Huber/SNR 调度（逐图 δ 展开成逐 token 向量）。所有 token 均有效，
+    # 语义与逐图切片 + 全 1 mask 的 masked_token_loss 一致，只是 G 次小 kernel 合并
+    # 成一次 elementwise + 一次确定性 segment 均值。
     stage_timer.start("navit_loss_loop")
-    for i, n in enumerate(vseq):
-        p = pred[:, off:off + n, :]
-        tg = target_tokens[:, off:off + n, :]
-        m = torch.ones(1, n, device=pred.device, dtype=pred.dtype)
-        li = masked_token_loss(
-            p, tg, m,
-            loss_type=loss_cfg.loss_type,
-            huber_c=loss_cfg.huber_c,
-            huber_schedule=loss_cfg.huber_schedule,
-            t=t_per_image[i].reshape(1).float(),
-            huber_snr_clamp_max=loss_cfg.huber_snr_clamp_max,
-        )
-        per_image.append(li)
-        off += n
+    per_image = packed_per_image_token_loss(
+        pred, target_tokens, vseq, t_per_image, loss_cfg,
+    )                                                # [G], grad-bearing
     stage_timer.stop("navit_loss_loop")
-    per_image = torch.cat(per_image)                 # [G], grad-bearing
     loss = per_image.mean()
     info = {
         "visual_seqlens": vseq,

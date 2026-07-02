@@ -2827,6 +2827,9 @@ def main():
             # ── 分阶段计时：per-micro-batch 选 real/noop 计时器（仅 stage_timing_every>0 时）。
             # 被采样步用真实 StageTimer（记录 CUDA event + 末尾一次 sync），非采样步用 noop（零开销）。
             # warmup 内一律 noop。whole_step 跨整个 micro-batch，交叉校验 dt_step。
+            # flush 在 micro-batch 末尾（不要求撞上优化器边界步——按 micro-batch 计数的采样
+            # cadence 与 grad_accum 边界可能永不同余，边界处 flush 会静默丢行甚至零行）。
+            # optimizer 阶段只在恰为边界步的采样行有值，CSV 其余行该列为空。
             if _stage_timing_every > 0:
                 _stage_micro_step += 1
                 _stage_sampling = (_stage_micro_step > _stage_timing_warmup
@@ -3127,7 +3130,9 @@ def main():
                 # dfm_mode=vecor：负样本改为对 target 的破坏性增强（通道乱序/裁剪缩放），
                 # 不依赖 batch 大小（VeCoR arXiv 2511.18942 部分移植）；dense 路径限定。
                 _dfm_lambda = 0.0 if _skip_main_extras else float(objective_cfg.loss.dfm_lambda or 0.0)
-                _dfm_mode = str(getattr(args, "dfm_mode", "batch") or "batch")
+                # .lower() 与 navit fail-fast / navit 分支的比较保持一致：YAML 写 "VeCoR"
+                # 时若不归一大小写，这里会悄悄滑进 batch ΔFM 分支（行为改变而非报错）。
+                _dfm_mode = str(getattr(args, "dfm_mode", "batch") or "batch").lower()
                 if _dfm_lambda > 0.0 and _dfm_mode == "vecor" and not fit_packed_training:
                     per_sample_neg = vecor_contrastive_neg(
                         pred, target, t.float(),
@@ -3233,6 +3238,9 @@ def main():
             #   - perceptual_module 内部自己管 autocast（VAE decode + LPIPS/DINO 都用 bf16）
             # 顺序：先检查 t-gate → x₀ 恢复 → spectral → perceptual
             # x0_pred / x0_target / aux_total 在 None 兜底下声明，便于 NaN 路径统一 del
+            # aux 阶段计时从这里开始：dense/ARB 与 navit 的 aux 块都要计进 "aux" 列，
+            # 否则 ARB 的 aux 成本落在 loss_assembly、与 navit 不可比（探针的目的正是对比两者）。
+            _stage_timer.start("aux")
             x0_pred = None
             x0_target = None
             aux_total = None
@@ -3247,11 +3255,16 @@ def main():
                     _aux.perceptual_t_gate if _aux.perceptual_enabled else 0.0,
                     _aux.self_perceptual_t_gate if _aux.self_perceptual_enabled else 0.0,
                 )
-                _aux_active = t.float() < _max_gate
-                _any_below_gate = _aux_active.any().item()
+                # 一次 .tolist() 拿全部逐样本判定（镜像 navit aux 侧的做法）：
+                # 原来 .any().item() + nonzero() 是两次 GPU→CPU 同步，这里合并成一次。
+                _aux_active_l = (t.float() < _max_gate).tolist()
+                _any_below_gate = any(_aux_active_l)
 
                 if _any_below_gate:
-                    _aux_idx = _aux_active.nonzero(as_tuple=False).flatten()
+                    _aux_idx = torch.tensor(
+                        [i for i, _b in enumerate(_aux_active_l) if _b],
+                        device=t.device, dtype=torch.long,
+                    )
                     # fit_packed 路径下 pred 是 patch-token；aux 需要网格 x0，先 unpatchify
                     # 回 [B,C,1,h,w]（token_bucket 单一网格满足 unpatchify_tokens 的 uniform-grid
                     # 前提）。非 fit 路径 pred 本就是网格。仅在过 t-gate 时才 unpatchify，省高 t 步的分配。
@@ -3344,7 +3357,6 @@ def main():
             # 这里逐图把 pred 切片 unpatchify 回各自网格、recover x0，跑同一套 spectral /
             # perceptual 数学（self-perceptual 需额外模型前向，已在 setup 处对 navit 门控）。
             # 仅对 t < gate 的图算重路径，省高 t 步的 VAE decode / FFT 分配。
-            _stage_timer.start("aux")
             if navit_packing and objective_cfg.aux.any_enabled:
                 _aux = objective_cfg.aux
                 _max_gate = max(
@@ -3536,6 +3548,10 @@ def main():
             _stage_timer.start("backward")
             loss_to_backward.backward()
             _stage_timer.stop("backward")
+            # 非边界 micro-batch 到 backward 为止就是完整一步（无 optimizer 段）；
+            # 边界步的 whole_step 在 stop("optimizer") 后收口，避免把 eval/采样/存档算进来。
+            if not step_boundary:
+                _stage_timer.stop("whole_step")
             # T-LoRA: backward 完成后才能 reset，否则 grad checkpoint recompute 会看到
             # current_t=None，与原 forward 走的分支不一致 → CheckpointError
             injector.set_current_t(None)
@@ -3567,11 +3583,13 @@ def main():
                     continue
 
                 # ★ 守护 2：梯度 NaN/Inf 检查（即使 loss 全 finite，反向也可能出 NaN）
-                bad_grad = False
-                for p in trainable_params:
-                    if p.grad is not None and not torch.isfinite(p.grad).all():
-                        bad_grad = True
-                        break
+                # 逐参数 `if not isfinite(g).all()` 会每个参数触发一次 GPU→CPU 同步——LoKr
+                # 注入 100+ 个小 Linear 时即每边界步 100+ 次同步。这里先把逐参数判定 stack
+                # 成一个 GPU 张量，只在最后做一次同步（与 compute_grad_norm 同款手法）。
+                _grads_chk = [p.grad for p in trainable_params if p.grad is not None]
+                bad_grad = bool(_grads_chk) and not bool(
+                    torch.stack([torch.isfinite(g).all() for g in _grads_chk]).all()
+                )
                 if bad_grad:
                     batch_images = batch.get("images", [])
                     preview = ", ".join(str(p) for p in batch_images[:4] if p)
@@ -3632,6 +3650,10 @@ def main():
                 if scheduler is not None:
                     scheduler.step()
                 _stage_timer.stop("optimizer")
+                # 边界步的 whole_step 在这里收口：只到 optimizer 为止，不含后面的
+                # telemetry/eval/采样/存档（否则撞上这些的采样步 whole_step 会虚高，
+                # 与各阶段之和对不上）。
+                _stage_timer.stop("whole_step")
                 # 遥测：step 后、zero_grad 前（grad/优化器 state 都新鲜）。step 号对齐 eval（+1）。
                 run_step_telemetry(global_step + 1)
                 optimizer.zero_grad(set_to_none=True)
@@ -3782,36 +3804,36 @@ def main():
                     injector.save(lora_path, model=model)
                     if hasattr(optimizer, "train"): optimizer.train()
 
-                # ── 分阶段计时：边界步末尾 flush（采样步触发一次 sync，写 CSV）。
-                # whole_step 跨整个 micro-batch；forward/loss/backward 每 micro-batch 都记录，
-                # optimizer/aux/adaptive 仅边界步。NaN-continue 路径不 flush（丢弃未完整采样，无副作用）。
-                if _stage_sampling:
-                    _stage_timer.stop("whole_step")
-                    try:
-                        _st = _stage_timer.flush()
-                        _mode = "navit" if navit_packing else ("fit" if fit_packed_training else "arb")
-                        _g = int(_stage_G)
-                        row = [
-                            global_step, _mode, int(bool(getattr(args, "grad_checkpoint", False))), _g,
-                            _st.get("data_fetch"), _st.get("text_encode"), _st.get("timestep"),
-                            _st.get("forward"), _st.get("navit_noise_patchify"),
-                            _st.get("navit_model_forward"), _st.get("navit_loss_loop"),
-                            _st.get("loss_assembly"), _st.get("aux"), _st.get("adaptive"),
-                            _st.get("backward"), _st.get("optimizer"), _st.get("whole_step"),
-                        ]
-                        _stage_append_csv(_stage_timing_csv, _stage_timing_header, row)
-                        # console 摘要（镜像 telemetry emit）：前 5 大阶段
-                        _top = sorted(
-                            ((k, v) for k, v in _st.items() if v is not None and v > 0),
-                            key=lambda kv: kv[1], reverse=True)[:5]
-                        emit(f"[stage_timing] step {global_step} ({_mode} G={_g}): "
-                             + " ".join(f"{k}={v:.1f}ms" for k, v in _top))
-                    except Exception as _e:
-                        logger.warning("[stage_timing] flush failed: %s", _e)
+            # ── 分阶段计时：micro-batch 末尾 flush（采样步触发一次 sync，写 CSV）。
+            # 不再要求采样步撞上优化器边界（按 micro-batch 计数的 cadence 与 grad_accum
+            # 边界可能永不同余）：每个被采样的 micro-batch 都出一行；optimizer 列仅在该
+            # micro-batch 恰为边界步时有值。NaN-continue 路径不 flush（丢弃未完整采样，无副作用）。
+            if _stage_sampling:
+                try:
+                    _st = _stage_timer.flush()
+                    _mode = "navit" if navit_packing else ("fit" if fit_packed_training else "arb")
+                    _g = int(_stage_G)
+                    row = [
+                        global_step, _mode, int(bool(getattr(args, "grad_checkpoint", False))), _g,
+                        _st.get("data_fetch"), _st.get("text_encode"), _st.get("timestep"),
+                        _st.get("forward"), _st.get("navit_noise_patchify"),
+                        _st.get("navit_model_forward"), _st.get("navit_loss_loop"),
+                        _st.get("loss_assembly"), _st.get("aux"), _st.get("adaptive"),
+                        _st.get("backward"), _st.get("optimizer"), _st.get("whole_step"),
+                    ]
+                    _stage_append_csv(_stage_timing_csv, _stage_timing_header, row)
+                    # console 摘要（镜像 telemetry emit）：前 5 大阶段
+                    _top = sorted(
+                        ((k, v) for k, v in _st.items() if v is not None and v > 0),
+                        key=lambda kv: kv[1], reverse=True)[:5]
+                    emit(f"[stage_timing] step {global_step} ({_mode} G={_g}): "
+                         + " ".join(f"{k}={v:.1f}ms" for k, v in _top))
+                except Exception as _e:
+                    logger.warning("[stage_timing] flush failed: %s", _e)
 
-                # 检查 max_steps
-                if args.max_steps and global_step >= args.max_steps:
-                    break
+            # 检查 max_steps（global_step 只在边界步递增，非边界步该条件恒不变）
+            if step_boundary and args.max_steps and global_step >= args.max_steps:
+                break
 
         if sample_accum_enabled and sample_accum_pending > 0 and args.max_steps and global_step >= args.max_steps:
             logger.info(

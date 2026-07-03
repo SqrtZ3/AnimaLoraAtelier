@@ -206,6 +206,30 @@ timestep”假设写的特性会语义错位。v1 的策略：
 | 训练步核心 | `navit_packed_forward_and_loss`（逐图加噪 → 打包前向 → 逐图 loss） | `trainer/objective.py` |
 | config 键 | `navit_packing` / `navit_token_budget` / `navit_max_images_per_pack` | `trainer/config.py` |
 
+### 4.1 per-image AdaLN 调制（速度优化，行为等价、无开关）
+
+**动机与实测（本地 RTX 5070 Laptop，真实维度 2048ch×28blocks×16 heads、pack=4×4096 token，
+bf16+xformers）：** 旧实现把 t_emb/adaln_lora `repeat_interleave` 成逐 token `[1, ΣN, *]`
+再喂进每个 block 的三个调制 MLP —— 即 ① 调制 matmul 在 ΣN=16384 行上跑（唯一值只有 G=4 个），
+② `chunk(3)` 出的 9 组 `[1, ΣN, D]` **非连续条带视图**直接喂 AdaLN 逐元素 op。
+交错测量（6 轮轮换顺序取中位，抵消笔记本时钟漂移；早期顺序测量曾给出 +85% 的夸大值，已弃用）：
+新路径较旧路径**前向 −13.3%**。同基准下注意力形状（dense `[4,4096]` 无掩码 vs 块对角
+`[1,16384]`）前向等速（±1.4%）、fwd+bwd 仅 +6% —— attention 不是瓶颈。
+**诚实标注：** −13% 前向不足以解释云端全部差距（navit budget=16384 ≈ 0.25 it/s vs
+ARB bs=4 ≈ 0.33 it/s，步时 +32%）；剩余部分的归因需要云端 `stage_timing_every` A/B 数据
+（本地卡与云端卡的带宽/算力比不同，各开销占比会移动）。
+
+**改法：** `forward_packed_navit` 改传 per-image `[1, G, *]` 的 emb/adaln_lora + `mod_index`
+（`[ΣN]` token→图行映射）；`Block/FinalLayer.forward_tokens` 在 G 行上算调制 MLP，各 chunk 经
+`index_select` gather 成**连续**逐 token 张量再应用。同一行同值 → 数学等价（fp32 单测
+`test_navit_per_image_adaln` 固化 Block/FinalLayer 两布局一致，含 use_adaln_lora 两分支；
+model 级等价仍由 `test_packed_navit_forward` 覆盖）。legacy 逐 token 布局（`mod_index=None`）
+保留，ARB/token-bucket 路径逐字节不变。
+
+顺手的小优化（同 commit）：`_packed_rope_from_grid` 两次 `.item()` 同步合并为一次 +
+freqs 按 (device, NTK) 缓存；`BlockDiagonalMask` 按 seqlens 元组 lru 缓存（纯 CPU 元数据，
+块内本就跨 28 block 复用）；补上 config 注释引用的 `tools/analyze_stage_timing.py`。
+
 ### 验证状态（诚实标注）
 
 本地 GPU（CUDA + xformers 0.0.30，head_dim 64/128）+ 纯 Python 单测，**已通过**：

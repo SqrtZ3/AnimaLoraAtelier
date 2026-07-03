@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
@@ -59,6 +60,25 @@ def _is_xformers_attn_bias(m) -> bool:
     except Exception:
         return False
     return isinstance(m, AttentionBias)
+
+
+@functools.lru_cache(maxsize=256)
+def _cached_block_diag_mask(q_seqlens: tuple, kv_seqlens: Optional[tuple] = None):
+    """Build (and memoize) an xformers ``BlockDiagonalMask`` for the given seqlens.
+
+    The mask is a pure CPU metadata object keyed only by the seqlen lists — the NaViT
+    step already reuses one instance across all 28 blocks and the checkpoint recompute,
+    so reusing it across steps with identical pack composition is equally safe. Small
+    datasets cycle through few distinct packs per epoch → high hit rate; entries are a
+    few ints + tiny tensors, so a bounded cache stays negligible.
+    """
+    from xformers.ops.fmha import BlockDiagonalMask  # lazy: only packed callers need it
+
+    if kv_seqlens is None:
+        return BlockDiagonalMask.from_seqlens(list(q_seqlens))
+    return BlockDiagonalMask.from_seqlens(
+        q_seqlen=list(q_seqlens), kv_seqlen=list(kv_seqlens)
+    )
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -694,13 +714,21 @@ class FinalLayer(nn.Module):
         emb_B_T_D: torch.Tensor,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         token_wise_mod: bool = False,
+        mod_index: Optional[torch.Tensor] = None,
     ):
-        # ``token_wise_mod`` is the NaViT/FiT packing path: ``emb`` (and ``adaln_lora``)
-        # are already per-token ``[1, N, *]`` — one timestep per packed image,
-        # ``repeat_interleave``-expanded across that image's tokens — so the AdaLN
-        # shift/scale must be applied per token rather than broadcast from a single
-        # ``[:, :1, :]`` slot. Default ``False`` keeps every existing caller (constant-N
-        # / token-bucket, where the whole row shares one timestep) byte-identical.
+        # ``token_wise_mod`` is the NaViT/FiT packing path: each packed image carries its
+        # own timestep, so AdaLN shift/scale must vary per token rather than broadcast
+        # from a single ``[:, :1, :]`` slot. Two layouts:
+        #
+        # * ``mod_index`` given（NaViT 默认）: ``emb``/``adaln_lora`` are *per-image*
+        #   ``[1, G, *]`` and ``mod_index`` ``[ΣN]`` maps each token to its image row —
+        #   the modulation MLP runs on G rows only, then each chunk is gathered to a
+        #   contiguous per-token tensor（同数学、免 ΣN 行 matmul 与跨 chunk 条带视图）。
+        # * ``mod_index=None``: legacy per-token layout — inputs are already
+        #   ``repeat_interleave`` 展开的 ``[1, ΣN, *]``，直接使用。
+        #
+        # Default ``False``/None keeps every existing caller (constant-N / token-bucket,
+        # where the whole row shares one timestep) byte-identical.
         if self.use_adaln_lora:
             assert adaln_lora_B_T_3D is not None
             shift_B_T_D, scale_B_T_D = (
@@ -709,7 +737,10 @@ class FinalLayer(nn.Module):
         else:
             shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
 
-        if token_wise_mod:
+        if token_wise_mod and mod_index is not None:
+            shift_mod = shift_B_T_D.index_select(1, mod_index)
+            scale_mod = scale_B_T_D.index_select(1, mod_index)
+        elif token_wise_mod:
             shift_mod, scale_mod = shift_B_T_D, scale_B_T_D
         else:
             shift_mod = shift_B_T_D[:, :1, :]
@@ -936,6 +967,7 @@ class Block(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         cross_attn_mask: Optional[torch.Tensor] = None,
         token_wise_mod: bool = False,
+        mod_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # ``attn_mask`` (additive key-padding mask) and ``token_mask_f`` (float
         # zeroing mask) are precomputed once per step by the caller via
@@ -945,11 +977,20 @@ class Block(nn.Module):
         #
         # NaViT/FiT packing path (``token_wise_mod=True``): ``attn_mask`` and
         # ``cross_attn_mask`` are xformers ``BlockDiagonalMask`` biases (per-image
-        # self / cross seqlens), and ``emb_B_T_D`` / ``adaln_lora_B_T_3D`` are already
-        # per-token ``[1, N, *]`` (one timestep per packed image, repeat-interleaved over
-        # its tokens). AdaLN shift/scale/gate are then applied per token instead of
-        # broadcast from the ``[:, :1, :]`` slot. All three default to None/False, so
-        # constant-N / token-bucket callers are byte-identical.
+        # self / cross seqlens). AdaLN shift/scale/gate vary per token（每图各自 t），
+        # 有两种输入布局：
+        #
+        # * ``mod_index`` given（NaViT 默认）: ``emb_B_T_D``/``adaln_lora_B_T_3D`` 是
+        #   *per-image* ``[1, G, *]``，``mod_index`` ``[ΣN]`` 把每个 token 映射到所属图行。
+        #   三个调制 MLP 只在 G 行上跑，各 chunk 经 ``index_select`` gather 成**连续**
+        #   逐 token 张量。与逐 token 布局同数学（同一行同值），省掉 ΣN 行调制 matmul
+        #   与喂给每个 AdaLN 逐元素 op 的跨 chunk 条带视图（本地交错实测前向中位 −13%，
+        #   RTX 5070 Laptop；云端占比待 stage_timing 验证）。
+        # * ``mod_index=None``: legacy 逐 token 布局——输入已 ``repeat_interleave`` 展开
+        #   为 ``[1, ΣN, *]``，按原样使用。
+        #
+        # All defaults are None/False, so constant-N / token-bucket callers are
+        # byte-identical.
         if self.use_adaln_lora:
             assert adaln_lora_B_T_3D is not None
             shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
@@ -970,7 +1011,12 @@ class Block(nn.Module):
             ).chunk(3, dim=-1)
             shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
 
-        _sel = (lambda t: t) if token_wise_mod else (lambda t: t[:, :1, :])
+        if token_wise_mod and mod_index is not None:
+            _sel = lambda t: t.index_select(1, mod_index)   # [1,G,D] → 连续 [1,ΣN,D]
+        elif token_wise_mod:
+            _sel = lambda t: t
+        else:
+            _sel = lambda t: t[:, :1, :]
         shift_self_attn_B_1_D = _sel(shift_self_attn_B_T_D)
         scale_self_attn_B_1_D = _sel(scale_self_attn_B_T_D)
         gate_self_attn_B_1_D = _sel(gate_self_attn_B_T_D)
@@ -1403,19 +1449,34 @@ class MiniTrainDIT(nn.Module):
         if "rope" not in self.pos_emb_cls.lower():
             return None
         pe = self.pos_embedder
-        max_row = int(grid_B_2_N[:, 0, :].max().detach().item()) if grid_B_2_N.numel() else 0
-        max_col = int(grid_B_2_N[:, 1, :].max().detach().item()) if grid_B_2_N.numel() else 0
+        if grid_B_2_N.numel():
+            # RoPE 容量 fail-fast：一次 GPU→CPU 同步取 (max_row, max_col)
+            # （原实现两次 .item() = 每步两次同步；amax 后 tolist 与逐通道 max 同值）。
+            max_row, max_col = (
+                int(v) for v in grid_B_2_N.amax(dim=(0, 2)).tolist()
+            )
+        else:
+            max_row = max_col = 0
         if max_row >= pe.max_h or max_col >= pe.max_w:
             raise ValueError(
                 f"packed FiT token grid {(max_row + 1)}x{(max_col + 1)} exceeds RoPE capacity "
                 f"{pe.max_h}x{pe.max_w}; increase max_img_h/max_img_w for this native resolution."
             )
-        h_theta = 10000.0 * pe.h_ntk_factor
-        w_theta = 10000.0 * pe.w_ntk_factor
-        t_theta = 10000.0 * pe.t_ntk_factor
-        h_freqs = 1.0 / (h_theta**pe.dim_spatial_range.to(grid_B_2_N.device))
-        w_freqs = 1.0 / (w_theta**pe.dim_spatial_range.to(grid_B_2_N.device))
-        t_freqs = 1.0 / (t_theta**pe.dim_temporal_range.to(grid_B_2_N.device))
+        # freqs 只依赖 NTK 系数与 device（与 grid 无关），缓存避免每步重建；
+        # 命中时张量与首算逐 bit 相同（同一对象）。
+        dev = grid_B_2_N.device
+        _key = (dev, float(pe.h_ntk_factor), float(pe.w_ntk_factor), float(pe.t_ntk_factor))
+        _cache = getattr(self, "_packed_rope_freqs_cache", None)
+        if _cache is not None and _cache[0] == _key:
+            h_freqs, w_freqs, t_freqs = _cache[1]
+        else:
+            h_theta = 10000.0 * pe.h_ntk_factor
+            w_theta = 10000.0 * pe.w_ntk_factor
+            t_theta = 10000.0 * pe.t_ntk_factor
+            h_freqs = 1.0 / (h_theta**pe.dim_spatial_range.to(dev))
+            w_freqs = 1.0 / (w_theta**pe.dim_spatial_range.to(dev))
+            t_freqs = 1.0 / (t_theta**pe.dim_temporal_range.to(dev))
+            self._packed_rope_freqs_cache = (_key, (h_freqs, w_freqs, t_freqs))
         row = grid_B_2_N[:, 0, :].float()
         col = grid_B_2_N[:, 1, :].float()
         half_emb_t = row.new_zeros((row.shape[0], row.shape[1], t_freqs.shape[0]))
@@ -1530,8 +1591,8 @@ class MiniTrainDIT(nn.Module):
         varlen kernel — there is no O(ΣN²) dense mask and no cross-image leakage (the
         invariant is asserted bit-for-bit in ``test_packed_block_diag_attention``).
         """
-        try:
-            from xformers.ops.fmha import BlockDiagonalMask
+        try:  # fail-fast 可用性检查；实际构建走 _cached_block_diag_mask（按 seqlens 缓存）
+            from xformers.ops.fmha import BlockDiagonalMask  # noqa: F401
         except Exception as exc:  # pragma: no cover - exercised only without xformers
             raise RuntimeError(
                 "forward_packed_navit requires xformers (BlockDiagonalMask) for "
@@ -1560,42 +1621,52 @@ class MiniTrainDIT(nn.Module):
             )
         x_1_N_D = self.x_embedder.proj[1](tokens_1_N_M)
 
-        # Per-image timestep embedding, then repeat-interleave to per token so AdaLN
-        # modulates each image's tokens with its own timestep (token_wise_mod=True).
+        # Per-image timestep embedding kept at [1, G, *]; blocks receive ``mod_index``
+        # ([ΣN] token→image row) and run AdaLN modulation on G rows, gathering each
+        # chunk to a contiguous per-token tensor inside ``forward_tokens``. Same math
+        # as the old repeat-interleave-to-token layout（同一行同值），but drops the
+        # ΣN-row modulation matmuls and the strided chunk views（本地交错实测前向
+        # 中位 −13%；云端占比待 stage_timing 验证）。
         if timesteps_G.ndim == 1:
             timesteps_G = timesteps_G.unsqueeze(1)            # [G, 1]
         t_emb_G_1_D, adaln_lora_G_1_3D = self.t_embedder(timesteps_G)
         t_emb_G_1_D = self.t_embedding_norm(t_emb_G_1_D)
 
         counts = torch.tensor(visual_seqlens, device=x_1_N_D.device)
-        t_emb_tok = t_emb_G_1_D[:, 0, :].repeat_interleave(counts, dim=0).unsqueeze(0)   # [1, ΣN, D]
+        mod_index = torch.repeat_interleave(
+            torch.arange(len(visual_seqlens), device=x_1_N_D.device), counts
+        )                                                     # [ΣN]
+        t_emb_1_G_D = t_emb_G_1_D[:, 0, :].unsqueeze(0)       # [1, G, D]
         if adaln_lora_G_1_3D is not None:
-            adaln_lora_tok = adaln_lora_G_1_3D[:, 0, :].repeat_interleave(counts, dim=0).unsqueeze(0)
+            adaln_lora_1_G_3D = adaln_lora_G_1_3D[:, 0, :].unsqueeze(0)
         else:
-            adaln_lora_tok = None
+            adaln_lora_1_G_3D = None
 
-        self.affline_scale_log_info = {"t_embedding_B_T_D": t_emb_tok.detach()}
-        self.affline_emb = t_emb_tok
+        self.affline_scale_log_info = {"t_embedding_B_T_D": t_emb_1_G_D.detach()}
+        self.affline_emb = t_emb_1_G_D
         self.crossattn_emb = crossattn_packed_1_L_D
 
         rope_emb = self._packed_rope_from_grid(grid_1_2_N)
-        self_bias = BlockDiagonalMask.from_seqlens(visual_seqlens)
-        cross_bias = BlockDiagonalMask.from_seqlens(
-            q_seqlen=visual_seqlens, kv_seqlen=text_seqlens
+        # BlockDiagonalMask 只依赖 seqlens（纯 CPU 元数据对象，块内已跨 28 block +
+        # checkpoint 重算复用），按 seqlens 元组缓存避免每步重建。
+        self_bias = _cached_block_diag_mask(tuple(visual_seqlens))
+        cross_bias = _cached_block_diag_mask(
+            tuple(visual_seqlens), tuple(text_seqlens)
         )
 
         for block in self.blocks:
             def _run(x_in, blk=block):
                 return blk.forward_tokens(
                     x_in,
-                    t_emb_tok,
+                    t_emb_1_G_D,
                     crossattn_packed_1_L_D,
                     rope_emb_L_1_1_D=rope_emb,
                     attn_mask=self_bias,
                     token_mask_f=None,
-                    adaln_lora_B_T_3D=adaln_lora_tok,
+                    adaln_lora_B_T_3D=adaln_lora_1_G_3D,
                     cross_attn_mask=cross_bias,
                     token_wise_mod=True,
+                    mod_index=mod_index,
                 )
             if use_checkpoint:
                 x_1_N_D = checkpoint(_run, x_1_N_D, use_reentrant=False)
@@ -1603,7 +1674,8 @@ class MiniTrainDIT(nn.Module):
                 x_1_N_D = _run(x_1_N_D)
 
         out = self.final_layer.forward_tokens(
-            x_1_N_D, t_emb_tok, adaln_lora_B_T_3D=adaln_lora_tok, token_wise_mod=True
+            x_1_N_D, t_emb_1_G_D, adaln_lora_B_T_3D=adaln_lora_1_G_3D,
+            token_wise_mod=True, mod_index=mod_index,
         )
         return self._output_tokens_to_patch_tokens(out, None)
 

@@ -452,6 +452,10 @@ def parse_args():
                    help="分块 encode 的块边长（像素，须 16 的整倍数）。峰值显存 ∝ 块像素数。")
     p.add_argument("--cache-encode-tile-overlap", type=int, default=128,
                    help="相邻块的重叠像素（须 16 的整倍数、< tile 的一半）。越大接缝误差越小、编码量越多。")
+    p.add_argument("--cache-encode-max-pixels", type=int, default=0,
+                   help="缓存阶段单次 VAE encode 的总像素预算（含 flip 份）。0=内置保守默认 4M。"
+                        "大显存卡上调可让同尺寸小图批量更深（纯提速，不改变单图结果）；"
+                        "同时是 cache_encode_tiled 的分块触发阈值（超预算的图才分块）。")
     p.add_argument("--stage-timing-every", type=int, default=0,
                    help="训练步分阶段计时 cadence（步）；0=关（默认，零开销/行为中立）。开启后每 N 步"
                         "用 CUDA event 计时 text_encode/forward/loss/aux/backward 等阶段、末尾一次 sync "
@@ -1516,6 +1520,11 @@ def main():
         _cache_tiled = bool(getattr(args, "cache_encode_tiled", False))
         _cache_tile_px = int(getattr(args, "cache_encode_tile_px", 1024) or 1024)
         _cache_tile_ov = int(getattr(args, "cache_encode_tile_overlap", 128) or 128)
+        _cache_max_px = int(getattr(args, "cache_encode_max_pixels", 0) or 0)
+        if _cache_max_px < 0:
+            raise RuntimeError(
+                f"cache_encode_max_pixels={_cache_max_px} 不能为负（0=内置默认 4M）。"
+            )
         if _cache_tiled:
             if _cache_tile_px < 256 or _cache_tile_px % 16 != 0:
                 raise RuntimeError(
@@ -1526,22 +1535,30 @@ def main():
                     f"cache_encode_tile_overlap={_cache_tile_ov} 需为 16 的整倍数、"
                     f"≥16 且 ≤ tile 的一半（tile={_cache_tile_px}）。"
                 )
+            if 0 < _cache_max_px < _cache_tile_px * _cache_tile_px:
+                logger.warning(
+                    "[cache-tiled] cache_encode_max_pixels=%d 小于单块像素 %d²=%d：单块 encode "
+                    "本身就超预算，分块无法把峰值压到预算内。建议调小 tile 或调大预算。",
+                    _cache_max_px, _cache_tile_px, _cache_tile_px * _cache_tile_px,
+                )
             logger.info(
-                "[cache-tiled] 已启用：>4M px 的图分块 encode（tile=%d overlap=%d），"
+                "[cache-tiled] 已启用：>%.1fM px 的图分块 encode（tile=%d overlap=%d），"
                 "峰值显存 ∝ 块像素；接缝为近似（overlap 越大越准）。",
-                _cache_tile_px, _cache_tile_ov,
+                (_cache_max_px or 4 * 1024 * 1024) / 1e6, _cache_tile_px, _cache_tile_ov,
             )
         dataset = CachedLatentDataset(dataset, vae, device, dtype, save_dtype=_cache_save_dtype,
                                       encode_batch_size=_cache_encode_bs,
                                       encode_tiled=_cache_tiled,
                                       encode_tile_px=_cache_tile_px,
-                                      encode_tile_overlap=_cache_tile_ov)
+                                      encode_tile_overlap=_cache_tile_ov,
+                                      encode_max_pixels=_cache_max_px)
     if reg_dataset is not None and use_cached:
         reg_dataset = CachedLatentDataset(reg_dataset, vae, device, dtype, save_dtype=_cache_save_dtype,
                                           encode_batch_size=_cache_encode_bs,
                                           encode_tiled=_cache_tiled,
                                           encode_tile_px=_cache_tile_px,
-                                          encode_tile_overlap=_cache_tile_ov)
+                                          encode_tile_overlap=_cache_tile_ov,
+                                          encode_max_pixels=_cache_max_px)
 
     # repeat 放在缓存之后
     if args.repeats > 1:

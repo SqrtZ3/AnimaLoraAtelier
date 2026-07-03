@@ -23,8 +23,10 @@ import torch.nn.functional as F  # noqa: E402
 
 from trainer.config import DEFAULTS, apply_yaml_config  # noqa: E402
 from trainer.data import (  # noqa: E402
+    _CACHE_ENCODE_MAX_PIXELS,
     CachedLatentDataset,
     ImageDataset,
+    _plan_encode_batches,
     _tile_starts,
     tiled_vae_encode,
 )
@@ -111,7 +113,7 @@ class TestEndToEndCachedDataset(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _build(self, side, tiled):
+    def _build(self, side, tiled, max_pixels=0):
         from PIL import Image
         Image.new("RGB", (side, side), (77, 150, 30)).save(self.data_dir / "img.png")
         (self.data_dir / "img.txt").write_text("1girl", encoding="utf-8")
@@ -120,6 +122,7 @@ class TestEndToEndCachedDataset(unittest.TestCase):
             base, _FakeVAE(), "cpu", torch.float32,
             save_dtype=torch.float32, encode_batch_size=2,
             encode_tiled=tiled, encode_tile_px=1024, encode_tile_overlap=128,
+            encode_max_pixels=max_pixels,
         )
 
     def test_over_budget_image_tiled_and_correct(self):
@@ -144,12 +147,91 @@ class TestEndToEndCachedDataset(unittest.TestCase):
         self.assertLess((lat.float() - expected.float()).abs().max().item(), 1e-6)
 
 
+class TestEncodeMaxPixelsOverride(unittest.TestCase):
+    """cache_encode_max_pixels：0=内置 4M 默认；上调后批量更深、tiled 触发阈值同步上移。"""
+
+    def test_plan_batches_respect_budget(self):
+        # 4 张 1024²（1.048M px）同尺寸图，max_batch=8，无 flip：
+        # 默认 4M 预算 → 4 张/批；2M 预算 → 2 张/批。
+        bucket_of = lambda i: (1024, 1024)
+        p_default = _plan_encode_batches([0, 1, 2, 3], bucket_of, 8,
+                                         _CACHE_ENCODE_MAX_PIXELS, False)
+        self.assertEqual([len(b) for b in p_default], [4])
+        p_small = _plan_encode_batches([0, 1, 2, 3], bucket_of, 8,
+                                       2 * 1024 * 1024, False)
+        self.assertEqual([len(b) for b in p_small], [2, 2])
+
+    def test_zero_falls_back_to_builtin_default(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp)
+            from PIL import Image
+            Image.new("RGB", (64, 64), (1, 2, 3)).save(d / "t.png")
+            (d / "t.txt").write_text("x", encoding="utf-8")
+            base = ImageDataset(str(d), 64, None, prefer_json=False)
+            ds = CachedLatentDataset(
+                base, _FakeVAE(), "cpu", torch.float32,
+                save_dtype=torch.float32, encode_max_pixels=0,
+            )
+            self.assertEqual(ds.encode_max_pixels, _CACHE_ENCODE_MAX_PIXELS)
+            ds2 = CachedLatentDataset(
+                base, _FakeVAE(), "cpu", torch.float32,
+                save_dtype=torch.float32, encode_max_pixels=16 * 1024 * 1024,
+            )
+            self.assertEqual(ds2.encode_max_pixels, 16 * 1024 * 1024)
+
+    def test_raised_budget_disables_tiling_for_mid_size_image(self):
+        # 2304² = 5.3M px：默认预算(4M)下应触发分块；预算提到 8M 后应整图 encode。
+        import tempfile
+        import trainer.data as data_mod
+        calls = {"n": 0}
+        orig = data_mod.tiled_vae_encode
+
+        def _counting(*a, **k):
+            calls["n"] += 1
+            return orig(*a, **k)
+
+        data_mod.tiled_vae_encode = _counting
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                d = pathlib.Path(tmp)
+                from PIL import Image
+                Image.new("RGB", (2304, 2304), (5, 5, 5)).save(d / "a.png")
+                (d / "a.txt").write_text("x", encoding="utf-8")
+                base = ImageDataset(str(d), 2304, None, prefer_json=False)
+                CachedLatentDataset(
+                    base, _FakeVAE(), "cpu", torch.float32,
+                    save_dtype=torch.float32, encode_batch_size=2,
+                    encode_tiled=True, encode_tile_px=1024,
+                    encode_tile_overlap=128,
+                    encode_max_pixels=8 * 1024 * 1024,   # 预算 > 图像素 → 不分块
+                )
+                self.assertEqual(calls["n"], 0)
+            with tempfile.TemporaryDirectory() as tmp:
+                d = pathlib.Path(tmp)
+                from PIL import Image
+                Image.new("RGB", (2304, 2304), (5, 5, 5)).save(d / "b.png")
+                (d / "b.txt").write_text("x", encoding="utf-8")
+                base = ImageDataset(str(d), 2304, None, prefer_json=False)
+                CachedLatentDataset(
+                    base, _FakeVAE(), "cpu", torch.float32,
+                    save_dtype=torch.float32, encode_batch_size=2,
+                    encode_tiled=True, encode_tile_px=1024,
+                    encode_tile_overlap=128,
+                    encode_max_pixels=0,                  # 内置 4M → 分块
+                )
+                self.assertEqual(calls["n"], 1)
+        finally:
+            data_mod.tiled_vae_encode = orig
+
+
 class TestConfigSwitch(unittest.TestCase):
     def test_default_off(self):
         self.assertIn("cache_encode_tiled", DEFAULTS)
         self.assertFalse(DEFAULTS["cache_encode_tiled"])
         self.assertEqual(int(DEFAULTS["cache_encode_tile_px"]), 1024)
         self.assertEqual(int(DEFAULTS["cache_encode_tile_overlap"]), 128)
+        self.assertEqual(int(DEFAULTS["cache_encode_max_pixels"]), 0)
 
     def test_yaml_enables(self):
         from types import SimpleNamespace

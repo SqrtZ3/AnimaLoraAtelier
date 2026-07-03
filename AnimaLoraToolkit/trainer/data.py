@@ -1809,10 +1809,11 @@ def collate_fn_navit_pack(batch):
     }
 
 
-# 单次送入 VAE encode 的「总像素」软上限（含翻转份）。VAE 3D encoder 中间激活很占显存，
-# 用像素预算让大图自动减小每批张数，避免缓存阶段 OOM；真遇到 OOM 还有逐张兜底。
+# 单次送入 VAE encode 的「总像素」软上限（含翻转份）默认值。VAE 3D encoder 中间激活很占
+# 显存，用像素预算让大图自动减小每批张数，避免缓存阶段 OOM；真遇到 OOM 还有逐张兜底。
 # 偏保守：1024² 原图在 flip 下每批 2 张（进网络 4 张），512² 每批可达 cache_encode_batch_size。
-# 想更激进可调大 cache_encode_batch_size（仍受本预算约束），或按显存改本常量。
+# 大显存卡可用 YAML `cache_encode_max_pixels` 覆盖（如 80GB 卡 16M）；它同时也是
+# cache_encode_tiled 的分块触发阈值（单图像素 > 预算才分块）。
 _CACHE_ENCODE_MAX_PIXELS = 4 * 1024 * 1024
 
 
@@ -1956,7 +1957,8 @@ class CachedLatentDataset(Dataset):
     """
     def __init__(self, base_dataset, vae, device, dtype, cache_dir=None,
                  save_dtype: torch.dtype = torch.bfloat16, encode_batch_size=8,
-                 encode_tiled=False, encode_tile_px=1024, encode_tile_overlap=128):
+                 encode_tiled=False, encode_tile_px=1024, encode_tile_overlap=128,
+                 encode_max_pixels=0):
         import numpy as np
         self.base_dataset = base_dataset
         self.np = np
@@ -1972,6 +1974,12 @@ class CachedLatentDataset(Dataset):
         self.encode_tiled = bool(encode_tiled)
         self.encode_tile_px = int(encode_tile_px or 1024)
         self.encode_tile_overlap = int(encode_tile_overlap or 128)
+        # 编码像素预算（cache_encode_max_pixels）：<=0 用内置保守默认 4M。
+        # 同时决定每批张数（_plan_encode_batches）与 tiled 分块触发阈值。
+        self.encode_max_pixels = (
+            int(encode_max_pixels) if int(encode_max_pixels or 0) > 0
+            else _CACHE_ENCODE_MAX_PIXELS
+        )
         # 捕获用户的 flip 意图（最底层 ImageDataset.flip_augment）。必须在 _build_cache 之前设好：
         # _is_cache_valid 依赖它判断旧的"仅单份 latent"缓存是否需要失效重编码。
         leaf = base_dataset
@@ -2147,7 +2155,7 @@ class CachedLatentDataset(Dataset):
             indices,
             lambda i: self.samples[i].get("bucket_key"),
             self.encode_batch_size,
-            _CACHE_ENCODE_MAX_PIXELS,
+            self.encode_max_pixels,
             flip,
         )
         use_cuda = str(getattr(device, "type", device)).startswith("cuda")
@@ -2201,7 +2209,7 @@ class CachedLatentDataset(Dataset):
 
                 # cache_encode_tiled：仅超像素预算的图走分块（此时 _plan_encode_batches
                 # 已保证该批只有 1 张原图，enc_in 为 [1 或 2(flip),C,1,H,W]）。
-                if self.encode_tiled and ph * pw > _CACHE_ENCODE_MAX_PIXELS:
+                if self.encode_tiled and ph * pw > self.encode_max_pixels:
                     logger.info(
                         "[cache-tiled] %dx%d 超像素预算，分块 encode（tile=%d overlap=%d）：%s",
                         pw, ph, self.encode_tile_px, self.encode_tile_overlap,

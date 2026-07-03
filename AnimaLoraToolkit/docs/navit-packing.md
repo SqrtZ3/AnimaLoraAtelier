@@ -110,11 +110,15 @@ resolution-sampling 是同一思路的随机版。
 cache_encode_tiled: true        # 默认 false；只影响缓存阶段，与训练步显存无关
 cache_encode_tile_px: 1024      # 块边长（16 的整倍数）；峰值显存 ∝ 块像素数
 cache_encode_tile_overlap: 128  # 相邻块重叠（16 的整倍数、≤ tile 一半）
+cache_encode_max_pixels: 0      # 单次 encode 像素预算（含 flip 份）；0=内置 4M（保守）。
+                                #   大显存卡上调（如 80GB → 16777216=16M）可让同尺寸小图
+                                #   批量更深（纯提速）；同时是 tiled 的分块触发阈值——
+                                #   超预算的图才分块，预算内整图 encode。
 ```
 
-**解决什么问题：** 缓存阶段的像素预算（`_CACHE_ENCODE_MAX_PIXELS`=4M px）只能"少装几张"，
-对单张超限图（如 2814×4456 = 12.5M px，flip 再 ×2）无约束力——整张过 VAE encoder 的
-全分辨率卷积激活曾实测把 80GB 卡顶满。
+**解决什么问题：** 缓存阶段的像素预算（默认 4M px，可用 `cache_encode_max_pixels` 覆盖）
+只能"少装几张"，对单张超限图（如 2814×4456 = 12.5M px，flip 再 ×2）无约束力——整张过
+VAE encoder 的全分辨率卷积激活曾实测把 80GB 卡顶满。
 
 **怎么做：** 超过 4M px 的图切成带重叠的像素块（末块贴齐边界保满块），逐块 encode 后在
 latent 网格上按线性羽化权重累加归一化拼回**完整原生分辨率 latent**——原生大图训练不受

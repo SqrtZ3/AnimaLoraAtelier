@@ -98,6 +98,7 @@ YAML_TO_ARGS = {
     "cache_encode_tiled": "cache_encode_tiled",
     "cache_encode_tile_px": "cache_encode_tile_px",
     "cache_encode_tile_overlap": "cache_encode_tile_overlap",
+    "cache_encode_max_pixels": "cache_encode_max_pixels",
     "alpha_handling": "alpha_handling",
     "alpha_background": "alpha_background",
     "alpha_threshold": "alpha_threshold",
@@ -463,6 +464,14 @@ DEFAULTS = {
     "cache_encode_tiled": False,
     "cache_encode_tile_px": 1024,
     "cache_encode_tile_overlap": 128,
+    # Pixel budget per VAE-encode call in the cache phase (flip copies included).
+    # 0 = built-in conservative default (4M px ≈ two 1024² images with flip, sized
+    # for small GPUs). Raising it lets same-shape small images batch deeper (e.g.
+    # 16M on an 80GB card → 8×1024²-with-flip per call) — pure speed, no behavior
+    # change per image. Also the cache_encode_tiled trigger threshold: only images
+    # *above* this budget are tiled, so raising it also means e.g. a 12.5M-px image
+    # is encoded whole under a 16M budget (make sure VRAM allows).
+    "cache_encode_max_pixels": 0,
     "alpha_handling": "none",
     "alpha_background": "neutral",
     "alpha_threshold": 0.01,

@@ -47,6 +47,18 @@ YAML_TO_ARGS = {
     "vae_path": "vae",
     "text_encoder_path": "qwen",
     "t5_tokenizer_path": "t5_tokenizer",
+    # 模型族（DiT family）。"anima"（默认）/"krea2"（Krea 2 单流 MMDiT，opt-in）。
+    # krea2 时 transformer_path 指 raw.safetensors，vae_path 仍是 Qwen-Image VAE（与
+    # anima 同一文件），text_encoder_path/t5_tokenizer_path 不用，改用 krea2_text_encoder_path。
+    "model_family": "model_family",
+    "krea2_text_encoder_path": "krea2_text_encoder",
+    "krea2_text_max_length": "krea2_text_max_length",
+    "krea2_text_cache_entries": "krea2_text_cache_entries",
+    "krea2_res_shift": "krea2_res_shift",
+    "krea2_shift_min_res": "krea2_shift_min_res",
+    "krea2_shift_max_res": "krea2_shift_max_res",
+    "krea2_shift_y1": "krea2_shift_y1",
+    "krea2_shift_y2": "krea2_shift_y2",
     # 数据集
     "data_dir": "data_dir",
     "reg_data_dir": "reg_data_dir",
@@ -475,6 +487,23 @@ DEFAULTS = {
     "alpha_handling": "none",
     "alpha_background": "neutral",
     "alpha_threshold": 0.01,
+    # ── 模型族（opt-in；"anima" 与历史行为逐一等价）─────────────────────────
+    "model_family": "anima",
+    # Krea2 专用：Qwen3-VL-4B-Instruct 的 HuggingFace 目录（model_family=krea2 必填）
+    "krea2_text_encoder": "",
+    # 官方 encoder 的 max_length（模板前缀/后缀之外的用户文本 token 预算）
+    "krea2_text_max_length": 512,
+    # Krea2 文本特征 LRU cache 条目数（每条 [L,12,2560]，压缩后典型 tag caption 数 MB；
+    # 128 条 ≈ 1GB 量级 VRAM，按数据集 caption 数量与显存调）
+    "krea2_text_cache_entries": 128,
+    # 训练 t 的分辨率感知 shift（Krea2 原生调度 α=exp(mu(seq_len))；仅 krea2 生效。
+    # true=对齐官方推理时间步分布（musubi 的 krea2_shift 同物）；false=退回原始 t）
+    "krea2_res_shift": True,
+    # mu 线性内插端点（官方 sampling.py 默认：256px→y1、1280px→y2）
+    "krea2_shift_min_res": 256,
+    "krea2_shift_max_res": 1280,
+    "krea2_shift_y1": 0.5,
+    "krea2_shift_y2": 1.15,
     "max_img_h": 0,
     "max_img_w": 0,
     "repeats": 1,

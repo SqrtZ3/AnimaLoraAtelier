@@ -209,11 +209,20 @@ def _encode_text(
     model, qwen_model, qwen_tokenizer, t5_tokenizer, prompt, device,
     *, use_t5_token_weights: bool = True,
 ) -> torch.Tensor:
-    """编码单条 prompt -> cross_cond（[1, ≥512, D]，已 pad 到 512）。
+    """编码单条 prompt -> cross_cond。
+
+    - anima：[1, ≥512, D]，已 pad 到 512（Qwen hidden states + T5 token 权重）。
+    - krea2（按 model.model_family 识别）：[1, L_valid, 12, D] Qwen3-VL 多层堆叠，
+      压缩到有效 token（B=1 → 前向无需 mask）。此时 `qwen_model` 参数承载
+      load_krea2_text_encoder 返回的 handles dict，t5/tokenizer 参数忽略。
 
     抽自 `sample_image` 的编码路径，cond / uncond 共用同一逻辑；DPO loser 生成也复用
     本函数（只编码正向 prompt，no-CFG 时无需 uncond）。
     """
+    if getattr(model, "model_family", "anima") == "krea2":
+        from trainer.model_family import encode_krea2_text
+        cross, _ = encode_krea2_text(qwen_model, [prompt], device)
+        return cross
     qwen_text = _build_qwen_text_from_prompt(prompt)
     qwen_embeds, qwen_attn = encode_qwen(qwen_model, qwen_tokenizer, [qwen_text], device)
     t5_ids, t5_attn, t5_w = tokenize_t5_weighted(t5_tokenizer, [prompt], max_length=512)
@@ -248,8 +257,13 @@ def sample_latent(
     dtype=torch.bfloat16,
     injector=None,
     seed: int | None = None,
+    shift: float | None = None,
 ) -> torch.Tensor:
     """运行 ER-SDE CONST 采样并返回训练 latent（`[1,16,1,h//8,w//8]`，float32），**不做 VAE decode**。
+
+    `shift`：sigma 调度的 time-snr shift。None = 按 family 取默认——anima 固定 3.0
+    （ComfyUI supported_models 口径），krea2 用官方分辨率感知 exp(mu(H,W))
+    （1024²≈2.48；与 Anima 的 `_time_snr_shift` 代数同形，直接复用同一 scheduler）。
 
     `sample_image` = 本函数 + VAE decode。DPO loser 生成直接调用本函数，全程留在 latent
     空间（loser pool 存的就是返回值，与训练加噪管线直接兼容）。
@@ -265,13 +279,19 @@ def sample_latent(
     model.eval()
     try:
         lat_h, lat_w = height // 8, width // 8
+        if shift is None:
+            if getattr(model, "model_family", "anima") == "krea2":
+                from trainer.model_family import krea2_sample_shift
+                shift = krea2_sample_shift(height, width)
+            else:
+                shift = 3.0
         _sched = str(scheduler).lower()
         if _sched == "beta":
-            sigmas = _flow_sigmas_beta(steps, shift=3.0, device=device)
+            sigmas = _flow_sigmas_beta(steps, shift=float(shift), device=device)
         else:
             if _sched != "simple":
                 logger.warning(f"采样 scheduler={scheduler} 未实现，回退 simple")
-            sigmas = _flow_sigmas_simple(steps, shift=3.0, device=device)
+            sigmas = _flow_sigmas_simple(steps, shift=float(shift), device=device)
 
         # 初始化噪声（ComfyUI CONST.noise_scaling: x = sigma*noise + (1-sigma)*latent_image；txt2img latent_image=0）
         if seed is not None:
@@ -376,13 +396,17 @@ def sample_image(
             logger.info(f"[Debug] VAE scale: mean_shape={m.shape}, std_inv_shape={s.shape}")
             logger.info(f"[Debug] VAE scale values: mean={m.mean().item():.4f}, std_inv={s.mean().item():.4f}")
 
-        # 默认负面提示词 (参考 Anima Prompt Guide)
+        # 默认负面提示词：anima 参考 Anima Prompt Guide；krea2 对齐官方（空负面，
+        # danbooru 风格质量 tag 对 krea2 语义未知，不做默认注入）。
         if negative_prompt is None:
-            negative_prompt = (
-                "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, "
-                "bad anatomy, bad hands, bad feet, missing fingers, extra fingers, text, watermark, "
-                "logo, signature, username, artist name, copyright name"
-            )
+            if getattr(model, "model_family", "anima") == "krea2":
+                negative_prompt = ""
+            else:
+                negative_prompt = (
+                    "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, "
+                    "bad anatomy, bad hands, bad feet, missing fingers, extra fingers, text, watermark, "
+                    "logo, signature, username, artist name, copyright name"
+                )
 
         # 文本编码（cond + uncond，复用 _encode_text）
         try:

@@ -1069,19 +1069,46 @@ def main():
             _auto_max = max(_auto_max, _native_auto)
     max_img_h = int(_user_max_h) if _user_max_h and int(_user_max_h) > 0 else _auto_max
     max_img_w = int(_user_max_w) if _user_max_w and int(_user_max_w) > 0 else _auto_max
-    logger.info("加载 Transformer...")
-    model = load_anima_model(
-        args.transformer, device, dtype, repo_root,
-        max_img_h=max_img_h, max_img_w=max_img_w,
+    # ── 模型族（model family）选择：默认 anima（行为与历史逐一等价），krea2 opt-in ──
+    from trainer.model_family import (
+        get_model_family, validate_family_compat, load_krea2_model,
+        load_krea2_text_encoder, encode_krea2_text, krea2_pack_text,
+        krea2_shift_timesteps, family_default_lora_targets,
+        set_krea2_text_cache, reset_krea2_text_cache,
     )
+    model_family = get_model_family(args)
+    is_krea2 = model_family == "krea2"
+    validate_family_compat(args, model_family)
+    if is_krea2:
+        logger.info("model_family=krea2（Krea 2 单流 MMDiT；文本通道 Qwen3-VL 多层特征）")
+
+    logger.info("加载 Transformer...")
+    krea2_te = None
+    if is_krea2:
+        model = load_krea2_model(
+            args.transformer, device, dtype, repo_root,
+            max_img_h=max_img_h, max_img_w=max_img_w,
+        )
+    else:
+        model = load_anima_model(
+            args.transformer, device, dtype, repo_root,
+            max_img_h=max_img_h, max_img_w=max_img_w,
+        )
 
     logger.info("加载 VAE...")
     vae = load_vae(args.vae, device, dtype, repo_root)
 
     logger.info("加载文本编码器...")
-    qwen_model, qwen_tok, t5_tok = load_text_encoders(
-        args.qwen, args.t5_tokenizer, device, dtype
-    )
+    if is_krea2:
+        # Krea2：Qwen3-VL-4B 单通道；qwen/t5 句柄置 None，所有用点都走 family 分支
+        krea2_te = load_krea2_text_encoder(
+            getattr(args, "krea2_text_encoder", ""), device, dtype
+        )
+        qwen_model = qwen_tok = t5_tok = None
+    else:
+        qwen_model, qwen_tok, t5_tok = load_text_encoders(
+            args.qwen, args.t5_tokenizer, device, dtype
+        )
 
     # ★ Text encode cache：caption 在训练中是否会变？
     # - shuffle_caption / tag_dropout / caption_dropout_rate / freq_balanced_dropout 任一开启
@@ -1097,8 +1124,14 @@ def main():
         from trainer.text_encode import set_text_encode_cache_enabled, reset_text_encode_cache
         reset_text_encode_cache()
         set_text_encode_cache_enabled(_caption_is_static)
+        if is_krea2:
+            # Krea2 的文本特征条目大（[L,12,2560]，压缩后典型 tag caption 也有若干 MB），
+            # cache 容量单独控制；caption 动态时同样禁用。
+            _k2_cap = int(getattr(args, "krea2_text_cache_entries", 128) or 128)
+            reset_krea2_text_cache()
+            set_krea2_text_cache(_caption_is_static, cap=_k2_cap)
         if _caption_is_static:
-            logger.info("[text-encode] caption 静态（无 shuffle / dropout），启用编码 LRU cache（命中即跳过 Qwen forward）")
+            logger.info("[text-encode] caption 静态（无 shuffle / dropout），启用编码 LRU cache（命中即跳过文本编码 forward）")
         else:
             logger.info("[text-encode] caption 启用了 shuffle / dropout，禁用编码 cache（命中率会很低）")
     except Exception as _e:
@@ -1139,6 +1172,13 @@ def main():
         if raw_targets:
             injector_kwargs["targets"] = raw_targets
             logger.info("LoRA targets: %s", ", ".join(raw_targets))
+    if "targets" not in injector_kwargs:
+        # 用户没显式给 targets → 按 family 取默认（anima=None → 注入器 DEFAULT_TARGETS；
+        # krea2=官方推荐"DiT 全部 Linear"，与 musubi/作者默认一致）
+        _fam_targets = family_default_lora_targets(model_family)
+        if _fam_targets:
+            injector_kwargs["targets"] = _fam_targets
+            logger.info("LoRA targets (krea2 默认，全部 Linear): %s", ", ".join(_fam_targets))
 
     # 模块级 rank/lr 控制
     reg_dims = getattr(args, "lora_reg_dims", None)
@@ -2217,7 +2257,7 @@ def main():
         s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
         s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
         img = _sample_with_vae_swap(
-            model, vae, qwen_model, qwen_tok, t5_tok,
+            model, vae, (krea2_te if is_krea2 else qwen_model), qwen_tok, t5_tok,
             prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
             negative_prompt=(s_neg or None),
             sampler_name=s_sampler,
@@ -2273,7 +2313,7 @@ def main():
             if s_seed:
                 torch.manual_seed(s_seed + i)
             img = _sample_with_vae_swap(
-                model, vae, qwen_model, qwen_tok, t5_tok,
+                model, vae, (krea2_te if is_krea2 else qwen_model), qwen_tok, t5_tok,
                 prompt, height=s_h, width=s_w, steps=s_steps, cfg_scale=s_cfg,
                 negative_prompt=(s_neg or None),
                 sampler_name=s_sampler,
@@ -2657,17 +2697,24 @@ def main():
                     if _elat_i.dim() == 4:
                         _elat_i = _elat_i.unsqueeze(0)          # [1,C,T,h,w]
                     _ecap = _eb["captions"][_bi]
-                    _eq_emb, _eq_attn = encode_qwen(qwen_model, qwen_tok,
-                                                    [_build_qwen_text_from_prompt(_ecap)], device)
-                    _et5_ids, _et5_attn, _et5_w = tokenize_t5_weighted(t5_tok, [_ecap], max_length=512)
-                    _ecross = model.preprocess_text_embeds(
-                        _eq_emb, _et5_ids.to(device), _et5_attn.to(device), _eq_attn)
-                    if (getattr(args, "use_t5_token_weights", True)
-                            and getattr(model, "llm_adapter", None) is not None
-                            and _ecross.shape[1] == _et5_w.shape[1]):
-                        _ecross = _ecross * _et5_w.to(device, dtype=torch.float32).to(_ecross.dtype).unsqueeze(-1)
-                    if _ecross.shape[1] < 512:
-                        _ecross = F.pad(_ecross, (0, 0, 0, 512 - _ecross.shape[1]))
+                    if is_krea2:
+                        # B=1 编码结果即"压缩到有效 token"（无 padding → 前向无需 mask），
+                        # 与训练/采样条件一致。
+                        _ecross, _ = encode_krea2_text(
+                            krea2_te, [_ecap], device,
+                            max_length=int(getattr(args, "krea2_text_max_length", 512) or 512))
+                    else:
+                        _eq_emb, _eq_attn = encode_qwen(qwen_model, qwen_tok,
+                                                        [_build_qwen_text_from_prompt(_ecap)], device)
+                        _et5_ids, _et5_attn, _et5_w = tokenize_t5_weighted(t5_tok, [_ecap], max_length=512)
+                        _ecross = model.preprocess_text_embeds(
+                            _eq_emb, _et5_ids.to(device), _et5_attn.to(device), _eq_attn)
+                        if (getattr(args, "use_t5_token_weights", True)
+                                and getattr(model, "llm_adapter", None) is not None
+                                and _ecross.shape[1] == _et5_w.shape[1]):
+                            _ecross = _ecross * _et5_w.to(device, dtype=torch.float32).to(_ecross.dtype).unsqueeze(-1)
+                        if _ecross.shape[1] < 512:
+                            _ecross = F.pad(_ecross, (0, 0, 0, 512 - _ecross.shape[1]))
                     _eval_set.append((_elat_i.clone(), _ecross.clone()))
         emit(f"[eval] 固定 eval 集就绪：{len(_eval_set)} 个样本")
 
@@ -2991,23 +3038,33 @@ def main():
             _stage_timer.stop_cpu("data_fetch")
             # 文本编码
             _stage_timer.start("text_encode")
+            cross_mask = None  # krea2 专用（[B,L] bool）；anima 恒 None
             with torch.no_grad():
-                # 参考指南/ComfyUI：Qwen 通道不传权重；T5 通道提供 token 权重
-                qwen_texts = [_build_qwen_text_from_prompt(c) for c in captions]
-                qwen_emb, qwen_attn = encode_qwen(qwen_model, qwen_tok, qwen_texts, device)
-                t5_ids, t5_attn, t5_w = tokenize_t5_weighted(t5_tok, captions, max_length=512)
-                t5_ids = t5_ids.to(device)
-                t5_attn = t5_attn.to(device)
-                t5_w = t5_w.to(device, dtype=torch.float32)
-                cross = model.preprocess_text_embeds(qwen_emb, t5_ids, t5_attn, qwen_attn)
-                if (
-                    getattr(args, "use_t5_token_weights", True)
-                    and getattr(model, "llm_adapter", None) is not None
-                    and cross.shape[1] == t5_w.shape[1]
-                ):
-                    cross = cross * t5_w.to(cross.dtype).unsqueeze(-1)
-                if cross.shape[1] < 512:
-                    cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
+                if is_krea2:
+                    # Krea2：Qwen3-VL 12 层堆叠 [B,L,12,D] + 有效位 mask（权重语法已剥离，
+                    # 无 T5 token 权重通道）。t5_attn/t5_w 不存在——navit 打包用 cross_mask。
+                    cross, cross_mask = encode_krea2_text(
+                        krea2_te, captions, device,
+                        max_length=int(getattr(args, "krea2_text_max_length", 512) or 512),
+                    )
+                    t5_attn = t5_w = None
+                else:
+                    # 参考指南/ComfyUI：Qwen 通道不传权重；T5 通道提供 token 权重
+                    qwen_texts = [_build_qwen_text_from_prompt(c) for c in captions]
+                    qwen_emb, qwen_attn = encode_qwen(qwen_model, qwen_tok, qwen_texts, device)
+                    t5_ids, t5_attn, t5_w = tokenize_t5_weighted(t5_tok, captions, max_length=512)
+                    t5_ids = t5_ids.to(device)
+                    t5_attn = t5_attn.to(device)
+                    t5_w = t5_w.to(device, dtype=torch.float32)
+                    cross = model.preprocess_text_embeds(qwen_emb, t5_ids, t5_attn, qwen_attn)
+                    if (
+                        getattr(args, "use_t5_token_weights", True)
+                        and getattr(model, "llm_adapter", None) is not None
+                        and cross.shape[1] == t5_w.shape[1]
+                    ):
+                        cross = cross * t5_w.to(cross.dtype).unsqueeze(-1)
+                    if cross.shape[1] < 512:
+                        cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
             _stage_timer.stop("text_encode")
 
             # Flow Matching：t 采样、噪声生成、目标计算
@@ -3045,6 +3102,24 @@ def main():
             # SD3 式 σ schedule shift：作用于所有模式的 t（含 uniform / mixed_*），
             # 把噪声混合用的 sigma 整体偏向高噪声端。1.0=禁用，向后兼容。
             t = apply_timestep_schedule_shift(t, sched_shift)
+            # ── Krea2 分辨率感知 shift（模型原生训练调度；krea2_res_shift=false 可关）──
+            # α=exp(mu(seq_len)) 施加在 base 分布之后（与 schedule_shift 同一挂点可叠加，
+            # 但同开会双重偏移——krea2 下建议 schedule_shift 留 1.0）。navit 逐图各自的
+            # token 数，dense 全批同一形状。mu 端点与官方 sampling.py 默认一致。
+            if is_krea2 and bool(getattr(args, "krea2_res_shift", True)):
+                _k2_minres = int(getattr(args, "krea2_shift_min_res", 256) or 256)
+                _k2_maxres = int(getattr(args, "krea2_shift_max_res", 1280) or 1280)
+                _k2_y1 = float(getattr(args, "krea2_shift_y1", 0.5))
+                _k2_y2 = float(getattr(args, "krea2_shift_y2", 1.15))
+                if navit_packing:
+                    _k2_toks = [
+                        (int(_l.shape[-2]) // 2) * (int(_l.shape[-1]) // 2)
+                        for _l in navit_latents
+                    ]
+                    t = krea2_shift_timesteps(t, _k2_toks, _k2_minres, _k2_maxres, _k2_y1, _k2_y2)
+                else:
+                    _k2_tok = (int(latents.shape[-2]) // 2) * (int(latents.shape[-1]) // 2)
+                    t = krea2_shift_timesteps(t, float(_k2_tok), _k2_minres, _k2_maxres, _k2_y1, _k2_y2)
             # t 值域截断（timestep_t_min/t_max；默认 0/1 = 历史 1e-4 行为）
             t = apply_t_range(t, objective_cfg.timestep.t_min, objective_cfg.timestep.t_max)
 
@@ -3114,7 +3189,13 @@ def main():
                     _G = len(navit_latents)
                     _stage_G = _G
                     _L = int(cross.shape[1])
-                    if bool(getattr(args, "navit_text_trim_padding", False)):
+                    if is_krea2:
+                        # Krea2 单流：每图段 = [有效 caption token ; image token]。
+                        # 压缩掉 padding 与官方 mask 屏蔽数学等价（text 无 RoPE、pad 作为
+                        # key 被 mask 后贡献恒 0）；navit_text_trim_padding 对 krea2 无意义
+                        # （没有"被训练进条件里的 512-pad"历史包袱）。
+                        cross_packed, text_seqlens = krea2_pack_text(cross, cross_mask)
+                    elif bool(getattr(args, "navit_text_trim_padding", False)):
                         # Variable-length text packing: each image contributes only its
                         # *valid* T5 tokens (mask sum), so block-diagonal cross-attn does
                         # no work on the 512-pad. Valid tokens are contiguous at the front
@@ -3174,6 +3255,27 @@ def main():
                         traj_sim_min=leap_traj_sim_min,
                     )
                     pred = None
+                elif is_krea2:
+                    # Krea2 dense：单流前向（内建 per-block checkpoint；TREAD 由
+                    # validate_family_compat 挡在启动期）。
+                    pred = model.forward_dense(
+                        noisy, t.view(-1, 1), cross,
+                        cross_mask=cross_mask,
+                        use_checkpoint=bool(args.grad_checkpoint),
+                    )
+                    lwd_w = None
+                    if objective_cfg.loss.lwd_enabled:
+                        lwd_w = lwd_saliency_mask(latents, t, objective_cfg.loss.lwd_floor)
+                    per_sample = per_sample_loss(
+                        pred,
+                        target,
+                        loss_type=objective_cfg.loss.loss_type,
+                        huber_c=objective_cfg.loss.huber_c,
+                        huber_schedule=objective_cfg.loss.huber_schedule,
+                        t=t.float(),
+                        huber_snr_clamp_max=objective_cfg.loss.huber_snr_clamp_max,
+                        weight_map=lwd_w,
+                    )
                 else:
                     pred = forward_with_optional_checkpoint(
                         model, noisy, t.view(-1, 1), cross, pad_mask,

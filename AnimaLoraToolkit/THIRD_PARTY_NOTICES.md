@@ -55,6 +55,19 @@
 - **本地改动**：移除了上游 ECC/backward monkey patch，改为训练循环显式注入聚合 loss；
   optimizer state 使用 fp32，以适配本项目的 bf16 LoRA/LoKr 训练。
 
+## Krea 2 (K2) MMDiT (Apache-2.0 代码 / Krea 2 Community License 权重)
+
+- **来源**：`krea-ai/krea-2` 官方推理实现（mmdit.py / encoder.py / sampling.py）；
+  技术报告 https://www.krea.ai/blog/krea-2-technical-report
+- **许可**：官方仓库代码为 Apache-2.0（见其 LICENSE.md）；模型权重
+  （krea/Krea-2-Raw、krea/Krea-2-Turbo）按 **Krea 2 Community License** 分发，
+  使用/部署须遵守其 Acceptable Use Policy —— 权重不随本仓库分发。
+- **涉及文件**：
+  - `models/krea2_modeling.py`（单流 MMDiT 训练移植；模块命名与官方一致以保证
+    checkpoint 直载，训练侧差异见该文件头部说明）
+  - `trainer/model_family.py`（Qwen3-VL 编码模板/常量、分辨率感知 timestep shift
+    公式移植自官方 encoder.py / sampling.py）
+
 ## Alibaba Wan2.1 VAE（请再次确认上游许可）
 
 - **来源**：`Wan-Video/Wan2.1` 的 VAE 实现（与 `wan/modules/vae.py` 对应）

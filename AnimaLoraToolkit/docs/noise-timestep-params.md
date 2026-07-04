@@ -466,6 +466,49 @@ loss = |amplitude(fft_pred) - amplitude(fft_target)|₁
 
 ---
 
+## 七.5、辅助 Loss — LPL（Latent Perceptual Loss）
+
+来源：*Boosting Latent Diffusion with Perceptual Objectives*（arXiv 2411.04873，Meta FAIR）。
+论文在 DDPM-ε/v 与 Flow Matching、256/512 分辨率、三个数据集上验证，FID +6~20%，
+定性收益即"更锐、纹理更真实"。注意：论文场景是全参数（继续）训练，**小数据 LoRA/LoKr
+微调下的收益无直接证据**，需 A/B 实测。
+
+### 机理
+
+latent-MSE（以及 latent 上的 FFT/wavelet 匹配）只关心 latent 数值逼近，与 decoder
+如何把 latent 映射为像素**脱节**——VAE latent 空间高度不规则，latent 的小偏差可能被
+decoder 放大成明显的质感/高频丢失。LPL 把 predicted x₀ 与 target x₀ 都过冻结 VAE
+decoder，在其**多尺度中间特征空间**（H/8→H 共 4 个分辨率 stage 的末个 ResidualBlock
+输出）做标准化后的 L2 匹配，梯度经 decoder 反传回 x₀_pred → LoRA。
+
+与 `aux_perceptual`（LPIPS/DINO）的区别：不需要 VGG/DINO 等外部模型（零额外下载/依赖），
+特征来自 VAE decoder 自身；与 `aux_spectral` 的区别：spectral 在 latent 上做频谱统计，
+LPL 在"更接近像素"的 decoder 特征上做逐点匹配，二者机理轴不同、可叠加。
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `aux_lpl_enabled` | false | 总开关（default-off，关闭时完全 no-op） |
+| `aux_lpl_lambda` | 0.1 | 权重。**保守起点、非论文值**（论文 w_LPL 在附录，正文未给；此处按仓库 aux 惯例取 0.1）。开训看日志把 LPL 项标定到主 loss 的 10~30% |
+| `aux_lpl_t_gate` | 0.6 | 只对 t < gate 的样本启用（论文按 SNR 硬门控，FM 线性调度下等价于 t 阈值；低噪端 x̂₀ 才有意义 + 省算力） |
+| `aux_lpl_outlier_k` | 8.0 | 标准化后 \|φ̂'\| > k 的特征元素不参与 loss（简化版 outlier 屏蔽；论文用 quantile+形态学操作）。0 = 关闭 |
+| `aux_lpl_use_checkpoint` | true | 把 decode(pred)+特征 loss 包进梯度检查点（同 `aux_perceptual_use_checkpoint` 的理由） |
+| `aux_lpl_num_scales` | 4 | 参与的 decoder 分辨率 stage 数（自低分辨率端起）。4=含全分辨率 tap（特征显存大头）；超大图预算紧张时降 3（显存约减半） |
+
+### 代价与注意
+
+- 每个过 gate 的样本 ≈ **2 次 VAE decoder 前向**（target 侧 no_grad + pred 侧带梯度，
+  checkpoint 下 backward 再重放一次 pred 侧）。t_gate=0.6 且三峰采样偏高噪时，
+  实际命中率 ≈ 低噪+部分中噪路由比例。
+- `lpl_enabled=true` 时 VAE 自动保留在 GPU（同 perceptual 的 offload 逻辑）。
+- NaViT 打包下逐图生效（与 spectral/perceptual 同一套逐图 unpatchify 路径）。
+- 实现上与论文的两处已知偏离（都只影响 λ 标定，不影响梯度方向，见 aux_losses.py 注释）：
+  ① 空间维取均值而非求和（navit 变尺寸图之间 per-image loss 可比）；
+  ② outlier 屏蔽用硬阈值替代 quantile+形态学。
+
+---
+
 ## 八、其他已实现参数
 
 ### `freq_balanced_dropout_strength`

@@ -77,6 +77,24 @@ class AuxLossConfig:
     #   捕获纹理/细节相似度，对 1024 原图的差异不明显。
     perceptual_lpips_size: int = 0
 
+    # ---- LPL: Latent Perceptual Loss (arXiv 2411.04873) ----
+    # 用冻结 VAE decoder 的**中间特征**做感知目标：把 predicted x₀ 与 target x₀ 都
+    # 过 decoder，在各分辨率 stage 的特征空间做（标准化后的）L2 匹配。专治 latent-MSE
+    # 与像素观感脱节导致的高频/质感丢失。零外部模型（只用已加载的 VAE），零推理开销。
+    # 成本：每个过 t-gate 的样本 ≈ 2 次 VAE decoder 前向（target 无梯度）。
+    lpl_enabled: bool = False
+    lpl_lambda: float = 0.1
+    # 论文按 SNR 硬门控（σ_t ≤ τ_σ 才启用；FM 线性调度下即 t ≤ τ）。语义同其它 aux 的 t_gate。
+    lpl_t_gate: float = 0.6
+    # 离群特征屏蔽：标准化后 |φ̂'| > k 的元素不参与 loss（0 = 关闭）。
+    # 论文用 quantile+形态学操作做 outlier detection（附录）；这里用简化的硬阈值实现。
+    lpl_outlier_k: float = 8.0
+    # 与 perceptual_use_checkpoint 同理：把「decode(pred) + 特征 loss」包进梯度检查点。
+    lpl_use_checkpoint: bool = True
+    # 参与的 decoder 分辨率 stage 数（从最低分辨率 H/8 起）。4 = 全部（含全分辨率 tap，
+    # 特征显存最大）；3 = 去掉全分辨率 tap，显存约减半，超大图预算紧张时用。
+    lpl_num_scales: int = 4
+
     # ---- Self-Perceptual SFT (arXiv 2401.00110) ----
     # 冻结 DiT 编码栈特征空间距离 ‖f(x0_pred) − f(x0_target)‖²，当带 t_gate 的 SFT 辅助项叠进
     # 主 loss。复用 trainer/ncp.py:perceptual_features（编码器=当前模型、adapter 冻梯度），
@@ -91,11 +109,12 @@ class AuxLossConfig:
 
     @property
     def any_enabled(self) -> bool:
-        return self.spectral_enabled or self.perceptual_enabled or self.self_perceptual_enabled
+        return (self.spectral_enabled or self.perceptual_enabled
+                or self.self_perceptual_enabled or self.lpl_enabled)
 
     @property
     def needs_vae_decoder(self) -> bool:
-        return self.perceptual_enabled
+        return self.perceptual_enabled or self.lpl_enabled
 
 
 def build_aux_loss_config(args) -> AuxLossConfig:
@@ -115,6 +134,12 @@ def build_aux_loss_config(args) -> AuxLossConfig:
         perceptual_cache_dir=str(getattr(args, "aux_perceptual_cache_dir", "") or ""),
         perceptual_use_checkpoint=bool(getattr(args, "aux_perceptual_use_checkpoint", True)),
         perceptual_lpips_size=int(getattr(args, "aux_perceptual_lpips_size", 0) or 0),
+        lpl_enabled=bool(getattr(args, "aux_lpl_enabled", False)),
+        lpl_lambda=float(getattr(args, "aux_lpl_lambda", 0.1) or 0.0),
+        lpl_t_gate=float(getattr(args, "aux_lpl_t_gate", 0.6) or 0.6),
+        lpl_outlier_k=float(getattr(args, "aux_lpl_outlier_k", 8.0) or 0.0),
+        lpl_use_checkpoint=bool(getattr(args, "aux_lpl_use_checkpoint", True)),
+        lpl_num_scales=int(getattr(args, "aux_lpl_num_scales", 4) or 4),
         self_perceptual_enabled=bool(getattr(args, "aux_self_perceptual_enabled", False)),
         self_perceptual_lambda=float(getattr(args, "aux_self_perceptual_lambda", 0.1) or 0.0),
         self_perceptual_t_gate=float(getattr(args, "aux_self_perceptual_t_gate", 0.5) or 0.5),
@@ -574,6 +599,191 @@ class PerceptualLossModule(torch.nn.Module):
 
 
 # ============================================================================
+# LPL: Latent Perceptual Loss (arXiv 2411.04873)
+# ============================================================================
+
+class LatentPerceptualLossModule(torch.nn.Module):
+    """LPL：在冻结 VAE decoder 的中间特征空间对齐 predicted x₀ 与 target x₀。
+
+    论文：Boosting Latent Diffusion with Perceptual Objectives (arXiv 2411.04873, Meta)。
+    机理：latent-MSE 训练与 decoder 脱节 → 生成图丢高频/质感；把 decoder 的多尺度中间
+    特征拉进目标，梯度经 decoder 反传回 x0_pred → LoRA。论文在 DDPM-ε/v 与 Flow Matching
+    上均验证（FID +6~20%），卖点即"sharper, more realistic textures"。
+
+    与 PerceptualLossModule（LPIPS/DINO）的区别：不需要任何外部模型（VGG/DINO），
+    只用已加载的 VAE decoder 本身；特征取自 decoder 各分辨率 stage 末个 ResidualBlock
+    的输出（Resample 前），共 lpl_num_scales 层（从 H/8 到 H）。
+
+    实现要点（对照论文 Eq.3）：
+      - 逐层逐通道标准化，统计量取自 **pred 侧特征**（论文 3.2 Normalization：用同一套
+        统计归一化两个张量，避免"值预测对了但统计不同→非零梯度"），且 detach。
+      - ω_l = r_1/r_l：分辨率每翻倍权重减半（论文 Depth-specific weighting）。
+      - outlier 屏蔽：论文用 quantile+形态学操作（附录，正文未给全）；此处**简化**为
+        标准化后 |φ̂'| > lpl_outlier_k 的元素置 0，语义一致（防 decoder 特征离群值
+        主导梯度）。k=0 关闭。
+      - 论文对空间维求和、按 C_l 归一；我们改成对 (C,h,w) 取均值——navit 下不同图
+        尺寸差异大，均值使 per-image loss 跨尺寸可比（**与论文的偏离**，仅影响
+        λ 的标定，不影响梯度方向）。
+      - t-gate：论文按 SNR 硬门控只在低噪端启用（x̂₀ 有意义 + 省算力）。
+
+    ⚠ 使用前提同 PerceptualLossModule：VAE.model 不能 offload 到 CPU
+    （aux_cfg.needs_vae_decoder 已包含 lpl_enabled，anima_train.py 的 offload 逻辑自动处理）。
+    """
+
+    def __init__(self, vae_wrapper, cfg: AuxLossConfig, device, compute_dtype=torch.bfloat16):
+        super().__init__()
+        self.cfg = cfg
+        self.vae_wrapper = vae_wrapper  # 同 PerceptualLossModule：不注册为子 module
+        self.compute_dtype = compute_dtype
+        self.device = device
+
+        if hasattr(vae_wrapper, "model"):
+            for p in vae_wrapper.model.parameters():
+                p.requires_grad_(False)
+            vae_wrapper.model.eval()
+
+        decoder = vae_wrapper.model.decoder
+        ups = list(decoder.upsamples)
+        # 每个分辨率 stage 的末个 ResidualBlock = 各 Resample 的前一个模块；最后一个
+        # stage 没有 Resample，取序列末元素。用类名匹配（vae2_1.py 经 load_module_from_path
+        # 动态加载，isinstance 跨加载路径不可靠）。
+        stage_end_idx = [i - 1 for i, m in enumerate(ups)
+                         if m.__class__.__name__ == "Resample"] + [len(ups) - 1]
+        stage_end_idx = [i for i in stage_end_idx if i >= 0]
+        if not stage_end_idx:
+            raise RuntimeError("LPL: 在 VAE decoder.upsamples 中未找到任何 stage 边界（Resample）")
+        n_scales = max(1, min(int(cfg.lpl_num_scales), len(stage_end_idx)))
+        # 从最低分辨率端起取 n_scales 层（截掉的是最高分辨率 tap，显存大头）
+        self._tap_idx = stage_end_idx[:n_scales]
+        self._tap_modules = [ups[i] for i in self._tap_idx]
+        logger.info(
+            "LPL taps: decoder.upsamples[%s]（%d/%d 个分辨率 stage）",
+            ",".join(str(i) for i in self._tap_idx), n_scales, len(stage_end_idx),
+        )
+
+    def _decode_features(self, x0_latent: torch.Tensor, with_grad: bool) -> list[torch.Tensor]:
+        """decode 一遍，经 forward hook 收集各 tap 的特征（5D → squeeze T）。
+
+        hook 只在本次 decode 期间注册，不影响训练中其它 decode（采样出图等）。
+        返回 compute_dtype 特征列表（fp32 转换推迟到 loss 内逐层做，省峰值显存）。
+        """
+        if x0_latent.ndim == 4:
+            z = x0_latent.unsqueeze(2)
+        else:
+            z = x0_latent
+        z = z.to(dtype=self.compute_dtype)
+
+        feats: list[torch.Tensor] = []
+        hooks = [m.register_forward_hook(lambda _m, _i, out: feats.append(out))
+                 for m in self._tap_modules]
+        try:
+            ctx = contextlib.nullcontext() if with_grad else torch.no_grad()
+            with ctx, torch.autocast("cuda", dtype=self.compute_dtype):
+                self.vae_wrapper.model.decode(z, self.vae_wrapper.scale)
+        finally:
+            for h in hooks:
+                h.remove()
+
+        if len(feats) != len(self._tap_modules):
+            # 图像 T=1 时 decode 循环恰好一轮、每个 hook 触发一次；否则说明喂了视频
+            raise RuntimeError(
+                f"LPL: hook 触发次数 {len(feats)} != tap 数 {len(self._tap_modules)}"
+                "（仅支持单帧图像 latent，T 必须为 1）"
+            )
+        out = []
+        for f in feats:
+            if f.ndim == 5:
+                f = f.squeeze(2)
+            out.append(f)
+        return out
+
+    def _lpl_from_feats(self, feats_pred: list[torch.Tensor],
+                        feats_target: list[torch.Tensor]) -> torch.Tensor:
+        """论文 Eq.3：Σ_l ω_l · mean_{c,h,w} ‖ρ ⊙ (φ' − φ̂')‖²，返回 per-sample [B]。"""
+        k = float(self.cfg.lpl_outlier_k)
+        r1 = float(feats_pred[0].shape[-1])
+        total = None
+        for fp, ft in zip(feats_pred, feats_target):
+            fp = fp.float()
+            ft = ft.float()
+            # 标准化统计量取 pred 侧（detach），两个张量共用同一套（论文 Normalization）
+            mu = fp.detach().mean(dim=(-2, -1), keepdim=True)
+            sd = fp.detach().std(dim=(-2, -1), keepdim=True).clamp_min(1e-5)
+            fpn = (fp - mu) / sd
+            ftn = (ft - mu) / sd
+            diff = ftn - fpn
+            if k > 0:
+                mask = (fpn.detach().abs() <= k).to(diff.dtype)
+                diff = diff * mask
+            per_sample = diff.square().mean(dim=(1, 2, 3))  # [B]
+            w_l = r1 / float(fp.shape[-1])  # ω_l = r_1/r_l：分辨率翻倍权重减半
+            term = w_l * per_sample
+            total = term if total is None else total + term
+        return total
+
+    def _compute_pred_against_target(self, x0_pred: torch.Tensor,
+                                     feats_target: list[torch.Tensor]) -> torch.Tensor:
+        """checkpoint 内部路径：decode(pred) + 特征 loss（target 特征闭包传入，不重跑）。"""
+        feats_pred = self._decode_features(x0_pred, with_grad=True)
+        return self._lpl_from_feats(feats_pred, feats_target)
+
+    def forward(self, x0_pred: torch.Tensor, x0_target: torch.Tensor,
+                t: torch.Tensor) -> torch.Tensor:
+        """λ_lpl · LPL，对 t < lpl_t_gate 样本做平均。navit 逐图路径（B=1）也走这里。"""
+        per_sample = self.forward_per_sample(x0_pred, x0_target, t)
+        active = t.float() < float(self.cfg.lpl_t_gate)
+        if not bool(active.any()):
+            return x0_pred.new_zeros((), dtype=torch.float32)
+        return per_sample.index_select(0, active.nonzero(as_tuple=False).flatten()).mean()
+
+    def forward_per_sample(self, x0_pred: torch.Tensor, x0_target: torch.Tensor,
+                           t: torch.Tensor) -> torch.Tensor:
+        """Return per-sample LPL loss（λ 已乘），inactive 样本为 0。
+
+        结构与 PerceptualLossModule.forward_per_sample 对称：
+        target 特征在 checkpoint 边界外 no_grad 逐样本预计算（backward replay 直接复用）；
+        pred 的 decode + loss 在 checkpoint 内逐样本跑，显存 ≈ 单样本 decode 峰值。
+        """
+        out = x0_pred.new_zeros((x0_pred.shape[0],), dtype=torch.float32)
+        if not self.cfg.lpl_enabled:
+            return out
+
+        active = t.float() < float(self.cfg.lpl_t_gate)
+        if not bool(active.any()):
+            return out
+
+        active_idx = active.nonzero(as_tuple=False).flatten()
+        x0_pred_active = x0_pred.index_select(0, active_idx)
+        x0_target_active = x0_target.index_select(0, active_idx)
+        B = x0_pred_active.shape[0]
+
+        if self.cfg.lpl_use_checkpoint and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint
+
+            per_sample_list = []
+            for i in range(B):
+                with torch.no_grad():
+                    feats_t_i = self._decode_features(
+                        x0_target_active[i:i + 1], with_grad=False)
+
+                def _heavy_i(x, _feats_t=feats_t_i):
+                    return self._compute_pred_against_target(x, _feats_t)
+
+                l_i = checkpoint(_heavy_i, x0_pred_active[i:i + 1], use_reentrant=False)
+                per_sample_list.append(l_i)
+                del feats_t_i
+            per_sample = torch.cat(per_sample_list, dim=0)
+        else:
+            with torch.no_grad():
+                feats_t = self._decode_features(x0_target_active, with_grad=False)
+            feats_p = self._decode_features(x0_pred_active, with_grad=True)
+            per_sample = self._lpl_from_feats(feats_p, feats_t)
+
+        out.index_copy_(0, active_idx, float(self.cfg.lpl_lambda) * per_sample.float())
+        return out
+
+
+# ============================================================================
 # 一些便利的 logging
 # ============================================================================
 
@@ -592,6 +802,11 @@ def summary_aux_loss_config(cfg: AuxLossConfig) -> str:
             f"λ_dino={cfg.perceptual_lambda_dino:.3f},"
             f"gate={cfg.perceptual_t_gate:.2f},"
             f"net={cfg.perceptual_lpips_net})"
+        )
+    if cfg.lpl_enabled:
+        parts.append(
+            f"lpl(λ={cfg.lpl_lambda:.3f},gate={cfg.lpl_t_gate:.2f},"
+            f"scales={cfg.lpl_num_scales},outlier_k={cfg.lpl_outlier_k:.1f})"
         )
     if cfg.self_perceptual_enabled:
         parts.append(

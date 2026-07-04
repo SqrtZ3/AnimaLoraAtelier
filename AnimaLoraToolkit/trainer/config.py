@@ -325,6 +325,12 @@ YAML_TO_ARGS = {
     "aux_perceptual_cache_dir": "aux_perceptual_cache_dir",
     "aux_perceptual_use_checkpoint": "aux_perceptual_use_checkpoint",
     "aux_perceptual_lpips_size": "aux_perceptual_lpips_size",
+    "aux_lpl_enabled": "aux_lpl_enabled",
+    "aux_lpl_lambda": "aux_lpl_lambda",
+    "aux_lpl_t_gate": "aux_lpl_t_gate",
+    "aux_lpl_outlier_k": "aux_lpl_outlier_k",
+    "aux_lpl_use_checkpoint": "aux_lpl_use_checkpoint",
+    "aux_lpl_num_scales": "aux_lpl_num_scales",
     # ── GAF 梯度一致性过滤（脏数据鲁棒性 B1；默认关）──
     "gaf_enabled": "gaf_enabled",
     "gaf_every": "gaf_every",
@@ -684,6 +690,16 @@ DEFAULTS = {
     "aux_perceptual_cache_dir": "",
     "aux_perceptual_use_checkpoint": True,
     "aux_perceptual_lpips_size": 0,
+    # LPL：Latent Perceptual Loss（arXiv 2411.04873，默认关 → no-op）。冻结 VAE decoder
+    # 中间特征空间对齐 pred/target x₀，专治 latent-MSE 丢高频质感。零外部模型；
+    # 成本 ≈ 每个过 gate 样本 2 次 VAE decode。λ=0.1 是保守起点（论文未在小数据 LoRA
+    # 场景验证，需 A/B 标定，开训看日志目标 ≈ 主 loss 的 10–30%）。
+    "aux_lpl_enabled": False,
+    "aux_lpl_lambda": 0.1,
+    "aux_lpl_t_gate": 0.6,
+    "aux_lpl_outlier_k": 8.0,
+    "aux_lpl_use_checkpoint": True,
+    "aux_lpl_num_scales": 4,
     # Self-Perceptual SFT（arXiv 2401.00110，默认关 → no-op）。冻结 DiT 编码栈特征空间距离，
     # 罚"糊/不像"（均值回归）比 latent-MSE 狠。复用 ncp.perceptual_features（编码器=当前模型、
     # adapter 冻梯度）；λ 起 0.05–0.1 且开训看日志标定（特征空间量纲未知，目标 ≈ 主 loss 的 10–30%）。

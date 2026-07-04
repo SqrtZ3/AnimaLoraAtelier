@@ -299,6 +299,7 @@ from trainer.aux_losses import (
     spectral_loss,
     spectral_loss_per_sample,
     PerceptualLossModule,
+    LatentPerceptualLossModule,
     summary_aux_loss_config,
 )
 from trainer.data import (
@@ -1760,7 +1761,7 @@ def main():
     aux_cfg = build_aux_loss_config(args)
     if navit_packing and getattr(aux_cfg, "self_perceptual_enabled", False):
         raise RuntimeError(
-            "navit_packing(v1) 的逐图 aux 暂只支持 spectral / perceptual（作用在 x0 网格上）；"
+            "navit_packing(v1) 的逐图 aux 暂只支持 spectral / perceptual / lpl（作用在 x0 网格上）；"
             "self-perceptual 需要逐图额外模型前向，尚未在 NaViT 下适配。请关闭 self-perceptual。"
         )
     if navit_packing and aux_cfg.any_enabled:
@@ -1845,7 +1846,19 @@ def main():
             # ★ 同步禁用 args，否则下面 build_training_objective_config(args).aux 仍会带着
             #    perceptual_enabled=True，训练循环会再次进入 perceptual 分支但 module=None。
             args.aux_perceptual_enabled = False
-    elif aux_cfg.spectral_enabled:
+    # ── LPL 模块（arXiv 2411.04873；冻结 VAE decoder 中间特征感知目标）────────
+    # 零外部依赖（只用已加载的 VAE），构建失败即配置/环境 bug，直接 fail-fast 不静默降级。
+    lpl_module = None
+    if aux_cfg.lpl_enabled:
+        lpl_module = LatentPerceptualLossModule(
+            vae_wrapper=vae,
+            cfg=aux_cfg,
+            device=device,
+            compute_dtype=dtype,
+        )
+        logger.info("LatentPerceptualLossModule 构建完成: %s", summary_aux_loss_config(aux_cfg))
+
+    if aux_cfg.spectral_enabled and not aux_cfg.perceptual_enabled and not aux_cfg.lpl_enabled:
         logger.info("辅助 loss 配置: %s", summary_aux_loss_config(aux_cfg))
 
     # 优化器
@@ -3475,6 +3488,7 @@ def main():
                 _max_gate = max(
                     _aux.spectral_t_gate if _aux.spectral_enabled else 0.0,
                     _aux.perceptual_t_gate if _aux.perceptual_enabled else 0.0,
+                    _aux.lpl_t_gate if _aux.lpl_enabled else 0.0,
                     _aux.self_perceptual_t_gate if _aux.self_perceptual_enabled else 0.0,
                 )
                 # 一次 .tolist() 拿全部逐样本判定（镜像 navit aux 侧的做法）：
@@ -3521,6 +3535,14 @@ def main():
                         else:
                             l_perc = perceptual_module(x0_pred, x0_target, t_aux)
                             aux_total = aux_total + l_perc
+
+                    # LPL（λ 已在模块内乘，与 perceptual 同约定）
+                    if _aux.lpl_enabled and lpl_module is not None:
+                        if sample_accum_enabled:
+                            l_lpl_vec = lpl_module.forward_per_sample(x0_pred, x0_target, t_aux)
+                            aux_total = aux_total + l_lpl_vec.sum() / float(effective_batch_size)
+                        else:
+                            aux_total = aux_total + lpl_module(x0_pred, x0_target, t_aux)
 
                     # ── Self-Perceptual SFT（arXiv 2401.00110）──────────────────────
                     # 冻结编码栈特征空间度量 x0_pred ↔ 真 x0，罚"糊/不像"（forward-KL 均值回归）。
@@ -3584,6 +3606,7 @@ def main():
                 _max_gate = max(
                     _aux.spectral_t_gate if _aux.spectral_enabled else 0.0,
                     _aux.perceptual_t_gate if _aux.perceptual_enabled else 0.0,
+                    _aux.lpl_t_gate if _aux.lpl_enabled else 0.0,
                 )
                 _size_list = _navit_info["size_list"]
                 _noisy_list = _navit_info["noisy_grid_list"]
@@ -3603,6 +3626,8 @@ def main():
                             aux_total = aux_total + float(_aux.spectral_lambda) * spectral_loss(_x0p, _x0t, _t1, _aux)
                         if _aux.perceptual_enabled and perceptual_module is not None:
                             aux_total = aux_total + perceptual_module(_x0p, _x0t, _t1)
+                        if _aux.lpl_enabled and lpl_module is not None:
+                            aux_total = aux_total + lpl_module(_x0p, _x0t, _t1)
                         _n_aux += 1
                     _off += _n
                 if _n_aux > 0:

@@ -94,6 +94,12 @@ class AuxLossConfig:
     # 参与的 decoder 分辨率 stage 数（从最低分辨率 H/8 起）。4 = 全部（含全分辨率 tap，
     # 特征显存最大）；3 = 去掉全分辨率 tap，显存约减半，超大图预算紧张时用。
     lpl_num_scales: int = 4
+    # ★ decode 像素封顶（防 OOM 的关键旋钮）。VAE decode 到全分辨率的激活 ∝ 像素数；
+    #   navit 原生分辨率单图可达 3136² → decode 激活几十 GB。若某图 decode 像素
+    #   （=64·H_latent·W_latent）> 此阈值，则 decode 前把 pred/target 的 latent 同步
+    #   下采样到封顶（同尺寸→特征仍可比）。默认 1048576=1024²。0 = 不封顶（原始行为，
+    #   仅小图安全）。显存仍紧张就再降（768²=589824 / 512²=262144）。
+    lpl_max_decode_px: int = 1048576
 
     # ---- Self-Perceptual SFT (arXiv 2401.00110) ----
     # 冻结 DiT 编码栈特征空间距离 ‖f(x0_pred) − f(x0_target)‖²，当带 t_gate 的 SFT 辅助项叠进
@@ -140,6 +146,7 @@ def build_aux_loss_config(args) -> AuxLossConfig:
         lpl_outlier_k=float(getattr(args, "aux_lpl_outlier_k", 8.0) or 0.0),
         lpl_use_checkpoint=bool(getattr(args, "aux_lpl_use_checkpoint", True)),
         lpl_num_scales=int(getattr(args, "aux_lpl_num_scales", 4) or 4),
+        lpl_max_decode_px=int(getattr(args, "aux_lpl_max_decode_px", 1048576) or 0),
         self_perceptual_enabled=bool(getattr(args, "aux_self_perceptual_enabled", False)),
         self_perceptual_lambda=float(getattr(args, "aux_self_perceptual_lambda", 0.1) or 0.0),
         self_perceptual_t_gate=float(getattr(args, "aux_self_perceptual_t_gate", 0.5) or 0.5),
@@ -661,6 +668,26 @@ class LatentPerceptualLossModule(torch.nn.Module):
             ",".join(str(i) for i in self._tap_idx), n_scales, len(stage_end_idx),
         )
 
+    def _maybe_downscale_latent(self, z: torch.Tensor) -> torch.Tensor:
+        """decode 像素封顶：latent (8×下采样) 对应 pixel = 64·H·W。超阈值则在 latent
+        上等比下采样到封顶（bilinear，可微，pred/target 同输入尺寸→同输出尺寸→特征可比）。
+
+        z: [B, C, 1, H, W]（已 unsqueeze T）。返回同 rank，空间维可能变小。
+        """
+        max_px = int(self.cfg.lpl_max_decode_px)
+        if max_px <= 0:
+            return z
+        H, W = int(z.shape[-2]), int(z.shape[-1])
+        px = 64 * H * W
+        if px <= max_px:
+            return z
+        scale = (max_px / px) ** 0.5
+        new_h = max(2, int(round(H * scale)))
+        new_w = max(2, int(round(W * scale)))
+        z4 = z.squeeze(2)  # [B,C,H,W]
+        z4 = F.interpolate(z4, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        return z4.unsqueeze(2)
+
     def _decode_features(self, x0_latent: torch.Tensor, with_grad: bool) -> list[torch.Tensor]:
         """decode 一遍，经 forward hook 收集各 tap 的特征（5D → squeeze T）。
 
@@ -672,6 +699,7 @@ class LatentPerceptualLossModule(torch.nn.Module):
         else:
             z = x0_latent
         z = z.to(dtype=self.compute_dtype)
+        z = self._maybe_downscale_latent(z)
 
         feats: list[torch.Tensor] = []
         hooks = [m.register_forward_hook(lambda _m, _i, out: feats.append(out))
@@ -806,7 +834,8 @@ def summary_aux_loss_config(cfg: AuxLossConfig) -> str:
     if cfg.lpl_enabled:
         parts.append(
             f"lpl(λ={cfg.lpl_lambda:.3f},gate={cfg.lpl_t_gate:.2f},"
-            f"scales={cfg.lpl_num_scales},outlier_k={cfg.lpl_outlier_k:.1f})"
+            f"scales={cfg.lpl_num_scales},outlier_k={cfg.lpl_outlier_k:.1f},"
+            f"max_px={cfg.lpl_max_decode_px})"
         )
     if cfg.self_perceptual_enabled:
         parts.append(

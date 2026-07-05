@@ -495,6 +495,23 @@ LPL 在"更接近像素"的 decoder 特征上做逐点匹配，二者机理轴�
 | `aux_lpl_outlier_k` | 8.0 | 标准化后 \|φ̂'\| > k 的特征元素不参与 loss（简化版 outlier 屏蔽；论文用 quantile+形态学操作）。0 = 关闭 |
 | `aux_lpl_use_checkpoint` | true | 把 decode(pred)+特征 loss 包进梯度检查点（同 `aux_perceptual_use_checkpoint` 的理由） |
 | `aux_lpl_num_scales` | 4 | 参与的 decoder 分辨率 stage 数（自低分辨率端起）。4=含全分辨率 tap（特征显存大头）；超大图预算紧张时降 3（显存约减半） |
+| `aux_lpl_max_decode_px` | 1048576 | **decode 像素封顶（防 OOM 的关键旋钮）**。见下 |
+
+### ⚠ 显存：必须封顶 decode 分辨率
+
+VAE decode 到全分辨率的激活 ∝ 像素数。navit `native_resolution` 下单图可达 3136²
+（`max_bucket_reso: 3072` → `max_img_h≈392` latent），decode 激活几十 GB，叠加 navit
+主步（65536 token ≈ 40+ GB）会直接 OOM——**即便 70GB 显存**。这与 cache 阶段 encode
+超大图 spike（已用 `cache_encode_tiled` 解决）同源，但 decode 侧没有分块工具。
+
+`aux_lpl_max_decode_px` 给 LPL 一个 pixel 封顶：某图 decode 像素（=64·H_latent·W_latent）
+超阈值时，decode 前把 pred/target 的 latent **同步等比下采样**到封顶（同尺寸→特征仍可比，
+梯度经 bilinear 可微回传）。默认 1048576=1024²。显存仍紧张就再降：768²=589824、
+512²=262144。0 = 不封顶（仅小图/低分辨率训练安全）。
+
+代价：对被下采样的大图，LPL 在较低分辨率上做感知匹配，最高频颗粒会有衰减（本地实测
+颗粒尺度 2~6px，下采到 1024 后 ~1~4px 仍在，但 3136→1024 这种大压缩会更明显）。这是
+显存与高频保真的权衡；配合 `num_scales` 一起调。
 
 ### 代价与注意
 

@@ -331,6 +331,7 @@ YAML_TO_ARGS = {
     "aux_lpl_outlier_k": "aux_lpl_outlier_k",
     "aux_lpl_use_checkpoint": "aux_lpl_use_checkpoint",
     "aux_lpl_num_scales": "aux_lpl_num_scales",
+    "aux_lpl_max_decode_px": "aux_lpl_max_decode_px",
     # ── GAF 梯度一致性过滤（脏数据鲁棒性 B1；默认关）──
     "gaf_enabled": "gaf_enabled",
     "gaf_every": "gaf_every",
@@ -700,6 +701,7 @@ DEFAULTS = {
     "aux_lpl_outlier_k": 8.0,
     "aux_lpl_use_checkpoint": True,
     "aux_lpl_num_scales": 4,
+    "aux_lpl_max_decode_px": 1048576,
     # Self-Perceptual SFT（arXiv 2401.00110，默认关 → no-op）。冻结 DiT 编码栈特征空间距离，
     # 罚"糊/不像"（均值回归）比 latent-MSE 狠。复用 ncp.perceptual_features（编码器=当前模型、
     # adapter 冻梯度）；λ 起 0.05–0.1 且开训看日志标定（特征空间量纲未知，目标 ≈ 主 loss 的 10–30%）。

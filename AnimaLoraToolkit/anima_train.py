@@ -262,6 +262,7 @@ from trainer.objective import (
     AdaptiveTimestepSampler,
     make_noise,
     make_noise_from_config,
+    make_training_noise,
     _huber_delta_for_t,
     per_sample_loss,
     eisbach_barrier_weight,
@@ -2916,6 +2917,8 @@ def main():
             )
             _lt = apply_timestep_schedule_shift(_lt, objective_cfg.timestep.schedule_shift)
             _lt = apply_t_range(_lt, objective_cfg.timestep.t_min, objective_cfg.timestep.t_max)
+            # 梯度子空间/遥测探针：刻意用基础噪声（不套 immiscible）——避免每探针步多算
+            # k 倍候选噪声，且 immiscible 的偏置对子空间估计是二阶影响，保持基础分布更干净。
             _lnoise = make_noise_from_config(_llat, objective_cfg.noise)
             _lte = _lt.view(-1, 1, 1, 1, 1)
             _lnoisy = (1 - _lte) * _llat + _lte * _lnoise
@@ -3141,7 +3144,8 @@ def main():
             if not navit_packing:
                 t_exp = t.view(-1, 1, 1, 1, 1)
 
-                noise = make_noise_from_config(latents, objective_cfg.noise)
+                # immiscible(可选)：逐样本从 k 个候选噪声中选最近者；关闭时等价 make_noise_from_config
+                noise = make_training_noise(latents, objective_cfg.noise)
 
                 noisy = (1 - t_exp) * latents + t_exp * noise
                 target = noise - latents

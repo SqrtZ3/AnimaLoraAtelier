@@ -71,6 +71,13 @@ class NoiseConfig:
     random_offset_strength: bool = False
     pyramid_iterations: int = 0
     pyramid_discount: float = 0.3
+    # ── Improved Immiscible Diffusion（arXiv 2505.18521）KNN 噪声选择 ──
+    # 逐样本从 k 个候选高斯噪声中选与该样本 latent L2 距离最小者，缩短 flow 轨迹、
+    # 降低轨迹混合(miscibility) → 去噪目标更少歧义 → 收敛加速（论文 >4×，from-scratch 上验证）。
+    # per-sample、形状无关 → 与 NaViT 异形逐图打包兼容；k<=1 或 disabled 时等价标准噪声。
+    # 默认关 = no-op 向后兼容。作用点在真·训练加噪(dense/navit)；遥测梯度探针不受影响。
+    immiscible_enabled: bool = False
+    immiscible_k: int = 4
 
 
 @dataclass(frozen=True)
@@ -142,6 +149,8 @@ def build_training_objective_config(args) -> TrainingObjectiveConfig:
             random_offset_strength=bool(getattr(args, "noise_offset_random_strength", False)),
             pyramid_iterations=int(getattr(args, "pyramid_noise_iterations", 0) or 0),
             pyramid_discount=float(getattr(args, "pyramid_noise_discount", 0.3) or 0.3),
+            immiscible_enabled=bool(getattr(args, "immiscible_enabled", False)),
+            immiscible_k=int(getattr(args, "immiscible_k", 4) or 4),
         ),
         loss=LossConfig(
             loss_type=str(getattr(args, "loss_type", "mse") or "mse"),
@@ -628,6 +637,49 @@ def make_noise_from_config(latents: torch.Tensor, cfg: NoiseConfig) -> torch.Ten
         random_offset_strength=cfg.random_offset_strength,
         noise_offset_min=cfg.offset_min,
     )
+
+
+def select_immiscible_noise(latents: torch.Tensor, cfg: NoiseConfig, k: int) -> torch.Tensor:
+    """Improved Immiscible Diffusion (arXiv 2505.18521) 的 KNN 噪声选择变种。
+
+    机理：标准扩散训练把每张图扩散到整个噪声空间，不同图的轨迹在噪声层大量交叠
+    (miscibility)，去噪目标是"多图混合"→难优化。Immiscible 通过给每张图配一个**更近**
+    的噪声来降低这种混合。原版用 batch 内线性分配(Hungarian)，需要同形 batch；本仓库
+    NaViT 逐图异形打包无法做跨图分配，故采用论文 §「KNN noise selection」变种：
+
+      对每个样本独立地采 k 个候选高斯噪声，选与该样本 latent 的 L2 距离最小者。
+
+    这是 per-sample、形状无关的操作：对 navit 单图 [1,C,T,h,w] 与 dense batch
+    [B,C,T,H,W] 均适用。k<=1 直接退回标准噪声（无额外开销）。
+
+    候选噪声仍走 make_noise_from_config，从而保留既有 noise_offset / pyramid 语义
+    （每个候选各自加 offset/pyramid，再按到 latent 的距离择优）。
+
+    ⚠ 与线性分配不同，KNN 不保证 batch 内噪声互异（非双射），论文 §3 论证其仍保持
+    生成多样性；k 越大混合越低、收敛越快，但偏离纯高斯越多 → 过大 k 有多样性/伪影风险。
+    本仓库曾用旧版 immiscible(pool assignment)出现过推理斑块，故默认 k 取保守小值，
+    首次务必单变量 A/B 观察采样图是否出现斑块/多样性塌缩。
+    """
+    if k is None or int(k) <= 1:
+        return make_noise_from_config(latents, cfg)
+    k = int(k)
+    B = latents.shape[0]
+    # k 个候选，各自保留 offset/pyramid 语义；堆到候选维 [k, B, ...]
+    cand = torch.stack([make_noise_from_config(latents, cfg) for _ in range(k)], dim=0)
+    # 距离在 fp32 上算（bf16 对大元素数求和会丢精度、影响 argmin 选择）
+    lat = latents.unsqueeze(0).to(torch.float32)             # [1, B, ...]
+    d = (cand.to(torch.float32) - lat).flatten(2).pow(2).sum(dim=2)   # [k, B]
+    idx = d.argmin(dim=0)                                    # [B] 每样本最近候选的下标
+    sel = cand[idx, torch.arange(B, device=cand.device)]    # [B, ...] 逐样本 gather
+    return sel.to(latents.dtype)
+
+
+def make_training_noise(latents: torch.Tensor, cfg: NoiseConfig) -> torch.Tensor:
+    """真·训练加噪用的噪声：默认等价 make_noise_from_config；
+    仅当 cfg.immiscible_enabled 且 k>1 时走 Improved Immiscible 的 KNN 选择。"""
+    if getattr(cfg, "immiscible_enabled", False) and int(getattr(cfg, "immiscible_k", 1) or 1) > 1:
+        return select_immiscible_noise(latents, cfg, int(cfg.immiscible_k))
+    return make_noise_from_config(latents, cfg)
 
 
 # ============================================================================
@@ -1465,7 +1517,7 @@ def navit_packed_forward_and_loss(
         if lat.dim() == 4:
             lat = lat.unsqueeze(0)
         ti = t_per_image[i].to(dtype=lat.dtype)
-        noise_i = noise_list[i] if noise_list is not None else make_noise_from_config(lat, noise_cfg)
+        noise_i = noise_list[i] if noise_list is not None else make_training_noise(lat, noise_cfg)
         t_exp = ti.view(1, 1, 1, 1, 1)
         noisy_i = (1 - t_exp) * lat + t_exp * noise_i
         target_i = noise_i - lat

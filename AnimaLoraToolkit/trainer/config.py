@@ -278,6 +278,8 @@ YAML_TO_ARGS = {
     "noise_offset_random_strength": "noise_offset_random_strength",
     "pyramid_noise_iterations": "pyramid_noise_iterations",
     "pyramid_noise_discount": "pyramid_noise_discount",
+    "immiscible_enabled": "immiscible_enabled",
+    "immiscible_k": "immiscible_k",
     "caption_dropout_rate": "caption_dropout_rate",
     "grad_norm_log_every": "grad_norm_log_every",
     # Regex 模块选择（kohya 风格）
@@ -656,6 +658,10 @@ DEFAULTS = {
     "noise_offset_random_strength": False,
     "pyramid_noise_iterations": 0,
     "pyramid_noise_discount": 0.3,
+    # Improved Immiscible Diffusion（arXiv 2505.18521）KNN 噪声选择；默认关 = no-op。
+    # 开启后逐样本从 immiscible_k 个候选噪声中选与 latent 最近者（收敛加速，见 objective.py）。
+    "immiscible_enabled": False,
+    "immiscible_k": 4,
     "caption_dropout_rate": 0.0,
     "grad_norm_log_every": 0,
     "lora_exclude_patterns": None,

@@ -512,8 +512,8 @@ class LoKrLayer(torch.nn.Module):
 
         # ⟨W, ΔW⟩ per row
         W_r = W.reshape(factor, out_dim, factor, in_dim)  # (f_o, o, f_i, ii)
-        WU = torch.einsum('fofi,oi->fof', W_r, U)  # (f_o, o, f_i)
-        dot = self.scaling * torch.einsum('fof,ff->fo', WU, w1)  # (f_o, o)
+        WU = torch.einsum('abcd,bd->abc', W_r, U)  # (f_o, o, f_i)
+        dot = self.scaling * torch.einsum('abc,ac->ab', WU, w1)  # (f_o, o)
         dot = dot.reshape(-1)  # (out_features,)
 
         # Ortho init: ΔW = scaling·(kron(w1,U) - kron(w1_init,U_init))
@@ -535,8 +535,8 @@ class LoKrLayer(torch.nn.Module):
                 + (self.scaling ** 2) * (w1_init_sq.unsqueeze(1) * U_init_sq.unsqueeze(0)).reshape(-1)
 
             # Subtract init contribution from ⟨W, ΔW⟩
-            WU_init = torch.einsum('fofi,oi->fof', W_r, U_init)
-            dot_init = self.scaling * torch.einsum('fof,ff->fo', WU_init, w1_init)
+            WU_init = torch.einsum('abcd,bd->abc', W_r, U_init)
+            dot_init = self.scaling * torch.einsum('abc,ac->ab', WU_init, w1_init)
             dot = dot - dot_init.reshape(-1)
 
         # ||W + ΔW||² = ||W||² + 2·dot + ||ΔW||²

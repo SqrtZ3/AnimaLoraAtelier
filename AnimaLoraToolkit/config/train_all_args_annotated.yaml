@@ -26,6 +26,36 @@ text_encoder_path: "models/text_encoders"
 t5_tokenizer_path: "models/t5_tokenizer"
 
 # ============================================================================
+# 模型族（model family）—— opt-in，默认 anima 行为不变
+# ============================================================================
+
+# DiT 底模族："anima"（默认）或 "krea2"（Krea 2 单流 MMDiT 12B）。
+# krea2 时：transformer_path 指官方 raw.safetensors（训练一律用 RAW，推理可上 Turbo）；
+# vae_path 仍是上面的 qwen_image_vae.safetensors（两家同一 VAE，latent 缓存通用）；
+# text_encoder_path / t5_tokenizer_path 不使用。详见 docs/krea2-family.md。
+model_family: "anima"
+
+# [krea2] Qwen3-VL-4B-Instruct 的 HuggingFace 目录（model_family=krea2 必填）。
+krea2_text_encoder_path: ""
+
+# [krea2] 官方 encoder 的用户文本 token 预算（模板前后缀之外）。默认 512=官方值。
+krea2_text_max_length: 512
+
+# [krea2] 文本特征 LRU cache 条目数。每条 [L,12,2560] 压缩特征、典型 tag caption 数 MB；
+# caption 静态时命中率≈100%。128 条 ≈ 1GB 量级显存。
+krea2_text_cache_entries: 128
+
+# [krea2] 训练 t 的分辨率感知 shift（模型原生调度 α=exp(mu(token 数))，navit 逐图）。
+# true=对齐官方推理时间步分布；开着它时 schedule_shift 建议保持 1.0 避免双重偏移。
+krea2_res_shift: true
+
+# [krea2] mu 线性内插端点（官方默认：256px→y1=0.5、1280px→y2=1.15；1024²≈shift 2.48）。
+krea2_shift_min_res: 256
+krea2_shift_max_res: 1280
+krea2_shift_y1: 0.5
+krea2_shift_y2: 1.15
+
+# ============================================================================
 # 数据集与 Caption
 # ============================================================================
 
@@ -468,6 +498,18 @@ pyramid_noise_iterations: 0
 # pyramid_noise_discount：每层衰减。0.2-0.4 较稳；越高低频影响越强。
 pyramid_noise_discount: 0.3
 
+# ── Improved Immiscible Diffusion（arXiv 2505.18521）KNN 噪声选择 ──────────────
+# 机理：标准训练把每张图扩散到整个噪声空间，不同图轨迹在噪声层大量交叠(miscibility)，
+# 去噪目标是"多图混合"→难优化。immiscible 给每张图配一个更近的噪声，缩短 flow 轨迹、
+# 降低混合 → 目标更少歧义 → 收敛加速（论文 from-scratch 上 >4×）。
+# 本仓库用 KNN 变种：逐样本采 immiscible_k 个候选高斯噪声，选与该图 latent L2 最近者。
+# per-sample、形状无关 → 与 NaViT 异形逐图打包兼容；关闭时与旧行为逐 bit 等价。
+# ⚠ 注意：论文战绩是 from-scratch 训练"加速"，非 LoRA 微调"画质"；对暗部粒状高频这类
+#   aleatoric 细节，效果点在中~高 t，t→0 处 x_t≈x_0 收益有限。旧版 immiscible(pool)
+#   曾致推理斑块，首次务必单变量 A/B、盯采样图是否出现斑块或多样性塌缩，k 从小值起。
+immiscible_enabled: false   # true 开启；默认 false = no-op
+immiscible_k: 4             # 候选噪声数；1=关，越大混合越低/收敛越快，但偏离纯高斯越多(4~8 起)
+
 # caption_dropout_rate：整条 caption 置空概率，训练无条件分支，提升 CFG 表现。
 # 0.03-0.08 常用；>0.2 容易学不到具体内容。
 caption_dropout_rate: 0.05
@@ -564,6 +606,15 @@ monitor_port: 8765
 
 # 不自动打开浏览器。服务器/云端建议 true。
 no_browser: true
+
+# ── 分阶段计时（opt-in default-off，定位 NaViT vs ARB 速度根因）─────────────
+# flash varlen 已实测与 xformers 等速（attention 非瓶颈），本开关用 CUDA event 分阶段
+# 计时 text_encode / forward / loss / aux / backward / optimizer 等，写 stage_timing.csv。
+# 0 = 关（默认，零开销/行为中立）。开启后每 N 步采样一次，仅被采样步末尾 sync 一次，
+# 稳态 it/s 在非采样步测量不受影响。分析：python tools/analyze_stage_timing.py --csv <output_dir>/stage_timing.csv
+stage_timing_every: 0
+# 计时跳过前 N 步（cudnn autotune / cache 冷），仅 stage_timing_every>0 时生效。
+stage_timing_warmup: 10
 
 # ============================================================================
 # 命令行专用参数提示

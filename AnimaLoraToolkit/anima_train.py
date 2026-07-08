@@ -821,7 +821,17 @@ def _try_rich():
         return None, None
 
 
+def _is_interactive():
+    """stdin 是否可交互（有 TTY）。云端 / CI / 管道重定向时返回 False。"""
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 def _ask_str(label, default=""):
+    if not _is_interactive():
+        return default
     Prompt, _ = _try_rich()
     if Prompt:
         return Prompt.ask(label, default=default) if default else Prompt.ask(label)
@@ -830,6 +840,8 @@ def _ask_str(label, default=""):
 
 
 def _ask_bool(label, default=False):
+    if not _is_interactive():
+        return default
     _, Confirm = _try_rich()
     if Confirm:
         return Confirm.ask(label, default=default)
@@ -926,9 +938,33 @@ def main():
         args.prefer_json = True  # 默认启用
 
     # 交互模式检查
-    required = [args.data_dir, args.transformer, args.vae, args.qwen]
-    if args.interactive or any(not x for x in required):
-        args = prompt_for_args(args)
+    # krea2 用 krea2_text_encoder 替代 qwen，不能把 qwen 算进必填项
+    _is_krea2 = str(getattr(args, "model_family", "anima") or "anima").lower() == "krea2"
+    if _is_krea2:
+        required = [args.data_dir, args.transformer, args.vae,
+                    getattr(args, "krea2_text_encoder", "")]
+    else:
+        required = [args.data_dir, args.transformer, args.vae, args.qwen]
+
+    _missing = [not x for x in required]
+    if args.interactive or any(_missing):
+        if not sys.stdin.isatty():
+            # 非交互环境（云端 / CI / 管道）：无法弹出交互提示
+            if any(_missing):
+                _labels = (
+                    ["data_dir", "transformer_path", "vae_path", "krea2_text_encoder_path"]
+                    if _is_krea2
+                    else ["data_dir", "transformer_path", "vae_path", "text_encoder_path"]
+                )
+                _miss = [lab for lab, miss in zip(_labels, _missing) if miss]
+                logger.error(
+                    "非交互环境（stdin 不是 TTY），无法通过交互提示补全缺失参数。"
+                    "请在 YAML 配置或命令行中补全以下必填项: %s", ", ".join(_miss)
+                )
+                raise SystemExit(1)
+            # 没有缺失、只是 --interactive 被显式开启 -> 跳过交互
+        else:
+            args = prompt_for_args(args)
 
     # 依赖检测
     ensure_dependencies(auto_install=args.auto_install)

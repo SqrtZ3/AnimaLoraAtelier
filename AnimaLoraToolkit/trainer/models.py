@@ -43,9 +43,15 @@ def find_diffusion_pipe_root():
 
 
 def load_module_from_path(module_name, file_path):
-    """动态加载 Python 模块"""
+    """动态加载 Python 模块
+
+    必须在 exec_module 之前把模块注册到 sys.modules，否则模块内定义的
+    @dataclass 装饰器在 CPython 3.12+ 会因 sys.modules.get(cls.__module__)
+    返回 None 而抛 AttributeError（bpo-120492）。
+    """
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 

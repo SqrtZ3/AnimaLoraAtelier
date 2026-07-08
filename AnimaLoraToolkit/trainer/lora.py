@@ -378,20 +378,16 @@ class LoKrLayer(torch.nn.Module):
         ).reshape(P, self.factor, self.rank)
         return tmp_flat * mask_view, mask_BR
 
-    def forward(self, x):
-        # Module dropout 两路（见 LoRALayer.__init__ 注释）：eager 懒抽签早返回（零开销）；
-        # compile-safe 末尾乘 keep 标量。compile 时 `not self._md_compile_safe` 常量 False → 短路。
-        if (self.training and self.module_dropout > 0 and not self._md_compile_safe
-                and torch.rand(1).item() < self.module_dropout):
-            return torch.zeros(*x.shape[:-1], self.out_features,
-                               device=x.device, dtype=x.dtype)
+    def _compute(self, x):
+        self._rd_mask = None
+        self._rd_scale = 1.0
 
         # ★ Training 路径：bf16 下 kron 容易数值放大，统一转 fp32 中间运算（必要）。
         # ★ Inference (eval + no_grad) 路径：可直接用原 dtype（通常 bf16），跳过 3 个 fp32 副本。
         #   - 推理时不积累梯度，bf16 精度对单步前向足够
-        #   - 节省 ~3× LoKr 参数副本（对 5120ch model 大概 80MB / inject 层 → 总省几 GB 临时显存）
+        #   - 节省 ~3× LoKr 参数副本（对 5120ch model 大概 80MB / inject 层 -> 总省几 GB 临时显存）
         #   - 推理速度也快 ~1.5×（bf16 matmul tensor core）
-        # rank_dropout / T-LoRA mask / ortho init 路径都需要严格的数值一致性 → 训练路径仍 fp32。
+        # rank_dropout / T-LoRA mask / ortho init 路径都需要严格的数值一致性 -> 训练路径仍 fp32。
         if self.training:
             w1 = self.lokr_w1.float()
             w2_a = self.lokr_w2_a.float()
@@ -406,29 +402,29 @@ class LoKrLayer(torch.nn.Module):
         # Rank dropout: 随机置零 rank 中的某些通道（训练时，inverted dropout）
         # ★ 同一个 rd_mask 必须同时作用到 w2_b 和后面的 w2b_init，否则破坏 step 0 净 delta=0
         # （详见 LoRALayer.forward 同名注释）。保留 rd 元组传到 ortho 补偿块用。
-        _rd_for_init = None
         if self.training and self.rank_dropout > 0:
             mask = torch.bernoulli(
                 torch.full((self.rank,), 1.0 - self.rank_dropout, device=w2_b.device)
             )
             scale = 1.0 / (1.0 - self.rank_dropout + 1e-6)
             w2_b = w2_b * (mask.unsqueeze(1) * scale)  # (rank, in_dim)
-            _rd_for_init = (mask, scale)
+            self._rd_mask = mask
+            self._rd_scale = scale
 
         x_drop = self.dropout(x)
         orig_shape = x_drop.shape
-        # (..., in_features) → (B*, factor, in_dim)；保留前置维度
+        # (..., in_features) -> (B*, factor, in_dim)；保留前置维度
         # 推理路径用 compute_dtype（通常 bf16），训练路径转 fp32
         x_flat = x_drop.reshape(-1, self.factor, self.in_dim).to(dtype=_compute_dtype)
 
         # 两段低秩矩阵乘代替 kron 全矩阵：
-        #   tmp = x_flat @ w2_b^T  → (B*, factor, rank)
+        #   tmp = x_flat @ w2_b^T  -> (B*, factor, rank)
         #   T-LoRA mask 插在两段 matmul 之间（rank 维）
-        #   tmp = tmp     @ w2_a^T → (B*, factor, out_dim)
+        #   tmp = tmp     @ w2_a^T -> (B*, factor, out_dim)
         tmp = torch.matmul(x_flat, w2_b.transpose(0, 1))
         tmp, mask_BR = self._apply_tlora_mask_kron(tmp, orig_shape)
         tmp = torch.matmul(tmp, w2_a.transpose(0, 1))
-        # 用 (factor, factor) 在前广播：w1 @ (B*, factor, out_dim) → (B*, factor, out_dim)
+        # 用 (factor, factor) 在前广播：w1 @ (B*, factor, out_dim) -> (B*, factor, out_dim)
         y = torch.matmul(w1, tmp)
 
         # Ortho init compensation for LoKr T-LoRA：减去用 init 权重 + 同一 mask 的贡献，
@@ -441,9 +437,8 @@ class LoKrLayer(torch.nn.Module):
             w2a_init = self.lokr_w2_a_init.float()
             w2b_init = self.lokr_w2_b_init.float()
             # 与 w2_b 用同一个 rd_mask，保 step 0 净 delta=0
-            if _rd_for_init is not None:
-                rd_mask, rd_scale = _rd_for_init
-                w2b_init = w2b_init * (rd_mask.unsqueeze(1) * rd_scale)
+            if self._rd_mask is not None:
+                w2b_init = w2b_init * (self._rd_mask.unsqueeze(1) * self._rd_scale)
             tmp_i = torch.matmul(x_flat, w2b_init.transpose(0, 1))
             if mask_BR is not None:
                 # 复用刚才算好的 mask
@@ -461,9 +456,92 @@ class LoKrLayer(torch.nn.Module):
         # reshape 回 (..., out_features)
         y = y.reshape(*orig_shape[:-1], self.factor * self.out_dim)
         out = y.to(dtype=x.dtype) * self.scaling
+        return out
+
+    def forward(self, x):
+        if (self.training and self.module_dropout > 0 and not self._md_compile_safe
+                and torch.rand(1).item() < self.module_dropout):
+            return torch.zeros(*x.shape[:-1], self.out_features,
+                               device=x.device, dtype=x.dtype)
+        out = self._compute(x)
         if self._md_keep is not None:
             out = out * self._md_keep.to(out.dtype)
         return out
+
+    def merged_row_norms(self, base_weight):
+        """Per-row L2 norms of (base_weight + ΔW) without materializing full delta.
+
+        Uses: ||W + ΔW||² = ||W||² + 2⟨W, ΔW⟩ + ||ΔW||²
+        For LoKr ΔW = scaling · kron(w1, U), U = w2a @ w2b:
+          ||ΔW_{f,o}||² = scaling² · ||w1[f]||² · ||U[o]||²
+          ⟨W_{f,o}, ΔW_{f,o}⟩ = scaling · Σ_{f_i} w1[f, f_i] · ⟨W_r[f,o,f_i,:], U[o,:]⟩
+
+        峰值显存 = O(out_dim · in_dim)（即 U），远小于 O(out_features · in_features) 的 full delta。
+        对 krea2 mlp 层：25MB vs 384MB（~15× 缩减）。
+
+        必须在 _compute() 之后调用以复用同一 rank dropout mask。
+        """
+        factor, out_dim, in_dim = self.factor, self.out_dim, self.in_dim
+
+        if self.training:
+            w1 = self.lokr_w1.float()
+            w2_a = self.lokr_w2_a.float()
+            w2_b = self.lokr_w2_b.float()
+        else:
+            w1 = self.lokr_w1
+            w2_a = self.lokr_w2_a
+            w2_b = self.lokr_w2_b
+
+        # Apply same rank dropout mask as _compute()
+        if getattr(self, '_rd_mask', None) is not None:
+            w2_b = w2_b * (self._rd_mask.unsqueeze(1) * self._rd_scale)
+
+        # U = w2a @ w2b: (out_dim, in_dim) -- 最大的中间量，远小于 full delta
+        U = torch.matmul(w2_a, w2_b)
+
+        # ||W||² per row
+        W = base_weight.float()  # (out_features, in_features)
+        W_sq = (W ** 2).sum(dim=1)  # (out_features,)
+
+        # ||ΔW||² per row = scaling² · ||w1[f_o]||² · ||U[o]||²
+        w1_sq = (w1 ** 2).sum(dim=1)  # (factor,)
+        U_sq = (U ** 2).sum(dim=1)    # (out_dim,)
+        delta_sq = (self.scaling ** 2) * (
+            w1_sq.unsqueeze(1) * U_sq.unsqueeze(0)  # (factor, out_dim)
+        ).reshape(-1)  # (out_features,)
+
+        # ⟨W, ΔW⟩ per row
+        W_r = W.reshape(factor, out_dim, factor, in_dim)  # (f_o, o, f_i, ii)
+        WU = torch.einsum('fofi,oi->fof', W_r, U)  # (f_o, o, f_i)
+        dot = self.scaling * torch.einsum('fof,ff->fo', WU, w1)  # (f_o, o)
+        dot = dot.reshape(-1)  # (out_features,)
+
+        # Ortho init: ΔW = scaling·(kron(w1,U) - kron(w1_init,U_init))
+        if self.lokr_w2_a_init is not None and self.lokr_w2_b_init is not None:
+            w1_init = (self.lokr_w1_init.float() if self.training else self.lokr_w1_init)
+            w2a_init = (self.lokr_w2_a_init.float() if self.training else self.lokr_w2_a_init)
+            w2b_init = (self.lokr_w2_b_init.float() if self.training else self.lokr_w2_b_init)
+            if getattr(self, '_rd_mask', None) is not None:
+                w2b_init = w2b_init * (self._rd_mask.unsqueeze(1) * self._rd_scale)
+            U_init = torch.matmul(w2a_init, w2b_init)
+
+            # Cross terms for ||ΔW||²
+            w1_cross = (w1 * w1_init).sum(dim=1)   # (factor,)
+            U_cross = (U * U_init).sum(dim=1)       # (out_dim,)
+            w1_init_sq = (w1_init ** 2).sum(dim=1)  # (factor,)
+            U_init_sq = (U_init ** 2).sum(dim=1)   # (out_dim,)
+            delta_sq = delta_sq \
+                - (self.scaling ** 2) * 2.0 * (w1_cross.unsqueeze(1) * U_cross.unsqueeze(0)).reshape(-1) \
+                + (self.scaling ** 2) * (w1_init_sq.unsqueeze(1) * U_init_sq.unsqueeze(0)).reshape(-1)
+
+            # Subtract init contribution from ⟨W, ΔW⟩
+            WU_init = torch.einsum('fofi,oi->fof', W_r, U_init)
+            dot_init = self.scaling * torch.einsum('fof,ff->fo', WU_init, w1_init)
+            dot = dot - dot_init.reshape(-1)
+
+        # ||W + ΔW||² = ||W||² + 2·dot + ||ΔW||²
+        merged_sq = W_sq + 2.0 * dot + delta_sq
+        return merged_sq.clamp(min=1e-12).sqrt()
 
     def delta_weight(self, apply_rank_dropout: bool = False) -> torch.Tensor:
         """Materialize 净 ΔW for DoRA weight decomposition and export checks.
@@ -573,23 +651,31 @@ class LoRALinear(torch.nn.Module):
     def forward(self, x):
         if self.use_dora:
             adapter = self.adapter
-            # eager：原版懒抽签，命中即退回 base（不材料化 delta）。compile-safe 走下面的权重 blend。
+            # eager module dropout: 命中即退回 base（无 LoRA / 无 DoRA）
             if (self.training and adapter.module_dropout > 0 and not adapter._md_compile_safe
                     and torch.rand(1).item() < adapter.module_dropout):
                 return self.original(x)
-            delta = adapter.delta_weight(apply_rank_dropout=True).to(device=self.original.weight.device)
-            base_w = self.original.weight.float()
-            merged = base_w + delta
-            denom = merged.norm(dim=1, keepdim=True).clamp(min=1e-6)
-            scale = self.dora_scale.float().view(-1, 1) / denom
-            dora_w = (merged * scale).to(dtype=self.original.weight.dtype)
-            # Module dropout compile path: blend weights, not outputs. This preserves
-            # base + keep * (dora - base) semantics while avoiding a second base linear.
+
+            # ★ Memory-efficient DoRA: 不实例化 (out, in) 全矩阵，改在输出域分解。
+            # y = (base_no_bias + lora_out) · (dora_scale / ||W + ΔW||) + bias
+            # 其中 lora_out 走 LoKr 低秩前向（kron-bypass），||W + ΔW|| 走 merged_row_norms()。
+            # 峰值显存从 O(out·in) 降到 O(out_dim·in_dim)（缩小 ~factor² 倍）。
+            base_no_bias = F.linear(x, self.original.weight, None)
+            lora_out = adapter._compute(x)  # 也存储 _rd_mask 供下一步复用
+            merged_norm = adapter.merged_row_norms(self.original.weight)  # (out_features,)
+            scale = (self.dora_scale.float() / merged_norm.clamp(min=1e-6))  # (out_features,)
+            raw_out = base_no_bias.float() + lora_out.float()
+            dora_no_bias = (raw_out * scale.unsqueeze(0)).to(dtype=x.dtype)
+
+            # Module dropout compile-safe: blend in output domain
+            # dora_w = base_w + keep·(dora_w − base_w)  =>  y = base + keep·(dora_y − base_no_bias)
             if adapter._md_keep is not None:
-                keep = adapter._md_keep.to(dtype=dora_w.dtype)
-                base_w = self.original.weight.to(dtype=dora_w.dtype)
-                dora_w = base_w + keep * (dora_w - base_w)
-            return F.linear(x, dora_w, self.original.bias)
+                keep = adapter._md_keep.to(dtype=dora_no_bias.dtype)
+                dora_no_bias = base_no_bias + keep * (dora_no_bias - base_no_bias)
+
+            if self.original.bias is not None:
+                return dora_no_bias + self.original.bias.to(dtype=dora_no_bias.dtype)
+            return dora_no_bias
         return self.original(x) + self.adapter(x)
 
     @property

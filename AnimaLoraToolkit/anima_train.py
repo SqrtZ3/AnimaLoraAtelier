@@ -1069,6 +1069,7 @@ def main():
     args.vae = resolve_path_best_effort(args.vae, bases)
     args.qwen = resolve_path_best_effort(args.qwen, bases)
     args.t5_tokenizer = resolve_path_best_effort(getattr(args, "t5_tokenizer", ""), bases)
+    args.krea2_text_encoder = resolve_path_best_effort(getattr(args, "krea2_text_encoder", ""), bases)
     args.data_dir = resolve_path_best_effort(args.data_dir, bases)
     reg_data_dir = getattr(args, "reg_data_dir", "") or ""
     if reg_data_dir:

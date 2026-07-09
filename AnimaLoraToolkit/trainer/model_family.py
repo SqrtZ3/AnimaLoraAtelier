@@ -104,7 +104,7 @@ def load_krea2_model(transformer_path, device, dtype, repo_root,
     max_img_h/w 仅作日志参考 —— Krea2 的 RoPE 按需从 pos 现算，无容量 buffer 上限
     （与 Anima 的 pos_embedder.seq 预分配不同）。
     """
-    from trainer.checkpoint import _load_safetensors_state_dict
+    from trainer.checkpoint import _get_safetensors_shapes, _load_safetensors_into_model
     from trainer.models import ensure_models_namespace, load_module_from_path
 
     ensure_models_namespace(repo_root)
@@ -112,26 +112,33 @@ def load_krea2_model(transformer_path, device, dtype, repo_root,
         "krea2_modeling", Path(repo_root) / "krea2_modeling.py"
     )
 
-    sd = _load_safetensors_state_dict(Path(transformer_path))
+    # 仅读 key + shape（不加载 tensor 数据），用于配置推断和前缀检测
+    shapes = _get_safetensors_shapes(Path(transformer_path))
     # 剥离可能的 "model." / "diffusion_model." 前缀（ComfyUI 再打包等场景）
+    prefixes = None
     for prefix in ("model.diffusion_model.", "diffusion_model.", "model."):
-        if any(k.startswith(prefix) for k in sd.keys()) and f"{prefix}first.weight" in sd:
-            sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+        if any(k.startswith(prefix) for k in shapes) and f"{prefix}first.weight" in shapes:
+            shapes = {k[len(prefix):]: v for k, v in shapes.items() if k.startswith(prefix)}
+            prefixes = [prefix]
             break
-    if "first.weight" not in sd:
+    if "first.weight" not in shapes:
         raise RuntimeError(
             f"{transformer_path} 里找不到 Krea2 权重（缺 first.weight）。"
             "请确认是官方 raw.safetensors（训练用 RAW，不要用 diffusers 分片目录）。"
         )
 
-    config = krea2_modeling.infer_config_from_state_dict(sd)
+    config = krea2_modeling.infer_config_from_state_dict(shapes)
     model = krea2_modeling.SingleStreamDiT(config)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    if missing:
-        raise RuntimeError(f"Krea2 权重缺失 {len(missing)} 个 key（前 5 个: {missing[:5]}）")
-    if unexpected:
+
+    # 流式加载：逐 tensor 拷入模型参数，避免在 RAM 中持有完整 state dict
+    result = _load_safetensors_into_model(
+        model, Path(transformer_path),
+        prefixes=prefixes, label="Krea2 Transformer",
+        strict_missing=True,
+    )
+    if result["unexpected"]:
         logger.warning("Krea2 checkpoint 多出 %d 个未用 key（前 5 个: %s）",
-                       len(unexpected), unexpected[:5])
+                       len(result["unexpected"]), result["unexpected"][:5])
     model = model.to(device=device, dtype=dtype)
     model.requires_grad_(False)
     n_params = sum(p.numel() for p in model.parameters())

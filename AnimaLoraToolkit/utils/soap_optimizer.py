@@ -143,6 +143,20 @@ class SOAP(Optimizer):
                     state[key] = self._fp32_tree(state[key])
 
     def load_state_dict(self, state_dict):
+        # Mirror state_dict(): when _precond_in_state is False, strip the
+        # recomputable Shampoo matrices (GG/Q/has_preconditioner) on load too.
+        # Without this, a checkpoint saved with precond_in_state=True (the
+        # default) would dump all GG/Q onto the GPU regardless of the current
+        # config, causing a massive—and often fatal—VRAM spike on resume.
+        if not getattr(self, "_precond_in_state", True):
+            drop = ("GG", "Q", "has_preconditioner")
+            state_dict = {
+                **state_dict,
+                "state": {
+                    idx: {k: v for k, v in pstate.items() if k not in drop}
+                    for idx, pstate in state_dict.get("state", {}).items()
+                },
+            }
         super().load_state_dict(state_dict)
         self._restore_fp32_state()
 

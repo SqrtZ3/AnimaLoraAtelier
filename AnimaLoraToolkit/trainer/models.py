@@ -22,7 +22,7 @@ from pathlib import Path
 
 import torch
 
-from trainer.checkpoint import _load_safetensors_state_dict, _load_weights_best_effort
+from trainer.checkpoint import _load_safetensors_into_model
 
 logger = logging.getLogger(__name__)
 
@@ -80,37 +80,6 @@ _RECOMPUTABLE_BUFFER_PATTERNS = (
 )
 
 
-def _filter_recomputable_buffers(sd: dict, model) -> dict:
-    """从 checkpoint state_dict 中滤掉 shape 不匹配的 derivative buffer。
-
-    背景：把 `max_img_h` 从 240 改成 288 后，`pos_embedder.seq` 的 model 端 shape 从
-    (128,) 变成 (144,)（取决于 max(len_h, len_w, len_t)）。但 checkpoint 里的 seq 还是
-    旧 shape；`model.load_state_dict(..., strict=False)` 在某些 PyTorch 版本会因为
-    shape mismatch 直接 raise RuntimeError，而不是吞掉。
-
-    这里只滤 derivative buffer，不影响任何学到的参数（weights/biases/learnable pos）。
-    """
-    model_sd = model.state_dict()
-    out = {}
-    dropped = []
-    for k, v in sd.items():
-        # 看裸 key（剥离常见 prefix 之前）是否含有 derivative buffer 关键字
-        recomputable = any(pat in k for pat in _RECOMPUTABLE_BUFFER_PATTERNS)
-        if recomputable and k in model_sd and tuple(v.shape) != tuple(model_sd[k].shape):
-            dropped.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
-            continue
-        out[k] = v
-    if dropped:
-        for name, ck_shape, md_shape in dropped[:5]:
-            logger.info(
-                "Drop recomputable buffer from ckpt: %s (ckpt=%s, model=%s) — 模型 reset_parameters() 会重算",
-                name, ck_shape, md_shape,
-            )
-        if len(dropped) > 5:
-            logger.info("  ... 共 %d 个 recomputable buffer 被跳过", len(dropped))
-    return out
-
-
 def load_anima_model(transformer_path, device, dtype, repo_root,
                      max_img_h: int = 240, max_img_w: int = 240, max_frames: int = 128):
     """加载 Anima transformer 模型。
@@ -124,8 +93,8 @@ def load_anima_model(transformer_path, device, dtype, repo_root,
 
     Anima 当前没有启用 `extra_per_block_abs_pos_emb`（learnable pos embedding 是关掉的），
     所以加大这两个值**只会改变 RoPE 的 arange buffer 长度**，不会破坏权重加载兼容性。
-    seq buffer 是 derivative tensor（recomputable from arange），shape 不匹配时被
-    `_filter_recomputable_buffers` 滤掉，模型仍按构造时的正确 shape 工作。
+    seq buffer 是 derivative tensor（recomputable from arange），shape 不匹配时
+    `_load_safetensors_into_model(skip_buffer_patterns=...)` 跳过，模型仍按构造时的正确 shape 工作。
     """
     from safetensors import safe_open
 
@@ -192,12 +161,14 @@ def load_anima_model(transformer_path, device, dtype, repo_root,
 
     model = Anima(**config)
 
-    sd = _load_safetensors_state_dict(Path(transformer_path))
-    sd = _filter_recomputable_buffers(sd, model)
-    _load_weights_best_effort(model, sd, label="Transformer")
+    _load_safetensors_into_model(
+        model, Path(transformer_path), label="Transformer",
+        skip_buffer_patterns=_RECOMPUTABLE_BUFFER_PATTERNS,
+    )
 
     # 如果 checkpoint 中完全没有 llm_adapter 权重，随机初始化会把 cross-attn 条件搞乱，直接禁用更安全
-    has_llm_adapter = any("llm_adapter" in k for k in sd.keys())
+    with safe_open(transformer_path, framework="pt", device="cpu") as f:
+        has_llm_adapter = any("llm_adapter" in k for k in f.keys())
     if not has_llm_adapter and hasattr(model, "llm_adapter"):
         try:
             model.llm_adapter = None
@@ -224,8 +195,7 @@ def load_vae(vae_path, device, dtype, repo_root):
 
     model = WanVAE(**cfg).eval().requires_grad_(False)
 
-    sd = _load_safetensors_state_dict(Path(vae_path))
-    _load_weights_best_effort(model, sd, label="VAE")
+    _load_safetensors_into_model(model, Path(vae_path), label="VAE")
     model = model.to(device=device, dtype=dtype)
 
     # VAE 归一化参数

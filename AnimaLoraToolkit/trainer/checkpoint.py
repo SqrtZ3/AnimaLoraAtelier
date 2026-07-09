@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import random
 import re
+import gc
 from pathlib import Path
 
 import torch
@@ -88,6 +89,165 @@ def _load_safetensors_state_dict(path: Path) -> dict:
         for k in f.keys():
             sd[k] = f.get_tensor(k)
     return sd
+
+
+
+
+class _ShapeProxy:
+    """Lightweight stand-in for a tensor, exposing only .shape.
+
+    Used by ``_get_safetensors_shapes()`` so that
+    ``infer_config_from_state_dict()`` can read tensor shapes without
+    loading the actual weight data (~1000x lighter for 12B models).
+    """
+    __slots__ = ("shape",)
+
+    def __init__(self, shape):
+        self.shape = shape
+
+
+def _get_safetensors_shapes(path: Path) -> dict:
+    """Read all key -> shape pairs from a safetensors file **without** loading tensor data.
+
+    Returns a ``dict[str, _ShapeProxy]``.  Only metadata is read -- no weight
+    bytes are copied to RAM.  This is the right primitive for config inference
+    (``infer_config_from_state_dict``) where only ``.shape`` and ``key in dict``
+    are needed.
+    """
+    from safetensors import safe_open
+
+    shapes = {}
+    with safe_open(path, framework="pt", device="cpu") as f:
+        for k in f.keys():
+            shapes[k] = _ShapeProxy(tuple(f.get_slice(k).get_shape()))
+    return shapes
+
+
+def _load_safetensors_into_model(
+    model: torch.nn.Module,
+    path: Path,
+    prefixes: list[str] | None = None,
+    label: str = "Model",
+    skip_buffer_patterns: tuple[str, ...] | None = None,
+    strict_missing: bool = False,
+) -> dict:
+    """Stream-load safetensors weights directly into *model* parameters, one tensor at a time.
+
+    Avoids creating a full state-dict copy in RAM.  For a 12B model (bf16 ~24 GB)
+    this cuts peak host-RAM from ~72-96 GB (3-4 simultaneous copies in the old
+    ``_load_safetensors_state_dict`` + ``_filter_recomputable_buffers`` +
+    ``_load_weights_best_effort`` pipeline) down to ~24 GB (model itself + one
+    transient tensor).
+
+    Parameters
+    ----------
+    model : nn.Module
+        Target model (typically on CPU).  Weights are loaded via
+        ``param.data.copy_(tensor)`` in-place, so the model's own storage
+        is the only persistent allocation.
+    path : Path
+        Path to ``.safetensors`` file.
+    prefixes : list[str] | None
+        Prefix list to strip (e.g. ``["model."]``).  If ``None``, the best
+        prefix is auto-detected via ``_pick_best_prefix_remap``.
+    label : str
+        Label for log messages (e.g. ``"Transformer"``, ``"VAE"``).
+    skip_buffer_patterns : tuple[str, ...] | None
+        If a model key contains any of these substrings, the tensor is
+        shape-checked; a mismatch means the buffer is recomputable (e.g.
+        RoPE position embeddings) and is **skipped** -- the model's own
+        ``reset_parameters()`` will have set it correctly.
+    strict_missing : bool
+        If ``True``, **any** missing key raises ``RuntimeError`` (Krea2
+        semantics).  If ``False``, only critical layers (``x_embedder.``,
+        ``blocks.``, ``final_layer.``) or coverage < 60% raise (Anima / VAE).
+
+    Returns
+    -------
+    dict  with keys ``remap``, ``coverage``, ``missing``, ``unexpected``.
+    """
+    from safetensors import safe_open
+
+    model_sd = model.state_dict()
+    model_keys = set(model_sd.keys())
+
+    with safe_open(path, framework="pt", device="cpu") as f:
+        sd_keys = list(f.keys())
+
+        # Auto-detect best prefix if not provided
+        if prefixes is None:
+            prefixes, _ = _pick_best_prefix_remap(sd_keys, model_keys)
+        remap_name = "+".join(prefixes) if prefixes else "none"
+
+        # Build mapping: model_key -> safetensors_key
+        key_map: dict[str, str] = {}
+        for sk in sd_keys:
+            mk = _strip_prefixes(sk, prefixes)
+            if mk in model_keys:
+                key_map[mk] = sk
+
+        # Stream-load: one tensor at a time, copy into model param, then free
+        loaded = 0
+        skipped_buffers: list[tuple[str, tuple, tuple]] = []
+        for mk, sk in key_map.items():
+            # Skip recomputable derivative buffers whose shape doesn't match
+            if skip_buffer_patterns and any(pat in mk for pat in skip_buffer_patterns):
+                param_shape = tuple(model_sd[mk].shape)
+                ckpt_shape = tuple(f.get_slice(sk).get_shape())
+                if param_shape != ckpt_shape:
+                    skipped_buffers.append((mk, ckpt_shape, param_shape))
+                    continue
+            tensor = f.get_tensor(sk)
+            model_sd[mk].data.copy_(tensor)
+            del tensor
+            loaded += 1
+
+    if skipped_buffers:
+        for name, ck_shape, md_shape in skipped_buffers[:5]:
+            logger.info(
+                "Drop recomputable buffer from ckpt: %s (ckpt=%s, model=%s) - "
+                "模型 reset_parameters() 会重算",
+                name, ck_shape, md_shape,
+            )
+        if len(skipped_buffers) > 5:
+            logger.info("  ... 共 %d 个 recomputable buffer 被跳过", len(skipped_buffers))
+
+    # Coverage stats (mirror _load_weights_best_effort log format)
+    matched_keys = set(key_map.keys())
+    missing = sorted(model_keys - matched_keys)
+    unexpected = sorted(
+        _strip_prefixes(k, prefixes) for k in sd_keys
+        if _strip_prefixes(k, prefixes) not in model_keys
+    )
+    coverage = loaded / max(1, len(model_keys))
+
+    logger.info(
+        f"{label} 权重加载: remap={remap_name}, 匹配 {loaded}/{len(model_keys)} "
+        f"({coverage:.1%}), missing={len(missing)}, unexpected={len(unexpected)}"
+    )
+
+    # Fail-fast checks
+    if strict_missing and missing:
+        raise RuntimeError(
+            f"{label} 权重缺失 {len(missing)} 个 key（前 5 个: {missing[:5]}）。"
+        )
+    critical_prefixes = ("x_embedder.", "blocks.", "final_layer.")
+    critical_missing = [k for k in missing if k.startswith(critical_prefixes)]
+    if coverage < 0.60 or len(critical_missing) > 0:
+        preview_missing = ", ".join(critical_missing[:8])
+        raise RuntimeError(
+            f"{label} 权重看起来没有正确加载（remap={remap_name}, coverage={coverage:.1%}）。"
+            f"关键参数缺失: {preview_missing or 'N/A'}。\n"
+            f"这通常表示你选错了 .safetensors（不是完整 transformer/vae 权重），或 "
+            f"checkpoint key 前缀不匹配。"
+        )
+
+    return {
+        "remap": remap_name,
+        "coverage": coverage,
+        "missing": missing,
+        "unexpected": unexpected,
+    }
 
 
 def resolve_path_best_effort(path_str: str, bases: list[Path]) -> str:
@@ -321,4 +481,12 @@ def load_training_state(path, injector, optimizer, scheduler=None):
     logger.info(f"训练状态已恢复: epoch={epoch}, step={global_step}")
     samples_seen = state.get("samples_seen")
     reference_state = state.get("reference_state")
+
+    # Free the CPU-side checkpoint copy and any intermediate GPU tensors
+    # (e.g. bf16 casts from load_state_dict) before training begins.
+    del state
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return epoch, global_step, loss_history, monitor_state, samples_seen, reference_state

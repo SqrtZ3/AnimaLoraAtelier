@@ -278,7 +278,14 @@ class SOAP(Optimizer):
             eye = torch.eye(matrix.shape[0], device=matrix.device, dtype=matrix.dtype)
             try:
                 _, q = torch.linalg.eigh(matrix + 1e-30 * eye)
+            except torch.cuda.OutOfMemoryError:
+                # OOM（cusolver 工作区 GB 级）≠ 数值不收敛：fp64 重试只会让
+                # 工作区翻倍、必然更炸。先清 allocator 缓存块再原精度重试一次；
+                # 仍 OOM 就如实抛出（fail-fast，让用户降 budget 而不是误导去查数值）。
+                torch.cuda.empty_cache()
+                _, q = torch.linalg.eigh(matrix + 1e-30 * eye)
             except RuntimeError:
+                # 数值不收敛（ill-conditioned fp32 syevd）→ fp64 重试
                 _, q64 = torch.linalg.eigh(matrix.double() + 1e-30 * eye.double())
                 q = q64.float()
             bases.append(torch.flip(q.float(), dims=[1]))

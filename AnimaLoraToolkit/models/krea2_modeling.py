@@ -660,12 +660,27 @@ class SingleStreamDiT(nn.Module):
         else:
             cross_mask = cross_mask.bool().to(device)
 
-        img = self.first(img_tokens)
+        # ── 块外层也纳入 checkpoint（use_checkpoint 时）──────────────────────
+        # first / txtfusion / txtmlp 在 per-block checkpoint 之外，LoRA/DoRA 包住
+        # 它们后（官方全 264 targets），DoRA 前向的 fp32 中间量会整段留到 backward
+        # （first 一层即 ~0.4GB/16k token）。checkpoint 后只存输入、backward 重算，
+        # 数学恒等；重算成本相对 28 个主 block 可忽略。
+        txt_mask = _mask(cross_mask)
+
+        def _img_stack(tok_in):
+            return self.first(tok_in)
+
+        def _text_stack(ctx_in):
+            return self.txtmlp(self.txtfusion(ctx_in, mask=txt_mask))
+
+        if use_checkpoint:
+            img = checkpoint(_img_stack, img_tokens, use_reentrant=False)
+            txt = checkpoint(_text_stack, context, use_reentrant=False)
+        else:
+            img = _img_stack(img_tokens)
+            txt = _text_stack(context)
         t_vec = self.tmlp(temb(t, self.config.tdim, device=device, dtype=img.dtype))
         tvec = self.tproj(t_vec)
-
-        txt = self.txtfusion(context, mask=_mask(cross_mask))
-        txt = self.txtmlp(txt)
 
         combined = torch.cat((txt, img), dim=1)
         full_mask = torch.cat(
@@ -809,10 +824,18 @@ class SingleStreamDiT(nn.Module):
             txt_bias = cached_block_diag_mask(tuple(text_seqlens))
         else:
             txt_bias = block_diag_bool_mask(text_seqlens, device)
-        txt = self.txtfusion(crossattn_packed, mask=txt_bias)   # [1, ΣL, D_txt]
-        txt = self.txtmlp(txt)                                  # [1, ΣL, features]
 
-        img = self.first(tokens_1_N_M)                          # [1, ΣN, features]
+        # 块外层纳入 checkpoint（与 forward_dense 同理：官方全 targets 下这些层
+        # 被 DoRA 包住后 fp32 中间量会留到 backward，checkpoint 后数学恒等）。
+        def _text_stack(ctx_in):
+            return self.txtmlp(self.txtfusion(ctx_in, mask=txt_bias))
+
+        if use_checkpoint:
+            txt = checkpoint(_text_stack, crossattn_packed, use_reentrant=False)
+            img = checkpoint(self.first, tokens_1_N_M, use_reentrant=False)
+        else:
+            txt = _text_stack(crossattn_packed)                 # [1, ΣL, features]
+            img = self.first(tokens_1_N_M)                      # [1, ΣN, features]
 
         # ── 逐图 timestep 向量（G 行）───────────────────────────────────────
         t_flat = timesteps_G.reshape(-1).float()

@@ -227,6 +227,19 @@ class TestEncodeKrea2Batch(unittest.TestCase):
             if n < cross.shape[1]:
                 self.assertEqual(float(cross[i, n:].abs().sum()), 0.0)
 
+    def test_dedup_and_chunking_equal_single(self):
+        """批内重复 caption（multiscale 副本场景）+ 超过 chunk 上限（8）的批，
+        输出与逐条编码逐 bit 一致。"""
+        from trainer import model_family as mf
+        base = [f"caption number {i}" for i in range(6)]
+        texts = base + base[:4]  # 10 条、其中 4 条重复 → 触发去重 + 分块
+        cross, cmask = mf.encode_krea2_text(self.handles, texts, "cpu", max_length=16)
+        for i, t in enumerate(texts):
+            ref = mf._encode_krea2_batch(self.handles, [t], "cpu", max_length=16)[0]
+            n = int(cmask[i].sum())
+            self.assertEqual(n, ref.shape[0])
+            self.assertTrue(torch.equal(cross[i, :n], ref))
+
     def test_cache_mixed_hit_miss(self):
         from trainer import model_family as mf
         mf.set_krea2_text_cache(True, cap=8)
@@ -393,6 +406,14 @@ class TestInjectedPackedForward(unittest.TestCase):
                 tokens, t_g, cross_packed, grid, vseq, text_lens,
                 use_checkpoint=True,
             )
+            # 块外层（first / txtfusion / txtmlp）纳入 checkpoint 后前向应与
+            # 不 checkpoint 逐 bit 一致（同一批 kernel 只是重算时机不同）
+            out_nock = model.forward_packed_navit(
+                tokens, t_g, cross_packed, grid, vseq, text_lens,
+                use_checkpoint=False,
+            )
+        self.assertTrue(torch.equal(out, out_nock),
+                        "use_checkpoint 开/关前向应逐 bit 一致")
         self.assertEqual(out.shape[1], sum(vseq))
         loss = out.float().square().mean()
         loss.backward()

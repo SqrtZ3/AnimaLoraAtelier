@@ -309,10 +309,21 @@ def encode_krea2_text(handles: dict, texts, device, max_length: int = 512):
         missing = list(range(len(cleaned)))
 
     if missing:
-        encoded = _encode_krea2_batch(
-            handles, [cleaned[i] for i in missing], device, max_length
-        )
-        for i, f in zip(missing, encoded):
+        # 批内去重：navit_multiscale 的缩放副本与原图共 caption（cache 关闭时
+        # 同一 pack 里是完全相同的字符串），只编码一次、多处引用（下游 cat/pad
+        # 都是拷贝语义，共享安全）。
+        uniq_texts = list(dict.fromkeys(cleaned[i] for i in missing))
+        encoded_map = {}
+        # 分块编码：output_hidden_states 会让 37 层 hidden states 同时驻留
+        # [B, 541, D]×37 ≈ 102MB/条 —— 整包一次前向在 G≈12 时瞬时 +1.2GB。
+        # 按 8 条一块编码把该峰值封顶在 ~0.8GB，数学与整批/逐条一致。
+        _CHUNK = 8
+        for s in range(0, len(uniq_texts), _CHUNK):
+            chunk = uniq_texts[s:s + _CHUNK]
+            for txt, f in zip(chunk, _encode_krea2_batch(handles, chunk, device, max_length)):
+                encoded_map[txt] = f
+        for i in missing:
+            f = encoded_map[cleaned[i]]
             if _KREA2_TEXT_CACHE_ENABLED:
                 key = (cleaned[i], int(max_length), id(handles["model"]))
                 _KREA2_TEXT_CACHE[key] = f

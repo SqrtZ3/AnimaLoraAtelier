@@ -292,5 +292,66 @@ class TestXformersGqa5D(unittest.TestCase):
         self.assertTrue(torch.isfinite(k.grad.float()).all())
 
 
+# ---------------------------------------------------------------------------
+# 4. 全 264 targets 注入后的 packed 前向（云端实跑崩过的路径回归）
+# ---------------------------------------------------------------------------
+@unittest.skipUnless(HAS_CUDA, "needs CUDA")
+class TestInjectedPackedForward(unittest.TestCase):
+    def test_dora_full_targets_packed_forward(self):
+        """LoKr+DoRA 注入官方全部 Linear（含 first）后 forward_packed_navit 不应
+        AttributeError（LoRALinear 需透传 in_features），且前向/反传有限。"""
+        from models import krea2_modeling as k2
+        from trainer.lora import LoRAInjector
+        from trainer.model_family import KREA2_DEFAULT_LORA_TARGETS
+
+        cfg = k2.SingleMMDiTConfig(
+            features=128, tdim=32, txtdim=64, heads=2, kvheads=1,
+            multiplier=2, layers=2, patch=2, channels=16,
+            txtheads=2, txtkvheads=1, txtlayers=3,
+        )
+        torch.manual_seed(0)
+        model = k2.SingleStreamDiT(cfg).cuda().bfloat16()
+        model.requires_grad_(False)
+        inj = LoRAInjector(rank=8, alpha=8.0, use_lokr=True, factor=2,
+                           lora_variant="dora", dora_fast_norm=True,
+                           targets=list(KREA2_DEFAULT_LORA_TARGETS))
+        inj.inject(model)
+        self.assertIn("first", inj.injected)
+        # 属性透传
+        self.assertEqual(model.first.in_features, 16 * 2 * 2)
+        model.train()
+
+        device, dtype = "cuda", torch.bfloat16
+        lat_shapes = [(4, 4), (6, 8)]
+        text_lens = [5, 3]
+        toks, grids, vseq, crosses = [], [], [], []
+        torch.manual_seed(1)
+        for (h, w), L in zip(lat_shapes, text_lens):
+            lat = torch.randn(1, 16, 1, h, w, device=device, dtype=dtype)
+            tok, grid, _m, _s = model.patchify_latents_to_tokens(lat)
+            toks.append(tok)
+            grids.append(grid)
+            vseq.append(tok.shape[1])
+            crosses.append(torch.randn(1, L, 3, 64, device=device, dtype=dtype))
+        tokens = torch.cat(toks, dim=1)
+        grid = torch.cat(grids, dim=2)
+        cross_packed = torch.cat(crosses, dim=1)
+        t_g = torch.tensor([0.3, 0.8], device=device)
+
+        with torch.autocast("cuda", dtype=dtype):
+            out = model.forward_packed_navit(
+                tokens, t_g, cross_packed, grid, vseq, text_lens,
+                use_checkpoint=True,
+            )
+        self.assertEqual(out.shape[1], sum(vseq))
+        loss = out.float().square().mean()
+        loss.backward()
+        for name, lin in inj.injected.items():
+            for p in lin.adapter.parameters():
+                if p.grad is not None:
+                    self.assertTrue(
+                        torch.isfinite(p.grad.float()).all(), f"{name} grad 非有限")
+
+
 if __name__ == "__main__":
     unittest.main()

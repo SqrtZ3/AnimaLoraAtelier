@@ -736,6 +736,18 @@ class LoRALinear(torch.nn.Module):
     def bias(self):
         return self.original.bias
 
+    # nn.Linear 元数据透传：被包住的层对外仍表现为 Linear。
+    # krea2 forward_packed_navit 读 self.first.in_features 校验 token 维、
+    # Anima packed 路径读 x_embedder.proj[1].in_features —— targets 覆盖这些层
+    # （如官方全 264 Linear 口径含 first）时缺透传会直接 AttributeError。
+    @property
+    def in_features(self):
+        return self.original.in_features
+
+    @property
+    def out_features(self):
+        return self.original.out_features
+
     def merged_weight(self) -> torch.Tensor:
         base_w = self.original.weight.float()
         if self.use_lokr:

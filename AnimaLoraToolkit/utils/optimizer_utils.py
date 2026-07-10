@@ -838,6 +838,7 @@ def create_muon_sf_optimizer(
 ) -> Optimizer:
     valid_keys = {
         "ns_steps", "weight_lr_power", "r", "warmup_steps", "correct_bias",
+        "momentum",
     }
     sf_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
     ignored = [k for k in kwargs if k not in valid_keys]
@@ -847,11 +848,12 @@ def create_muon_sf_optimizer(
     param_list = params if _is_param_groups(params) else list(params)
     logger.info(
         "Creating Muon-SF (Schedule-Free) optimizer "
-        "(lr=%s, betas=%s, wd=%s, ns_steps=%s, weight_lr_power=%s, r=%s, warmup_steps=%s)",
+        "(lr=%s, betas=%s, wd=%s, ns_steps=%s, momentum=%s, weight_lr_power=%s, r=%s, warmup_steps=%s)",
         lr,
         betas,
         weight_decay,
         sf_kwargs.get("ns_steps", 5),
+        sf_kwargs.get("momentum", 0.95),
         sf_kwargs.get("weight_lr_power", 2.0),
         sf_kwargs.get("r", 0.0),
         sf_kwargs.get("warmup_steps", 0),

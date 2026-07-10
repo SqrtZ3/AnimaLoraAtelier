@@ -312,30 +312,50 @@ class LoRALayer(torch.nn.Module):
 
         ΔW = (B @ A - B_init @ A_init) * scaling  (含 PiSSA/ortho init 补偿)
         ||W + ΔW||² = ||W||² + 2·⟨W, ΔW⟩ + ||ΔW||²  per row
+
+        fast=True：⟨W,·⟩ 收缩直接在 W 原 dtype（bf16 tensor core，fp32 累加）上做，
+        不物化全量 fp32 W 副本 —— 关键的是 autograd 图里保存的是 base 权重的
+        detached 引用而非每层一份 fp32 拷贝（12B/264 targets 下这是 GB 级差异）。
+        范数相对误差 ~1e-3。语义与 LoKrLayer.merged_row_norms 的 fast 一致。
+        此前该参数在标准 LoRA 路径上被静默忽略（只有 LoKr 实现了）。
         """
+        Wd = base_weight.detach()
         if base_row_sq is None:
-            base_row_sq = base_weight.detach().float().pow(2).sum(dim=1)
+            if fast:
+                base_row_sq = (Wd * Wd).sum(dim=1, dtype=torch.float32)
+            else:
+                base_row_sq = Wd.float().pow(2).sum(dim=1)
         A = self.lora_down.weight.float()  # (rank, in)
         B = self.lora_up.weight.float()    # (out, rank)
         s = self.scaling
-        W = base_weight.detach().float()
+        W = None if fast else Wd.float()
         # ⟨W, s·B@A⟩ per row = s * (B * (W @ A.T)).sum(dim=1)
-        WA = torch.matmul(W, A.t())  # (out, rank)
+        if fast:
+            WA = torch.matmul(Wd, A.t().to(Wd.dtype)).float()  # (out, rank)
+        else:
+            WA = torch.matmul(W, A.t())  # (out, rank)
         dot = s * (B * WA).sum(dim=1)  # (out,)
-        # ||s·B@A||² per row = s² * (B² @ ||A||²)
-        A_sq = (A ** 2).sum(dim=1)  # (rank,)
-        delta_sq = (s ** 2) * torch.matmul(B ** 2, A_sq)  # (out,)
+        # ||s·B@A||² per row = s² * Σ_{r,r'} B[o,r]·B[o,r']·⟨A[r],A[r']⟩
+        #                    = s² * (B @ (A@Aᵀ) * B).sum(dim=1)
+        # ★ 必须带 A 的 rank×rank Gram：只取对角（B²@||A||²）仅在 A 行正交时
+        # 成立（PiSSA 第 0 步），训练后 A 偏离正交会系统性低/高估范数。
+        G = torch.matmul(A, A.t())  # (rank, rank)
+        delta_sq = (s ** 2) * (torch.matmul(B, G) * B).sum(dim=1)  # (out,)
         # Init delta compensation (PiSSA / Ortho-LoRA):
         # ΔW = s·(B@A - B_i@A_i), so subtract init contributions
         if self.lora_down_init is not None and self.lora_up_init is not None:
             A_i = self.lora_down_init.float()
             B_i = self.lora_up_init.float()
             # ⟨W, -s·B_i@A_i⟩ per row
-            WA_i = torch.matmul(W, A_i.t())  # (out, rank)
+            if fast:
+                WA_i = torch.matmul(Wd, A_i.t().to(Wd.dtype)).float()  # (out, rank)
+            else:
+                WA_i = torch.matmul(W, A_i.t())  # (out, rank)
             dot_i = s * (B_i * WA_i).sum(dim=1)  # (out,)
-            # ||s·B_i@A_i||² per row
-            A_i_sq = (A_i ** 2).sum(dim=1)  # (rank,)
-            delta_i_sq = (s ** 2) * torch.matmul(B_i ** 2, A_i_sq)  # (out,)
+            # ||s·B_i@A_i||² per row（同样带 Gram；A_i 是 SVD 正交行时 G_i=I，
+            # 与对角式一致，但不依赖这一假设）
+            G_i = torch.matmul(A_i, A_i.t())  # (rank, rank)
+            delta_i_sq = (s ** 2) * (torch.matmul(B_i, G_i) * B_i).sum(dim=1)  # (out,)
             # ⟨s·B@A, s·B_i@A_i⟩ per row = s² * (B * (B_i @ (A@A_i.T).T)).sum(dim=1)
             # A@A_i.T: (rank, rank), element [r,r'] = Σ_i A[r,i]·A_i[r',i]
             AAi = torch.matmul(A, A_i.t())  # (rank, rank)
@@ -1237,6 +1257,12 @@ class LoRAInjector:
                 key_up = (weight_decay, ratio, custom_lr)
                 groups_dict.setdefault(key_down, []).append(lora.adapter.lora_down.weight)
                 groups_dict.setdefault(key_up, []).append(lora.adapter.lora_up.weight)
+                # DoRA 幅度向量：与 LoKr 分支同款（无 weight_decay —— 它是范数尺度，
+                # 衰减会系统性压暗输出）。漏掉的话 dora_scale 永远不进 optimizer/zero_grad，
+                # 幅度冻结在 ||W|| 初值、梯度还跨步累积。
+                if getattr(lora, "use_dora", False):
+                    key_dora = (0.0, 1.0, custom_lr)
+                    groups_dict.setdefault(key_dora, []).append(lora.dora_scale)
 
         param_groups = []
         for (wd, lr_mult, custom_lr), params in groups_dict.items():
@@ -1359,12 +1385,39 @@ class LoRAInjector:
                         if not self.tlora_skip_lambda_layer:
                             sd[f"{base}.lambda_layer"] = torch.matmul(b_init, a_init).to(torch.bfloat16)
                 else:
-                    sd[f"{base}.lora_down.weight"] = lora.adapter.lora_down.weight.data.clone()
-                    sd[f"{base}.lora_up.weight"] = lora.adapter.lora_up.weight.data.clone()
-                    if (getattr(lora.adapter, "lora_down_init", None) is not None
-                            and getattr(lora.adapter, "lora_up_init", None) is not None):
-                        sd[f"{base}.lora_down_init.weight"] = lora.adapter.lora_down_init.data.clone().bfloat16().cpu()
-                        sd[f"{base}.lora_up_init.weight"] = lora.adapter.lora_up_init.data.clone().bfloat16().cpu()
+                    ad = lora.adapter
+                    has_init = (getattr(ad, "lora_down_init", None) is not None
+                                and getattr(ad, "lora_up_init", None) is not None)
+                    if export_for_comfy and has_init:
+                        # PiSSA/ortho 补偿式训练的净 ΔW = s·(B@A − B₀@A₀)，单组 rank-r
+                        # 标准键表达不了 —— 直接存 B/A 会让 ComfyUI 把 base 权重的
+                        # top-r 主成分加倍。按 PiSSA 官方转换（MuLabPKU/PiSSA：
+                        # ΔW = [B | −B₀] @ [A; A₀]）折叠成 rank-2r 标准 LoRA。
+                        # ComfyUI 的 scaling = alpha/dim，dim 翻倍 → alpha 同步 ×2
+                        # 保持 s 不变。load_state_dict_from_mapping 能按 rank 切回
+                        # A/B/A₀/B₀ 继续训练（无损往返）。
+                        A = ad.lora_down.weight.data
+                        B = ad.lora_up.weight.data
+                        A0 = ad.lora_down_init.to(device=A.device, dtype=A.dtype)
+                        B0 = ad.lora_up_init.to(device=B.device, dtype=B.dtype)
+                        sd[f"{base}.lora_down.weight"] = torch.cat([A, A0], dim=0).clone()
+                        sd[f"{base}.lora_up.weight"] = torch.cat([B, -B0], dim=1).clone()
+                        sd[f"{base}.alpha"] = torch.tensor(float(mod_alpha) * 2.0)
+                    else:
+                        sd[f"{base}.lora_down.weight"] = ad.lora_down.weight.data.clone()
+                        sd[f"{base}.lora_up.weight"] = ad.lora_up.weight.data.clone()
+                        if has_init:
+                            sd[f"{base}.lora_down_init.weight"] = ad.lora_down_init.data.clone().bfloat16().cpu()
+                            sd[f"{base}.lora_up_init.weight"] = ad.lora_up_init.data.clone().bfloat16().cpu()
+                    # DoRA 幅度：此前只有 LoKr 分支导出，标准 LoRA + DoRA 的成品
+                    # 丢 dora_scale → 推理端连"按幅度重归一化"都复现不了；resume
+                    # 也拿不回训练中的幅度。与 LoKr 分支同款处理。
+                    if getattr(lora, "use_dora", False):
+                        if export_for_comfy:
+                            dora_scale = self.comfy_native_dora_scale(lora).bfloat16().cpu().view(-1, 1)
+                        else:
+                            dora_scale = lora.dora_scale.data.clone().bfloat16().cpu()
+                        sd[f"{base}.dora_scale"] = dora_scale
         return sd
 
     def _diff_state_dict(self):
@@ -1532,6 +1585,7 @@ class LoRAInjector:
         """
         loaded_count = 0
         lokr_init_missing = 0
+        pissa_init_missing = 0
         for name, lora in self.injected.items():
             base = "lora_unet_" + name.replace(".", "_")
 
@@ -1570,8 +1624,77 @@ class LoRAInjector:
                 q_key = f"{base}.q_layer.weight"
                 p_key = f"{base}.p_layer.weight"
                 if down_key in sd and up_key in sd:
-                    lora.adapter.lora_down.weight.data.copy_(sd[down_key])
-                    lora.adapter.lora_up.weight.data.copy_(sd[up_key])
+                    ad = lora.adapter
+                    down_t = sd[down_key]
+                    up_t = sd[up_key]
+                    r = ad.lora_down.weight.shape[0]
+                    has_init = (getattr(ad, "lora_down_init", None) is not None
+                                and getattr(ad, "lora_up_init", None) is not None)
+                    folded = (down_t.shape[0] == 2 * r and up_t.shape[1] == 2 * r)
+                    if folded:
+                        # rank-2r 折叠导出（PiSSA/ortho 补偿，见 state_dict 注释）：
+                        # down'=[A; A₀], up'=[B, −B₀] → 按 rank 切回四块，无损恢复训练态
+                        A_t, A0_t = down_t[:r], down_t[r:]
+                        B_t, B0_t = up_t[:, :r], -up_t[:, r:]
+                        ad.lora_down.weight.data.copy_(A_t)
+                        ad.lora_up.weight.data.copy_(B_t)
+                        if not has_init:
+                            # 当前 run 不是补偿式 init（如 lora_init=default 却 resume
+                            # 了 PiSSA 成品）：补注册 init buffers，否则净 ΔW 语义会把
+                            # B₀A₀（base 主成分）错误并入输出
+                            dev = ad.lora_down.weight.device
+                            dt = ad.lora_down.weight.dtype
+                            del ad.lora_down_init
+                            del ad.lora_up_init
+                            ad.register_buffer(
+                                "lora_down_init",
+                                A0_t.to(device=dev, dtype=dt).clone(), persistent=False)
+                            ad.register_buffer(
+                                "lora_up_init",
+                                B0_t.to(device=dev, dtype=dt).clone(), persistent=False)
+                            logger.warning(
+                                f"层 {name}: 加载了 rank-2r 折叠 PiSSA 成品，但当前配置"
+                                f"不是补偿式 init —— 已从文件补建 init 补偿 buffers。")
+                        else:
+                            ad.lora_down_init.copy_(A0_t.to(
+                                device=ad.lora_down_init.device,
+                                dtype=ad.lora_down_init.dtype))
+                            ad.lora_up_init.copy_(B0_t.to(
+                                device=ad.lora_up_init.device,
+                                dtype=ad.lora_up_init.dtype))
+                    else:
+                        ad.lora_down.weight.data.copy_(down_t)
+                        ad.lora_up.weight.data.copy_(up_t)
+                        # 训练态 raw 格式的 init buffers（PiSSA 补偿基准）。缺失时
+                        # init 已在注入期被 svd_lowrank（随机化算法）重算 → 基准漂移
+                        down_init_key = f"{base}.lora_down_init.weight"
+                        up_init_key = f"{base}.lora_up_init.weight"
+                        if has_init:
+                            if down_init_key in sd and up_init_key in sd:
+                                ad.lora_down_init.copy_(sd[down_init_key].to(
+                                    device=ad.lora_down_init.device,
+                                    dtype=ad.lora_down_init.dtype))
+                                ad.lora_up_init.copy_(sd[up_init_key].to(
+                                    device=ad.lora_up_init.device,
+                                    dtype=ad.lora_up_init.dtype))
+                            else:
+                                pissa_init_missing += 1
+                    # DoRA 幅度恢复。folded（=comfy 导出）里存的是换算后的
+                    # output-axis scale（magnitude × ||W||/||W+ΔW||，见
+                    # comfy_native_dora_scale），需按已恢复的 ΔW 精确逆换算回
+                    # 训练态 magnitude；raw 格式直接拷贝。
+                    dora_key = f"{base}.dora_scale"
+                    if getattr(lora, "use_dora", False) and dora_key in sd:
+                        scale_t = sd[dora_key].reshape(-1).float()
+                        if folded:
+                            base_w = lora.original.weight.detach().float()
+                            delta = ad.delta_weight(apply_rank_dropout=False).detach().to(
+                                device=base_w.device)
+                            base_norm = base_w.norm(dim=1).clamp(min=1e-6)
+                            merged_norm = (base_w + delta).norm(dim=1).clamp(min=1e-6)
+                            scale_t = scale_t.to(device=base_w.device) * (merged_norm / base_norm)
+                        lora.dora_scale.data.copy_(scale_t.to(
+                            device=lora.dora_scale.device, dtype=lora.dora_scale.dtype))
                     loaded_count += 1
                 elif q_key in sd and p_key in sd:
                     lora.adapter.lora_down.weight.data.copy_(sd[q_key])
@@ -1598,6 +1721,12 @@ class LoRAInjector:
                 f"⚠ {lokr_init_missing} 层启用了 tlora_lokr_ortho_init，但 {label} 中没有 "
                 f"lokr_*_init buffers（修复前的旧 checkpoint？）——这些层的 ortho 补偿基准"
                 f"已重新随机生成，续训语义会偏离原 run。"
+            )
+        if pissa_init_missing:
+            logger.warning(
+                f"⚠ {pissa_init_missing} 层启用了 PiSSA/ortho 补偿式 init，但 {label} 中没有 "
+                f"lora_*_init buffers（修复前的旧 checkpoint？）——这些层的补偿基准已由 "
+                f"svd_lowrank（随机化算法）重算，续训净 ΔW 会与原 run 有漂移。"
             )
         logger.info(f"从 {label} 加载了 {loaded_count}/{len(self.injected)} 层 LoRA 权重")
         return loaded_count

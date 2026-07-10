@@ -13,10 +13,16 @@ Muon (MomentUm Orthogonalized by Newton-Schulz, Keller Jordan 2024):
   1D 参数（bias、DoRA scale）走标准 AdamW fallback。
 
 MuonScheduleFree:
-  Schedule-Free 轨迹 + Newton-Schulz 正交化。Drop momentum（SF 的
-  Polyak-Ruppert 平均替代之），保留 z base-sequence + 2D 走 NS、1D 走
-  AdamW（second-moment only）。train()/eval() swap 遵循 SOAPScheduleFree
-  的同一套 y/x 模式。
+  Schedule-Free 轨迹 + Newton-Schulz 正交化。保留 z base-sequence + 2D 走
+  NS、1D 走 AdamW（second-moment only）。train()/eval() swap 遵循
+  SOAPScheduleFree 的同一套 y/x 模式。
+
+  ★ 2D 路径保留一个内层动量 buffer 作为 NS 的输入（momentum，默认 0.95，
+  设 0 关闭）。SF 的 Polyak 平均替代的是 lr *schedule*，发生在权重轨迹上，
+  替代不了 NS 之前的梯度平滑：极分解把所有奇异值拉到 1，喂裸梯度等于把
+  batch 噪声也"归一化放大"。Keller 原版 Muon 的 NS 输入就是动量 buffer；
+  ScheduleFree+ (arXiv:2605.19095) 实证把内层动量加回 SF 可修复大 batch
+  发散；SF 官方 wrapper 文档也允许内外动量并存。
 
 参考:
   - 原始 repo: github.com/KellerJordan/Muon
@@ -210,8 +216,8 @@ class Muon(Optimizer):
 class MuonScheduleFree(Optimizer):
     """Schedule-Free Muon: Polyak-Ruppert averaging + Newton-Schulz.
 
-    Drops momentum (SF averaging replaces it). 2D params get NS-preconditioned
-    gradient applied to z; 1D params get AdamW-normalized gradient applied to z.
+    2D params get NS-preconditioned momentum applied to z; 1D params get
+    AdamW-normalized gradient applied to z.
 
     The parameter tensor holds the gradient-evaluation point ``y`` while in
     train mode; call :meth:`eval` before sampling/checkpointing to swap to
@@ -221,6 +227,10 @@ class MuonScheduleFree(Optimizer):
         weight_lr_power: power on lr in the Polyak averaging weight (default 2.0).
         r: power on step index (default 0.0 = uniform average).
         warmup_steps: linear lr warmup (default 0).
+        momentum: inner momentum for the NS input on 2D params (default 0.95,
+            same as Muon; 0 disables and feeds the raw gradient to NS — not
+            recommended, see module docstring). Nesterov-style blend, matching
+            the plain :class:`Muon` implementation.
     """
 
     def __init__(
@@ -235,9 +245,12 @@ class MuonScheduleFree(Optimizer):
         r: float = 0.0,
         warmup_steps: int = 0,
         correct_bias: bool = True,
+        momentum: float = 0.95,
     ):
         if lr <= 0:
             raise ValueError(f"Invalid learning rate: {lr}")
+        if not (0.0 <= momentum < 1.0):
+            raise ValueError(f"Invalid momentum: {momentum}")
         defaults = dict(
             lr=lr,
             betas=betas,
@@ -248,6 +261,7 @@ class MuonScheduleFree(Optimizer):
             r=r,
             warmup_steps=warmup_steps,
             correct_bias=correct_bias,
+            momentum=momentum,
             k=0,
             weight_sum=0.0,
             lr_max=0.0,
@@ -301,6 +315,7 @@ class MuonScheduleFree(Optimizer):
             decay = group["weight_decay"]
             lr = group["lr"]
             warmup_steps = group["warmup_steps"]
+            momentum = group.get("momentum", 0.95)
 
             k = group["k"]
             sched = (k + 1) / warmup_steps if (warmup_steps > 0 and k < warmup_steps) else 1.0
@@ -334,7 +349,21 @@ class MuonScheduleFree(Optimizer):
                     else:
                         grad_flat = grad
 
-                    update = zeropower_via_newtonschulz5(grad_flat, steps=ns_steps)
+                    # 内层动量平滑 NS 输入（与 Muon 同款 Nesterov blend）。
+                    # 必须在 NS 之前：极分解会把噪声的奇异值也拉到 1，
+                    # 喂裸梯度 = 放大 batch 噪声（见模块 docstring 引证）。
+                    if momentum > 0.0:
+                        buf = state.get("momentum_buffer")
+                        if buf is None:
+                            buf = state["momentum_buffer"] = torch.zeros_like(
+                                grad_flat, dtype=torch.float32
+                            )
+                        buf.lerp_(grad_flat, 1.0 - momentum)
+                        ns_input = grad_flat.lerp(buf, momentum)
+                    else:
+                        ns_input = grad_flat
+
+                    update = zeropower_via_newtonschulz5(ns_input, steps=ns_steps)
 
                     # Update RMS scaling
                     rows, cols = update.shape

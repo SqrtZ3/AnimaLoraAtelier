@@ -96,9 +96,11 @@ def _pissa_init(in_features: int, out_features: int, rank: int,
     W = base_weight.detach().float().to(device)
     # W: (out_features, in_features)，svd_lowrank 要求 2D 输入
     # 返回 U: (out, q), S: (q,), V: (in, q)
+    # ★ 注意：svd_lowrank 返回 V（不是 Vh），V 的形状是 (in, q)
+    #   全量 svd 返回 Vh: (k, in)，截断版本返回 V: (in, q)
     q = min(rank + 8, min(in_features, out_features))  # 多取几个提高精度
     U, S, V = torch.svd_lowrank(W, q=q, niter=2)
-    A_init = V[:rank, :].t().contiguous()                        # (rank, in_features)
+    A_init = V[:, :rank].t().contiguous()                        # (rank, in_features)
     B_init = (U[:, :rank] * S[:rank].unsqueeze(0)).contiguous()  # (out_features, rank)
     return A_init, B_init
 
@@ -316,26 +318,32 @@ class LoRALayer(torch.nn.Module):
         A = self.lora_down.weight.float()  # (rank, in)
         B = self.lora_up.weight.float()    # (out, rank)
         s = self.scaling
-        # ⟨W, B@A⟩ per row = s * (B * (W @ A.T)).sum(dim=1)
-        WA = torch.matmul(base_weight.detach().float(), A.t())  # (out, rank)
+        W = base_weight.detach().float()
+        # ⟨W, s·B@A⟩ per row = s * (B * (W @ A.T)).sum(dim=1)
+        WA = torch.matmul(W, A.t())  # (out, rank)
         dot = s * (B * WA).sum(dim=1)  # (out,)
-        # ||B@A||² per row = s² * (B² @ ||A||²)
+        # ||s·B@A||² per row = s² * (B² @ ||A||²)
         A_sq = (A ** 2).sum(dim=1)  # (rank,)
         delta_sq = (s ** 2) * torch.matmul(B ** 2, A_sq)  # (out,)
-        # Init delta compensation (PiSSA / Ortho-LoRA)
+        # Init delta compensation (PiSSA / Ortho-LoRA):
+        # ΔW = s·(B@A - B_i@A_i), so subtract init contributions
         if self.lora_down_init is not None and self.lora_up_init is not None:
             A_i = self.lora_down_init.float()
             B_i = self.lora_up_init.float()
-            WA_i = torch.matmul(base_weight.detach().float(), A_i.t())
-            dot_i = s * (B_i * WA_i).sum(dim=1)
-            A_i_sq = (A_i ** 2).sum(dim=1)
-            delta_i_sq = (s ** 2) * torch.matmul(B_i ** 2, A_i_sq)
-            # Cross: ⟨W, -B_i@A_i⟩ = -dot_i, ||-B_i@A_i||² = delta_i_sq
+            # ⟨W, -s·B_i@A_i⟩ per row
+            WA_i = torch.matmul(W, A_i.t())  # (out, rank)
+            dot_i = s * (B_i * WA_i).sum(dim=1)  # (out,)
+            # ||s·B_i@A_i||² per row
+            A_i_sq = (A_i ** 2).sum(dim=1)  # (rank,)
+            delta_i_sq = (s ** 2) * torch.matmul(B_i ** 2, A_i_sq)  # (out,)
+            # ⟨s·B@A, s·B_i@A_i⟩ per row = s² * (B * (B_i @ (A@A_i.T).T)).sum(dim=1)
+            # A@A_i.T: (rank, rank), element [r,r'] = Σ_i A[r,i]·A_i[r',i]
+            AAi = torch.matmul(A, A_i.t())  # (rank, rank)
+            cross_inner = (B * torch.matmul(B_i, AAi.t())).sum(dim=1)  # (out,)
+            cross = (s ** 2) * cross_inner  # (out,)
+            # Combine: dot -= dot_i, delta_sq = delta_sq + delta_i_sq - 2·cross
             dot = dot - dot_i
-            delta_sq = delta_sq + delta_i_sq
-            # Cross: ⟨B@A, -B_i@A_i⟩ per row = -s² * (B * B_i).sum(dim=1) * (A * A_i).sum(dim=1)
-            cross = (s ** 2) * ((B * B_i).sum(dim=1) * ((A * A_i).sum(dim=1)))
-            delta_sq = delta_sq - 2.0 * cross
+            delta_sq = delta_sq + delta_i_sq - 2.0 * cross
         merged_sq = base_row_sq + 2.0 * dot + delta_sq
         return merged_sq.clamp(min=1e-12).sqrt()
 

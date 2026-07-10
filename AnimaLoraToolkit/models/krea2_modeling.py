@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Optional, Sequence
@@ -40,11 +41,21 @@ from einops import rearrange
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
+logger = logging.getLogger(__name__)
+
 # torch >= 2.5 的 SDPA 原生支持 GQA（enable_gqa）；老版本退回手动展开 KV 头（数值相同）。
 try:
     _SDPA_HAS_GQA = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 5)
 except Exception:  # pragma: no cover
     _SDPA_HAS_GQA = False
+
+# xformers GQA：优先走 5D grouped 布局 [B, L, G, H/G, D]，KV 用 expand（stride-0
+# 视图）广播到组内 —— 免去 repeat_interleave 物化 4×KV 的读写（28 块 × grad
+# checkpoint recompute 每步各来一遍）。与展开后计算数学等价（同一 q 头分组约定：
+# q 头 i ↔ kv 头 i//rep，与 repeat_interleave / SDPA enable_gqa 一致）。
+# 老版本 xformers 不支持 5D + BlockDiagonalMask 时：首次调用捕获异常、记 WARNING、
+# 永久回退 repeat_interleave 路径（回退有日志，非静默）。
+_XF_GQA_5D_OK = True
 
 
 def _is_xformers_bias(mask) -> bool:
@@ -133,6 +144,26 @@ def attention(
     """
     if _is_xformers_bias(mask):
         import xformers.ops as xops
+
+        global _XF_GQA_5D_OK
+        if gqa and k.shape[1] != q.shape[1] and _XF_GQA_5D_OK:
+            # 5D grouped 布局：q [B,L,G,rep,D]，kv [B,L,G,1,D]→expand（零拷贝）。
+            B, Hq, L, D = q.shape
+            G_kv = k.shape[1]
+            rep = Hq // G_kv
+            q5 = q.transpose(1, 2).contiguous().view(B, L, G_kv, rep, D)
+            k5 = k.transpose(1, 2).contiguous().unsqueeze(3).expand(B, L, G_kv, rep, D)
+            v5 = v.transpose(1, 2).contiguous().unsqueeze(3).expand(B, L, G_kv, rep, D)
+            try:
+                x = xops.memory_efficient_attention(q5, k5, v5, attn_bias=mask, scale=scale)
+                return x.reshape(B, L, Hq * D)
+            except (NotImplementedError, ValueError, RuntimeError) as e:
+                _XF_GQA_5D_OK = False
+                logger.warning(
+                    "xformers 5D grouped GQA 不可用（%s: %s），永久回退 "
+                    "repeat_interleave 展开路径（数值相同，仅多物化 KV 副本）。",
+                    type(e).__name__, e,
+                )
 
         if gqa and k.shape[1] != q.shape[1]:
             rep = q.shape[1] // k.shape[1]

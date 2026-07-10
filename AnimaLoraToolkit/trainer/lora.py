@@ -468,7 +468,7 @@ class LoKrLayer(torch.nn.Module):
             out = out * self._md_keep.to(out.dtype)
         return out
 
-    def merged_row_norms(self, base_weight):
+    def merged_row_norms(self, base_weight, base_row_sq=None, fast=False):
         """Per-row L2 norms of (base_weight + ΔW) without materializing full delta.
 
         Uses: ||W + ΔW||² = ||W||² + 2⟨W, ΔW⟩ + ||ΔW||²
@@ -480,6 +480,16 @@ class LoKrLayer(torch.nn.Module):
         对 krea2 mlp 层：25MB vs 384MB（~15× 缩减）。
 
         必须在 _compute() 之后调用以复用同一 rank dropout mask。
+
+        Args:
+            base_row_sq: 可选的 ||W||² per-row 预计算缓存（fp32, (out_features,)）。
+                W 冻结时该量全程不变，调用方缓存后可省去每次前向对全量 W 的
+                cast + 平方 + 归约一整趟（LoRALinear.forward 的 DoRA 分支即如此）。
+                数值与现算严格一致。
+            fast: True 时 ⟨W,ΔW⟩ 的收缩直接用 base_weight 原 dtype（通常 bf16，
+                matmul 内部 fp32 累加）计算，免去对全量 W 的 fp32 物化拷贝——
+                读写流量 ~减半。范数量级 O(1)、仅作幅度归一，bf16 收缩的相对误差
+                ~1e-3 量级；数值敏感场景保持 False（默认，逐 bit 不变）。
         """
         factor, out_dim, in_dim = self.factor, self.out_dim, self.in_dim
 
@@ -499,9 +509,11 @@ class LoKrLayer(torch.nn.Module):
         # U = w2a @ w2b: (out_dim, in_dim) -- 最大的中间量，远小于 full delta
         U = torch.matmul(w2_a, w2_b)
 
-        # ||W||² per row
-        W = base_weight.float()  # (out_features, in_features)
-        W_sq = (W ** 2).sum(dim=1)  # (out_features,)
+        # ||W||² per row（W 冻结 → 可由调用方缓存注入）
+        if base_row_sq is not None:
+            W_sq = base_row_sq.to(device=base_weight.device)  # (out_features,) fp32
+        else:
+            W_sq = (base_weight.float() ** 2).sum(dim=1)      # (out_features,)
 
         # ||ΔW||² per row = scaling² · ||w1[f_o]||² · ||U[o]||²
         w1_sq = (w1 ** 2).sum(dim=1)  # (factor,)
@@ -511,8 +523,17 @@ class LoKrLayer(torch.nn.Module):
         ).reshape(-1)  # (out_features,)
 
         # ⟨W, ΔW⟩ per row
-        W_r = W.reshape(factor, out_dim, factor, in_dim)  # (f_o, o, f_i, ii)
-        WU = torch.einsum('abcd,bd->abc', W_r, U)  # (f_o, o, f_i)
+        if fast:
+            # 免物化：W 保持原 dtype（bf16 存储读它不损精度），einsum 走 tensor core
+            # fp32 累加；仅乘法操作数是 bf16 舍入。
+            W_r = base_weight.reshape(factor, out_dim, factor, in_dim)
+            WU = torch.einsum(
+                'abcd,bd->abc', W_r, U.to(base_weight.dtype)
+            ).float()  # (f_o, o, f_i)
+        else:
+            W = base_weight.float()  # (out_features, in_features)
+            W_r = W.reshape(factor, out_dim, factor, in_dim)  # (f_o, o, f_i, ii)
+            WU = torch.einsum('abcd,bd->abc', W_r, U)  # (f_o, o, f_i)
         dot = self.scaling * torch.einsum('abc,ac->ab', WU, w1)  # (f_o, o)
         dot = dot.reshape(-1)  # (out_features,)
 
@@ -534,8 +555,10 @@ class LoKrLayer(torch.nn.Module):
                 - (self.scaling ** 2) * 2.0 * (w1_cross.unsqueeze(1) * U_cross.unsqueeze(0)).reshape(-1) \
                 + (self.scaling ** 2) * (w1_init_sq.unsqueeze(1) * U_init_sq.unsqueeze(0)).reshape(-1)
 
-            # Subtract init contribution from ⟨W, ΔW⟩
-            WU_init = torch.einsum('abcd,bd->abc', W_r, U_init)
+            # Subtract init contribution from ⟨W, ΔW⟩（fast 模式 W_r 是 bf16，对齐 dtype）
+            WU_init = torch.einsum(
+                'abcd,bd->abc', W_r, U_init.to(W_r.dtype)
+            ).float()
             dot_init = self.scaling * torch.einsum('abc,ac->ab', WU_init, w1_init)
             dot = dot - dot_init.reshape(-1)
 
@@ -582,13 +605,24 @@ class LoRALinear(torch.nn.Module):
     def __init__(self, original, rank=4, alpha=1.0, dropout=0.0, use_lokr=False, factor=8,
                  rank_dropout=0.0, module_dropout=0.0, lora_variant="base",
                  tlora_rmin_ratio=0.5, tlora_alpha=1.0, tlora_init="default",
-                 tlora_lokr_ortho_init=False):
+                 tlora_lokr_ortho_init=False,
+                 dora_fast_norm=False, dora_detach_norm=False):
         super().__init__()
         self.original = original
         self.use_lokr = use_lokr
         self.lora_variant = (lora_variant or "base").lower()
         self.use_dora = self.lora_variant == "dora"
         self.use_tlora = self.lora_variant == "tlora"
+        # DoRA 范数计算的两个 opt-in 加速开关（默认 False = 逐 bit 与历史一致）：
+        # - fast_norm: ⟨W,ΔW⟩ 收缩用 W 原 dtype（bf16 tensor core, fp32 累加），
+        #   免全量 fp32 物化；范数相对误差 ~1e-3。
+        # - detach_norm: ||W+ΔW|| 对 LoKr 因子 detach（PEFT DoRA 参考实现同款，
+        #   出自 DoRA 论文 Sec 4.3 的省显存梯度近似）；省 backward 里对全量 W
+        #   的再收缩与范数支路的 autograd 图。梯度有轻微改变 → 必须 opt-in。
+        self.dora_fast_norm = bool(dora_fast_norm)
+        self.dora_detach_norm = bool(dora_detach_norm)
+        # ||W||² per-row 缓存（W 冻结不变；惰性初始化以跟随 device 迁移）
+        self._dora_base_row_sq = None
 
         # 组合兼容性校验：
         # - dora 仍只支持 lokr
@@ -662,7 +696,23 @@ class LoRALinear(torch.nn.Module):
             # 峰值显存从 O(out·in) 降到 O(out_dim·in_dim)（缩小 ~factor² 倍）。
             base_no_bias = F.linear(x, self.original.weight, None)
             lora_out = adapter._compute(x)  # 也存储 _rd_mask 供下一步复用
-            merged_norm = adapter.merged_row_norms(self.original.weight)  # (out_features,)
+            # ||W||² per-row 缓存：W 冻结（requires_grad=False、不进 optimizer），
+            # 该量全程不变 → 只算一次（device 迁移时重算）。严格等价于每次现算。
+            _w = self.original.weight
+            if (self._dora_base_row_sq is None
+                    or self._dora_base_row_sq.device != _w.device):
+                self._dora_base_row_sq = (_w.detach().float() ** 2).sum(dim=1)
+            if self.dora_detach_norm:
+                with torch.no_grad():
+                    merged_norm = adapter.merged_row_norms(
+                        _w, base_row_sq=self._dora_base_row_sq,
+                        fast=self.dora_fast_norm,
+                    )  # (out_features,), no grad
+            else:
+                merged_norm = adapter.merged_row_norms(
+                    _w, base_row_sq=self._dora_base_row_sq,
+                    fast=self.dora_fast_norm,
+                )  # (out_features,)
             scale = (self.dora_scale.float() / merged_norm.clamp(min=1e-6))  # (out_features,)
             raw_out = base_no_bias.float() + lora_out.float()
             dora_no_bias = (raw_out * scale.unsqueeze(0)).to(dtype=x.dtype)
@@ -734,7 +784,9 @@ class LoRAInjector:
                  tlora_rmin_ratio=0.5, tlora_alpha=1.0, tlora_init="ortho",
                  tlora_lokr_experimental=False, tlora_lokr_ortho_init=False,
                  # T-LoRA 导出体积控制
-                 tlora_skip_lambda_layer=True):
+                 tlora_skip_lambda_layer=True,
+                 # DoRA 范数加速开关（见 LoRALinear.__init__ 注释；默认关 = 行为不变）
+                 dora_fast_norm=False, dora_detach_norm=False):
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
@@ -777,6 +829,8 @@ class LoRAInjector:
         self.dora_export_mode = (dora_export_mode or "native").lower()
         if self.dora_export_mode not in ("native", "diff", "merged_model"):
             raise ValueError(f"Unknown dora_export_mode: {dora_export_mode}")
+        self.dora_fast_norm = bool(dora_fast_norm)
+        self.dora_detach_norm = bool(dora_detach_norm)
 
         # Ortho init 的净 ΔW = kron(w1,w2a@w2b) − kron(w1_init,w2a_init@w2b_init)，
         # 两个 Kronecker 积之差数学上无法合并成单组标准 LoKr key（lokr_w1/w2_a/w2_b）
@@ -915,6 +969,8 @@ class LoRAInjector:
                 tlora_alpha=self.tlora_alpha_param,
                 tlora_init=self.tlora_init,
                 tlora_lokr_ortho_init=self.tlora_lokr_ortho_init,
+                dora_fast_norm=self.dora_fast_norm,
+                dora_detach_norm=self.dora_detach_norm,
             )
 
             parent_name, _, child_name = name.rpartition(".")

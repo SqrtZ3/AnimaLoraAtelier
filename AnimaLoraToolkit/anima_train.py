@@ -1241,6 +1241,8 @@ def main():
         loraplus_lr_ratio=float(getattr(args, "loraplus_lr_ratio", 1.0) or 1.0),
         lora_variant=lora_variant,
         dora_export_mode=dora_export_mode,
+        dora_fast_norm=bool(getattr(args, "dora_fast_norm", False)),
+        dora_detach_norm=bool(getattr(args, "dora_detach_norm", False)),
         tlora_rmin_ratio=float(getattr(args, "tlora_rmin_ratio", 0.5) or 0.5),
         tlora_alpha=float(getattr(args, "tlora_alpha", 1.0) or 1.0),
         tlora_init=str(getattr(args, "tlora_init", "ortho") or "ortho"),

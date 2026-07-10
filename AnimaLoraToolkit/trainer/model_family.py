@@ -217,44 +217,59 @@ def reset_krea2_text_cache():
 
 
 @torch.no_grad()
-def _encode_krea2_single(handles: dict, text: str, device, max_length: int) -> torch.Tensor:
-    """单条 prompt → 压缩后有效 token 特征 [L_valid, 12, D]（官方 encoder.py 逐步对齐）。
+def _encode_krea2_batch(handles: dict, texts: list, device, max_length: int) -> list:
+    """一次 TE 前向编码 N 条 prompt → list of [L_valid_i, 12, D]（官方 encoder.py 逐步对齐）。
+
+    与逐条编码数学等价：所有条目本就 pad 到同一 max_length、拼同一 suffix，
+    batch 内每行的 input_ids / attention_mask / position 布局与单条时完全相同，
+    仅把 N 次串行 TE 前向合并成 1 次（caption 动态时 cache 全关、训练每步都走
+    这条路径 —— 省 N−1 次 4B 模型的整趟启动）。
 
     压缩（去掉 attention_mask=0 的 padding 位）与官方"mask 屏蔽 padding"数学等价：
     text token 无 RoPE（pos 全 0）、padding 作为 key 被 mask 后贡献恒为 0，
     删除它们不改变任何有效 token 的注意力输出。
     """
-    key = (text, int(max_length), id(handles["model"]))
-    if _KREA2_TEXT_CACHE_ENABLED:
-        hit = _KREA2_TEXT_CACHE.get(key)
-        if hit is not None:
-            _KREA2_TEXT_CACHE.move_to_end(key)
-            return hit.to(device)
-
     te, tokenizer = handles["model"], handles["tokenizer"]
-    full = _KREA2_PROMPT_PREFIX + (text if text else " ")
+    fulls = [_KREA2_PROMPT_PREFIX + (t if t else " ") for t in texts]
     inputs = tokenizer(
-        [full], truncation=True, return_overflowing_tokens=False,
+        fulls, truncation=True, return_overflowing_tokens=False,
         padding="max_length",
         max_length=max_length + _KREA2_PREFIX_IDX - _KREA2_SUFFIX_START_IDX,
         return_tensors="pt",
     ).to(te.device)
     suffix = tokenizer([_KREA2_PROMPT_SUFFIX], return_tensors="pt",
                        add_special_tokens=False).to(te.device)
-    input_ids = torch.cat([inputs["input_ids"], suffix["input_ids"]], dim=1)
+    B = len(fulls)
+    input_ids = torch.cat(
+        [inputs["input_ids"], suffix["input_ids"].expand(B, -1)], dim=1
+    )
     mask = torch.cat(
-        [inputs["attention_mask"].bool(), suffix["attention_mask"].bool()], dim=1
+        [inputs["attention_mask"].bool(), suffix["attention_mask"].bool().expand(B, -1)],
+        dim=1,
     )
     states = te(input_ids=input_ids, attention_mask=mask, output_hidden_states=True)
     hiddens = torch.stack([states.hidden_states[i] for i in KREA2_SELECT_LAYERS], dim=2)
-    hiddens = hiddens[:, _KREA2_PREFIX_IDX:]          # [1, L, 12, D]
-    mask = mask[:, _KREA2_PREFIX_IDX:]                # [1, L]
+    hiddens = hiddens[:, _KREA2_PREFIX_IDX:]          # [B, L, 12, D]
+    mask = mask[:, _KREA2_PREFIX_IDX:]                # [B, L]
 
-    valid = hiddens[0][mask[0]]                       # [L_valid, 12, D]（压缩）
-    if valid.shape[0] == 0:
-        valid = hiddens[0][:1]                        # 兜底：至少 1 个 token
-    valid = valid.detach()
+    out = []
+    for i in range(B):
+        valid = hiddens[i][mask[i]]                   # [L_valid, 12, D]（压缩）
+        if valid.shape[0] == 0:
+            valid = hiddens[i][:1]                    # 兜底：至少 1 个 token
+        out.append(valid.detach())
+    return out
 
+
+def _encode_krea2_single(handles: dict, text: str, device, max_length: int) -> torch.Tensor:
+    """单条 prompt → [L_valid, 12, D]。批量路径的 B=1 包装（含 cache 查询/写入）。"""
+    key = (text, int(max_length), id(handles["model"]))
+    if _KREA2_TEXT_CACHE_ENABLED:
+        hit = _KREA2_TEXT_CACHE.get(key)
+        if hit is not None:
+            _KREA2_TEXT_CACHE.move_to_end(key)
+            return hit.to(device)
+    valid = _encode_krea2_batch(handles, [text], device, max_length)[0]
     if _KREA2_TEXT_CACHE_ENABLED:
         _KREA2_TEXT_CACHE[key] = valid
         _KREA2_TEXT_CACHE.move_to_end(key)
@@ -270,15 +285,43 @@ def encode_krea2_text(handles: dict, texts, device, max_length: int = 512):
       的 Qwen 通道同处理）。
     - 每条先压缩到有效 token，再 pad 到 batch 内最长 + mask —— dense 前向用 mask，
       navit 打包直接用压缩长度（见 encode_krea2_text_packed）。
+    - cache 未命中的条目合并成**一次** TE batch 前向（数学等价于逐条，见
+      _encode_krea2_batch）；命中的直接取 cache。
     """
     from trainer.text_encode import _build_qwen_text_from_prompt
 
     if isinstance(texts, str):
         texts = [texts]
-    feats = [
-        _encode_krea2_single(handles, _build_qwen_text_from_prompt(str(t or "")), device, max_length)
-        for t in texts
-    ]
+    cleaned = [_build_qwen_text_from_prompt(str(t or "")) for t in texts]
+
+    feats: list = [None] * len(cleaned)
+    missing = []
+    if _KREA2_TEXT_CACHE_ENABLED:
+        for i, txt in enumerate(cleaned):
+            key = (txt, int(max_length), id(handles["model"]))
+            hit = _KREA2_TEXT_CACHE.get(key)
+            if hit is not None:
+                _KREA2_TEXT_CACHE.move_to_end(key)
+                feats[i] = hit.to(device)
+            else:
+                missing.append(i)
+    else:
+        missing = list(range(len(cleaned)))
+
+    if missing:
+        encoded = _encode_krea2_batch(
+            handles, [cleaned[i] for i in missing], device, max_length
+        )
+        for i, f in zip(missing, encoded):
+            if _KREA2_TEXT_CACHE_ENABLED:
+                key = (cleaned[i], int(max_length), id(handles["model"]))
+                _KREA2_TEXT_CACHE[key] = f
+                _KREA2_TEXT_CACHE.move_to_end(key)
+            feats[i] = f.to(device)
+        if _KREA2_TEXT_CACHE_ENABLED:
+            while len(_KREA2_TEXT_CACHE) > _KREA2_TEXT_CACHE_CAP:
+                _KREA2_TEXT_CACHE.popitem(last=False)
+
     L_max = max(f.shape[0] for f in feats)
     B = len(feats)
     n_layers, dim = feats[0].shape[1], feats[0].shape[2]

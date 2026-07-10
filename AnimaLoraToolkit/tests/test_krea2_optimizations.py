@@ -243,6 +243,51 @@ class TestEncodeKrea2Batch(unittest.TestCase):
 # ---------------------------------------------------------------------------
 @unittest.skipUnless(HAS_CUDA and HAS_XFORMERS, "needs CUDA + xformers")
 class TestXformersGqa5D(unittest.TestCase):
+    def test_probe_runs_once_on_first_use(self):
+        """flag=None 时首次 GQA 调用应触发探针（含 backward）并落定 True/False，
+        且无论落定结果如何调用都应产出有限输出。
+
+        实测现状（2026-07）：xformers 的 BMGHK 只有 forward 算子、backward 缺失
+        （本地 torch2.7 与云端 fa2 2.8.3 构建一致）→ 探针在当前环境应为 False。
+        未来 xformers 支持后此断言自然翻转为 True，届时更新。"""
+        from models import krea2_modeling as k2
+        old_flag = k2._XF_GQA_5D_OK
+        try:
+            k2._XF_GQA_5D_OK = None
+            q = torch.randn(1, 8, 32, 64, device="cuda", dtype=torch.bfloat16)
+            kk = torch.randn(1, 2, 32, 64, device="cuda", dtype=torch.bfloat16)
+            vv = torch.randn(1, 2, 32, 64, device="cuda", dtype=torch.bfloat16)
+            mask = k2.cached_block_diag_mask((16, 16))
+            out = k2.attention(q, kk, vv, mask=mask, gqa=True)
+            self.assertIsNotNone(k2._XF_GQA_5D_OK, "探针应已运行并落定")
+            self.assertIsInstance(k2._XF_GQA_5D_OK, bool)
+            self.assertTrue(torch.isfinite(out.float()).all())
+        finally:
+            k2._XF_GQA_5D_OK = old_flag
+
+    def test_probe_failure_falls_back(self):
+        """探针失败（模拟云端 fa2-only 构建）→ flag=False → 走 repeat 路径且结果正确。"""
+        from models import krea2_modeling as k2
+        old_flag = k2._XF_GQA_5D_OK
+        old_probe = k2._probe_xf_gqa_5d
+        try:
+            k2._probe_xf_gqa_5d = lambda *a, **kw: False
+            k2._XF_GQA_5D_OK = None
+            torch.manual_seed(0)
+            q = torch.randn(1, 8, 32, 64, device="cuda", dtype=torch.bfloat16)
+            kk = torch.randn(1, 2, 32, 64, device="cuda", dtype=torch.bfloat16)
+            vv = torch.randn(1, 2, 32, 64, device="cuda", dtype=torch.bfloat16)
+            mask = k2.cached_block_diag_mask((16, 16))
+            out_fb = k2.attention(q, kk, vv, mask=mask, gqa=True)
+            self.assertFalse(k2._XF_GQA_5D_OK)
+            k2._XF_GQA_5D_OK = True
+            out_5d = k2.attention(q, kk, vv, mask=mask, gqa=True)
+            diff = (out_fb.float() - out_5d.float()).abs().max().item()
+            self.assertLess(diff, 2e-2)
+        finally:
+            k2._XF_GQA_5D_OK = old_flag
+            k2._probe_xf_gqa_5d = old_probe
+
     def test_5d_equals_repeat(self):
         from models import krea2_modeling as k2
         torch.manual_seed(0)
@@ -272,7 +317,12 @@ class TestXformersGqa5D(unittest.TestCase):
         diff = (out_5d.float() - out_rep.float()).abs().max().item()
         self.assertLess(diff, 2e-2, f"5D vs repeat 偏差 {diff}")
 
-    def test_5d_backward(self):
+    def test_training_grad_path_via_probe(self):
+        """带梯度输入走探针决定的路径（当前环境探针 False → repeat），
+        backward 必须可用且梯度有限——这是训练每步的真实路径。
+
+        注：不再存在旧版的调用内静默回退；此前的 test_5d_backward 正是被
+        那个回退掩盖成了假阳性（5D backward 实际不被 xformers 支持）。"""
         from models import krea2_modeling as k2
         torch.manual_seed(1)
         device, dtype = "cuda", torch.bfloat16
@@ -282,7 +332,7 @@ class TestXformersGqa5D(unittest.TestCase):
         mask = k2.cached_block_diag_mask((32, 32))
         old_flag = k2._XF_GQA_5D_OK
         try:
-            k2._XF_GQA_5D_OK = True
+            k2._XF_GQA_5D_OK = None   # 让探针现场决定（与真实训练首步一致）
             out = k2.attention(q, k, v, mask=mask, gqa=True)
             out.float().square().sum().backward()
         finally:

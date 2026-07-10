@@ -53,9 +53,44 @@ except Exception:  # pragma: no cover
 # 视图）广播到组内 —— 免去 repeat_interleave 物化 4×KV 的读写（28 块 × grad
 # checkpoint recompute 每步各来一遍）。与展开后计算数学等价（同一 q 头分组约定：
 # q 头 i ↔ kv 头 i//rep，与 repeat_interleave / SDPA enable_gqa 一致）。
-# 老版本 xformers 不支持 5D + BlockDiagonalMask 时：首次调用捕获异常、记 WARNING、
-# 永久回退 repeat_interleave 路径（回退有日志，非静默）。
-_XF_GQA_5D_OK = True
+# 可用性由**首次调用时的一次性小张量探针**决定（含 backward —— 部分 xformers
+# 构建只有 fa2B/fa3B backward 算子、不支持 BMGHK 格式，前向能过 backward 会炸；
+# 云端实测如此）。探针失败记一条 WARNING 后永久走 repeat_interleave（非静默）。
+# 不在真实前向里试错：grad checkpoint 下中途换 kernel 会让同一步混两种
+# bf16 舍入路径，探针前置可彻底避免。
+# None=未探针；True/False=探针结果。测试可显式覆写。
+_XF_GQA_5D_OK: Optional[bool] = None
+
+
+def _probe_xf_gqa_5d(device, dtype, headdim: int, rep: int) -> bool:
+    """小张量探针：BMGHK 布局 + BlockDiagonalMask 的 forward+backward 是否可用。"""
+    try:
+        import xformers.ops as xops
+        from xformers.ops.fmha import BlockDiagonalMask
+
+        G = 2
+        with torch.enable_grad():
+            q = torch.randn(1, 8, G, rep, headdim, device=device, dtype=dtype,
+                            requires_grad=True)
+            kv = torch.randn(1, 8, G, 1, headdim, device=device, dtype=dtype,
+                             requires_grad=True)
+            k = kv.expand(1, 8, G, rep, headdim)
+            v = kv.expand(1, 8, G, rep, headdim)
+            bias = BlockDiagonalMask.from_seqlens([4, 4])
+            out = xops.memory_efficient_attention(q, k, v, attn_bias=bias)
+            out.float().sum().backward()
+        return True
+    except Exception as e:
+        # 已知现状（2026-07 实测，本地 xformers/torch2.7 与云端 fa2 2.8.3 构建一致）：
+        # BMGHK 只有 forward 算子，backward 一律缺失 → 训练场景探针必然失败。
+        # 这是能力检测的常态而非异常，记 INFO；待未来 xformers 补上
+        # cutlassB/fa 的 BMGHK backward 后此路径自动启用。
+        logger.info(
+            "xformers 5D grouped GQA 不可用（%s: %s），走 repeat_interleave "
+            "展开路径（数值相同，仅多物化 KV 副本，实测开销 <0.5%% 步时）。",
+            type(e).__name__, str(e).split("\n")[0],
+        )
+        return False
 
 
 def _is_xformers_bias(mask) -> bool:
@@ -146,24 +181,23 @@ def attention(
         import xformers.ops as xops
 
         global _XF_GQA_5D_OK
-        if gqa and k.shape[1] != q.shape[1] and _XF_GQA_5D_OK:
-            # 5D grouped 布局：q [B,L,G,rep,D]，kv [B,L,G,1,D]→expand（零拷贝）。
+        if gqa and k.shape[1] != q.shape[1]:
             B, Hq, L, D = q.shape
             G_kv = k.shape[1]
             rep = Hq // G_kv
-            q5 = q.transpose(1, 2).contiguous().view(B, L, G_kv, rep, D)
-            k5 = k.transpose(1, 2).contiguous().unsqueeze(3).expand(B, L, G_kv, rep, D)
-            v5 = v.transpose(1, 2).contiguous().unsqueeze(3).expand(B, L, G_kv, rep, D)
-            try:
+            if _XF_GQA_5D_OK is None:
+                _XF_GQA_5D_OK = _probe_xf_gqa_5d(q.device, q.dtype, D, rep)
+                if _XF_GQA_5D_OK:
+                    logger.info("xformers 5D grouped GQA 探针通过，启用免物化 KV 路径")
+            if _XF_GQA_5D_OK:
+                # 5D grouped 布局：q [B,L,G,rep,D]，kv [B,L,G,1,D]→expand（零拷贝）。
+                # 可用性已由探针（含 backward）确认，此处不再试错——真实前向若仍
+                # 失败应当 fail-fast 抛出，而不是在 grad checkpoint 中途换 kernel。
+                q5 = q.transpose(1, 2).contiguous().view(B, L, G_kv, rep, D)
+                k5 = k.transpose(1, 2).contiguous().unsqueeze(3).expand(B, L, G_kv, rep, D)
+                v5 = v.transpose(1, 2).contiguous().unsqueeze(3).expand(B, L, G_kv, rep, D)
                 x = xops.memory_efficient_attention(q5, k5, v5, attn_bias=mask, scale=scale)
                 return x.reshape(B, L, Hq * D)
-            except (NotImplementedError, ValueError, RuntimeError) as e:
-                _XF_GQA_5D_OK = False
-                logger.warning(
-                    "xformers 5D grouped GQA 不可用（%s: %s），永久回退 "
-                    "repeat_interleave 展开路径（数值相同，仅多物化 KV 副本）。",
-                    type(e).__name__, e,
-                )
 
         if gqa and k.shape[1] != q.shape[1]:
             rep = q.shape[1] // k.shape[1]

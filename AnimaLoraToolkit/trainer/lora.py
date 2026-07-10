@@ -75,6 +75,29 @@ def _ortho_lora_init(in_features: int, out_features: int, rank: int, device=None
     return A_init, B_init
 
 
+def _pissa_init(in_features: int, out_features: int, rank: int,
+                base_weight: torch.Tensor, device=None):
+    """PiSSA SVD initialization (arxiv:2404.02948, NeurIPS 2024 spotlight).
+
+    取 W 的 SVD 的前 rank 个主成分（最大奇异值方向）初始化 A/B：
+        A_init = Vh[:rank, :]                (rank, in_features)
+        B_init = U[:, :rank] * S[:rank]      (out_features, rank)   # 把 S 折进 B
+
+    与 Ortho-LoRA 取最小奇异值相反，PiSSA 取最大奇异值（最重要的方向）。
+    配合 delta 补偿（forward 时减去 B_init@A_init * scaling），step 0 净 delta=0，
+    但 A/B 起点在 W 的主方向子空间内，梯度方向天然对齐最重要的变化方向。
+
+    要求 alpha = rank（scaling = 1），否则 step 0 净 delta ≠ 0。
+
+    SVD 在传入的 device 上计算（建议传 GPU）。
+    """
+    W = base_weight.detach().float().to(device)
+    U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+    A_init = Vh[:rank, :].contiguous()                          # (rank, in_features)
+    B_init = (U[:, :rank] * S[:rank].unsqueeze(0)).contiguous()  # (out_features, rank)
+    return A_init, B_init
+
+
 class LoRALayer(torch.nn.Module):
     """标准 LoRA 层（含 rank_dropout / module_dropout / 可选 T-LoRA）
 
@@ -92,7 +115,8 @@ class LoRALayer(torch.nn.Module):
     def __init__(self, in_features, out_features, rank=4, alpha=1.0, dropout=0.0,
                  rank_dropout=0.0, module_dropout=0.0,
                  tlora_enabled=False, tlora_rmin_ratio=0.5, tlora_alpha=1.0,
-                 tlora_init="default", device=None):
+                 tlora_init="default", device=None,
+                 lora_init="default", base_weight=None):
         super().__init__()
         self.rank = rank
         self.alpha = alpha
@@ -123,7 +147,7 @@ class LoRALayer(torch.nn.Module):
         self._md_keep: torch.Tensor | None = None
         self._md_compile_safe: bool = False
 
-        # 初始化 + 可选 Ortho-LoRA + 初始 delta 补偿 buffer
+        # 初始化 + 可选 Ortho-LoRA / PiSSA + 初始 delta 补偿 buffer
         if self.tlora_enabled and self.tlora_init == "ortho":
             A_init, B_init = _ortho_lora_init(in_features, out_features, rank, device=device)
             with torch.no_grad():
@@ -131,6 +155,20 @@ class LoRALayer(torch.nn.Module):
                 self.lora_up.weight.copy_(B_init)
             # 初始权重副本（不参与梯度），forward 时用同样的 mask 重新计算 init
             # 贡献并减去，让训练初始 step 净 delta ≈ 0（论文 Eq.5 的等价 2-matrix 版）
+            self.register_buffer("lora_down_init", A_init.clone(), persistent=False)
+            self.register_buffer("lora_up_init", B_init.clone(), persistent=False)
+        elif lora_init == "pissa" and base_weight is not None:
+            # PiSSA (arxiv:2404.02948): SVD of base weight, top-r principal components
+            # A/B 起点在 W 主方向子空间内，配合 delta 补偿保证 step 0 净 delta=0
+            if abs(self.scaling - 1.0) > 1e-6:
+                logger.warning(
+                    "[PiSSA] alpha != rank (scaling=%.4f); step 0 net delta != 0. "
+                    "Set alpha=rank for correct PiSSA behavior.", self.scaling)
+            A_init, B_init = _pissa_init(in_features, out_features, rank,
+                                         base_weight=base_weight, device=device)
+            with torch.no_grad():
+                self.lora_down.weight.copy_(A_init.to(device=device))
+                self.lora_up.weight.copy_(B_init.to(device=device))
             self.register_buffer("lora_down_init", A_init.clone(), persistent=False)
             self.register_buffer("lora_up_init", B_init.clone(), persistent=False)
         else:
@@ -200,15 +238,18 @@ class LoRALayer(torch.nn.Module):
         # T-LoRA: rank mask
         h, mask = self._apply_tlora_mask(h)
 
-        # 是否启用 Ortho-LoRA 初始 delta 补偿。先确定，因为 rank_dropout 需要同时作用到两支。
-        use_ortho_comp = (
-            self.tlora_enabled and self.lora_down_init is not None
-            and self.lora_up_init is not None and self.current_t is not None
+        # 是否启用初始 delta 补偿（Ortho-LoRA 或 PiSSA）。先确定，因为 rank_dropout
+        # 需要同时作用到两支。
+        has_init = (
+            self.lora_down_init is not None and self.lora_up_init is not None
         )
+        use_ortho_comp = has_init and self.tlora_enabled and self.current_t is not None
+        # PiSSA init compensation: no T-LoRA, just subtract init delta for step-0 = 0
+        use_init_comp = use_ortho_comp or (has_init and not self.tlora_enabled)
 
         # 提前算出 init 分支的 h_init（应用同一个 T-LoRA mask），稍后与 train 分支共用 rd_mask
         h_init = None
-        if use_ortho_comp:
+        if use_init_comp:
             h_init = F.linear(x_drop, self.lora_down_init)
             if mask is not None:
                 h_init = h_init * mask.view(mask.shape[0], *([1] * (h_init.ndim - 2)), self.rank)
@@ -247,6 +288,72 @@ class LoRALayer(torch.nn.Module):
         if self._md_keep is not None:
             out = out * self._md_keep.to(out.dtype)
         return out
+
+    # ── DoRA 支持：标准 LoRA 路径的 _compute / merged_row_norms ──────────
+    # 这些方法让 lora_type="lora" + lora_variant="dora" 可用（此前仅 LoKr 支持 DoRA）。
+    # LoKr 版通过 Kronecker 结构避免全矩阵物化；标准 LoRA 版更简单，直接低秩收缩。
+
+    def _compute(self, x):
+        """LoRA delta output without base -- for DoRA forward path.
+
+        等价于 self.forward(x)（adapter forward 只返回 delta，不含 base）。
+        """
+        return self.forward(x)
+
+    def merged_row_norms(self, base_weight, base_row_sq=None, fast=False):
+        """||W + ΔW|| per row for DoRA, without materializing full (out, in) matrix.
+
+        ΔW = (B @ A - B_init @ A_init) * scaling  (含 PiSSA/ortho init 补偿)
+        ||W + ΔW||² = ||W||² + 2·⟨W, ΔW⟩ + ||ΔW||²  per row
+        """
+        if base_row_sq is None:
+            base_row_sq = base_weight.detach().float().pow(2).sum(dim=1)
+        A = self.lora_down.weight.float()  # (rank, in)
+        B = self.lora_up.weight.float()    # (out, rank)
+        s = self.scaling
+        # ⟨W, B@A⟩ per row = s * (B * (W @ A.T)).sum(dim=1)
+        WA = torch.matmul(base_weight.detach().float(), A.t())  # (out, rank)
+        dot = s * (B * WA).sum(dim=1)  # (out,)
+        # ||B@A||² per row = s² * (B² @ ||A||²)
+        A_sq = (A ** 2).sum(dim=1)  # (rank,)
+        delta_sq = (s ** 2) * torch.matmul(B ** 2, A_sq)  # (out,)
+        # Init delta compensation (PiSSA / Ortho-LoRA)
+        if self.lora_down_init is not None and self.lora_up_init is not None:
+            A_i = self.lora_down_init.float()
+            B_i = self.lora_up_init.float()
+            WA_i = torch.matmul(base_weight.detach().float(), A_i.t())
+            dot_i = s * (B_i * WA_i).sum(dim=1)
+            A_i_sq = (A_i ** 2).sum(dim=1)
+            delta_i_sq = (s ** 2) * torch.matmul(B_i ** 2, A_i_sq)
+            # Cross: ⟨W, -B_i@A_i⟩ = -dot_i, ||-B_i@A_i||² = delta_i_sq
+            dot = dot - dot_i
+            delta_sq = delta_sq + delta_i_sq
+            # Cross: ⟨B@A, -B_i@A_i⟩ per row = -s² * (B * B_i).sum(dim=1) * (A * A_i).sum(dim=1)
+            cross = (s ** 2) * ((B * B_i).sum(dim=1) * ((A * A_i).sum(dim=1)))
+            delta_sq = delta_sq - 2.0 * cross
+        merged_sq = base_row_sq + 2.0 * dot + delta_sq
+        return merged_sq.clamp(min=1e-12).sqrt()
+
+    def delta_weight(self, apply_rank_dropout: bool = False) -> torch.Tensor:
+        """Materialize ΔW for DoRA weight decomposition and export.
+
+        含 PiSSA/ortho init 补偿：ΔW = (B@A - B_init@A_init) * scaling
+        """
+        A = self.lora_down.weight.float()
+        B = self.lora_up.weight.float()
+        if apply_rank_dropout and self.training and self.rank_dropout > 0:
+            mask = torch.bernoulli(
+                torch.full((self.rank,), 1.0 - self.rank_dropout, device=A.device)
+            )
+            scale = 1.0 / (1.0 - self.rank_dropout + 1e-6)
+            A = A * (mask.unsqueeze(1) * scale)
+        delta = torch.matmul(B, A) * self.scaling
+        if self.lora_down_init is not None and self.lora_up_init is not None:
+            init_delta = torch.matmul(
+                self.lora_up_init.float(), self.lora_down_init.float()
+            ) * self.scaling
+            delta = delta - init_delta
+        return delta
 
 
 class LoKrLayer(torch.nn.Module):
@@ -606,13 +713,15 @@ class LoRALinear(torch.nn.Module):
                  rank_dropout=0.0, module_dropout=0.0, lora_variant="base",
                  tlora_rmin_ratio=0.5, tlora_alpha=1.0, tlora_init="default",
                  tlora_lokr_ortho_init=False,
-                 dora_fast_norm=False, dora_detach_norm=False):
+                 dora_fast_norm=False, dora_detach_norm=False,
+                 lora_init="default"):
         super().__init__()
         self.original = original
         self.use_lokr = use_lokr
         self.lora_variant = (lora_variant or "base").lower()
         self.use_dora = self.lora_variant == "dora"
         self.use_tlora = self.lora_variant == "tlora"
+        self.lora_init = (lora_init or "default").lower()
         # DoRA 范数计算的两个 opt-in 加速开关（默认 False = 逐 bit 与历史一致）：
         # - fast_norm: ⟨W,ΔW⟩ 收缩用 W 原 dtype（bf16 tensor core, fp32 累加），
         #   免全量 fp32 物化；范数相对误差 ~1e-3。
@@ -625,11 +734,8 @@ class LoRALinear(torch.nn.Module):
         self._dora_base_row_sq = None
 
         # 组合兼容性校验：
-        # - dora 仍只支持 lokr
         # - tlora 主路径只支持 lora；与 lokr 的组合属于实验性，由 injector 层显式 opt-in
         # - tlora × dora 不支持
-        if self.use_dora and not use_lokr:
-            raise ValueError("lora_variant='dora' is currently supported only with lora_type='lokr'")
         if self.use_tlora and self.use_dora:
             raise ValueError("lora_variant='tlora' is incompatible with DoRA")
 
@@ -656,6 +762,8 @@ class LoRALinear(torch.nn.Module):
                 tlora_rmin_ratio=tlora_rmin_ratio,
                 tlora_alpha=tlora_alpha,
                 tlora_init=tlora_init,
+                lora_init=self.lora_init,
+                base_weight=original.weight,
                 device=svd_device,
             )
 
@@ -767,6 +875,14 @@ class LoRALinear(torch.nn.Module):
                     self.adapter.lora_down_init.float(),
                 ).to(device=base_w.device) * self.adapter.scaling
                 delta = delta - init_delta
+            elif (not self.use_tlora
+                    and getattr(self.adapter, "lora_down_init", None) is not None
+                    and getattr(self.adapter, "lora_up_init", None) is not None):
+                init_delta = torch.matmul(
+                    self.adapter.lora_up_init.float(),
+                    self.adapter.lora_down_init.float(),
+                ).to(device=base_w.device) * self.adapter.scaling
+                delta = delta - init_delta
         merged = base_w + delta
         if self.use_dora:
             denom = merged.norm(dim=1, keepdim=True).clamp(min=1e-6)
@@ -798,7 +914,8 @@ class LoRAInjector:
                  # T-LoRA 导出体积控制
                  tlora_skip_lambda_layer=True,
                  # DoRA 范数加速开关（见 LoRALinear.__init__ 注释；默认关 = 行为不变）
-                 dora_fast_norm=False, dora_detach_norm=False):
+                 dora_fast_norm=False, dora_detach_norm=False,
+                 lora_init="default"):
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
@@ -809,8 +926,7 @@ class LoRAInjector:
         self.lora_variant = (lora_variant or "base").lower()
         if self.lora_variant not in ("base", "dora", "tlora"):
             raise ValueError(f"Unknown lora_variant: {lora_variant}")
-        if self.lora_variant == "dora" and not self.use_lokr:
-            raise ValueError("lora_variant='dora' requires lora_type='lokr'")
+        self.lora_init = lora_init
 
         # T-LoRA 组合校验：
         # - 与 dora 互斥
@@ -977,6 +1093,7 @@ class LoRAInjector:
                 dropout=self.dropout, use_lokr=self.use_lokr, factor=self.factor,
                 rank_dropout=self.rank_dropout, module_dropout=self.module_dropout,
                 lora_variant=self.lora_variant,
+                lora_init=self.lora_init,
                 tlora_rmin_ratio=self.tlora_rmin_ratio,
                 tlora_alpha=self.tlora_alpha_param,
                 tlora_init=self.tlora_init,
@@ -1231,6 +1348,10 @@ class LoRAInjector:
                 else:
                     sd[f"{base}.lora_down.weight"] = lora.adapter.lora_down.weight.data.clone()
                     sd[f"{base}.lora_up.weight"] = lora.adapter.lora_up.weight.data.clone()
+                    if (getattr(lora.adapter, "lora_down_init", None) is not None
+                            and getattr(lora.adapter, "lora_up_init", None) is not None):
+                        sd[f"{base}.lora_down_init.weight"] = lora.adapter.lora_down_init.data.clone().bfloat16().cpu()
+                        sd[f"{base}.lora_up_init.weight"] = lora.adapter.lora_up_init.data.clone().bfloat16().cpu()
         return sd
 
     def _diff_state_dict(self):

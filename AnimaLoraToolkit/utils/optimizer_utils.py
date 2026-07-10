@@ -42,6 +42,11 @@ except ImportError:  # pragma: no cover - fallback for direct script execution
     from soap_optimizer import SOAP, SOAPScheduleFree  # type: ignore
 
 try:
+    from .muon_optimizer import Muon, MuonScheduleFree
+except ImportError:  # pragma: no cover
+    from muon_optimizer import Muon, MuonScheduleFree  # type: ignore
+
+try:
     from .adopt_optimizer import ADOPT
 except ImportError:  # pragma: no cover
     from adopt_optimizer import ADOPT  # type: ignore
@@ -320,9 +325,43 @@ def create_optimizer(
             weight_decay=weight_decay, eps=eps, **kwargs,
         )
 
+    if optimizer_type == "muon":
+        if "lr" in kwargs:
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
+        if "betas" in kwargs:
+            betas = _coerce_betas(kwargs.pop("betas"))
+        if "weight_decay" in kwargs:
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
+        if "eps" in kwargs:
+            eps = _coerce_float(kwargs.pop("eps"), "optimizer_args.eps")
+        return create_muon_optimizer(
+            params=params, lr=learning_rate, betas=betas,
+            weight_decay=weight_decay, eps=eps, **kwargs,
+        )
+    if optimizer_type in {"muon_sf", "muonsf"}:
+        if "lr" in kwargs:
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
+        if "betas" in kwargs:
+            betas = _coerce_betas(kwargs.pop("betas"))
+        elif betas == (0.9, 0.999):
+            betas = (0.9, 0.95)
+        if "weight_decay" in kwargs:
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
+        if "eps" in kwargs:
+            eps = _coerce_float(kwargs.pop("eps"), "optimizer_args.eps")
+        return create_muon_sf_optimizer(
+            params=params, lr=learning_rate, betas=betas,
+            weight_decay=weight_decay, eps=eps, **kwargs,
+        )
+
     raise ValueError(
         f"Unknown optimizer type: {optimizer_type}. "
-        f"Choose from: adamw8bit, adamw, prodigyplus, soap, soap_sf, adopt, lion, clion, emosens"
+        f"Choose from: adamw8bit, adamw, prodigyplus, soap, soap_sf, "
+        f"muon, muon_sf, adopt, lion, clion, emosens"
     )
 
 
@@ -742,3 +781,86 @@ def is_optimizer_state_healthy(optimizer: Optimizer) -> bool:
                     if not torch.isfinite(s).all():
                         return False
     return True
+
+
+# =============================================================================
+# Muon (Newton-Schulz orthogonalized momentum)
+# =============================================================================
+
+def create_muon_optimizer(
+    params: ParamInput,
+    lr: float = 0.02,
+    betas: tuple = (0.9, 0.999),
+    weight_decay: float = 0.0,
+    eps: float = 1e-8,
+    **kwargs,
+) -> Optimizer:
+    valid_keys = {
+        "momentum", "nesterov", "ns_steps", "correct_bias",
+    }
+    muon_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+    ignored = [k for k in kwargs if k not in valid_keys]
+    if ignored:
+        logger.warning(f"[Muon] Ignored unsupported params: {ignored}")
+
+    param_list = params if _is_param_groups(params) else list(params)
+    logger.info(
+        "Creating Muon optimizer "
+        "(lr=%s, momentum=%s, nesterov=%s, ns_steps=%s, wd=%s, betas=%s)",
+        lr,
+        muon_kwargs.get("momentum", 0.95),
+        muon_kwargs.get("nesterov", True),
+        muon_kwargs.get("ns_steps", 5),
+        weight_decay,
+        betas,
+    )
+    return Muon(
+        param_list,
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
+        eps=eps,
+        **muon_kwargs,
+    )
+
+
+# =============================================================================
+# Muon-SF (Schedule-Free Muon)
+# =============================================================================
+
+def create_muon_sf_optimizer(
+    params: ParamInput,
+    lr: float = 0.02,
+    betas: tuple = (0.9, 0.95),
+    weight_decay: float = 0.0,
+    eps: float = 1e-8,
+    **kwargs,
+) -> Optimizer:
+    valid_keys = {
+        "ns_steps", "weight_lr_power", "r", "warmup_steps", "correct_bias",
+    }
+    sf_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+    ignored = [k for k in kwargs if k not in valid_keys]
+    if ignored:
+        logger.warning(f"[Muon-SF] Ignored unsupported params: {ignored}")
+
+    param_list = params if _is_param_groups(params) else list(params)
+    logger.info(
+        "Creating Muon-SF (Schedule-Free) optimizer "
+        "(lr=%s, betas=%s, wd=%s, ns_steps=%s, weight_lr_power=%s, r=%s, warmup_steps=%s)",
+        lr,
+        betas,
+        weight_decay,
+        sf_kwargs.get("ns_steps", 5),
+        sf_kwargs.get("weight_lr_power", 2.0),
+        sf_kwargs.get("r", 0.0),
+        sf_kwargs.get("warmup_steps", 0),
+    )
+    return MuonScheduleFree(
+        param_list,
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
+        eps=eps,
+        **sf_kwargs,
+    )

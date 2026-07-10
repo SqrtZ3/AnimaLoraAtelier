@@ -1179,8 +1179,7 @@ def main():
     # 注入 LoRA
     lora_variant = str(getattr(args, "lora_variant", "base") or "base").lower()
     dora_export_mode = str(getattr(args, "dora_export_mode", "native") or "native").lower()
-    if lora_variant == "dora" and args.lora_type != "lokr":
-        raise ValueError("lora_variant='dora' requires lora_type='lokr'")
+    # DoRA is now supported with both standard LoRA and LoKr.
     # T-LoRA × LoKr 的组合校验交给 LoRAInjector.__init__（带详细错误提示）；
     # 这里只在标准 LoRA 路径下记录一行 info。
     logger.info(f"注入 {args.lora_type.upper()} ({lora_variant})...")
@@ -1240,6 +1239,7 @@ def main():
         module_dropout=float(getattr(args, "module_dropout", 0.0) or 0.0),
         loraplus_lr_ratio=float(getattr(args, "loraplus_lr_ratio", 1.0) or 1.0),
         lora_variant=lora_variant,
+        lora_init=getattr(args, 'lora_init', 'default'),
         dora_export_mode=dora_export_mode,
         dora_fast_norm=bool(getattr(args, "dora_fast_norm", False)),
         dora_detach_norm=bool(getattr(args, "dora_detach_norm", False)),

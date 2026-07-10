@@ -423,6 +423,14 @@ def load_training_state(path, injector, optimizer, scheduler=None):
     复用注入器自己的 loader，单一来源避免漂移。
     """
     logger.info(f"加载训练状态: {path}")
+    if str(path).endswith(".safetensors"):
+        raise ValueError(
+            f"resume_state 指向了 safetensors 文件: {path}\n"
+            "这是 LoRA 权重成品，不是训练状态。两者的用法：\n"
+            "  - 只从权重继续（优化器从零）: resume_lora 填该 .safetensors，resume_state 留空\n"
+            "  - 完整断点续训（含优化器/step/RNG）: resume_state 填 output 目录下的 "
+            "training_state_step{N}.pt（由 save_state_every 产出，其中已含 LoRA 权重）"
+        )
     state = torch.load(path, map_location="cpu", weights_only=False)
 
     # 委托给 injector.load_state_dict_from_mapping —— 这是新加的 in-memory 加载入口，

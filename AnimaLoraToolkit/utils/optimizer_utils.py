@@ -796,7 +796,7 @@ def create_muon_optimizer(
     **kwargs,
 ) -> Optimizer:
     valid_keys = {
-        "momentum", "nesterov", "ns_steps", "correct_bias",
+        "momentum", "nesterov", "ns_steps", "correct_bias", "rms_scale",
     }
     muon_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
     ignored = [k for k in kwargs if k not in valid_keys]
@@ -838,7 +838,7 @@ def create_muon_sf_optimizer(
 ) -> Optimizer:
     valid_keys = {
         "ns_steps", "weight_lr_power", "r", "warmup_steps", "correct_bias",
-        "momentum",
+        "momentum", "rms_scale",
     }
     sf_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
     ignored = [k for k in kwargs if k not in valid_keys]

@@ -24,6 +24,19 @@ MuonScheduleFree:
   ScheduleFree+ (arXiv:2605.19095) 实证把内层动量加回 SF 可修复大 batch
   发散；SF 官方 wrapper 文档也允许内外动量并存。
 
+★ 2026-07-11 两处修复（krea2 LoRA 实测"完全不拟合"的根因，实验复现：
+  同 lr=1e-4 下 AdamW 对 LoRA down 矩阵的位移是 muon_sf 的 165 倍）：
+  1. RMS 缩放换成 Moonlight 口径 0.2·sqrt(max(rows,cols))（rms_scale，
+     默认 "moonlight"）：NS 输出的条目 RMS = sqrt(min/(rows·cols))，乘该
+     系数后恒为 0.2 —— 任意形状下更新量级与 AdamW lr 可比（arXiv:2502.16982）。
+     旧的 Keller 口径 sqrt(max(1, rows/cols)) 只放大高瘦矩阵，LoRA 的矮宽
+     down (r=24, in=6144) 被系统性缩小 ~16 倍（rms_scale="keller" 保留对照）。
+  2. fp32 master：更新先落在 fp32 状态（Muon: state["master"]；SF: state["y"]），
+     每步 param.copy_(master.to(bf16)) 只是展示视图。此前更新直接写 bf16
+     参数，每步增量（缩放 bug 叠加 SF 的 ~0.1×lr 阻尼后 ~1e-7）远低于
+     bf16 在 LoRA 参数量级(~6e-3)的 ulp(~3e-5)，78~93% 条目被四舍五入
+     永久冻结。开销：每参数 +1 份 fp32（LoRA 级别可忽略）。
+
 参考:
   - 原始 repo: github.com/KellerJordan/Muon
   - Kimi Moonlight scaling: arXiv:2502.16982
@@ -70,6 +83,21 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5) -> Tensor:
     return X.float()
 
 
+def _apply_rms_scale(update: Tensor, mode: str) -> Tensor:
+    """NS 正交化输出的 update-RMS 对齐缩放。
+
+    NS 输出条目 RMS = sqrt(min(rows,cols)/(rows·cols))。
+    - "moonlight"（默认）：×0.2·sqrt(max(rows,cols)) → 条目 RMS 恒为 0.2，
+      任意形状下与 AdamW 的归一化更新同量级（Moonlight arXiv:2502.16982）。
+    - "keller"：×sqrt(max(1, rows/cols))（Keller Jordan 原版），只放大高瘦
+      矩阵；对 LoRA 矮宽 down (r, in) 会缩小 ~sqrt(in/r) 倍，保留仅作对照。
+    """
+    rows, cols = update.shape
+    if mode == "keller":
+        return update * max(1.0, rows / cols) ** 0.5
+    return update * (0.2 * math.sqrt(max(rows, cols)))
+
+
 # =============================================================================
 # Muon optimizer (momentum + Newton-Schulz)
 # =============================================================================
@@ -107,9 +135,12 @@ class Muon(Optimizer):
         eps: float = 1e-8,
         betas: tuple[float, float] = (0.9, 0.999),
         correct_bias: bool = True,
+        rms_scale: str = "moonlight",
     ):
         if lr <= 0:
             raise ValueError(f"Invalid learning rate: {lr}")
+        if rms_scale not in ("moonlight", "keller"):
+            raise ValueError(f"Invalid rms_scale: {rms_scale!r} (moonlight | keller)")
         defaults = dict(
             lr=lr,
             momentum=momentum,
@@ -119,6 +150,7 @@ class Muon(Optimizer):
             eps=eps,
             betas=betas,
             correct_bias=correct_bias,
+            rms_scale=rms_scale,
         )
         super().__init__(params, defaults)
 
@@ -138,17 +170,23 @@ class Muon(Optimizer):
             eps = group["eps"]
             beta1, beta2 = group["betas"]
             correct_bias = group["correct_bias"]
+            rms_scale = group.get("rms_scale", "moonlight")
 
             for param in group["params"]:
                 if param.grad is None:
                     continue
 
                 grad = param.grad.detach()
+                state = self.state[param]
+                # fp32 master：更新累积在 fp32，bf16 参数只是每步刷新的展示视图
+                # （旧 checkpoint 恢复的 state 无 master → 从当前参数惰性重建）。
+                master = state.get("master")
+                if master is None:
+                    master = state["master"] = param.detach().clone().float()
 
                 if param.ndim >= 2:
                     # ── 2D: Muon path (momentum + Newton-Schulz) ──────────
-                    state = self.state[param]
-                    if len(state) == 0:
+                    if "momentum_buffer" not in state:
                         state["step"] = 0
                         state["momentum_buffer"] = torch.zeros_like(
                             param, dtype=torch.float32
@@ -168,22 +206,19 @@ class Muon(Optimizer):
                         update = update.view(update.shape[0], -1)
                     update_ns = zeropower_via_newtonschulz5(update, steps=ns_steps)
 
-                    # Update RMS scaling: normalize so that the update has
-                    # similar magnitude to AdamW regardless of matrix shape.
-                    # Original Muon: scale by sqrt(max(1, rows/cols))
-                    rows, cols = update_ns.shape
-                    update_ns = update_ns * max(1.0, rows / cols) ** 0.5
+                    # Update RMS scaling（moonlight：任意形状对齐 AdamW 量级）
+                    update_ns = _apply_rms_scale(update_ns, rms_scale)
 
                     if wd != 0:
-                        update_ns = update_ns.add(param.detach().float(), alpha=wd)
+                        update_ns = update_ns.add(master.view(update_ns.shape), alpha=wd)
 
-                    param.add_(update_ns.view(orig_shape).to(dtype=param.dtype), alpha=-lr)
+                    master.add_(update_ns.view(orig_shape), alpha=-lr)
+                    param.copy_(master.to(dtype=param.dtype))
                     state["step"] += 1
 
                 else:
                     # ── 1D: AdamW fallback (bias, DoRA scale, etc.) ─────────
-                    state = self.state[param]
-                    if len(state) == 0:
+                    if "exp_avg" not in state:
                         state["step"] = 0
                         state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
                         state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
@@ -201,9 +236,10 @@ class Muon(Optimizer):
 
                     update = exp_avg / (exp_avg_sq.sqrt() + eps)
                     if wd != 0:
-                        update = update.add(param.detach().float(), alpha=wd)
+                        update = update.add(master, alpha=wd)
 
-                    param.add_(update.to(dtype=param.dtype), alpha=-step_size)
+                    master.add_(update, alpha=-step_size)
+                    param.copy_(master.to(dtype=param.dtype))
                     state["step"] += 1
 
         return loss
@@ -246,11 +282,14 @@ class MuonScheduleFree(Optimizer):
         warmup_steps: int = 0,
         correct_bias: bool = True,
         momentum: float = 0.95,
+        rms_scale: str = "moonlight",
     ):
         if lr <= 0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not (0.0 <= momentum < 1.0):
             raise ValueError(f"Invalid momentum: {momentum}")
+        if rms_scale not in ("moonlight", "keller"):
+            raise ValueError(f"Invalid rms_scale: {rms_scale!r} (moonlight | keller)")
         defaults = dict(
             lr=lr,
             betas=betas,
@@ -262,6 +301,7 @@ class MuonScheduleFree(Optimizer):
             warmup_steps=warmup_steps,
             correct_bias=correct_bias,
             momentum=momentum,
+            rms_scale=rms_scale,
             k=0,
             weight_sum=0.0,
             lr_max=0.0,
@@ -271,30 +311,46 @@ class MuonScheduleFree(Optimizer):
 
     @torch.no_grad()
     def train(self) -> None:
-        """Swap parameter from eval point x back to gradient point y."""
+        """Swap parameter from eval point x back to gradient point y.
+
+        y 以 fp32 master（state["y"]）为准直接写回；旧 checkpoint（无 y master）
+        退回逆插值恢复并就地建 master。
+        """
         for group in self.param_groups:
             beta1 = group["betas"][0]
             if not group.get("train_mode", True):
                 for param in group["params"]:
-                    z = self.state.get(param, {}).get("z")
-                    if z is not None:
+                    st = self.state.get(param, {})
+                    z = st.get("z")
+                    if z is None:
+                        continue
+                    y = st.get("y")
+                    if y is None:
                         y = param.detach().float()
                         y.lerp_(z, weight=1.0 - beta1)
-                        param.copy_(y.to(dtype=param.dtype))
+                        st["y"] = y
+                    param.copy_(y.to(dtype=param.dtype))
                 group["train_mode"] = True
 
     @torch.no_grad()
     def eval(self) -> None:
-        """Swap parameter to the Polyak-averaged iterate x (for sampling/saving)."""
+        """Swap parameter to the Polyak-averaged iterate x (for sampling/saving).
+
+        x 从 fp32 master (y, z) 现算，y master 本身不动 —— train() 时无损换回。
+        """
         for group in self.param_groups:
             beta1 = group["betas"][0]
             if group.get("train_mode", True):
                 for param in group["params"]:
-                    z = self.state.get(param, {}).get("z")
-                    if z is not None:
-                        x = param.detach().float()
-                        x.lerp_(z, weight=1.0 - 1.0 / beta1)
-                        param.copy_(x.to(dtype=param.dtype))
+                    st = self.state.get(param, {})
+                    z = st.get("z")
+                    if z is None:
+                        continue
+                    y = st.get("y")
+                    if y is None:
+                        y = st["y"] = param.detach().clone().float()
+                    x = y.lerp(z, weight=1.0 - 1.0 / beta1)
+                    param.copy_(x.to(dtype=param.dtype))
                 group["train_mode"] = False
 
     @torch.no_grad()
@@ -317,6 +373,8 @@ class MuonScheduleFree(Optimizer):
             warmup_steps = group["warmup_steps"]
             momentum = group.get("momentum", 0.95)
 
+            rms_scale = group.get("rms_scale", "moonlight")
+
             k = group["k"]
             sched = (k + 1) / warmup_steps if (warmup_steps > 0 and k < warmup_steps) else 1.0
             bias_correction2 = (1.0 - beta2 ** (k + 1)) if group["correct_bias"] else 1.0
@@ -335,15 +393,19 @@ class MuonScheduleFree(Optimizer):
                 grad = param.grad.detach().float()
                 state = self.state[param]
 
-                if len(state) == 0:
+                if "z" not in state:
                     state["step"] = 0
                     state["z"] = param.detach().clone().float()
-
                 z = state["z"]
+                # fp32 master y：SF 的每步 y 增量自带 ~(1-beta1)·lr 阻尼，直接写
+                # bf16 参数会被 ulp 吞掉（见模块 docstring 修复 #2）。旧 state 恢复
+                # 时惰性重建（train_mode 下参数即 y 的 bf16 舍入，可接受）。
+                y = state.get("y")
+                if y is None:
+                    y = state["y"] = param.detach().clone().float()
 
                 if param.ndim >= 2:
                     # ── 2D: Newton-Schulz path ─────────────────────────────
-                    orig_shape = grad.shape
                     if grad.ndim > 2:
                         grad_flat = grad.view(grad.shape[0], -1)
                     else:
@@ -365,16 +427,14 @@ class MuonScheduleFree(Optimizer):
 
                     update = zeropower_via_newtonschulz5(ns_input, steps=ns_steps)
 
-                    # Update RMS scaling
-                    rows, cols = update.shape
-                    update = update * max(1.0, rows / cols) ** 0.5
+                    # Update RMS scaling（moonlight：任意形状对齐 AdamW 量级）
+                    update = _apply_rms_scale(update, rms_scale)
+                    update = update.view(param.shape)
 
                     if decay != 0.0:
-                        y = param.detach().float()
                         update = update.add(y, alpha=decay)
 
-                    # Schedule-Free y/z update (fp32), cast y back to param dtype
-                    y = param.detach().float()
+                    # Schedule-Free y/z update — 全程 fp32 master，bf16 仅视图
                     y.lerp_(z, weight=ckp1)
                     y.add_(update, alpha=adaptive_y_lr)
                     param.copy_(y.to(dtype=param.dtype))
@@ -390,10 +450,8 @@ class MuonScheduleFree(Optimizer):
                     update = grad / (exp_avg_sq.sqrt() + eps)
 
                     if decay != 0.0:
-                        y = param.detach().float()
                         update = update.add(y, alpha=decay)
 
-                    y = param.detach().float()
                     y.lerp_(z, weight=ckp1)
                     y.add_(update, alpha=adaptive_y_lr)
                     param.copy_(y.to(dtype=param.dtype))

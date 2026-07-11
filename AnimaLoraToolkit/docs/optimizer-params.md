@@ -18,6 +18,8 @@
 | `lion` | Sign-based 单 EMA | ✅ 是（更小） | 1× 参数量 | arXiv:2302.06675 (NeurIPS 2023) |
 | `clion` | Lion + Cautious 掩码 | ✅ 是 | 1× 参数量 | arXiv:2411.16085 |
 | `emosens` | Loss 序列驱动动态 LR | ⚠️ 仅设范围 | 2× 参数量 | github.com/muooon/EmoSens |
+| `muon` | 动量 + Newton-Schulz 正交化（2D）| ✅ 是（≈AdamW 量级）| 2× 参数量（momentum+master）| github.com/KellerJordan/Muon + arXiv:2502.16982 |
+| `muon_sf` | Muon + Schedule-Free 平均 | ✅ 是（无需调度）| 3× 参数量（z+y+momentum）| 同上 + arXiv:2405.15682 |
 
 **共同实现细节**：SOAP / ADOPT / Lion / EmoSens 的**状态张量全部强制存 fp32**，即使参数是 bf16 也不例外——防止 bf16 下二阶矩精度损失。
 
@@ -442,6 +444,45 @@ optimizer_args:
 | `use_shadow` | 维护参数的"影子拷贝"，scalar 极端时用 trust 加权回滚，实验性 |
 
 > ⚠️ **重要**：EmoSens 需要训练脚本在每个 `optimizer.step()` 前调用 `optimizer.set_loss(loss_scalar)`，否则 emo_pulse 始终基于 `_manual_loss=0.0` 计算，等价于固定极小 LR。
+
+---
+
+### 8. `muon` / `muon_sf` — Newton-Schulz 正交化动量（±Schedule-Free）
+
+**核心思想**（Keller Jordan 2024；Moonlight arXiv:2502.16982）：2D 参数的动量矩阵经
+5 步 Newton-Schulz 迭代近似极分解 UV^T（全部奇异值→1），得到类 Shampoo 的谱预条件，
+但优化器状态只有动量（+SF 的 z/y），无 GG/Q 矩阵。1D 参数（bias、DoRA scale）走
+AdamW fallback。`muon_sf` 在此之上叠 Schedule-Free 平均（`lr_scheduler` 必须 `none`，
+任意 step `eval()` 拿平均 checkpoint；短跑 ≤100 步的滞后警告同 soap_sf）。
+
+```yaml
+optimizer_type: "muon_sf"        # 或 "muon"
+learning_rate: 1e-4              # moonlight 缩放下与 AdamW lr 同量级，直接用 AdamW 的经验值
+lr_scheduler: "none"
+optimizer_args:
+  betas: [0.9, 0.95]             # muon_sf: [SF 插值权重, 1D 二阶矩衰减]；muon: 1D AdamW betas
+  momentum: 0.95                 # NS 输入的内层动量（0 关闭=喂裸梯度，不推荐——放大 batch 噪声）
+  ns_steps: 5                    # Newton-Schulz 迭代步数（10 更精确但无实测收益）
+  weight_decay: 0.0
+  warmup_steps: 50               # 仅 muon_sf；线性 warmup 稳定早期
+  rms_scale: "moonlight"         # 默认；"keller" 仅作历史对照（见下）
+```
+
+**参数影响：**
+
+| 参数 | 影响 |
+|---|---|
+| `learning_rate` | moonlight 缩放使任意形状矩阵的更新条目 RMS ≡ 0.2×lr，语义与 AdamW lr 可比；从 AdamW 已验证值（如 1e-4）起步 |
+| `momentum` | NS 之前的梯度平滑；SF 的 Polyak 平均替代的是 lr schedule，替代不了它（ScheduleFree+ arXiv:2605.19095） |
+| `rms_scale` | `moonlight`=0.2·√max(rows,cols)（形状无关）；`keller`=√max(1,rows/cols) 只放大高瘦矩阵——对 LoRA 矮宽 down (r,in) 缩小 ~√(in/r) 倍 |
+
+> ⚠️ **2026-07-11 修复（krea2 LoRA 实测"完全不拟合"根因，勿回退）**：
+> ① 旧实现用 keller 缩放但文档声称 Kimi 口径——LoRA down (24,6144) 的更新被缩小 ~16 倍；
+> ② 更新直接写 bf16 参数，每步增量低于 bf16 ulp（~3e-5 @ 6e-3 量级），78~93% 条目被
+> 四舍五入永久冻结。现更新一律先落 fp32 master（muon: `state["master"]`；muon_sf:
+> `state["y"]`），bf16 参数只是每步刷新的视图。数值复现：同 lr=1e-4 下修复前 AdamW
+> 对 down 矩阵的位移是 muon_sf 的 165 倍，修复后 bf16≡fp32、量级与 AdamW 相当
+> （tests/test_pissa_dora_muon_fixes.py::TestMuonRMSScaleAndMaster）。
 
 ---
 

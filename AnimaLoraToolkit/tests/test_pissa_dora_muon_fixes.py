@@ -302,5 +302,103 @@ class TestMuonSFMomentum(unittest.TestCase):
         self.assertFalse(torch.allclose(results[0], results[1]))
 
 
+# ---------------------------------------------------------------------------
+# 7. Muon RMS 缩放（moonlight）+ fp32 master（2026-07-11 krea2 不拟合修复）
+# ---------------------------------------------------------------------------
+@unittest.skipUnless(HAS_TORCH, "torch not available")
+class TestMuonRMSScaleAndMaster(unittest.TestCase):
+    """锁定两条修复：
+    1. moonlight 缩放让 NS 更新的条目 RMS ≈ 0.2·lr，与矩阵形状无关（LoRA 矮宽
+       down 矩阵在 keller 口径下被缩小 ~sqrt(in/r) 倍 → 实测不拟合主因之一）。
+    2. fp32 master：bf16 参数上的微小更新不再被 ulp 吞掉（此前 78~93% 条目冻结）。
+    """
+
+    def test_moonlight_rms_shape_invariant(self):
+        from utils.muon_optimizer import zeropower_via_newtonschulz5, _apply_rms_scale
+        torch.manual_seed(0)
+        rms = []
+        for shape in ((8, 512), (512, 8), (64, 64)):
+            g = torch.randn(*shape)
+            u = _apply_rms_scale(zeropower_via_newtonschulz5(g), "moonlight")
+            rms.append(u.pow(2).mean().sqrt().item())
+        for v in rms:
+            self.assertAlmostEqual(v, 0.2, delta=0.05,
+                                   msg=f"moonlight 缩放后 RMS 应 ≈0.2 与形状无关，得到 {rms}")
+
+    def test_keller_mode_preserved_for_comparison(self):
+        from utils.muon_optimizer import zeropower_via_newtonschulz5, _apply_rms_scale
+        torch.manual_seed(0)
+        g = torch.randn(8, 512)
+        u = zeropower_via_newtonschulz5(g)
+        self.assertTrue(torch.allclose(_apply_rms_scale(u, "keller"), u))  # rows<cols → ×1
+
+    def test_bf16_master_no_freeze_muon_sf(self):
+        """LoRA down 真实量级 (~6e-3 kaiming) 的 bf16 参数在 lr=1e-4 下必须能动。
+        修复前：仅 ~22% 条目被动过、位移是 fp32 的 1/5；修复后 bf16 ≡ fp32。"""
+        from utils.muon_optimizer import MuonScheduleFree
+        deltas = {}
+        for dtype in (torch.bfloat16, torch.float32):
+            torch.manual_seed(0)
+            base = torch.empty(8, 512)
+            torch.nn.init.kaiming_uniform_(base, a=5 ** 0.5)
+            p = torch.nn.Parameter(base.to(dtype).clone())
+            p0 = p.detach().float().clone()
+            opt = MuonScheduleFree([p], lr=1e-4)
+            torch.manual_seed(42)
+            for _ in range(100):
+                opt.zero_grad(set_to_none=True)
+                p.grad = (torch.randn(8, 512) * 1e-3).to(dtype)
+                opt.step()
+            d = (p.detach().float() - p0)
+            deltas[dtype] = d.pow(2).mean().sqrt().item()
+            frac = (d != 0).float().mean().item()
+            self.assertGreater(frac, 0.9,
+                               f"{dtype} 下应有 >90% 条目被更新（冻结修复），得到 {frac:.2%}")
+        ratio = deltas[torch.bfloat16] / deltas[torch.float32]
+        self.assertAlmostEqual(ratio, 1.0, delta=0.05,
+                               msg=f"bf16 位移应与 fp32 一致（fp32 master），比值 {ratio:.3f}")
+
+    def test_muon_sf_eval_train_roundtrip_keeps_y(self):
+        """eval→train 往返后参数应精确回到 y master 的舍入值（master 不被 swap 破坏）。
+
+        用 fp32 参数：bf16 下 x−y ~1e-4 会被 randn 量级的 ulp(~8e-3) 吞掉，
+        看不出 swap（swap 本身正确）；fp32 才能断言可见的往返。"""
+        from utils.muon_optimizer import MuonScheduleFree
+        torch.manual_seed(0)
+        p = torch.nn.Parameter(torch.randn(8, 6, dtype=torch.float32))
+        opt = MuonScheduleFree([p], lr=1e-3)
+        for _ in range(3):
+            opt.zero_grad(set_to_none=True)
+            p.grad = torch.randn(8, 6, dtype=torch.float32)
+            opt.step()
+        y_ref = opt.state[p]["y"].clone()
+        before = p.detach().clone()
+        opt.eval()
+        self.assertFalse(torch.equal(p.detach(), before), "eval 应切到 Polyak 平均 x")
+        opt.train()
+        self.assertTrue(torch.equal(p.detach(), before), "train 应无损换回 y")
+        self.assertTrue(torch.equal(opt.state[p]["y"], y_ref), "swap 不应改动 y master")
+
+    def test_plain_muon_master_matches_fp32(self):
+        from utils.muon_optimizer import Muon
+        deltas = {}
+        for dtype in (torch.bfloat16, torch.float32):
+            torch.manual_seed(0)
+            base = torch.empty(8, 512)
+            torch.nn.init.kaiming_uniform_(base, a=5 ** 0.5)
+            p = torch.nn.Parameter(base.to(dtype).clone())
+            p0 = p.detach().float().clone()
+            opt = Muon([p], lr=1e-4)
+            torch.manual_seed(42)
+            for _ in range(100):
+                opt.zero_grad(set_to_none=True)
+                p.grad = (torch.randn(8, 512) * 1e-3).to(dtype)
+                opt.step()
+            deltas[dtype] = (p.detach().float() - p0).pow(2).mean().sqrt().item()
+        ratio = deltas[torch.bfloat16] / deltas[torch.float32]
+        self.assertAlmostEqual(ratio, 1.0, delta=0.05,
+                               msg=f"plain Muon bf16 应与 fp32 一致，比值 {ratio:.3f}")
+
+
 if __name__ == "__main__":
     unittest.main()

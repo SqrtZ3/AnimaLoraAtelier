@@ -158,8 +158,41 @@ class TestABBA(unittest.TestCase):
         torch.testing.assert_close(d_ref, d_new, atol=2e-3, rtol=2e-2)
         del out2, ref
 
-    def test_comfy_export_exact(self):
+    def test_native_only_export_default(self):
+        # 默认 abba_export_kr=False：comfy 导出也只有 native 键（体积=同预算 LoRA），
+        # KR 物化在本地用 tools/abba_export_lora.py 完成
         model, injector = _inject(seed=6)
+        sd = injector.state_dict(export_for_comfy=True)
+        self.assertTrue(any(k.endswith(".abba_a1") for k in sd))
+        self.assertFalse(any(k.endswith(".lora_down.weight") for k in sd))
+
+    def test_export_tool_exact(self):
+        # native 成品 → 转换工具（energy=1.0）→ 标准 LoRA delta 与训练态精确一致
+        import subprocess, tempfile, os, sys as _sys
+        model, injector = _inject(seed=10)
+        _perturb(injector)
+        ad = next(iter(injector.injected.values())).adapter
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "abba.safetensors")
+            dst = os.path.join(td, "lora.safetensors")
+            injector.save(src)
+            tool = str(ROOT / "tools" / "abba_export_lora.py")
+            r = subprocess.run([_sys.executable, tool, src, dst, "--device", "cpu"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            from safetensors import safe_open
+            with safe_open(dst, "pt") as f:
+                keys = list(f.keys())
+                base = next(k for k in keys if k.endswith(".lora_down.weight")).rsplit(".", 2)[0]
+                down = f.get_tensor(f"{base}.lora_down.weight").float()
+                up = f.get_tensor(f"{base}.lora_up.weight").float()
+                alpha = float(f.get_tensor(f"{base}.alpha"))
+            delta = (up @ down) * (alpha / down.shape[0])
+            # 两次 bf16 量化（native 存盘 + 导出存盘）容差
+            torch.testing.assert_close(delta, ad.delta_weight(), atol=3e-2, rtol=3e-2)
+
+    def test_comfy_export_exact(self):
+        model, injector = _inject(seed=6, abba_export_kr=True)
         _perturb(injector)
         ad = next(iter(injector.injected.values())).adapter
         sd = injector.state_dict(export_for_comfy=True)

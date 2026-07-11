@@ -1238,6 +1238,7 @@ def main():
         use_lokr=(args.lora_type == "lokr"),
         use_abba=(args.lora_type == "abba"),
         abba_alpha=getattr(args, "abba_alpha", None),
+        abba_export_kr=bool(getattr(args, "abba_export_kr", False)),
         factor=args.lokr_factor,
         rank_dropout=float(getattr(args, "rank_dropout", 0.0) or 0.0),
         module_dropout=float(getattr(args, "module_dropout", 0.0) or 0.0),

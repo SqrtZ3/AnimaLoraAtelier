@@ -1104,13 +1104,18 @@ class LoRAInjector:
                  # ABBA (arXiv:2505.14238)：lora_type='abba' 时 use_abba=True。
                  # 每模块 r1=r2=mod_rank//2（参数预算=同 rank 标准 LoRA）；
                  # abba_alpha 覆盖 alpha1=alpha2（默认 None → 官方口径 alpha=r）。
-                 use_abba=False, abba_alpha=None):
+                 # abba_export_kr：save() 时是否额外写 KR 物化的标准 LoRA 键
+                 # （rank=r1·r2，体积 ~8×，仅当想让成品直接被 ComfyUI 加载时开；
+                 # 默认 False = 只存 native 因子（体积 = 同预算 LoRA），部署件
+                 # 用 tools/abba_export_lora.py 在本地转换/压缩）。
+                 use_abba=False, abba_alpha=None, abba_export_kr=False):
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
         self.use_lokr = use_lokr
         self.use_abba = bool(use_abba)
         self.abba_alpha = float(abba_alpha) if abba_alpha else None
+        self.abba_export_kr = bool(abba_export_kr)
         self.factor = factor
         if self.use_abba:
             if self.use_lokr:
@@ -1567,11 +1572,14 @@ class LoRAInjector:
                 sd[f"{base}.abba_b2"] = ad.abba_b2.data.clone().bfloat16().cpu()
                 sd[f"{base}.abba_alpha1"] = torch.tensor(float(ad.alpha1))
                 sd[f"{base}.abba_alpha2"] = torch.tensor(float(ad.alpha2))
-                if export_for_comfy:
+                if export_for_comfy and self.abba_export_kr:
                     # KR 物化成标准 LoRA（精确恒等）：ΔW = scaling·B_kr@A_kr
                     #   = (alpha/rank)·up@down，取 rank=r1·r2、alpha=scaling·r1·r2。
                     # ComfyUI 直接可载（rank 变大但数学无损）；native abba_* 键会被
                     # 标准 loader 忽略（仅 resume 用）。fp32 计算 KR 再降 bf16 存储。
+                    # ★ 默认关（abba_export_kr=false）：KR 键让文件膨胀 ~8×（云端
+                    # 下载不友好）；native 因子信息完备，部署件在本地用
+                    # tools/abba_export_lora.py 转换（可顺带 SVD 截断压缩）。
                     a_kr, b_kr = ad.khatri_rao_factors()
                     kr_rank = a_kr.shape[0]
                     sd[f"{base}.lora_down.weight"] = a_kr.bfloat16().cpu()
@@ -1753,18 +1761,29 @@ class LoRAInjector:
         if self.use_lokr and self.lora_variant == "dora":
             meta["anima_dora_scale_format"] = "comfy_output_axis_adjusted"
         if self.use_abba:
-            # 标准键是 KR 物化（rank=r1·r2、alpha=scaling·r1·r2 已按层写进 tensor）；
-            # ss_network_dim/alpha 元数据按 KR 口径覆盖，防下游按预算 rank 误读
             _r_half = max(int(self.rank) // 2, 1)
             _a = self.abba_alpha or float(_r_half)
-            meta["ss_network_dim"] = str(_r_half * _r_half)
-            meta["ss_network_alpha"] = str(float(_a) * _r_half * _r_half)
             meta["anima_lora_variant"] = "abba"
-            meta["anima_abba_note"] = (
-                "Standard lora_down/lora_up keys are the exact Khatri-Rao "
-                "materialization of ABBA (arXiv:2505.14238); abba_* keys are the "
-                "native factors kept for resume and are safe for loaders to ignore."
-            )
+            if self.abba_export_kr:
+                # 标准键是 KR 物化（rank=r1·r2、alpha=scaling·r1·r2 已按层写进 tensor）；
+                # ss_network_dim/alpha 元数据按 KR 口径覆盖，防下游按预算 rank 误读
+                meta["ss_network_dim"] = str(_r_half * _r_half)
+                meta["ss_network_alpha"] = str(float(_a) * _r_half * _r_half)
+                meta["anima_abba_note"] = (
+                    "Standard lora_down/lora_up keys are the exact Khatri-Rao "
+                    "materialization of ABBA (arXiv:2505.14238); abba_* keys are the "
+                    "native factors kept for resume and are safe for loaders to ignore."
+                )
+            else:
+                # native-only（默认）：文件里没有标准 LoRA 键，标准 loader 无法直载。
+                # 换成自有 module 名防误读；部署件用本地转换工具生成。
+                meta["ss_network_module"] = "anima.abba"
+                meta["anima_abba_note"] = (
+                    "Native ABBA factors only (abba_a1/b1/a2/b2 + alpha1/alpha2 per "
+                    "layer). Not loadable by standard LoRA loaders; convert with "
+                    "tools/abba_export_lora.py (optionally with SVD truncation) "
+                    "to produce a ComfyUI-loadable standard LoRA."
+                )
 
         # T-LoRA 元数据（便于审计 + 下游 loader 解释 rank schedule）
         if self.lora_variant == "tlora":

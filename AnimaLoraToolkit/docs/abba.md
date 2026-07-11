@@ -30,10 +30,18 @@
   niter=10)`（B1=U√Σ、A1=√ΣVᵀ），`B2=0`、A2 kaiming → **step 0 净 ΔW=0**。
   注入阶段逐层 SVD，264 层 GPU 上约 1 分钟。
 - **scaling**：官方口径 `s1=√alpha1, s2=√alpha2`（不是 alpha/rank）。
-- **导出**：`injector.save()` 同时写两组键——
-  1. KR 物化的标准 `lora_down/lora_up`（rank=r1·r2、`alpha=s·r1·r2`，精确恒等，
-     ComfyUI 直载；文件比预算 rank 大 ~8×，部署前建议 SVD 截断压缩）；
-  2. native `abba_a1/b1/a2/b2 (+alpha1/alpha2)`（resume 必需；标准 loader 忽略）。
+- **导出（默认 native-only，云端下载友好）**：`injector.save()` 默认只写 native
+  `abba_a1/b1/a2/b2 (+alpha1/alpha2)` —— **体积与同预算标准 LoRA 完全相同**
+  （rank 32 预算 ≈ 235MB），resume 也用它。部署件在本地转换：
+
+  ```
+  python tools/abba_export_lora.py in_abba.safetensors out_lora.safetensors \
+      [--energy 0.999] [--max-rank 128]
+  ```
+
+  转换 = KR 物化（精确恒等）+ 可选逐层 SVD 截断（QR 技巧，秒级），输出 kohya
+  标准键、ComfyUI 直载；`--energy 1.0`（默认）时与训练前向 bf16 容差内一致。
+  若确需云端直接产出可直载文件，设 `abba_export_kr: true`（文件 ~8×，慎用）。
   resume 只认 native 键（KR 乘积无法唯一回推 4 因子）。
 - **step-0 梯度流**：B2=0 使 step 0 只有 B2 有梯度，一步后全因子解冻
   （与 LoRA 的 B=0 同类，单元测试覆盖）。

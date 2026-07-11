@@ -132,6 +132,7 @@ YAML_TO_ARGS = {
     "lora_dropout": "lora_dropout",
     "lokr_factor": "lokr_factor",
     "abba_alpha": "abba_alpha",
+    "abba_export_kr": "abba_export_kr",
     "lora_variant": "lora_variant",
     "lora_init": "lora_init",
     "dora_export_mode": "dora_export_mode",
@@ -534,6 +535,9 @@ DEFAULTS = {
     "lokr_factor": 8,
     # ABBA（lora_type='abba'）：alpha1=alpha2 的统一覆盖；None → 官方口径 alpha=r（r=rank//2）
     "abba_alpha": None,
+    # save() 是否额外写 KR 物化标准 LoRA 键（文件 ~8×，云端下载不友好）。
+    # 默认 False：只存 native 因子（体积=同预算 LoRA），本地用 tools/abba_export_lora.py 转部署件
+    "abba_export_kr": False,
     "lora_variant": "base",
     "lora_init": "default",
     "dora_export_mode": "native",

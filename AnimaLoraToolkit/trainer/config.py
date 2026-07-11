@@ -131,6 +131,7 @@ YAML_TO_ARGS = {
     "lora_alpha": "lora_alpha",
     "lora_dropout": "lora_dropout",
     "lokr_factor": "lokr_factor",
+    "abba_alpha": "abba_alpha",
     "lora_variant": "lora_variant",
     "lora_init": "lora_init",
     "dora_export_mode": "dora_export_mode",
@@ -531,6 +532,8 @@ DEFAULTS = {
     "lora_alpha": 32.0,
     "lora_dropout": 0.0,
     "lokr_factor": 8,
+    # ABBA（lora_type='abba'）：alpha1=alpha2 的统一覆盖；None → 官方口径 alpha=r（r=rank//2）
+    "abba_alpha": None,
     "lora_variant": "base",
     "lora_init": "default",
     "dora_export_mode": "native",

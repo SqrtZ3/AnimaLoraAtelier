@@ -1028,7 +1028,7 @@ def main():
                 open_browser=(not getattr(args, "no_browser", False)),
             )
             update_monitor(config={
-                "model": "Anima LoKr" if args.lora_type == "lokr" else "Anima LoRA",
+                "model": {"lokr": "Anima LoKr", "abba": "Anima ABBA"}.get(args.lora_type, "Anima LoRA"),
                 "rank": args.lora_rank,
                 "alpha": args.lora_alpha,
                 "epochs": args.epochs,
@@ -1179,6 +1179,8 @@ def main():
     # 注入 LoRA
     lora_variant = str(getattr(args, "lora_variant", "base") or "base").lower()
     dora_export_mode = str(getattr(args, "dora_export_mode", "native") or "native").lower()
+    if args.lora_type not in ("lora", "lokr", "abba"):
+        raise ValueError(f"未知 lora_type: {args.lora_type!r}（可选: lora / lokr / abba）")
     # DoRA is now supported with both standard LoRA and LoKr.
     # T-LoRA × LoKr 的组合校验交给 LoRAInjector.__init__（带详细错误提示）；
     # 这里只在标准 LoRA 路径下记录一行 info。
@@ -1234,6 +1236,8 @@ def main():
         alpha=args.lora_alpha,
         dropout=float(getattr(args, "lora_dropout", 0.0) or 0.0),
         use_lokr=(args.lora_type == "lokr"),
+        use_abba=(args.lora_type == "abba"),
+        abba_alpha=getattr(args, "abba_alpha", None),
         factor=args.lokr_factor,
         rank_dropout=float(getattr(args, "rank_dropout", 0.0) or 0.0),
         module_dropout=float(getattr(args, "module_dropout", 0.0) or 0.0),

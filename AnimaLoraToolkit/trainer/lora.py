@@ -1,7 +1,8 @@
 """LoRA / LoKr / DoRA 适配器与注入器。
 
 包含：
-- `LoRALayer`、`LoKrLayer` —— 两种低秩分解适配器（含 rank_dropout / module_dropout）
+- `LoRALayer`、`LoKrLayer`、`ABBALayer` —— 三种低秩分解适配器（含 rank_dropout / module_dropout；
+  ABBA 为 Hadamard 双低秩，arXiv:2505.14238，不支持 rank_dropout）
 - `LoRALinear` —— 把原始 `torch.nn.Linear` 包成 adapter + base 的复合层，支持 DoRA
 - `LoRAInjector` —— 全模型扫描 + regex 选择 + 模块级 rank / alpha / lr + LoRA+
                     + ComfyUI 兼容的 safetensors 保存/加载（native / diff / merged_model 三种导出格式）
@@ -389,6 +390,129 @@ class LoRALayer(torch.nn.Module):
         return delta
 
 
+class ABBALayer(torch.nn.Module):
+    """ABBA 适配器 (arXiv:2505.14238, ICLR 2026)：ΔW = (s1·B1@A1) ∘ (s2·B2@A2)
+
+    Hadamard 双低秩：参数量 (r1+r2)(in+out)，有效秩上限 r1·r2。
+    r1=r2=lora_rank/2 时参数预算与标准 LoRA rank=lora_rank 相同。
+    可达集合严格包含标准 LoRA rank-r1 的全部解（B2@A2 学成全 1 矩阵即退化，
+    全 1 矩阵 rank-1 可表示）——与 LoKr 的 kron 块共享结构不同，没有
+    "对一般目标只能覆盖 ~1/f² 能量"的结构病理。
+
+    前向用 Khatri-Rao 精确重排（官方 CERT-Lab/abba 同款，数学恒等无近似）：
+        (B1@A1) ∘ (B2@A2) = B_kr @ A_kr
+        B_kr[i,:] = B1[i,:] ⊗ B2[i,:]   → (out, r1·r2)   行向 KR
+        A_kr[:,j] = A1[:,j] ⊗ A2[:,j]   → (r1·r2, in)    列向 KR
+        ΔW·x = B_kr(A_kr·x) —— 全程不物化 (out, in) 矩阵。
+
+    init（官方 init_weights_svd_mixed）：
+        (B1,A1) ← W0 截断 SVD：B1=U√Σ, A1=√Σ·Vᵀ（svd_lowrank q=r1, niter=10）
+        (B2,A2) ← B2=0, A2 kaiming → step 0 净 ΔW=0（行为中立）
+    scaling 官方口径：s1=√alpha1, s2=√alpha2，self.scaling = s1·s2。
+
+    不支持 rank_dropout / T-LoRA / DoRA（构造期 fail-fast，见 LoRALinear 校验）。
+    """
+    def __init__(self, in_features, out_features, r1=16, r2=16,
+                 alpha1=16.0, alpha2=16.0, dropout=0.0, module_dropout=0.0,
+                 rank_dropout=0.0, base_weight=None, device=None):
+        super().__init__()
+        if rank_dropout and float(rank_dropout) > 0:
+            raise ValueError("ABBALayer 不支持 rank_dropout（4 因子乘性结构下 rank 通道"
+                             "语义不明确）；请设 rank_dropout: 0")
+        if base_weight is None:
+            raise ValueError("ABBALayer 需要 base_weight 做 SVD init（官方 init 方案）")
+        r_cap = min(in_features, out_features)
+        if int(r1) > r_cap or int(r2) > r_cap:
+            logger.warning(
+                "[ABBA] r1/r2=%s/%s 超过层最小维 %d，收紧到 %d（SVD 截断秩上限）",
+                r1, r2, r_cap, r_cap)
+        self.r1 = min(int(r1), r_cap)
+        self.r2 = min(int(r2), r_cap)
+        self.rank = self.r1 * self.r2   # KR 有效秩（信息用途）
+        self.alpha1 = float(alpha1)
+        self.alpha2 = float(alpha2)
+        # 官方口径：scaling1/2 = sqrt(alpha)，folded 进最终输出
+        self.scaling = math.sqrt(self.alpha1) * math.sqrt(self.alpha2)
+
+        self.abba_a1 = torch.nn.Parameter(torch.empty(self.r1, in_features, device=device))
+        self.abba_b1 = torch.nn.Parameter(torch.empty(out_features, self.r1, device=device))
+        self.abba_a2 = torch.nn.Parameter(torch.empty(self.r2, in_features, device=device))
+        self.abba_b2 = torch.nn.Parameter(torch.empty(out_features, self.r2, device=device))
+        self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
+        self.rank_dropout = 0.0
+        self.module_dropout = float(module_dropout or 0.0)
+        self.current_t = None
+        self._md_keep: torch.Tensor | None = None
+        self._md_compile_safe: bool = False
+
+        # ── init（fp32 SVD，与 _pissa_init 同理由：bf16 SVD 数值不稳）─────
+        with torch.no_grad():
+            W = base_weight.detach().float().to(device)
+            q = min(self.r1, min(in_features, out_features))
+            U, S, V = torch.svd_lowrank(W, q=q, niter=10)
+            # ★ svd_lowrank 返回 V (in, q) 而非 Vh —— 与 _pissa_init 同一坑位
+            s_sqrt = S[:q].clamp(min=0).sqrt()
+            self.abba_a1.copy_((V[:, :q] * s_sqrt.unsqueeze(0)).t())   # (r1, in)
+            self.abba_b1.copy_(U[:, :q] * s_sqrt.unsqueeze(0))          # (out, r1)
+            torch.nn.init.kaiming_uniform_(self.abba_a2)                # 官方默认口径
+            torch.nn.init.zeros_(self.abba_b2)
+
+    # ── module_dropout 机制：与 LoRALayer 语义一致 ─────────────────────
+    def set_current_t(self, t):
+        self.current_t = t   # ABBA 不消费 timestep；保留接口以兼容 LoRALinear 转发
+
+    def set_module_dropout_compile_safe(self, flag):
+        self._md_compile_safe = bool(flag)
+        if not self._md_compile_safe:
+            self._md_keep = None
+
+    def roll_module_dropout(self):
+        if self._md_compile_safe and self.training and self.module_dropout > 0:
+            dev = self.abba_b2.device
+            self._md_keep = (torch.rand((), device=dev) >= self.module_dropout).float()
+        else:
+            self._md_keep = None
+
+    def clear_module_dropout(self):
+        self._md_keep = None
+
+    def khatri_rao_factors(self):
+        """返回 (A_kr, B_kr) fp32：ΔW = scaling · B_kr @ A_kr（精确，供导出/取证）。"""
+        a1 = self.abba_a1.float()
+        a2 = self.abba_a2.float()
+        b1 = self.abba_b1.float()
+        b2 = self.abba_b2.float()
+        a_kr = (a1.unsqueeze(1) * a2.unsqueeze(0)).reshape(self.r1 * self.r2, a1.shape[1])
+        b_kr = (b1.unsqueeze(2) * b2.unsqueeze(1)).reshape(b1.shape[0], self.r1 * self.r2)
+        return a_kr, b_kr
+
+    def forward(self, x):
+        # eager module dropout：与 LoRALayer 同款懒抽签早返回
+        if (self.training and self.module_dropout > 0 and not self._md_compile_safe
+                and torch.rand(1).item() < self.module_dropout):
+            return torch.zeros(*x.shape[:-1], self.abba_b1.shape[0],
+                               device=x.device, dtype=x.dtype)
+        x_drop = self.dropout(x)
+        a1, a2, b1, b2 = self.abba_a1, self.abba_a2, self.abba_b1, self.abba_b2
+        # KR 因子逐 forward 重建（autograd 穿过；成本 O((r1·r2)(in+out))，远小于 matmul）
+        a_kr = (a1.unsqueeze(1) * a2.unsqueeze(0)).reshape(self.r1 * self.r2, a1.shape[1])
+        b_kr = (b1.unsqueeze(2) * b2.unsqueeze(1)).reshape(b1.shape[0], self.r1 * self.r2)
+        if x_drop.dtype != a_kr.dtype:
+            x_drop = x_drop.to(dtype=a_kr.dtype)
+        h = F.linear(x_drop, a_kr)
+        out = F.linear(h, b_kr) * self.scaling
+        if self._md_keep is not None:
+            out = out * self._md_keep.to(out.dtype)
+        return out
+
+    def delta_weight(self, apply_rank_dropout: bool = False) -> torch.Tensor:
+        """Materialize ΔW（导出 / diff / merged_weight 用）。"""
+        del apply_rank_dropout  # ABBA 无 rank_dropout；保留签名与 LoKrLayer 一致
+        d1 = torch.matmul(self.abba_b1.float(), self.abba_a1.float())
+        d2 = torch.matmul(self.abba_b2.float(), self.abba_a2.float())
+        return d1 * d2 * self.scaling
+
+
 class LoKrLayer(torch.nn.Module):
     """LyCORIS LoKr 层 (ComfyUI 兼容) — w2 低秩分解版
 
@@ -747,10 +871,13 @@ class LoRALinear(torch.nn.Module):
                  tlora_rmin_ratio=0.5, tlora_alpha=1.0, tlora_init="default",
                  tlora_lokr_ortho_init=False,
                  dora_fast_norm=False, dora_detach_norm=False,
-                 lora_init="default"):
+                 lora_init="default",
+                 use_abba=False, abba_r1=None, abba_r2=None,
+                 abba_alpha1=None, abba_alpha2=None):
         super().__init__()
         self.original = original
         self.use_lokr = use_lokr
+        self.use_abba = bool(use_abba)
         self.lora_variant = (lora_variant or "base").lower()
         self.use_dora = self.lora_variant == "dora"
         self.use_tlora = self.lora_variant == "tlora"
@@ -771,11 +898,36 @@ class LoRALinear(torch.nn.Module):
         # - tlora × dora 不支持
         if self.use_tlora and self.use_dora:
             raise ValueError("lora_variant='tlora' is incompatible with DoRA")
+        # - ABBA 首版保持最小变量面：不与 lokr / dora / tlora / pissa / rank_dropout 组合
+        if self.use_abba:
+            if self.use_lokr:
+                raise ValueError("lora_type='abba' 与 lokr 互斥")
+            if self.use_dora or self.use_tlora:
+                raise ValueError("lora_type='abba' 暂不支持 lora_variant='dora'/'tlora'"
+                                 "（首版单变量验证；如需组合，先在云端确认 ABBA 基线拟合）")
+            if self.lora_init not in ("default",):
+                raise ValueError("lora_type='abba' 自带官方 SVD init，与 lora_init="
+                                 f"{self.lora_init!r} 冲突；请保持 lora_init: default")
+            if rank_dropout and float(rank_dropout) > 0:
+                raise ValueError("lora_type='abba' 不支持 rank_dropout；请设 rank_dropout: 0")
 
         # Ortho init 里的 SVD 走 original.weight.device（通常 GPU），避免 CPU SVD
         # 在大尺寸层（>5120）上每层 10–50 秒、整网累积一小时的开销
         svd_device = original.weight.device
-        if use_lokr:
+        if self.use_abba:
+            r_half = max(int(rank) // 2, 1)
+            r1 = int(abba_r1) if abba_r1 else r_half
+            r2 = int(abba_r2) if abba_r2 else r_half
+            self.adapter = ABBALayer(
+                original.in_features, original.out_features,
+                r1=r1, r2=r2,
+                alpha1=float(abba_alpha1) if abba_alpha1 else float(r1),
+                alpha2=float(abba_alpha2) if abba_alpha2 else float(r2),
+                dropout=dropout, module_dropout=module_dropout,
+                rank_dropout=rank_dropout,
+                base_weight=original.weight, device=svd_device,
+            )
+        elif use_lokr:
             self.adapter = LoKrLayer(
                 original.in_features, original.out_features,
                 rank=rank, alpha=alpha, factor=factor, dropout=dropout,
@@ -891,7 +1043,7 @@ class LoRALinear(torch.nn.Module):
 
     def merged_weight(self) -> torch.Tensor:
         base_w = self.original.weight.float()
-        if self.use_lokr:
+        if self.use_lokr or self.use_abba:
             delta = self.adapter.delta_weight(apply_rank_dropout=False).to(device=base_w.device)
         else:
             delta = torch.matmul(
@@ -948,12 +1100,26 @@ class LoRAInjector:
                  tlora_skip_lambda_layer=True,
                  # DoRA 范数加速开关（见 LoRALinear.__init__ 注释；默认关 = 行为不变）
                  dora_fast_norm=False, dora_detach_norm=False,
-                 lora_init="default"):
+                 lora_init="default",
+                 # ABBA (arXiv:2505.14238)：lora_type='abba' 时 use_abba=True。
+                 # 每模块 r1=r2=mod_rank//2（参数预算=同 rank 标准 LoRA）；
+                 # abba_alpha 覆盖 alpha1=alpha2（默认 None → 官方口径 alpha=r）。
+                 use_abba=False, abba_alpha=None):
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
         self.use_lokr = use_lokr
+        self.use_abba = bool(use_abba)
+        self.abba_alpha = float(abba_alpha) if abba_alpha else None
         self.factor = factor
+        if self.use_abba:
+            if self.use_lokr:
+                raise ValueError("lora_type='abba' 与 lokr 互斥")
+            if (lora_variant or "base").lower() != "base":
+                raise ValueError("lora_type='abba' 暂不支持 lora_variant="
+                                 f"{lora_variant!r}（首版单变量验证）")
+            if rank_dropout and float(rank_dropout) > 0:
+                raise ValueError("lora_type='abba' 不支持 rank_dropout；请设 rank_dropout: 0")
         # 完整训练配置快照；save() 时整体写进 safetensors metadata（成品自描述 / 防云端 yaml 丢失）。
         self.training_metadata: dict = {}
         self.lora_variant = (lora_variant or "base").lower()
@@ -1121,6 +1287,15 @@ class LoRAInjector:
                                 _label, name, _hits[0][0], _hits[0][1],
                                 [(p, v) for p, v in _hits[1:]])
 
+            abba_kwargs = {}
+            if self.use_abba:
+                r_half = max(int(mod_rank) // 2, 1)
+                abba_kwargs = {
+                    "use_abba": True,
+                    "abba_r1": r_half, "abba_r2": r_half,
+                    "abba_alpha1": self.abba_alpha or float(r_half),
+                    "abba_alpha2": self.abba_alpha or float(r_half),
+                }
             lora_linear = LoRALinear(
                 module, rank=mod_rank, alpha=mod_alpha,
                 dropout=self.dropout, use_lokr=self.use_lokr, factor=self.factor,
@@ -1133,6 +1308,7 @@ class LoRAInjector:
                 tlora_lokr_ortho_init=self.tlora_lokr_ortho_init,
                 dora_fast_norm=self.dora_fast_norm,
                 dora_detach_norm=self.dora_detach_norm,
+                **abba_kwargs,
             )
 
             parent_name, _, child_name = name.rpartition(".")
@@ -1151,12 +1327,21 @@ class LoRAInjector:
             variant_label = "T-LoKr (实验性)" if self.use_lokr else "T-LoRA"
         elif self.lora_variant == "dora":
             variant_label = "DoRA-LoKr"
+        elif self.use_abba:
+            variant_label = "ABBA"
         else:
             variant_label = "LoKr" if self.use_lokr else "LoRA"
         logger.info(
             f"注入 {variant_label} 到 {len(self.injected)} 层 "
             f"（排除: [{exc_str}], 包含: [{inc_str}], rank 分布: {rank_dist}）"
         )
+        if self.use_abba:
+            _r_half = max(int(self.rank) // 2, 1)
+            logger.info(
+                f"  ABBA: r1=r2=rank/2（全局 rank={self.rank} → {_r_half}，参数预算=同 rank 标准 LoRA），"
+                f"alpha1=alpha2={self.abba_alpha or float(_r_half):g}，"
+                f"init=SVD(W0)+B2=0（arXiv:2505.14238，KR 有效秩上限 {_r_half * _r_half}）"
+            )
         if self.lora_variant == "tlora":
             r_min_example = max(int(round(self.rank * self.tlora_rmin_ratio)), 1)
             logger.info(
@@ -1252,6 +1437,14 @@ class LoRAInjector:
                 if getattr(lora, "use_dora", False):
                     key_dora = (0.0, 1.0, custom_lr)
                     groups_dict.setdefault(key_dora, []).append(lora.dora_scale)
+            elif self.use_abba:
+                # A1/A2 类比 lora_down（wd, 1.0），B1/B2 类比 lora_up（wd, LoRA+ ratio）
+                key_a = (weight_decay, 1.0, custom_lr)
+                key_b = (weight_decay, ratio, custom_lr)
+                groups_dict.setdefault(key_a, []).append(lora.adapter.abba_a1)
+                groups_dict.setdefault(key_a, []).append(lora.adapter.abba_a2)
+                groups_dict.setdefault(key_b, []).append(lora.adapter.abba_b1)
+                groups_dict.setdefault(key_b, []).append(lora.adapter.abba_b2)
             else:
                 key_down = (weight_decay, 1.0, custom_lr)
                 key_up = (weight_decay, ratio, custom_lr)
@@ -1276,7 +1469,12 @@ class LoRAInjector:
             param_groups.append(group)
 
         if ratio > 1.0:
-            lr_target = "LoKr w2_b" if self.use_lokr else "lora_up"
+            if self.use_lokr:
+                lr_target = "LoKr w2_b"
+            elif self.use_abba:
+                lr_target = "ABBA b1/b2"
+            else:
+                lr_target = "lora_up"
             logger.info(f"[LoRA+] {lr_target} lr ×{ratio:.1f}")
         return param_groups
 
@@ -1360,6 +1558,25 @@ class LoRAInjector:
                     sd[f"{base}.lokr_w1_init"] = ad.lokr_w1_init.data.clone().bfloat16().cpu()
                     sd[f"{base}.lokr_w2_a_init"] = ad.lokr_w2_a_init.data.clone().bfloat16().cpu()
                     sd[f"{base}.lokr_w2_b_init"] = ad.lokr_w2_b_init.data.clone().bfloat16().cpu()
+            elif self.use_abba:
+                ad = lora.adapter
+                # native 4 因子：resume 必需（KR 乘积无法唯一回推因子）。bf16 与训练精度一致。
+                sd[f"{base}.abba_a1"] = ad.abba_a1.data.clone().bfloat16().cpu()
+                sd[f"{base}.abba_b1"] = ad.abba_b1.data.clone().bfloat16().cpu()
+                sd[f"{base}.abba_a2"] = ad.abba_a2.data.clone().bfloat16().cpu()
+                sd[f"{base}.abba_b2"] = ad.abba_b2.data.clone().bfloat16().cpu()
+                sd[f"{base}.abba_alpha1"] = torch.tensor(float(ad.alpha1))
+                sd[f"{base}.abba_alpha2"] = torch.tensor(float(ad.alpha2))
+                if export_for_comfy:
+                    # KR 物化成标准 LoRA（精确恒等）：ΔW = scaling·B_kr@A_kr
+                    #   = (alpha/rank)·up@down，取 rank=r1·r2、alpha=scaling·r1·r2。
+                    # ComfyUI 直接可载（rank 变大但数学无损）；native abba_* 键会被
+                    # 标准 loader 忽略（仅 resume 用）。fp32 计算 KR 再降 bf16 存储。
+                    a_kr, b_kr = ad.khatri_rao_factors()
+                    kr_rank = a_kr.shape[0]
+                    sd[f"{base}.lora_down.weight"] = a_kr.bfloat16().cpu()
+                    sd[f"{base}.lora_up.weight"] = b_kr.bfloat16().cpu()
+                    sd[f"{base}.alpha"] = torch.tensor(float(ad.scaling) * kr_rank)
             else:
                 if self.lora_variant == "tlora":
                     # LyCORIS-style key 命名，兼容 bghira/ComfyUI-T-LoRA loader
@@ -1513,6 +1730,11 @@ class LoRAInjector:
         network_args = f'{{"algo": "lokr", "factor": {self.factor}}}' if self.use_lokr else "{}"
         if self.use_lokr and self.lora_variant == "dora":
             network_args = f'{{"algo": "lokr", "factor": {self.factor}, "dora_wd": true}}'
+        if self.use_abba:
+            _r_half = max(int(self.rank) // 2, 1)
+            _a = self.abba_alpha or float(_r_half)
+            network_args = (f'{{"algo": "abba", "r1": {_r_half}, "r2": {_r_half}, '
+                            f'"alpha1": {_a:g}, "alpha2": {_a:g}}}')
 
         # T-LoRA 标准路径：用 bghira/ComfyUI-T-LoRA 能识别的 module 名 t_lora
         if self.lora_variant == "tlora" and not self.use_lokr:
@@ -1530,6 +1752,19 @@ class LoRAInjector:
         }
         if self.use_lokr and self.lora_variant == "dora":
             meta["anima_dora_scale_format"] = "comfy_output_axis_adjusted"
+        if self.use_abba:
+            # 标准键是 KR 物化（rank=r1·r2、alpha=scaling·r1·r2 已按层写进 tensor）；
+            # ss_network_dim/alpha 元数据按 KR 口径覆盖，防下游按预算 rank 误读
+            _r_half = max(int(self.rank) // 2, 1)
+            _a = self.abba_alpha or float(_r_half)
+            meta["ss_network_dim"] = str(_r_half * _r_half)
+            meta["ss_network_alpha"] = str(float(_a) * _r_half * _r_half)
+            meta["anima_lora_variant"] = "abba"
+            meta["anima_abba_note"] = (
+                "Standard lora_down/lora_up keys are the exact Khatri-Rao "
+                "materialization of ABBA (arXiv:2505.14238); abba_* keys are the "
+                "native factors kept for resume and are safe for loaders to ignore."
+            )
 
         # T-LoRA 元数据（便于审计 + 下游 loader 解释 rank schedule）
         if self.lora_variant == "tlora":
@@ -1617,6 +1852,25 @@ class LoRAInjector:
                     loaded_count += 1
                 elif w1_key in sd and w2_old_key in sd:
                     logger.warning(f"跳过旧格式 lokr_w2 全矩阵层: {name}（需重新训练）")
+            elif self.use_abba:
+                keys = tuple(f"{base}.abba_{k}" for k in ("a1", "b1", "a2", "b2"))
+                if all(k in sd for k in keys):
+                    ad = lora.adapter
+                    for p, k in zip((ad.abba_a1, ad.abba_b1, ad.abba_a2, ad.abba_b2), keys):
+                        p.data.copy_(sd[k].to(device=p.device, dtype=p.dtype))
+                    # alpha1/alpha2 若在文件里则以文件为准（跨配置 resume 时 scaling 不漂移）
+                    a1k, a2k = f"{base}.abba_alpha1", f"{base}.abba_alpha2"
+                    if a1k in sd and a2k in sd:
+                        ad.alpha1 = float(sd[a1k])
+                        ad.alpha2 = float(sd[a2k])
+                        ad.scaling = math.sqrt(ad.alpha1) * math.sqrt(ad.alpha2)
+                    loaded_count += 1
+                elif f"{base}.lora_down.weight" in sd:
+                    # 只有 KR 物化的标准 LoRA 键（缺 native 因子）：4 因子无法从乘积唯一
+                    # 回推 → 明确拒绝，而不是静默加载错语义
+                    logger.warning(
+                        f"层 {name}: 文件只含 KR 物化的标准 LoRA 键、缺 abba_* native 因子，"
+                        f"ABBA 无法 resume。请从含 abba_* 键的 checkpoint 恢复。")
             else:
                 down_key = f"{base}.lora_down.weight"
                 up_key = f"{base}.lora_up.weight"

@@ -68,6 +68,17 @@
   - `trainer/model_family.py`（Qwen3-VL 编码模板/常量、分辨率感知 timestep shift
     公式移植自官方 encoder.py / sampling.py）
 
+## ABBA-Adapters（论文方法移植）
+
+- **来源**：论文 *ABBA-Adapters: Efficient and Expressive Fine-Tuning of Foundation
+  Models*（arXiv:2505.14238，ICLR 2026）；官方实现 `CERT-Lab/abba`（截至引入时
+  上游仓库未见 LICENSE 文件——本仓库为按论文公式的独立重实现，未复制上游代码，
+  仅对照其 init / scaling / Khatri-Rao 重排的数值口径）。
+- **涉及文件**：
+  - `trainer/lora.py`（`ABBALayer` 及 LoRAInjector 的 abba 分支）
+- **本地差异**：适配本仓库 adapter-输出叠加式注入（官方是包 base_layer 的
+  wrapper）；导出为 KR 物化标准 LoRA 键 + native `abba_*` 因子并存。
+
 ## Alibaba Wan2.1 VAE（请再次确认上游许可）
 
 - **来源**：`Wan-Video/Wan2.1` 的 VAE 实现（与 `wan/modules/vae.py` 对应）

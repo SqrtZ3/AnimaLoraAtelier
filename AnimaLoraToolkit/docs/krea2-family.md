@@ -35,7 +35,9 @@ navit_token_budget: <按显存定>
 ## 关键行为
 
 - **LoRA targets 默认 = DiT 全部 264 个 Linear**（官方/musubi 推荐口径，rank/alpha 32
-  为作者默认）。想复刻官方"长训练"的 attention-only（140 Linear）：
+  为作者默认；含 tproj.1。modulation/RMSNorm 是裸张量、非 Linear，本就不被包）。
+  tproj.1 是全网最大单层，训练侧无问题（预览正常即证），部署时的显存坑见下方
+  「ComfyUI 推理部署」。想复刻官方"长训练"的 attention-only（140 Linear）：
   ```yaml
   lora_targets: ["attn.wq","attn.wk","attn.wv","attn.wo","attn.gate"]
   lora_exclude_patterns: [".*txtfusion.*"]
@@ -57,6 +59,35 @@ navit_token_budget: <按显存定>
   TREAD、DPO、LeapAlign、GAF、NCP、self-perceptual、dispersive、LoRA-One init——
   这些绑定 Anima 前向内部结构，需要时单独移植。ΔFM/VeCoR、Eisbach、LWD、
   min-SNR/EDM2 加权、三峰/Laplace/CSFlow 等 latent 空间/t 轴技术照常可用。
+
+## ComfyUI 推理部署（tproj.1 的显存坑 + 解法）
+
+**现象**：把训好的 LoRA 喂进 ComfyUI，日志刷 `ERROR lora diffusion_model.tproj.1.weight
+Allocation on device`，出图人物风格在、**背景崩成乱图**。
+
+**根因（已定位到 ComfyUI 源码，非训练/数据问题）**：ComfyUI 标准 *Load LoRA* 节点对每个
+权重物化**完整 delta 矩阵**再并入底模（`comfy/weight_adapter/lora.py`：
+`lora_diff = torch.mm(up, down).reshape(weight.shape)` → `weight += ...`）。tproj.1 =
+`nn.Linear(6144, 36864)`，delta 是 `[36864,6144]`≈453MB(bf16)/905MB(fp32)；12B 底模占满
+显存时这步 OOM，被 `except` 静默吞掉、该层回退底模。于是只有 tproj.1 用底模、其余 263 层是
+训练后的 → 全局 timestep 调制（tproj 输出喂全部 28 个 block 共享）错位 → 背景崩。
+（训练时的采样预览用活模型全 264 层、tproj.1 是训练后的，所以预览正常——问题只在 ComfyUI
+这条实时加载路径。这也是 ComfyUI 已知问题，见 Comfy-Org/ComfyUI#12000 一类 fp8/大层 OOM。）
+
+**解法：改用 ComfyUI 内置节点 `Load LoRA (Bypass, Model Only)`**（类
+`LoraLoaderBypassModelOnly`，分类 `model/loaders`，节点菜单搜 "Bypass"；实现见
+`comfy_extras/nodes_lora_debug.py` → `comfy.sd.load_bypass_lora_for_models`）。它把 LoRA
+作为**前向低秩注入**（`out = base_forward(x) + strength·(x·downᵀ)·upᵀ·(α/r)`），**永不物化
+完整 delta**，故 tproj.1 不再 OOM，全部 264 层（含 tproj.1）都正确生效。与"完整合并"数学
+等价（本地用真实 tproj.1 因子实测：fp32 max_abs_diff 1.7e-6，bf16 1.6e-2 属正常舍入）。
+接线：把原来的 *Load LoRA (Model Only)* 换成 *Load LoRA (Bypass, Model Only)* 即可，其余不变。
+
+- 代价：每步每层多一次低秩 matmul（rank 32，相对底模 6144 维开销很小），略慢，画质不变。
+- 该节点标 `EXPERIMENTAL`/"(for debugging)"，但是 ComfyUI 官方代码、机制正确。
+- 若你的**推理** ComfyUI 是缺 `nodes_lora_debug.py` 的旧构建，把该文件作为 custom node
+  放进 `custom_nodes/` 即可获得同名节点。
+- 不要用"从 LoRA 里删掉 tproj.1 键"来绕：那等价于 tproj.1 用底模，背景照崩（已实测），
+  且丢了官方推荐训练的一层。
 
 ## 显存与速度预期（未实测，推断）
 

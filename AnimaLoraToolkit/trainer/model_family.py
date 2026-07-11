@@ -413,6 +413,13 @@ def krea2_sample_shift(height: int, width: int, min_res: int = 256, max_res: int
 # 28 block × (attn 5 + mlp 3) + txtfusion(4 block × 8 + projector) + txtmlp 2 +
 # tmlp 2 + tproj 1 + first 1 + last.linear 1。
 # 注入器按"子串命中 + nn.Linear"匹配，以下列表恰好覆盖全部 Linear 且不误伤。
+#
+# 关于 tproj.1（= nn.Linear(6144, 36864)，226M 参数，全网最大单层）：官方/musubi
+# 默认就训它（modulation/RMSNorm 是裸张量、非 Linear，本就不被包）。训练侧无问题——
+# 训练时采样预览正常即证。真正的坑在 **ComfyUI 部署侧**：标准 Load LoRA 节点会物化
+# 完整 delta (36864×6144 ≈ 453MB bf16)，12B 占满显存时 "Allocation on device"（OOM），
+# 该层被静默丢弃 → 全局调制错位 → 背景崩。解法不是不训它，而是推理改用 ComfyUI 内置
+# **Load LoRA (Bypass, Model Only)**（前向低秩注入、不物化 delta）。详见 docs/krea2-family.md。
 KREA2_DEFAULT_LORA_TARGETS = [
     "attn.wq", "attn.wk", "attn.wv", "attn.wo", "attn.gate",
     "mlp.gate", "mlp.up", "mlp.down",

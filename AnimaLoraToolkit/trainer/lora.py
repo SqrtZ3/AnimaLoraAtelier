@@ -506,7 +506,12 @@ class ABBALayer(torch.nn.Module):
         return out
 
     def delta_weight(self, apply_rank_dropout: bool = False) -> torch.Tensor:
-        """Materialize ΔW（导出 / diff / merged_weight 用）。"""
+        """Materialize ΔW（导出 / diff / merged_weight 用）。
+
+        ΔW = scaling·(B1@A1)∘(B2@A2)。与 forward() 的 Khatri-Rao 重排 b_kr@a_kr
+        严格恒等（(B1A1)∘(B2A2) = KR(B1,B2)@KR(A1,A2)，本地对拍 max_abs≈9e-9），
+        这里用 Hadamard 形式：FLOPs 更少且直观。
+        """
         del apply_rank_dropout  # ABBA 无 rank_dropout；保留签名与 LoKrLayer 一致
         d1 = torch.matmul(self.abba_b1.float(), self.abba_a1.float())
         d2 = torch.matmul(self.abba_b2.float(), self.abba_a2.float())
@@ -1443,13 +1448,21 @@ class LoRAInjector:
                     key_dora = (0.0, 1.0, custom_lr)
                     groups_dict.setdefault(key_dora, []).append(lora.dora_scale)
             elif self.use_abba:
-                # A1/A2 类比 lora_down（wd, 1.0），B1/B2 类比 lora_up（wd, LoRA+ ratio）
-                key_a = (weight_decay, 1.0, custom_lr)
-                key_b = (weight_decay, ratio, custom_lr)
-                groups_dict.setdefault(key_a, []).append(lora.adapter.abba_a1)
-                groups_dict.setdefault(key_a, []).append(lora.adapter.abba_a2)
-                groups_dict.setdefault(key_b, []).append(lora.adapter.abba_b1)
-                groups_dict.setdefault(key_b, []).append(lora.adapter.abba_b2)
+                # ABBA 分组按参数来源区分（关键是把零初始化的 b2 单独隔离）：
+                #   a1/b1 = W0 截断 SVD 暖启动（承载有意义的大值）→ wd=0，不衰减暖启动。
+                #     （注：wd 侵蚀量级 = lr×wd ≈ 1e-6/step，本身可忽略；wd=0 只是干净）
+                #   a2 = kaiming init → 常规 wd。
+                #   b2 = zeros init，是 step-0 唯一有梯度、需从 0 长起的瓶颈因子 →
+                #     单独进 LoRA+ ratio 组，使 loraplus_lr_ratio 能定向只给 b2 加速
+                #     （本地取证：ABBA 在 lr=1e-4 下 b2 长得比 LoRA up 慢 ~20–30×，
+                #      定向抬 b2 lr 可追平；见 memory krea2-fitting-experiment-matrix）。
+                key_svd  = (0.0,          1.0,   custom_lr)  # wd=0  for SVD factors a1, b1
+                key_a2   = (weight_decay, 1.0,   custom_lr)  # wd for kaiming-init a2
+                key_b2   = (weight_decay, ratio, custom_lr)  # wd + LoRA+ ratio for zeros-init b2
+                groups_dict.setdefault(key_svd, []).append(lora.adapter.abba_a1)
+                groups_dict.setdefault(key_svd, []).append(lora.adapter.abba_b1)
+                groups_dict.setdefault(key_a2,  []).append(lora.adapter.abba_a2)
+                groups_dict.setdefault(key_b2,  []).append(lora.adapter.abba_b2)
             else:
                 key_down = (weight_decay, 1.0, custom_lr)
                 key_up = (weight_decay, ratio, custom_lr)
@@ -1477,7 +1490,7 @@ class LoRAInjector:
             if self.use_lokr:
                 lr_target = "LoKr w2_b"
             elif self.use_abba:
-                lr_target = "ABBA b1/b2"
+                lr_target = "ABBA b2"
             else:
                 lr_target = "lora_up"
             logger.info(f"[LoRA+] {lr_target} lr ×{ratio:.1f}")

@@ -464,6 +464,25 @@ def load_training_state(path, injector, optimizer, scheduler=None):
     # 加载优化器状态
     optimizer.load_state_dict(state["optimizer_state_dict"])
 
+    # ── fp32 master 复原 ─────────────────────────────────────────────────
+    # PyTorch 的 Optimizer.load_state_dict 会把每个"逐参数"浮点状态张量强制
+    # 转成 *该参数* 的 dtype（_process_value_according_to_param_policy）。本仓库
+    # 的 LoRA 参数是 bf16，于是保存时本为 fp32 的 master 状态
+    # （momentum_buffer / z / y / exp_avg / exp_avg_sq …）会在恢复时被静默降成
+    # bf16 —— 既触发 MuonSF lerp_ 的 dtype 不匹配崩溃，也直接废掉 muon_optimizer
+    # docstring 里的 fix #2（fp32 master 防 ulp 冻结）。这里把所有浮点状态张量
+    # 复原为 fp32，重新压回本仓库优化器一致的 fp32-master 不变式。
+    _restored = 0
+    for _st in optimizer.state.values():
+        if not isinstance(_st, dict):
+            continue
+        for _k, _v in _st.items():
+            if isinstance(_v, torch.Tensor) and _v.is_floating_point() and _v.dtype != torch.float32:
+                _st[_k] = _v.float()
+                _restored += 1
+    if _restored:
+        logger.info(f"优化器状态 fp32 master 复原: {_restored} 个浮点状态张量已转回 fp32")
+
     # 加载调度器状态
     if scheduler is not None and "scheduler_state_dict" in state:
         try:

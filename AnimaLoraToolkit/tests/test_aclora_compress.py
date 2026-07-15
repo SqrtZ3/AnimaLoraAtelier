@@ -65,6 +65,34 @@ def test_truncate_max_rank_cap():
     assert keep == 10
 
 
+# ── 截断口径差异锁死（防未来误"统一"）─────────────────────────────────────
+# svd_truncate_lora_pair（导出压缩）与 aclora_restart_matrix（训练期 RESTART）
+# 都按"累计能量占比"截断，但口径相反，这是有意的、各自都有理由：
+#   · svd_truncate  用 (ce<energy).sum()+1 → 实际保留能量 ≥ energy（导出宁可多留）
+#   · aclora        用 (cum<p·tot).sum()   → 实际保留能量 ≤ p（忠实论文 Eq.3 严格<）
+# 这个测试锁死两者的不变量 + 同阈值下保留秩不同。若有人把任一个"统一"成另一个
+# 口径，本测试会失败，迫使其重新确认用途（见两函数 docstring 的交叉引用）。
+def test_truncate_vs_restart_threshold_semantics_diverge():
+    torch.manual_seed(7)
+    rank = 16
+    U = torch.linalg.qr(torch.randn(48, rank))[0]        # (48, rank)
+    V = torch.linalg.qr(torch.randn(30, rank))[0]        # (30, rank)
+    S = torch.linspace(10.0, 1.0, rank)                  # 缓慢衰减 → 能量分布散
+    M = (U * S.unsqueeze(0)) @ V.t()                     # (48, 30) = B @ A
+    A = (V * S.unsqueeze(0)).t()                         # (rank, 30) lora_down
+    B = U                                                # (48, rank) lora_up
+    ce = (torch.cumsum(S ** 2, 0) / (S ** 2).sum())      # 累积能量占比（降序）
+
+    for thr in (0.6, 0.8, 0.95):
+        _d, _u, kt, _ = svd_truncate_lora_pair(A, B, 1.0, energy=thr)
+        _Mn, ka = aclora_restart_matrix(M, thr)
+        # 不变量：各自的能量边界
+        assert ce[kt - 1].item() >= thr, (thr, kt, ce[kt - 1].item())   # svd ≥ energy
+        assert ce[ka - 1].item() <= thr, (thr, ka, ce[ka - 1].item())   # aclora ≤ p
+        # 同阈值下两者保留秩不同（svd 恰好比 aclora 多一个保守分量）
+        assert kt == ka + 1, (thr, kt, ka)
+
+
 # ── aclora_restart_matrix ────────────────────────────────────────────────
 def test_restart_keep_monotone_and_topsignal():
     torch.manual_seed(0)

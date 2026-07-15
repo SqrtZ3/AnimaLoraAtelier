@@ -119,8 +119,15 @@ def svd_truncate_lora_pair(down: torch.Tensor, up: torch.Tensor, scaling: float,
         top-`keep` 秩近似；**scaling 已折进因子**，导出时应写 alpha'=keep（→ scaling'=1）。
         keep    = 保留的秩；dropped = 被丢弃的能量占比（0 表示无损）。
 
-    截断准则与 tools/abba_export_lora.py 一致：保留累计能量 ≥ energy 的最小秩。
+    截断准则与 tools/abba_export_lora.py 一致：保留累计能量 ≥ energy 的最小秩
+    （实现 `keep=(ce<energy).sum()+1`，保守多留一个，实际保留能量 ≥ energy）。
     energy=1.0 → keep=r（不截断，数值容差内无损）。max_rank>0 时与能量准则取更紧者。
+
+    ★ 截断口径（与 aclora_restart_matrix 相反，勿混淆）：
+    本函数用于**导出期压缩**，口径是"宁可多留、别截过头"，故取 ≥ energy。
+    同文件的 aclora_restart_matrix（训练期 RESTART 用）忠实论文 Eq.3 用**严格 `<`**，
+    实际保留能量 ≤ p。两者 docstring 措辞相近但语义相反，改其中任一个前请先确认用途，
+    不要"统一"成同一个口径。
 
     用 QR 技巧在 r×r 上做 SVD，**不物化 (out, in) 全矩阵**：
         B = Qb Rb, Aᵀ = Qa Ra → B@A = Qb (Rb Raᵀ) Qaᵀ，只对 (Rb Raᵀ) 这个 r×r SVD。
@@ -158,7 +165,7 @@ def aclora_restart_matrix(M: torch.Tensor, p: float, generator=None):
     """AC-LoRA RESTART（arXiv:2504.02231 Eq.2/3）对单个矩阵 M（A 或 B）做一次。
 
     信号/噪声切分（Eq.3）：对 M 做 SVD 得奇异值 S（降序），按累计能量占比切分——
-        保留集 S_keep = {i | cumsum_i < p·total}（**保留 top 能量、累计到占比 p 之前**）,
+        保留集 S_keep = {i | cumsum_i < p·total}（严格小于，忠实论文 Eq.3 / Algo.1 L12），
         其余奇异分量清零。keep 至少 1。
     RESTART（Eq.2）：M_signal = U·diag(D')·Vᵀ（D' 把噪声奇异值清零重建），
         σ² = Var(M − M_signal)（被丢弃残差的方差），G ~ N(0, σ²) 与 M 同形，
@@ -166,6 +173,13 @@ def aclora_restart_matrix(M: torch.Tensor, p: float, generator=None):
 
     返回 (M'（与 M 同 dtype/device）, keep)。不修改输入。
     注意：p 越大 → 保留越多 → 加噪越少；p→1 时近乎 no-op（信号≈全部，σ²≈0）。
+
+    ★ 截断口径（与 svd_truncate_lora_pair 相反，勿混淆）：
+    本函数用**严格 `<`**，因此实际保留能量 **≤ p**（总能重置 ≥1 个最小分量）。
+    这是论文原意——RESTART 的目的就是主动重置噪声分量。而同文件的
+    svd_truncate_lora_pair（导出压缩用）用 `(ce < energy).sum()+1`，实际保留
+    **≥ energy**，是为"导出宁可多留、别截过头"的保守口径。两者 docstring 措辞
+    相近但语义相反，改其中任一个前请先确认用途，不要"统一"。
     """
     orig_dtype, orig_device = M.dtype, M.device
     Mf = M.detach().float()

@@ -200,3 +200,43 @@ def test_compressed_export_and_neutrality():
     main2 = os.path.join(tmp, "n.safetensors")
     inj2.save(main2)
     assert not os.path.exists(os.path.join(tmp, "n.compressed.safetensors"))
+
+
+def test_compressed_export_pissa_subtracts_init_delta():
+    # PiSSA 补偿式 init：压缩件必须导出净 ΔW = scaling·(B@A − B₀@A₀)，而不是
+    # scaling·B@A（后者会把 base 权重的 top-r 主成分算进成品，部署全错）。
+    # energy=0.999 → 近无损（写压缩件；energy=1.0 会早返回不写），压缩件重建的
+    # ΔW 应约等于 adapter.delta_weight()（已减 init）。
+    torch.manual_seed(0)
+    tmp = tempfile.mkdtemp()
+    m = _make_model()
+    # alpha=rank → scaling=1（PiSSA step-0 中立的必要条件）
+    inj = LoRAInjector(rank=8, alpha=8.0, targets=TARGETS,
+                       lora_init="pissa", lora_compress_energy=0.999)
+    inj.inject(m)
+    # 模拟训练：把 A/B 推离 PiSSA init，使 B@A ≠ B₀@A₀（否则净 delta≡0，测不出差异）
+    with torch.no_grad():
+        for lora in inj.injected.values():
+            lora.adapter.lora_up.weight.add_(
+                torch.randn_like(lora.adapter.lora_up.weight) * 0.1)
+            lora.adapter.lora_down.weight.add_(
+                torch.randn_like(lora.adapter.lora_down.weight) * 0.1)
+    main = os.path.join(tmp, "p.safetensors")
+    inj.save(main)
+    comp = os.path.join(tmp, "p.compressed.safetensors")
+    assert os.path.exists(comp)
+    from safetensors.torch import load_file
+    sd = load_file(comp)
+    for name, lora in inj.injected.items():
+        base = "lora_unet_" + name.replace(".", "_")
+        down = sd[f"{base}.lora_down.weight"].float()
+        up = sd[f"{base}.lora_up.weight"].float()
+        recon = up @ down                              # scaling 已折进因子
+        want = lora.adapter.delta_weight().float()      # scaling·(B@A − B₀@A₀)
+        rel = ((recon - want).norm() / want.norm().clamp(min=1e-12)).item()
+        assert rel < 2e-2, (base, rel)                  # bf16 存储容差
+        # 反证：净 delta 与 raw scaling·B@A（旧 bug 导出物）必须显著不同，否则测试无判别力
+        raw = (lora.adapter.lora_up.weight.float()
+               @ lora.adapter.lora_down.weight.float()) * float(lora.adapter.scaling)
+        raw_gap = ((raw - want).norm() / want.norm()).item()
+        assert raw_gap > 0.1, (base, raw_gap)

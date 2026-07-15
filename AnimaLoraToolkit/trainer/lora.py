@@ -2091,14 +2091,30 @@ class LoRAInjector:
         for name, lora in self.injected.items():
             base = "lora_unet_" + name.replace(".", "_")
             ad = lora.adapter
+            # PiSSA/ortho 补偿式 init：净 ΔW = scaling·(B@A − B₀@A₀)，直接压 B@A 会把
+            # base 权重的 top-r 主成分算进去（成品部署全错）。压缩前先按官方 PiSSA 折叠
+            # （MuLabPKU/PiSSA：ΔW = scaling·[B|−B₀]@[A;A₀]）成 rank-2r 等价因子——与主
+            # comfy 导出（state_dict export_for_comfy 分支）同一口径。svd_truncate_lora_pair
+            # 走 QR，支持任意秩输入，折叠后照压不物化全矩阵。lora_init=default 时
+            # lora_down_init 为 None → 走 else，与改动前逐字节一致（行为中立）。
+            if (getattr(ad, "lora_down_init", None) is not None
+                    and getattr(ad, "lora_up_init", None) is not None):
+                A0 = ad.lora_down_init.to(device=ad.lora_down.weight.device,
+                                          dtype=ad.lora_down.weight.dtype)
+                B0 = ad.lora_up_init.to(device=ad.lora_up.weight.device,
+                                        dtype=ad.lora_up.weight.dtype)
+                eff_down = torch.cat([ad.lora_down.weight, A0], dim=0)     # (2r, in)
+                eff_up = torch.cat([ad.lora_up.weight, -B0], dim=1)        # (out, 2r)
+            else:
+                eff_down, eff_up = ad.lora_down.weight, ad.lora_up.weight
             down, up, keep, dropped = svd_truncate_lora_pair(
-                ad.lora_down.weight, ad.lora_up.weight, float(ad.scaling),
+                eff_down, eff_up, float(ad.scaling),
                 energy=energy, max_rank=max_rank)
             comp[f"{base}.lora_down.weight"] = down.to(torch.bfloat16).cpu().contiguous()
             comp[f"{base}.lora_up.weight"] = up.to(torch.bfloat16).cpu().contiguous()
             comp[f"{base}.alpha"] = torch.tensor(float(keep))
-            r0 = ad.lora_down.weight.shape[0]
-            in_f, out_f = ad.lora_down.weight.shape[1], ad.lora_up.weight.shape[0]
+            r0 = eff_down.shape[0]
+            in_f, out_f = eff_down.shape[1], eff_up.shape[0]
             tot_in += r0 * (in_f + out_f)
             tot_out += keep * (in_f + out_f)
             if dropped > worst[0]:

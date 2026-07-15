@@ -106,6 +106,89 @@ def _pissa_init(in_features: int, out_features: int, rank: int,
     return A_init, B_init
 
 
+def svd_truncate_lora_pair(down: torch.Tensor, up: torch.Tensor, scaling: float,
+                           energy: float = 1.0, max_rank: int = 0):
+    """按每层能量阈值对标准 LoRA 的 (down, up) 做 SVD 截断压缩。
+
+    输入（标准 LoRA 语义）：
+        down = A : (r, in)        # lora_down.weight
+        up   = B : (out, r)       # lora_up.weight
+        scaling  = alpha / r      # 训练时的 ΔW = scaling · B @ A
+    返回 (down', up', keep, dropped)：
+        down' : (keep, in)、up' : (out, keep)，满足 up' @ down' ≈ scaling·(B@A) 的
+        top-`keep` 秩近似；**scaling 已折进因子**，导出时应写 alpha'=keep（→ scaling'=1）。
+        keep    = 保留的秩；dropped = 被丢弃的能量占比（0 表示无损）。
+
+    截断准则与 tools/abba_export_lora.py 一致：保留累计能量 ≥ energy 的最小秩。
+    energy=1.0 → keep=r（不截断，数值容差内无损）。max_rank>0 时与能量准则取更紧者。
+
+    用 QR 技巧在 r×r 上做 SVD，**不物化 (out, in) 全矩阵**：
+        B = Qb Rb, Aᵀ = Qa Ra → B@A = Qb (Rb Raᵀ) Qaᵀ，只对 (Rb Raᵀ) 这个 r×r SVD。
+    对 6144×4096 的 mlp 层，全矩阵 SVD 要秒级且吃显存，这里 r×r（r≤64）近乎免费。
+    """
+    if not (0.0 < energy <= 1.0):
+        raise ValueError(f"energy 必须在 (0,1]，得到 {energy}")
+    A = down.detach().float()          # (r, in)
+    B = up.detach().float()            # (out, r)
+    r = A.shape[0]
+    s = float(scaling)
+    # QR：B=Qb Rb（Qb:(out,r), Rb:(r,r)），Aᵀ=Qa Ra（Qa:(in,r), Ra:(r,r)）
+    Qb, Rb = torch.linalg.qr(B)
+    Qa, Ra = torch.linalg.qr(A.t())
+    Uc, S, Vhc = torch.linalg.svd(Rb @ Ra.t())   # r×r
+    e = S ** 2
+    e_tot = e.sum().clamp(min=1e-30)
+    ce = torch.cumsum(e, 0) / e_tot
+    if energy < 1.0:
+        keep = int((ce < energy).sum().item()) + 1
+    else:
+        keep = int(S.numel())
+    if max_rank and max_rank > 0:
+        keep = min(keep, int(max_rank))
+    keep = max(min(keep, int(S.numel())), 1)
+    dropped = float(1.0 - ce[keep - 1].item()) if keep < S.numel() else 0.0
+    # 把 scaling 折进因子：up'@down' = Qb Uc[:, :k] (S[:k]·s) Vhc[:k] Qaᵀ = s·(B@A) 截断
+    s_sqrt = (S[:keep] * s).clamp(min=0).sqrt()
+    down_new = (Vhc[:keep] @ Qa.t()) * s_sqrt.unsqueeze(1)   # (keep, in)
+    up_new = (Qb @ Uc[:, :keep]) * s_sqrt.unsqueeze(0)       # (out, keep)
+    return down_new, up_new, keep, dropped
+
+
+def aclora_restart_matrix(M: torch.Tensor, p: float, generator=None):
+    """AC-LoRA RESTART（arXiv:2504.02231 Eq.2/3）对单个矩阵 M（A 或 B）做一次。
+
+    信号/噪声切分（Eq.3）：对 M 做 SVD 得奇异值 S（降序），按累计能量占比切分——
+        保留集 S_keep = {i | cumsum_i < p·total}（**保留 top 能量、累计到占比 p 之前**）,
+        其余奇异分量清零。keep 至少 1。
+    RESTART（Eq.2）：M_signal = U·diag(D')·Vᵀ（D' 把噪声奇异值清零重建），
+        σ² = Var(M − M_signal)（被丢弃残差的方差），G ~ N(0, σ²) 与 M 同形，
+        M' = M_signal + G。**丢弃分量不是永久删除，而是重置成同方差噪声继续训练。**
+
+    返回 (M'（与 M 同 dtype/device）, keep)。不修改输入。
+    注意：p 越大 → 保留越多 → 加噪越少；p→1 时近乎 no-op（信号≈全部，σ²≈0）。
+    """
+    orig_dtype, orig_device = M.dtype, M.device
+    Mf = M.detach().float()
+    U, S, Vh = torch.linalg.svd(Mf, full_matrices=False)   # U:(m,k) S:(k,) Vh:(k,n)
+    e = S ** 2
+    tot = e.sum().clamp(min=1e-30)
+    cum = torch.cumsum(e, 0)
+    keep = int((cum < float(p) * tot).sum().item())
+    keep = max(min(keep, int(S.numel())), 1)
+    Dp = S.clone()
+    if keep < S.numel():
+        Dp[keep:] = 0.0
+    M_signal = (U * Dp.unsqueeze(0)) @ Vh                   # U·diag(D')·Vᵀ
+    resid = Mf - M_signal
+    sigma = resid.std(unbiased=False)                      # sqrt(Var(残差))
+    if generator is not None:
+        G = torch.randn(Mf.shape, device=Mf.device, dtype=Mf.dtype, generator=generator)
+    else:
+        G = torch.randn_like(Mf)
+    M_new = M_signal + G * sigma
+    return M_new.to(dtype=orig_dtype, device=orig_device), keep
+
+
 class LoRALayer(torch.nn.Module):
     """标准 LoRA 层（含 rank_dropout / module_dropout / 可选 T-LoRA）
 
@@ -1113,7 +1196,13 @@ class LoRAInjector:
                  # （rank=r1·r2，体积 ~8×，仅当想让成品直接被 ComfyUI 加载时开；
                  # 默认 False = 只存 native 因子（体积 = 同预算 LoRA），部署件
                  # 用 tools/abba_export_lora.py 在本地转换/压缩）。
-                 use_abba=False, abba_alpha=None, abba_export_kr=False):
+                 use_abba=False, abba_alpha=None, abba_export_kr=False,
+                 # ── Layer A：导出期 SVD 压缩（save() 额外写压缩件；默认 off = 行为中立）──
+                 lora_compress_energy=1.0, lora_compress_max_rank=0,
+                 # ── Layer B：AC-LoRA 训练期 RESTART（arXiv:2504.02231；默认 off）──
+                 aclora_enabled=False, aclora_restart_every=200, aclora_warmup_steps=200,
+                 aclora_p_mode="schedule", aclora_p_start=0.7, aclora_p_end=0.99,
+                 aclora_p_floor=0.5, aclora_total_steps=0, aclora_loss_ema_beta=0.98):
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
@@ -1210,6 +1299,44 @@ class LoRAInjector:
         self._module_ranks = {}
         self._module_alphas = {}
         self._module_lrs = {}
+
+        # ── Layer A：导出期 SVD 压缩配置 ────────────────────────────────
+        self.lora_compress_energy = float(lora_compress_energy)
+        self.lora_compress_max_rank = int(lora_compress_max_rank or 0)
+        if not (0.0 < self.lora_compress_energy <= 1.0):
+            raise ValueError(f"lora_compress_energy 必须在 (0,1]，得到 {self.lora_compress_energy}")
+        _compress_on = self.lora_compress_energy < 1.0 or self.lora_compress_max_rank > 0
+        if _compress_on and (self.use_lokr or self.use_abba or self.lora_variant != "base"):
+            raise ValueError(
+                "导出期 SVD 压缩（lora_compress_energy<1 或 lora_compress_max_rank>0）"
+                "首版只支持标准 LoRA（lora_type=lora, lora_variant=base）。\n"
+                "  · LoKr/ABBA：请用各自的 native 导出 + tools/abba_export_lora.py；\n"
+                "  · DoRA：ΔW 含 dora_scale 逐行重归一化，非单纯 B@A，压缩语义不一致。")
+
+        # ── Layer B：AC-LoRA 训练期 RESTART 配置 ────────────────────────
+        self._aclora = {
+            "enabled": bool(aclora_enabled),
+            "restart_every": int(aclora_restart_every or 0),
+            "warmup_steps": int(aclora_warmup_steps or 0),
+            "mode": str(aclora_p_mode or "schedule").lower(),
+            "p_start": float(aclora_p_start),
+            "p_end": float(aclora_p_end),
+            "p_floor": float(aclora_p_floor),
+            "total_steps": int(aclora_total_steps or 0),
+            "loss_ema_beta": float(aclora_loss_ema_beta),
+        }
+        self._aclora_loss_ema = None
+        if self._aclora["enabled"]:
+            if self.use_lokr or self.use_abba or self.lora_variant != "base" or self.lora_init != "default":
+                raise ValueError(
+                    "aclora_enabled=true 首版只支持标准 LoRA（lora_type=lora, "
+                    "lora_variant=base, lora_init=default）——RESTART 直接对 A/B 两个"
+                    "矩阵做 SVD，LoKr/ABBA 的因子结构、DoRA 的幅度向量、PiSSA/ortho 的"
+                    "init 补偿都会被它破坏。请先在标准 LoRA 上单变量验证。")
+            if self._aclora["mode"] not in ("schedule", "loss"):
+                raise ValueError(f"aclora_p_mode 必须是 'schedule' 或 'loss'，得到 {self._aclora['mode']}")
+            if not (0.0 < self._aclora["p_floor"] < 1.0):
+                raise ValueError(f"aclora_p_floor 必须在 (0,1)，得到 {self._aclora['p_floor']}")
 
     def _should_inject(self, name):
         """判断模块是否应该被注入 LoRA（regex 匹配）"""
@@ -1429,6 +1556,93 @@ class LoRAInjector:
             return
         for lora in self.injected.values():
             lora.clear_module_dropout()
+
+    # ── AC-LoRA 训练期 RESTART（arXiv:2504.02231）────────────────────────
+    def aclora_active(self) -> bool:
+        return bool(self._aclora.get("enabled"))
+
+    def _aclora_compute_p(self, global_step: int) -> float:
+        """按配置算当前阈值 p（保留累计能量占比到 p 之前的信号分量）。
+
+        - mode="schedule"（默认，FM-稳健）：p 从 p_start 线性升到 p_end，
+          进度 = global_step/total_steps（total_steps<=0 时恒为 p_end）。
+        - mode="loss"（论文 Eq.5-6 口径，假设 loss<1）：p = 1 − l^α，
+          α = global_step/total_steps + 1（total_steps<=0 时 α=1），l=clamp(loss_ema)。
+        统一夹到 [p_floor, 0.999999]。
+        """
+        cfg = self._aclora
+        total = cfg["total_steps"]
+        if cfg["mode"] == "loss":
+            alpha = (global_step / total if total > 0 else 0.0) + 1.0
+            l = self._aclora_loss_ema if self._aclora_loss_ema is not None else 0.5
+            l = min(max(float(l), 0.0), 0.999)
+            p = 1.0 - l ** alpha
+        else:
+            frac = min(global_step / total, 1.0) if total > 0 else 1.0
+            p = cfg["p_start"] + (cfg["p_end"] - cfg["p_start"]) * frac
+        return float(min(max(p, cfg["p_floor"]), 0.999999))
+
+    def aclora_restart(self, p: float):
+        """对所有注入的标准 LoRA 层的 A、B 各做一次 RESTART（就地改 .data）。
+
+        返回统计 dict：{层数, A/B 平均保留秩, 用到的 p}。仅标准 LoRA 生效
+        （构造期已 fail-fast 排除 LoKr/ABBA/DoRA/PiSSA）。
+        """
+        keeps_a, keeps_b = [], []
+        with torch.no_grad():
+            for lora in self.injected.values():
+                ad = lora.adapter
+                new_a, ka = aclora_restart_matrix(ad.lora_down.weight, p)
+                new_b, kb = aclora_restart_matrix(ad.lora_up.weight, p)
+                ad.lora_down.weight.copy_(new_a)
+                ad.lora_up.weight.copy_(new_b)
+                keeps_a.append(ka)
+                keeps_b.append(kb)
+        n = max(len(keeps_a), 1)
+        return {
+            "layers": len(keeps_a),
+            "p": float(p),
+            "mean_keep_down": sum(keeps_a) / n,
+            "mean_keep_up": sum(keeps_b) / n,
+            "min_keep": min(keeps_a + keeps_b) if keeps_a else 0,
+            "max_keep": max(keeps_a + keeps_b) if keeps_a else 0,
+        }
+
+    def aclora_step(self, global_step: int, loss_val=None):
+        """训练循环每个 optimizer step 后调一次。
+
+        更新 loss EMA；若已过 warmup 且 global_step 命中 restart_every 间隔，则触发
+        一次 RESTART。返回 (did_restart: bool, stats: dict | None)。
+        RESTART 会就地改写 A/B → 调用方若配置了重置优化器状态，应在拿到 did_restart=True
+        后自行清理这些参数的 optimizer state（本方法不持有 optimizer）。
+        """
+        cfg = self._aclora
+        if not cfg["enabled"]:
+            return False, None
+        if loss_val is not None:
+            try:
+                lv = float(loss_val)
+            except (TypeError, ValueError):
+                lv = None
+            if lv is not None and math.isfinite(lv):
+                b = cfg["loss_ema_beta"]
+                if self._aclora_loss_ema is None:
+                    self._aclora_loss_ema = lv
+                else:
+                    self._aclora_loss_ema = b * self._aclora_loss_ema + (1.0 - b) * lv
+        every = cfg["restart_every"]
+        if every <= 0 or global_step < cfg["warmup_steps"] or global_step % every != 0:
+            return False, None
+        p = self._aclora_compute_p(global_step)
+        stats = self.aclora_restart(p)
+        logger.info(
+            "[AC-LoRA] RESTART @ step %d：p=%.4f，%d 层，保留秩 down 均值 %.1f / up 均值 %.1f "
+            "（min %d, max %d）%s",
+            global_step, p, stats["layers"], stats["mean_keep_down"], stats["mean_keep_up"],
+            stats["min_keep"], stats["max_keep"],
+            f"，loss_ema={self._aclora_loss_ema:.4f}" if self._aclora_loss_ema is not None else "",
+        )
+        return True, stats
 
     def get_param_groups(self, weight_decay, base_lr: float = 1.0, loraplus_lr_ratio=None):
         """获取参数组（支持 LoRA+、模块级 lr、LoKr w1 排除 weight_decay）"""
@@ -1841,6 +2055,57 @@ class LoRAInjector:
             logger.info(f"T-LoRA 保存到: {path}  [{mode}]")
         else:
             logger.info(f"LoRA 保存到: {path}")
+            self._maybe_save_compressed(path, meta)
+
+    def _maybe_save_compressed(self, path, meta: dict):
+        """Layer A：若开了导出压缩，额外写一份逐层 SVD 截断的部署件。
+
+        主件（path，满 rank）保持不变——resume_lora 从它续训、信息完备；压缩件
+        `{stem}.compressed.safetensors` 仅供部署（逐层变 rank，ComfyUI 直载）。
+        默认关（energy=1.0 且 max_rank=0）→ 本方法直接返回，行为中立。
+        仅标准 base LoRA 路径调用（构造期已 fail-fast 排除 lokr/abba/dora）。
+        """
+        energy = self.lora_compress_energy
+        max_rank = self.lora_compress_max_rank
+        if not (energy < 1.0 or max_rank > 0):
+            return
+        import os as _os
+        from safetensors.torch import save_file
+        comp = {}
+        tot_in = tot_out = 0
+        worst = (0.0, "")
+        for name, lora in self.injected.items():
+            base = "lora_unet_" + name.replace(".", "_")
+            ad = lora.adapter
+            down, up, keep, dropped = svd_truncate_lora_pair(
+                ad.lora_down.weight, ad.lora_up.weight, float(ad.scaling),
+                energy=energy, max_rank=max_rank)
+            comp[f"{base}.lora_down.weight"] = down.to(torch.bfloat16).cpu().contiguous()
+            comp[f"{base}.lora_up.weight"] = up.to(torch.bfloat16).cpu().contiguous()
+            comp[f"{base}.alpha"] = torch.tensor(float(keep))
+            r0 = ad.lora_down.weight.shape[0]
+            in_f, out_f = ad.lora_down.weight.shape[1], ad.lora_up.weight.shape[0]
+            tot_in += r0 * (in_f + out_f)
+            tot_out += keep * (in_f + out_f)
+            if dropped > worst[0]:
+                worst = (dropped, base)
+        stem, _ext = _os.path.splitext(str(path))
+        comp_path = stem + ".compressed.safetensors"
+        max_keep = max((int(t.shape[0]) for k, t in comp.items()
+                        if k.endswith("lora_down.weight")), default=0)
+        comp_meta = dict(meta)
+        comp_meta.update({
+            "ss_network_alpha": "per-layer",
+            "ss_network_dim": str(max_keep),
+            "anima_lora_variant": "svd_compressed",
+            "anima_compress_energy": f"{energy}",
+            "anima_compress_max_rank": str(max_rank or 0),
+        })
+        save_file(comp, comp_path, metadata=self._augment_meta_with_config(comp_meta))
+        logger.info(
+            "[压缩件] %s：满 rank %.1f MB → %.1f MB（energy=%s, max_rank=%s，最大逐层丢弃能量 %.2f%% @ %s）",
+            comp_path, tot_in * 2 / 1e6, tot_out * 2 / 1e6, energy, max_rank or "∞",
+            worst[0] * 100.0, worst[1].removeprefix("lora_unet_"))
 
     def load_state_dict_from_mapping(self, sd: dict, label: str = "checkpoint") -> int:
         """从 in-memory dict 加载 LoRA 权重。

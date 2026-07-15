@@ -1254,6 +1254,19 @@ def main():
         tlora_lokr_experimental=bool(getattr(args, "tlora_lokr_experimental", False)),
         tlora_lokr_ortho_init=bool(getattr(args, "tlora_lokr_ortho_init", False)),
         tlora_skip_lambda_layer=bool(getattr(args, "tlora_skip_lambda_layer", True)),
+        # Layer A：导出期 SVD 压缩
+        lora_compress_energy=float(getattr(args, "lora_compress_energy", 1.0) or 1.0),
+        lora_compress_max_rank=int(getattr(args, "lora_compress_max_rank", 0) or 0),
+        # Layer B：AC-LoRA 训练期 RESTART
+        aclora_enabled=bool(getattr(args, "aclora_enabled", False)),
+        aclora_restart_every=int(getattr(args, "aclora_restart_every", 200) or 0),
+        aclora_warmup_steps=int(getattr(args, "aclora_warmup_steps", 200) or 0),
+        aclora_p_mode=str(getattr(args, "aclora_p_mode", "schedule") or "schedule"),
+        aclora_p_start=float(getattr(args, "aclora_p_start", 0.7)),
+        aclora_p_end=float(getattr(args, "aclora_p_end", 0.99)),
+        aclora_p_floor=float(getattr(args, "aclora_p_floor", 0.5)),
+        aclora_total_steps=int(getattr(args, "aclora_total_steps", 0) or 0),
+        aclora_loss_ema_beta=float(getattr(args, "aclora_loss_ema_beta", 0.98)),
         **injector_kwargs,
     )
     injector.inject(model)
@@ -3983,6 +3996,20 @@ def main():
                     loss_val = float(loss.item() * args.grad_accum)
                     legacy_accum_samples = 0
                 samples_seen += max(0, committed_samples)
+
+                # AC-LoRA 训练期 RESTART（arXiv:2504.02231）：每 aclora_restart_every 步
+                # 对每层 A/B 做信号-噪声重置。默认关（aclora_active()=False → 直接短路）。
+                # 放在 optimizer.step + zero_grad 之后：grad 已清、参数刚更新，就地改 .data 安全。
+                if injector.aclora_active():
+                    _did_restart, _ = injector.aclora_step(global_step, loss_val)
+                    if _did_restart and bool(getattr(args, "aclora_reset_optimizer_state", False)):
+                        _reset_n = 0
+                        for _p in injector.get_params():
+                            if _p in optimizer.state:
+                                del optimizer.state[_p]
+                                _reset_n += 1
+                        logger.info("[AC-LoRA] RESTART 后清零 %d 个参数的优化器状态", _reset_n)
+
                 previous_ref_step, ref_step = reference_tracker.commit_batches(pending_reference_batches)
                 pending_reference_batches = 0
                 sample_reference_steps = int(getattr(args, "sample_reference_steps", 0) or 0)

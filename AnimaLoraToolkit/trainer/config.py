@@ -138,6 +138,20 @@ YAML_TO_ARGS = {
     "dora_export_mode": "dora_export_mode",
     "dora_fast_norm": "dora_fast_norm",
     "dora_detach_norm": "dora_detach_norm",
+    # Layer A：导出期 SVD 压缩（save() 额外写 .compressed.safetensors 部署件）
+    "lora_compress_energy": "lora_compress_energy",
+    "lora_compress_max_rank": "lora_compress_max_rank",
+    # Layer B：AC-LoRA 训练期 RESTART（arXiv:2504.02231）
+    "aclora_enabled": "aclora_enabled",
+    "aclora_restart_every": "aclora_restart_every",
+    "aclora_warmup_steps": "aclora_warmup_steps",
+    "aclora_p_mode": "aclora_p_mode",
+    "aclora_p_start": "aclora_p_start",
+    "aclora_p_end": "aclora_p_end",
+    "aclora_p_floor": "aclora_p_floor",
+    "aclora_total_steps": "aclora_total_steps",
+    "aclora_loss_ema_beta": "aclora_loss_ema_beta",
+    "aclora_reset_optimizer_state": "aclora_reset_optimizer_state",
     "lora_targets": "lora_targets",
     "lora_exclude_prefixes": "lora_exclude_prefixes",
     "resume_lora": "resume_lora",
@@ -543,6 +557,22 @@ DEFAULTS = {
     "dora_export_mode": "native",
     "dora_fast_norm": False,
     "dora_detach_norm": False,
+    # Layer A：导出期 SVD 压缩。energy=1.0 且 max_rank=0 → 关闭（行为中立，不写压缩件）。
+    # 开启后每次标准 LoRA save() 额外写一份逐层 SVD 截断的 .compressed.safetensors 部署件，
+    # 主件（满 rank）不变、供 resume。仅 lora_type=lora + variant=base 可用。
+    "lora_compress_energy": 1.0,
+    "lora_compress_max_rank": 0,
+    # Layer B：AC-LoRA 训练期 RESTART。默认关。仅 lora_type=lora + variant=base + init=default。
+    "aclora_enabled": False,
+    "aclora_restart_every": 200,     # 每多少 optimizer step 做一次 RESTART（论文 E=10 epoch 的 step 类比）
+    "aclora_warmup_steps": 200,      # 此前不 RESTART（保 step-0 中立 + 让信号先形成）
+    "aclora_p_mode": "schedule",     # "schedule"=FM 稳健(p_start→p_end 线性)；"loss"=论文 p=1-l^α（假设 loss<1）
+    "aclora_p_start": 0.7,           # schedule 模式起始保留能量占比
+    "aclora_p_end": 0.99,            # schedule 模式终点保留能量占比
+    "aclora_p_floor": 0.5,           # p 下限（防某步把层几乎清空）
+    "aclora_total_steps": 0,         # schedule/loss 的进度分母；0=恒用 p_end / α=1（stop-anytime 友好）
+    "aclora_loss_ema_beta": 0.98,    # loss EMA 平滑（仅 loss 模式用）
+    "aclora_reset_optimizer_state": False,  # RESTART 后是否清零被改写参数的优化器动量（默认否=忠实论文）
     "lora_targets": None,
     "lora_exclude_prefixes": None,
     "resume_lora": "",

@@ -79,6 +79,25 @@
 - **本地差异**：适配本仓库 adapter-输出叠加式注入（官方是包 base_layer 的
   wrapper）；导出为 KR 物化标准 LoRA 键 + native `abba_*` 因子并存。
 
+## AC-LoRA（论文方法移植：训练期 RESTART + 导出 SVD 压缩）
+
+- **来源**：论文 *AC-LoRA: Auto Component LoRA for Personalized Artistic Style
+  Image Generation*（arXiv:2504.02231）。本仓库为**按论文公式的独立重实现**，未
+  复制上游代码，仅对照其信号/噪声切分（Eq.3 累计能量阈值）与 RESTART（Eq.2：
+  信号奇异分量保留、丢弃分量重置为同方差高斯噪声）的数值口径。
+- **涉及文件**：
+  - `trainer/lora.py`（`aclora_restart_matrix`、`svd_truncate_lora_pair`，以及
+    LoRAInjector 的 `aclora_*` / `_maybe_save_compressed` 方法）
+  - `tools/lora_svd_compress.py`（导出期逐层 SVD 截断的本地工具）
+- **本地差异 / 对论文的偏离（已在代码注释与配置头标注）**：
+  1. 论文按 epoch 触发（E=10）、阈值 `p=1−l^α` 依赖 loss<1；本仓库是 step-based
+     且底模是 Flow-Matching（loss 不保证 <1、不单调），故默认改用 FM-稳健的
+     `schedule` 模式（p 线性从 p_start 升到 p_end），保留 `loss` 模式为论文口径。
+  2. 论文未规定最终导出如何降 rank；本仓库把"按信号能量抽取逐层 rank"实现为
+     导出期 SVD 截断（save() 额外写 `.compressed.safetensors` 部署件 + 独立工具）。
+  3. 首版收窄变量面：仅标准 LoRA（lora_type=lora, variant=base, init=default），
+     与 LoKr/ABBA/DoRA/PiSSA/T-LoRA 构造期 fail-fast。均 opt-in / default-off。
+
 ## Alibaba Wan2.1 VAE（请再次确认上游许可）
 
 - **来源**：`Wan-Video/Wan2.1` 的 VAE 实现（与 `wan/modules/vae.py` 对应）

@@ -519,7 +519,9 @@ DEFAULTS = {
     "model_family": "anima",
     # Krea2 专用：Qwen3-VL-4B-Instruct 的 HuggingFace 目录（model_family=krea2 必填）
     "krea2_text_encoder": "",
-    # 官方 encoder 的 max_length（模板前缀/后缀之外的用户文本 token 预算）
+    # 官方 encoder 的 max_length（模板前缀/后缀之外的用户文本 token 预算）。
+    # 512=官方 encoder.py 默认值（右截断，超长 caption 丢尾部）；<=0=无上限（opt-in）：
+    # 不截断、动态 pad，超长 caption 全保留（ComfyUI 部署同样不截时用它对齐训练/推理）。
     "krea2_text_max_length": 512,
     # Krea2 文本特征 LRU cache 条目数（每条 [L,12,2560]，压缩后典型 tag caption 数 MB；
     # 128 条 ≈ 1GB 量级 VRAM，按数据集 caption 数量与显存调）

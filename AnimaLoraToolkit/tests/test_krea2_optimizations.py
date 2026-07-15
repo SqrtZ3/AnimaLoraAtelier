@@ -157,12 +157,18 @@ class _FakeTokenizer:
     def __call__(self, texts, truncation=False, return_overflowing_tokens=False,
                  padding=None, max_length=None, return_tensors=None,
                  add_special_tokens=True):
-        if padding == "max_length":
-            L = int(max_length)
+        if padding == "max_length" or padding is True:
+            # 每条"真实"有效 token 数（位置决定 id → batch ≡ 逐条）。
+            ns = [34 + 3 + (len(t) % 9) for t in texts]
+            if padding == "max_length":          # 官方定长 pad（可截断到 L）
+                L = int(max_length)
+                ns = [min(n, L) for n in ns] if truncation else ns
+            else:                                # 无上限：动态 pad 到 batch 内最长、不截断
+                L = max(ns) if ns else 1
             ids = torch.zeros(len(texts), L, dtype=torch.long)
             mask = torch.zeros(len(texts), L, dtype=torch.long)
             for i, t in enumerate(texts):
-                n = min(34 + 3 + (len(t) % 9), L)
+                n = ns[i]
                 for j in range(n):
                     ids[i, j] = 1 + (ord(t[j % len(t)]) + j) % 997 if t else 1
                 mask[i, :n] = 1
@@ -239,6 +245,29 @@ class TestEncodeKrea2Batch(unittest.TestCase):
             n = int(cmask[i].sum())
             self.assertEqual(n, ref.shape[0])
             self.assertTrue(torch.equal(cross[i, :n], ref))
+
+    def test_unlimited_batch_equals_single(self):
+        """无上限（max_length<=0）分支：batch ≡ 逐条（padding=True 到 batch 最长，
+        右侧 padding 在 causal LM + mask 下不改变有效 token → 与逐条一致）。"""
+        from trainer import model_family as mf
+        texts = ["1girl, solo, smile", "landscape", "a" * 30, "b" * 7]
+        batch = mf._encode_krea2_batch(self.handles, texts, "cpu", max_length=0)
+        for t, b in zip(texts, batch):
+            s = mf._encode_krea2_batch(self.handles, [t], "cpu", max_length=0)[0]
+            self.assertEqual(b.shape, s.shape)
+            self.assertTrue(torch.equal(b, s))
+
+    def test_unlimited_equals_untruncated_cap(self):
+        """未发生截断时，无上限路径 (max_length=0) 与官方定长路径逐 bit 相同 ——
+        证明无上限只是"去掉截断"，不改变编码本身。"""
+        from trainer import model_family as mf
+        texts = ["short", "a much longer caption here", "c" * 40]
+        # cap=16 → fake 有效长度 37..45，恒 ≤ 官方 tokenizer max_length(16+29=45)，不触发截断
+        capped = mf._encode_krea2_batch(self.handles, texts, "cpu", max_length=16)
+        unlim = mf._encode_krea2_batch(self.handles, texts, "cpu", max_length=0)
+        for c, u in zip(capped, unlim):
+            self.assertEqual(c.shape, u.shape)
+            self.assertTrue(torch.equal(c, u))
 
     def test_cache_mixed_hit_miss(self):
         from trainer import model_family as mf

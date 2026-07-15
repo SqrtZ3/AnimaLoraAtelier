@@ -918,6 +918,15 @@ def prompt_for_args(args):
 # 主函数
 # ============================================================================
 
+def _krea2_text_max_length(args) -> int:
+    """krea2 用户文本 token 预算：缺省/None→512（官方值）；<=0→原样返回（无上限，opt-in）。
+
+    不能写成 ``getattr(...) or 512`` —— 那会把 0（无上限）误判成 512。
+    """
+    v = getattr(args, "krea2_text_max_length", 512)
+    return 512 if v is None else int(v)
+
+
 def main():
     args = parse_args()
 
@@ -2336,6 +2345,7 @@ def main():
             device=device, dtype=dtype,
             use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
             injector=injector,
+            krea2_text_max_length=_krea2_text_max_length(args),
         )
         sample_path = sample_dir / f"{filename_stem}.png"
         img.save(sample_path)
@@ -2392,6 +2402,7 @@ def main():
                 device=device, dtype=dtype,
                 use_t5_token_weights=bool(getattr(args, "use_t5_token_weights", True)),
                 injector=injector,
+                krea2_text_max_length=_krea2_text_max_length(args),
             )
             sample_path = sample_dir / f"step_0_baseline_{i}.png"
             img.save(sample_path)
@@ -2773,7 +2784,7 @@ def main():
                         # 与训练/采样条件一致。
                         _ecross, _ = encode_krea2_text(
                             krea2_te, [_ecap], device,
-                            max_length=int(getattr(args, "krea2_text_max_length", 512) or 512))
+                            max_length=_krea2_text_max_length(args))
                     else:
                         _eq_emb, _eq_attn = encode_qwen(qwen_model, qwen_tok,
                                                         [_build_qwen_text_from_prompt(_ecap)], device)
@@ -3118,7 +3129,7 @@ def main():
                     # 无 T5 token 权重通道）。t5_attn/t5_w 不存在——navit 打包用 cross_mask。
                     cross, cross_mask = encode_krea2_text(
                         krea2_te, captions, device,
-                        max_length=int(getattr(args, "krea2_text_max_length", 512) or 512),
+                        max_length=_krea2_text_max_length(args),
                     )
                     t5_attn = t5_w = None
                 else:

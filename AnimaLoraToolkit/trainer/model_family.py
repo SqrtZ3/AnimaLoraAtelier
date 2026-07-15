@@ -228,15 +228,32 @@ def _encode_krea2_batch(handles: dict, texts: list, device, max_length: int) -> 
     压缩（去掉 attention_mask=0 的 padding 位）与官方"mask 屏蔽 padding"数学等价：
     text token 无 RoPE（pos 全 0）、padding 作为 key 被 mask 后贡献恒为 0，
     删除它们不改变任何有效 token 的注意力输出。
+
+    max_length>0：官方定长 pad 口径（默认 512）；max_length<=0：无上限（opt-in），不截断、
+    动态 pad 到 batch 内最长。两种 padding 量在 causal LM + mask 下对有效 token 的输出等价，
+    batch≡逐条仍成立（padding 量不同不影响压缩后结果）。
     """
     te, tokenizer = handles["model"], handles["tokenizer"]
     fulls = [_KREA2_PROMPT_PREFIX + (t if t else " ") for t in texts]
-    inputs = tokenizer(
-        fulls, truncation=True, return_overflowing_tokens=False,
-        padding="max_length",
-        max_length=max_length + _KREA2_PREFIX_IDX - _KREA2_SUFFIX_START_IDX,
-        return_tensors="pt",
-    ).to(te.device)
+    if max_length and int(max_length) > 0:
+        # 官方口径（default）：截断到 max_length 并 pad 到定长（默认 512，逐字对齐官方
+        # encoder.py：truncation=True、max_length + prefix_idx - suffix_start_idx）。
+        inputs = tokenizer(
+            fulls, truncation=True, return_overflowing_tokens=False,
+            padding="max_length",
+            max_length=int(max_length) + _KREA2_PREFIX_IDX - _KREA2_SUFFIX_START_IDX,
+            return_tensors="pt",
+        ).to(te.device)
+    else:
+        # 无上限（opt-in，krea2_text_max_length<=0）：不截断、动态 pad 到 batch 内最长。
+        # 与定长 pad 数学等价——Qwen3-VL 是因果 LM，右侧 padding 被 causal + attention_mask
+        # 双重屏蔽，不改变任何有效 token 的 hidden state；下游按 mask 压缩，输出与逐条/定长
+        # pad 完全一致，仅去掉截断这一步（超长 caption 的尾部标签不再被右截断丢弃）。
+        inputs = tokenizer(
+            fulls, truncation=False, return_overflowing_tokens=False,
+            padding=True,
+            return_tensors="pt",
+        ).to(te.device)
     suffix = tokenizer([_KREA2_PROMPT_SUFFIX], return_tensors="pt",
                        add_special_tokens=False).to(te.device)
     B = len(fulls)
@@ -280,6 +297,9 @@ def _encode_krea2_single(handles: dict, text: str, device, max_length: int) -> t
 
 def encode_krea2_text(handles: dict, texts, device, max_length: int = 512):
     """编码一批 prompt。返回 (cross [B, L_max, 12, D], cross_mask [B, L_max] bool)。
+
+    max_length>0 截断到该预算（默认 512=官方 encoder.py 值）；max_length<=0 无上限
+    （不截断，超长 caption 尾部保留）——见 _encode_krea2_batch。
 
     - 权重语法 `(tag:1.5)` 被剥离（Krea2 无 T5 token 权重通道；clean text 与 Anima
       的 Qwen 通道同处理）。

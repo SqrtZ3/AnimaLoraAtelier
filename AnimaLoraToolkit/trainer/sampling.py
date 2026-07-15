@@ -207,7 +207,7 @@ def _sample_er_sde_const_x0(
 
 def _encode_text(
     model, qwen_model, qwen_tokenizer, t5_tokenizer, prompt, device,
-    *, use_t5_token_weights: bool = True,
+    *, use_t5_token_weights: bool = True, krea2_text_max_length: int = 512,
 ) -> torch.Tensor:
     """编码单条 prompt -> cross_cond。
 
@@ -221,7 +221,8 @@ def _encode_text(
     """
     if getattr(model, "model_family", "anima") == "krea2":
         from trainer.model_family import encode_krea2_text
-        cross, _ = encode_krea2_text(qwen_model, [prompt], device)
+        cross, _ = encode_krea2_text(qwen_model, [prompt], device,
+                                     max_length=krea2_text_max_length)
         return cross
     qwen_text = _build_qwen_text_from_prompt(prompt)
     qwen_embeds, qwen_attn = encode_qwen(qwen_model, qwen_tokenizer, [qwen_text], device)
@@ -368,6 +369,7 @@ def sample_image(
     dtype=torch.bfloat16,
     use_t5_token_weights: bool = True,
     injector=None,
+    krea2_text_max_length: int = 512,
 ):
     """训练时采样预览（尽量对齐 ComfyUI KSampler）。
 
@@ -413,10 +415,12 @@ def sample_image(
             cross_cond = _encode_text(
                 model, qwen_model, qwen_tokenizer, t5_tokenizer, prompt, device,
                 use_t5_token_weights=use_t5_token_weights,
+                krea2_text_max_length=krea2_text_max_length,
             )
             cross_uncond = _encode_text(
                 model, qwen_model, qwen_tokenizer, t5_tokenizer, negative_prompt, device,
                 use_t5_token_weights=use_t5_token_weights,
+                krea2_text_max_length=krea2_text_max_length,
             )
         except Exception as e:
             logger.error(f"[Debug] Encoding failed: {e}")

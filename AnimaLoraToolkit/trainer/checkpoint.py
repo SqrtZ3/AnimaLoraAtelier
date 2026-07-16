@@ -464,24 +464,40 @@ def load_training_state(path, injector, optimizer, scheduler=None):
     # 加载优化器状态
     optimizer.load_state_dict(state["optimizer_state_dict"])
 
-    # ── fp32 master 复原 ─────────────────────────────────────────────────
+    # ── 优化器状态 dtype 复原（转回"保存时的 dtype"）──────────────────────
     # PyTorch 的 Optimizer.load_state_dict 会把每个"逐参数"浮点状态张量强制
     # 转成 *该参数* 的 dtype（_process_value_according_to_param_policy）。本仓库
-    # 的 LoRA 参数是 bf16，于是保存时本为 fp32 的 master 状态
-    # （momentum_buffer / z / y / exp_avg / exp_avg_sq …）会在恢复时被静默降成
-    # bf16 —— 既触发 MuonSF lerp_ 的 dtype 不匹配崩溃，也直接废掉 muon_optimizer
-    # docstring 里的 fix #2（fp32 master 防 ulp 冻结）。这里把所有浮点状态张量
-    # 复原为 fp32，重新压回本仓库优化器一致的 fp32-master 不变式。
+    # 的 LoRA 参数是 bf16，于是 MuonSF/soap 等自定义优化器保存时本为 fp32 的
+    # master 状态（momentum_buffer / z / y / exp_avg …）恢复时被静默降成 bf16
+    # —— 触发 MuonSF lerp_ dtype 崩溃、废掉 fp32-master 防 ulp 冻结的 fix。
+    # ★ 但不能无差别转 fp32（旧实现的 bug）：torch 原生 AdamW 的状态本来就是
+    # 按参数 dtype（bf16）创建的，强转 fp32 会让 resume 后第一步
+    # _foreach_lerp_(exp_avg_fp32, grad_bf16) 直接 RuntimeError。
+    # 正确的不变式是"resume 后 dtype == 保存时 dtype"：按磁盘里每个状态张量的
+    # 原始 dtype 逐个还原（fp32 master 回 fp32，bf16 态保持 bf16，各优化器自动正确）。
+    _saved_opt = state["optimizer_state_dict"]
+    _saved_state = _saved_opt.get("state", {})
+    # torch load_state_dict 的映射语义：保存的 param id 与当前 params 按 group
+    # 顺序 zip 对应，这里复用同一约定建 saved_id → 当前 param 的映射。
+    _saved_ids = [pid for g in _saved_opt.get("param_groups", [])
+                  for pid in g.get("params", [])]
+    _cur_params = [p for g in optimizer.param_groups for p in g["params"]]
     _restored = 0
-    for _st in optimizer.state.values():
-        if not isinstance(_st, dict):
+    for _pid, _p in zip(_saved_ids, _cur_params):
+        _saved_st = _saved_state.get(_pid)
+        _cur_st = optimizer.state.get(_p)
+        if not isinstance(_saved_st, dict) or not isinstance(_cur_st, dict):
             continue
-        for _k, _v in _st.items():
-            if isinstance(_v, torch.Tensor) and _v.is_floating_point() and _v.dtype != torch.float32:
-                _st[_k] = _v.float()
+        for _k, _v in _cur_st.items():
+            _sv = _saved_st.get(_k)
+            if (isinstance(_v, torch.Tensor) and isinstance(_sv, torch.Tensor)
+                    and _v.is_floating_point() and _sv.is_floating_point()
+                    and _v.dtype != _sv.dtype):
+                _cur_st[_k] = _v.to(_sv.dtype)
                 _restored += 1
     if _restored:
-        logger.info(f"优化器状态 fp32 master 复原: {_restored} 个浮点状态张量已转回 fp32")
+        logger.info(f"优化器状态 dtype 复原: {_restored} 个浮点状态张量已转回保存时的 dtype"
+                    f"（fp32 master 不变式；torch 原生优化器的 bf16 态不受影响）")
 
     # 加载调度器状态
     if scheduler is not None and "scheduler_state_dict" in state:

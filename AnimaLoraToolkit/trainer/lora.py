@@ -253,8 +253,29 @@ class LoRALayer(torch.nn.Module):
         self._md_compile_safe: bool = False
 
         # 初始化 + 可选 Ortho-LoRA / PiSSA + 初始 delta 补偿 buffer
-        if self.tlora_enabled and self.tlora_init == "ortho":
+        #
+        # ★ 退化层守卫：SVD 类补偿式 init（ortho/PiSSA）最多只能取出
+        #   min(in, out) 个奇异分量。min(in, out) < rank 的层（如 krea2
+        #   txtfusion.projector = Linear(12→1)）上 `[:rank]`/`[-rank:]` 切片会
+        #   静默切少，后续 copy_ 的隐式广播把形状错误掩盖到前向才炸
+        #   （物证：F.linear 报 (M,32)×(1,1)）。这类层回退 default init——
+        #   lora_up 零 init 天然满足 step-0 净 delta=0，无需补偿。
+        svd_init_ok = min(in_features, out_features) >= rank
+        wants_svd_init = (
+            (self.tlora_enabled and self.tlora_init == "ortho")
+            or (lora_init == "pissa" and base_weight is not None)
+        )
+        if wants_svd_init and not svd_init_ok:
+            logger.warning(
+                "[lora-init] 层 (%d→%d) 的 min(in,out)=%d < rank=%d，SVD 补偿式 "
+                "init（%s）在此退化 —— 该层回退 default init（step-0 净 delta 仍=0）。",
+                in_features, out_features, min(in_features, out_features), rank,
+                "ortho" if self.tlora_enabled else "pissa")
+        if self.tlora_enabled and self.tlora_init == "ortho" and svd_init_ok:
             A_init, B_init = _ortho_lora_init(in_features, out_features, rank, device=device)
+            assert A_init.shape == (rank, in_features) and B_init.shape == (out_features, rank), (
+                f"ortho init 形状错误: A{tuple(A_init.shape)} B{tuple(B_init.shape)}，"
+                f"期望 A({rank},{in_features}) B({out_features},{rank})")
             with torch.no_grad():
                 self.lora_down.weight.copy_(A_init)
                 self.lora_up.weight.copy_(B_init)
@@ -262,7 +283,7 @@ class LoRALayer(torch.nn.Module):
             # 贡献并减去，让训练初始 step 净 delta ≈ 0（论文 Eq.5 的等价 2-matrix 版）
             self.register_buffer("lora_down_init", A_init.clone(), persistent=False)
             self.register_buffer("lora_up_init", B_init.clone(), persistent=False)
-        elif lora_init == "pissa" and base_weight is not None:
+        elif lora_init == "pissa" and base_weight is not None and svd_init_ok:
             # PiSSA (arxiv:2404.02948): SVD of base weight, top-r principal components
             # A/B 起点在 W 主方向子空间内，配合 delta 补偿保证 step 0 净 delta=0
             if abs(self.scaling - 1.0) > 1e-6:
@@ -271,6 +292,9 @@ class LoRALayer(torch.nn.Module):
                     "Set alpha=rank for correct PiSSA behavior.", self.scaling)
             A_init, B_init = _pissa_init(in_features, out_features, rank,
                                          base_weight=base_weight, device=device)
+            assert A_init.shape == (rank, in_features) and B_init.shape == (out_features, rank), (
+                f"PiSSA init 形状错误: A{tuple(A_init.shape)} B{tuple(B_init.shape)}，"
+                f"期望 A({rank},{in_features}) B({out_features},{rank})")
             with torch.no_grad():
                 self.lora_down.weight.copy_(A_init.to(device=device))
                 self.lora_up.weight.copy_(B_init.to(device=device))

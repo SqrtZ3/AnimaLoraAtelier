@@ -400,5 +400,53 @@ class TestMuonRMSScaleAndMaster(unittest.TestCase):
                                msg=f"plain Muon bf16 应与 fp32 一致，比值 {ratio:.3f}")
 
 
-if __name__ == "__main__":
+@unittest.skipUnless(HAS_TORCH, "torch not available")
+class TestDegenerateLayerSvdInitGuard(unittest.TestCase):
+    """7. 退化层守卫：min(in,out) < rank 时 SVD 补偿式 init 必须回退 default。
+
+    物证（2026-07-17 云端）：krea2 txtfusion.projector = Linear(12→1) 注入
+    rank=32 + lora_init=pissa 时，svd_lowrank 的 q 被钳到 1、[:rank] 切片静默
+    切少，copy_ 的隐式广播把形状错误掩盖到前向才炸：
+    F.linear 报 mat1(M,32) × mat2(1,1)。
+    """
+
+    def test_pissa_degenerate_falls_back_to_default(self):
+        from trainer.lora import LoRALayer
+        torch.manual_seed(0)
+        W = torch.randn(1, 12)
+        layer = LoRALayer(12, 1, rank=32, alpha=32.0,
+                          lora_init="pissa", base_weight=W)
+        # 回退 default：无补偿 buffers，lora_up 零 init
+        self.assertIsNone(layer.lora_down_init)
+        self.assertIsNone(layer.lora_up_init)
+        y = layer(torch.randn(64, 12))
+        self.assertEqual(tuple(y.shape), (64, 1))
+        self.assertTrue(torch.equal(y, torch.zeros_like(y)),
+                        "step-0 净 delta 必须为 0")
+
+    def test_ortho_degenerate_falls_back_to_default(self):
+        from trainer.lora import LoRALayer
+        torch.manual_seed(0)
+        layer = LoRALayer(12, 1, rank=32, alpha=32.0,
+                          tlora_enabled=True, tlora_init="ortho")
+        self.assertIsNone(layer.lora_down_init)
+        self.assertIsNone(layer.lora_up_init)
+        y = layer(torch.randn(8, 12))
+        self.assertEqual(tuple(y.shape), (8, 1))
+
+    def test_normal_layer_pissa_unchanged(self):
+        from trainer.lora import LoRALayer
+        torch.manual_seed(0)
+        W = torch.randn(48, 64)
+        layer = LoRALayer(64, 48, rank=16, alpha=16.0,
+                          lora_init="pissa", base_weight=W)
+        self.assertIsNotNone(layer.lora_up_init)
+        self.assertEqual(tuple(layer.lora_up_init.shape), (48, 16))
+        self.assertEqual(tuple(layer.lora_down_init.shape), (16, 64))
+        y = layer(torch.randn(32, 64))
+        self.assertLess(y.abs().max().item(), 1e-4,
+                        "正常层 PiSSA 补偿应保证 step-0 净 delta≈0")
+
+
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()

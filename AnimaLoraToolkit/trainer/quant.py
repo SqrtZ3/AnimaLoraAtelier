@@ -58,6 +58,7 @@ _FP4_BLOCK = 16  # nvfp4 block 大小（沿 in_features/K 轴）
 # ──────────────────────────────────────────────────────────────────────
 
 _CAPS_CACHE: dict = {}
+_CAPS_ERR: dict = {}  # kind -> 最近一次探测失败的原因字符串（诊断用）
 
 
 def _gemm_probe(kind: str) -> bool:
@@ -85,6 +86,26 @@ def _gemm_probe(kind: str) -> bool:
             torch._scaled_mm(xq, wq.t(), scale_a=xs, scale_b=ws.t(),
                              out_dtype=torch.bfloat16)
             ok = True
+        elif kind in ("fp8_grad_rowwise", "fp8_grad_tensorwise"):
+            # 反向 dL/dx 的实际组合：e5m2 梯度 × e4m3 权重（部分平台的
+            # rowwise 内核只收双 e4m3，必须按真实 dtype 组合探测）。
+            # 形状按真实 backward：gy [M,N] @ W_cm [N,K] → [M,K]
+            g = torch.randn(M, N, device=dev, dtype=torch.bfloat16)
+            wq, ws = _quant_fp8_rowwise(w)
+            wq_cm = wq.t().contiguous().t()
+            if kind == "fp8_grad_rowwise":
+                gq, gs = _quant_fp8_rowwise(g, fmax=_E5M2_MAX,
+                                            dtype=torch.float8_e5m2)
+                ones = ws.new_ones(1, wq.shape[1])
+                torch._scaled_mm(gq, wq_cm, scale_a=gs, scale_b=ones,
+                                 out_dtype=torch.bfloat16)
+            else:
+                gq, gs = _quant_fp8_tensorwise(g, fmax=_E5M2_MAX,
+                                               dtype=torch.float8_e5m2)
+                _, ws_t = _quant_fp8_tensorwise(w)
+                torch._scaled_mm(gq, wq_cm, scale_a=gs, scale_b=ws_t,
+                                 out_dtype=torch.bfloat16)
+            ok = True
         elif kind == "fp4":
             if not hasattr(torch, "float4_e2m1fn_x2"):
                 ok = False
@@ -100,6 +121,7 @@ def _gemm_probe(kind: str) -> bool:
         else:
             raise ValueError(f"未知 probe kind: {kind}")
     except Exception as e:  # noqa: BLE001 —— 探测失败即"该路径不可用"
+        _CAPS_ERR[kind] = f"{type(e).__name__}: {e}"
         logger.info("[base-quant] GEMM 能力探测 %s 不可用: %s", kind, e)
         ok = False
     _CAPS_CACHE[key] = ok
@@ -524,6 +546,19 @@ def quantize_base_model(model, args, family: str = "anima"):
                 raise RuntimeError(
                     "base_quant_gemm=on 但当前设备/torch 探测不到可用的 fp8 "
                     "_scaled_mm。用 auto（自动退 dequant bf16 计算）或升级环境。")
+            # fp8_grad 的真实组合是 e5m2×e4m3，独立探测；失败降级 bf16 反向
+            # （速度旋钮而非语义，宁可慢不可首步 backward 才崩）
+            if fp8_grad and gemm_ok:
+                _grad_kind = ("fp8_grad_rowwise" if fp8_rowwise
+                              else "fp8_grad_tensorwise")
+                if not _gemm_probe(_grad_kind):
+                    logger.warning(
+                        "[base-quant] base_quant_fp8_grad=true 但 %s 探测失败"
+                        "（%s）——反向降级 bf16，前向量化 GEMM 不受影响",
+                        _grad_kind, _CAPS_ERR.get(_grad_kind, "?"))
+                    print("[base-quant] ⚠ fp8_grad 探测失败，反向已降级 bf16（详见日志）",
+                          flush=True)
+                    fp8_grad = False
     else:  # fp4
         gemm_ok = False if gemm_pref == "off" else _gemm_probe("fp4")
         if gemm_pref == "on" and not gemm_ok:
@@ -533,6 +568,31 @@ def quantize_base_model(model, args, family: str = "anima"):
                 "fp4 自动退回 dequant-bf16 计算，仍有 4× 权重显存收益。")
         if fp8_grad:
             raise ValueError("base_quant_fp8_grad 仅对 base_quant=fp8 有意义")
+
+    # ── 决策落地前先把探测/决策结果打到 stdout ─────────────────────
+    # （train_monitor 等外层只收 stdout 日志文件时，logging 的 stderr 行会
+    # 丢——GEMM 是否启用是判断"该不该有速度收益"的第一依据，必须可见。）
+    def _say(msg: str, warn: bool = False):
+        print(msg, flush=True)
+        (logger.warning if warn else logger.info)(msg)
+
+    if fmt == "fp8":
+        _say("[base-quant] 探测: fp8_rowwise=%s fp8_tensorwise=%s"
+             % (_gemm_probe("fp8_rowwise"), _gemm_probe("fp8_tensorwise")))
+        for kind in ("fp8_rowwise", "fp8_tensorwise"):
+            if not _gemm_probe(kind) and kind in _CAPS_ERR:
+                _say("[base-quant]   %s 失败原因: %s" % (kind, _CAPS_ERR[kind]))
+        _say("[base-quant] 决策: fmt=fp8 quant_gemm=%s scale=%s fp8_grad=%s"
+             % (gemm_ok, "rowwise" if fp8_rowwise else "tensorwise", fp8_grad))
+        if gemm_pref != "off" and not gemm_ok:
+            _say("[base-quant] ⚠ 当前设备/torch 探测不到可用的 fp8 _scaled_mm，"
+                 "全部量化层将走 dequant-bf16：显存照省，但**不会提速**（前向还会"
+                 "略慢于纯 bf16）。检查 torch 版本与 GPU 架构，或显式设 "
+                 "base_quant_gemm: off 消除本警告。", warn=True)
+    else:
+        _say("[base-quant] 探测: fp4_scaled_mm=%s" % gemm_ok)
+        _say("[base-quant] 决策: fmt=fp4 quant_gemm=%s（False=dequant-bf16，"
+             "H20 等无 fp4 tensor core 硬件的预期形态：纯省显存不提速）" % gemm_ok)
 
     inc_re = [re.compile(p) for p in include]
     skip_re = [re.compile(p) for p in skip]
@@ -622,18 +682,18 @@ def quantize_base_model(model, args, family: str = "anima"):
 
     if stats["count"]:
         saved = (stats["bytes_before"] - stats["bytes_after"]) / (1 << 30)
-        logger.info(
-            "[base-quant] %s：量化 %d 层（gemm=%d, dequant=%d, 保持bf16=%d），"
-            "权重 %.2fGB → %.2fGB（省 %.2fGB）；权重 relerr mean=%.4f max=%.4f (%s)%s",
-            fmt, stats["count"], stats["gemm"], stats["dequant"], stats["kept_bf16"],
-            stats["bytes_before"] / (1 << 30), stats["bytes_after"] / (1 << 30), saved,
-            stats["relerr_sum"] / stats["count"], stats["relerr_max"],
-            stats["relerr_max_layer"],
-            "；fp8 scale=%s, fp8_grad=%s" % (
-                "rowwise" if fp8_rowwise else "tensorwise", fp8_grad)
-            if fmt == "fp8" else "",
+        _say(
+            "[base-quant] %s：量化 %d 层（quant-GEMM=%d, dequant-bf16=%d, 保持bf16=%d），"
+            "权重 %.2fGB → %.2fGB（省 %.2fGB）；权重 relerr mean=%.4f max=%.4f (%s)%s"
+            % (fmt, stats["count"], stats["gemm"], stats["dequant"], stats["kept_bf16"],
+               stats["bytes_before"] / (1 << 30), stats["bytes_after"] / (1 << 30), saved,
+               stats["relerr_sum"] / stats["count"], stats["relerr_max"],
+               stats["relerr_max_layer"],
+               "；fp8 scale=%s, fp8_grad=%s" % (
+                   "rowwise" if fp8_rowwise else "tensorwise", fp8_grad)
+               if fmt == "fp8" else "")
         )
     else:
-        logger.warning("[base-quant] include/skip 规则没有命中任何 Linear，"
-                       "本次量化是 no-op（include=%s, skip=%s）", include, skip)
+        _say("[base-quant] ⚠ include/skip 规则没有命中任何 Linear，"
+             "本次量化是 no-op（include=%s, skip=%s）" % (include, skip), warn=True)
     return stats

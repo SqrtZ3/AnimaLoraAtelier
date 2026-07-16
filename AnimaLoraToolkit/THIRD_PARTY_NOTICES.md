@@ -98,6 +98,16 @@
   3. 首版收窄变量面：仅标准 LoRA（lora_type=lora, variant=base, init=default），
      与 LoKr/ABBA/DoRA/PiSSA/T-LoRA 构造期 fail-fast。均 opt-in / default-off。
 
+## torchao（fp4 block-scale swizzle 布局函数改写）
+
+- **来源**：`pytorch/ao`（torchao，BSD-3-Clause）
+  `torchao/prototype/mx_formats/utils.py` 的 `to_blocked`（cuBLAS nvfp4
+  GEMM 要求的 128×4 tile block-scale 布局变换）。
+- **涉及文件**：
+  - `trainer/quant.py`（`_to_blocked`，独立改写；其余量化/GEMM 代码为
+    本仓库原创实现，仅依赖 torch 核心的 `_scaled_mm`）
+- **本地差异**：仅此一个纯 reshape/pad 函数，避免引入 torchao 整包依赖。
+
 ## Alibaba Wan2.1 VAE（请再次确认上游许可）
 
 - **来源**：`Wan-Video/Wan2.1` 的 VAE 实现（与 `wan/modules/vae.py` 对应）

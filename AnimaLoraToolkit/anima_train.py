@@ -1127,6 +1127,11 @@ def main():
     model_family = get_model_family(args)
     is_krea2 = model_family == "krea2"
     validate_family_compat(args, model_family)
+    # 底模量化（opt-in）：非法组合在加载模型/建缓存之前 fail-fast
+    from trainer.quant import (
+        base_quant_requested, validate_base_quant_compat, quantize_base_model,
+    )
+    validate_base_quant_compat(args)
     if is_krea2:
         logger.info("model_family=krea2（Krea 2 单流 MMDiT；文本通道 Qwen3-VL 多层特征）")
 
@@ -1291,6 +1296,20 @@ def main():
     if getattr(args, "resume_lora", "") and Path(args.resume_lora).exists():
         injector.load(args.resume_lora)
         logger.info(f"将从已有 LoRA 继续训练: {args.resume_lora}")
+
+    # ── 底模量化（opt-in, default-off；见 docs/base-quant.md）──────────────
+    # 必须在 LoRA 注入之后：PiSSA/ortho/ABBA/LoRA init 都在注入时读 bf16 底模
+    # 权重做 SVD，量化放在其后保证 init 数学口径与历史一致。adapter 不量化。
+    # merged_weight()/导出等低频路径通过 QuantLinear.weight property（现算
+    # dequant）透明工作，合并结果带量化误差 —— 与训练时前向看到的底模一致。
+    if base_quant_requested(args):
+        _bq_stats = quantize_base_model(model, args, family=model_family)
+        logger.info(
+            "[base-quant] %s: 量化 %d 层 (quant-GEMM %d / dequant-bf16 %d), "
+            "权重显存 %.2fGB → %.2fGB",
+            _bq_stats["format"], _bq_stats["count"], _bq_stats["gemm"],
+            _bq_stats["dequant"], _bq_stats["bytes_before"] / (1 << 30),
+            _bq_stats["bytes_after"] / (1 << 30))
 
     # 数据集
     fit_packed_training = bool(getattr(args, "fit_packed_training", False))

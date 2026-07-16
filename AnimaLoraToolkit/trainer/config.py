@@ -86,6 +86,13 @@ YAML_TO_ARGS = {
     "torch_compile": "torch_compile",
     "compile_mode": "compile_mode",
     "compile_dynamic": "compile_dynamic",
+    # 冻结底模 Linear 量化（opt-in, default-off；见 docs/base-quant.md）
+    "base_quant": "base_quant",
+    "base_quant_gemm": "base_quant_gemm",
+    "base_quant_fp8_scale": "base_quant_fp8_scale",
+    "base_quant_fp8_grad": "base_quant_fp8_grad",
+    "base_quant_include": "base_quant_include",
+    "base_quant_skip": "base_quant_skip",
     "fit_packed_training": "fit_packed_training",
     "fit_max_tokens": "fit_max_tokens",
     "fit_warn_tokens": "fit_warn_tokens",
@@ -429,6 +436,26 @@ DEFAULTS = {
     "torch_compile": False,
     "compile_mode": None,
     "compile_dynamic": None,
+    # ── 冻结底模 Linear 量化（opt-in, default-off）──────────────────────────
+    # "none"（默认，行为与历史逐 bit 等价）/ "fp8"（e4m3 权重，H20 可走 fp8 GEMM）
+    # / "fp4"（nvfp4 权重，Blackwell 可走 fp4 GEMM；H20 上自动退 dequant-bf16，
+    # 仍有 4× 权重显存收益）。只量化冻结底模，LoRA adapter 全程 bf16。
+    "base_quant": "none",
+    # "auto"（探测到可用 _scaled_mm 就走量化 GEMM，否则 dequant-bf16）
+    # / "on"（强制量化 GEMM，探测不到就报错）/ "off"（只省显存，不改计算）
+    "base_quant_gemm": "auto",
+    # fp8 scale 粒度："auto"（优先 rowwise，H20/sm90 支持；不支持退 tensorwise）
+    # / "rowwise" / "tensorwise"
+    "base_quant_fp8_scale": "auto",
+    # 反向 dL/dx 也走 fp8 GEMM（e5m2 梯度 × e4m3 权重）。默认 false=反向 bf16
+    # （更稳）；开了前反向都吃 fp8 吞吐，梯度多一层量化噪声 → 需 A/B 验证
+    "base_quant_fp8_grad": False,
+    # 量化哪些层（regex fullmatch 逻辑层名）。null → family 默认：
+    # krea2=blocks.*/txtfusion.*/txtmlp.*（对齐推理端已验证画质的集合；
+    # first/last/tproj/tmlp 保持 bf16），anima=blocks.*
+    "base_quant_include": None,
+    # 在 include 基础上额外排除的 regex 列表（默认不排除）
+    "base_quant_skip": None,
     "fit_packed_training": False,
     "fit_max_tokens": 65536,
     "fit_warn_tokens": 16384,

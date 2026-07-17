@@ -249,6 +249,8 @@ YAML_TO_ARGS = {
     # ARB 速度根因。CUDA event 计时 GPU 阶段、perf_counter 计时 CPU/IO；仅被采样步 sync。
     "stage_timing_every": "stage_timing_every",
     "stage_timing_warmup": "stage_timing_warmup",
+    "stage_profile_step": "stage_profile_step",
+    "stage_profile_trace": "stage_profile_trace",
     # LoRA-One 谱对齐初始化 (arXiv 2502.01235, KPSVD→LoKr)
     "lora_one_init_steps": "lora_one_init_steps",
     "lora_one_init_scale": "lora_one_init_scale",
@@ -683,6 +685,10 @@ DEFAULTS = {
     "stage_timing_every": 0,
     # 跳过前 warmup 步不计时（cudnn autotune / cache 冷），避免冷启动污染统计；仅 every>0 时生效。
     "stage_timing_warmup": 10,
+    # 在第 N 个 micro-step 用 torch.profiler 采样完整一步，区分「kernel 慢」vs
+    # 「kernel 间空隙（CPU/分配器）」；0=关（默认，行为中立）。trace=额外导出 chrome json。
+    "stage_profile_step": 0,
+    "stage_profile_trace": False,
     "lora_one_init_steps": 0,
     "lora_one_init_scale": 0.01,
     "lwd_mask_enabled": False,

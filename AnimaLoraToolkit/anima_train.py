@@ -465,6 +465,15 @@ def parse_args():
                         "非采样步测量不受影响。")
     p.add_argument("--stage-timing-warmup", type=int, default=10,
                    help="分阶段计时跳过前 N 步（cudnn autotune / cache 冷），默认 10。仅 stage_timing_every>0 时生效。")
+    p.add_argument("--stage-profile-step", type=int, default=0,
+                   help="在第 N 个 micro-step 用 torch.profiler 采样完整一步（含 optimizer），"
+                        "下一步开始时把 kernel 汇总表 + GPU 忙碌占比打进日志。0=关（默认，"
+                        "非零仅多一次整型比较，行为中立）。用途：区分「kernel 本身慢」（忙碌≈100%）"
+                        "vs「kernel 之间有空隙 = CPU/分配器喂不上」（忙碌明显<100%）。"
+                        "注意：N 别选训练的最后一步（汇总在下一步的开头触发）。")
+    p.add_argument("--stage-profile-trace", action="store_true",
+                   help="stage_profile_step 采样时额外导出 chrome trace json（可能数百 MB，"
+                        "chrome://tracing 或 perfetto 打开）。默认关，只打文本汇总。")
     p.add_argument("--fit-max-tokens", type=int, default=65536,
                    help="Maximum FiT tokens per image before applying the over-budget policy.")
     p.add_argument("--fit-warn-tokens", type=int, default=16384,
@@ -2859,10 +2868,48 @@ def main():
             "data_fetch_ms", "text_encode_ms", "timestep_ms", "forward_ms",
             "navit_noise_patchify_ms", "navit_model_forward_ms", "navit_loss_loop_ms",
             "loss_assembly_ms", "aux_ms", "adaptive_ms", "backward_ms",
-            "optimizer_ms", "whole_step_ms",
+            "optimizer_ms", "whole_step_ms", "tokens",
         ]
         emit(f"[stage_timing] enabled: every={_stage_timing_every} warmup={_stage_timing_warmup} "
              f"-> {_stage_timing_csv}")
+
+    # ── 单步 torch.profiler（opt-in：stage_profile_step，default-off 行为中立）────
+    # 采样窗口 = 目标 micro-step 的开头到下一个 micro-step 的开头（含 optimizer/flush）。
+    # 判据：GPU kernel 自时间合计 / 墙钟 ≈100% → kernel 本身慢；明显 <100% → kernel
+    # 之间有空隙（CPU 喂不上 / 分配器同步）。服务 H20「训练进程比独立进程慢」归因。
+    _stage_profile_step = int(getattr(args, "stage_profile_step", 0) or 0)
+    _prof_active = None
+    _prof_micro_count = 0
+    _prof_wall0 = 0.0
+
+    def _emit_profile_summary(prof, wall_s: float):
+        try:
+            ka = prof.key_averages()
+
+            def _dev_us(e):
+                v = getattr(e, "self_device_time_total", None)
+                if v is None:
+                    v = getattr(e, "self_cuda_time_total", 0)
+                return float(v or 0)
+
+            busy_s = sum(_dev_us(e) for e in ka) / 1e6
+            if busy_s < 1e-3:
+                emit("[stage_profile] ⚠ CUDA kernel 时间未被捕获（CUPTI 不可用？）——"
+                     "忙碌占比无效，请改用 --stage-profile-trace 看时间线，或检查 torch/kineto。")
+            emit(f"[stage_profile] 墙钟 {wall_s:.2f}s | GPU kernel 自时间合计 {busy_s:.2f}s "
+                 f"| GPU 忙碌占比 {busy_s / max(wall_s, 1e-9) * 100:.0f}%"
+                 f"（≈100%→kernel 慢；明显<100%→CPU/分配器空隙）")
+            try:
+                table = ka.table(sort_by="self_device_time_total", row_limit=25)
+            except Exception:
+                table = ka.table(sort_by="self_cuda_time_total", row_limit=25)
+            emit("[stage_profile] top ops:\n" + table)
+            if bool(getattr(args, "stage_profile_trace", False)):
+                _trace_path = output_dir / "profile_step.json"
+                prof.export_chrome_trace(str(_trace_path))
+                emit(f"[stage_profile] chrome trace -> {_trace_path}")
+        except Exception as _pe:
+            logger.warning("[stage_profile] 汇总失败: %s", _pe)
 
     def run_eval_loss(step):
         """固定样本 × 固定噪声 × 固定 t 网格的确定性 MSE eval。
@@ -3091,6 +3138,27 @@ def main():
                 _stage_timer = make_stage_timer(_stage_sampling)
             else:
                 _stage_timer = _stage_noop_ref
+            _stage_tokens = None  # navit 采样步填真实 pack token 数，其余留空
+
+            # ── 单步 profiler：上一步开的在此收口（窗口=完整一个 micro-step），
+            # 本步命中目标则开新的。default-off 时只有一次整型比较。──────────
+            if _stage_profile_step > 0:
+                _prof_micro_count += 1
+                if _prof_active is not None:
+                    torch.cuda.synchronize()
+                    _prof_active.__exit__(None, None, None)
+                    _emit_profile_summary(_prof_active, time.perf_counter() - _prof_wall0)
+                    _prof_active = None
+                if _prof_micro_count == _stage_profile_step:
+                    from torch.profiler import ProfilerActivity
+                    from torch.profiler import profile as _torch_profile
+                    torch.cuda.synchronize()
+                    _prof_active = _torch_profile(
+                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+                    _prof_active.__enter__()
+                    _prof_wall0 = time.perf_counter()
+                    emit(f"[stage_profile] micro-step {_prof_micro_count}: profiler 开始"
+                         f"（本步与下一步开头略慢，属采样开销）")
             _stage_timer.start("whole_step")
             _stage_timer.start_cpu("data_fetch")
 
@@ -3325,6 +3393,9 @@ def main():
                     )
                     per_sample = _navit_info["per_image_loss"]
                     fit_size = None  # navit aux unpatchifies per image below
+                    if _stage_sampling:
+                        # 真实 pack token 数（image+text），供 stage_timing 按 token 归一
+                        _stage_tokens = int(sum(_navit_info["visual_seqlens"])) + int(sum(text_seqlens))
                 elif fit_packed_training:
                     noisy_tokens, fit_grid, fit_mask, fit_size = model.patchify_latents_to_tokens(noisy, latent_mask)
                     target_tokens, _target_grid, _target_mask, _target_size = model.patchify_latents_to_tokens(target, latent_mask)
@@ -4172,6 +4243,7 @@ def main():
                         _st.get("navit_model_forward"), _st.get("navit_loss_loop"),
                         _st.get("loss_assembly"), _st.get("aux"), _st.get("adaptive"),
                         _st.get("backward"), _st.get("optimizer"), _st.get("whole_step"),
+                        _stage_tokens,
                     ]
                     _stage_append_csv(_stage_timing_csv, _stage_timing_header, row)
                     # console 摘要（镜像 telemetry emit）：前 5 大阶段

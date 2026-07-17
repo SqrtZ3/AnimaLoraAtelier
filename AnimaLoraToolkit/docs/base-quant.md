@@ -36,7 +36,15 @@ base_quant_fp8_scale: auto  # auto | rowwise | tensorwise
 base_quant_fp8_grad: false  # 反向 dL/dx 也走 fp8（e5m2 梯度 × e4m3 权重）
 base_quant_include: null    # null = family 默认（见下）；regex fullmatch 列表
 base_quant_skip: null       # 额外排除的 regex 列表
+base_quant_fuse_act_quant: false  # torch.compile 融合激活量化链（见下）
 ```
+
+- **`base_quant_fuse_act_quant`**：热路径的激活量化（abs→amax→div→clamp→cast）
+  是 4-5 个分立 kernel，H20 profile 实测该 pointwise 家族每步吃数秒。开启后用
+  torch.compile **只编译这两个量化纯函数**（不碰模型整图，与 navit /
+  `torch_compile` 互斥无关），融成 1-2 个 kernel。启用时跑数值探针（dequant
+  allclose）校验，编译失败/探针不过自动回退 eager 并打日志。数值可能有 ulp 级
+  差异（fp8 码字边界值差 1 码），权重量化仍走 eager（保 resume 确定性）。
 
 - **`base_quant_gemm: auto`**（推荐）：启动时用真实小 GEMM 探测当前设备/torch
   的 `_scaled_mm` 能力，可用则量化层走量化 GEMM，不可用自动退回

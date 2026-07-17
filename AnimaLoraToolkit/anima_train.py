@@ -474,6 +474,11 @@ def parse_args():
     p.add_argument("--stage-profile-trace", action="store_true",
                    help="stage_profile_step 采样时额外导出 chrome trace json（可能数百 MB，"
                         "chrome://tracing 或 perfetto 打开）。默认关，只打文本汇总。")
+    p.add_argument("--navit-attn-backend", type=str, default="xformers",
+                   choices=["xformers", "sdpa_seg"],
+                   help="krea2 navit packed attention 后端。xformers=历史行为（默认，逐 bit 不变）；"
+                        "sdpa_seg=块对角 mask 换逐段 dense SDPA（cudnn），数学恒等（有对拍单测），"
+                        "H20 微基准 dense SDPA 比 xformers FA2 varlen 快 1.56×，预计省 ~10% 步时。")
     p.add_argument("--fit-max-tokens", type=int, default=65536,
                    help="Maximum FiT tokens per image before applying the over-budget policy.")
     p.add_argument("--fit-warn-tokens", type=int, default=16384,
@@ -2882,6 +2887,20 @@ def main():
     _prof_micro_count = 0
     _prof_wall0 = 0.0
 
+    # ── krea2 navit packed attention 后端（opt-in，默认 xformers 行为不变）────
+    _navit_attn_backend = str(getattr(args, "navit_attn_backend", "xformers")
+                              or "xformers").lower()
+    if _navit_attn_backend != "xformers":
+        from models.krea2_modeling import set_packed_attention_backend
+        set_packed_attention_backend(_navit_attn_backend)  # 非法值 fail-fast
+        if str(getattr(args, "model_family", "anima")).lower() != "krea2":
+            logger.warning("[navit-attn] navit_attn_backend=%s 目前只作用于 krea2 "
+                           "packed 前向；当前 family 非 krea2，该设置无效果。",
+                           _navit_attn_backend)
+        else:
+            emit(f"[navit-attn] packed attention backend = {_navit_attn_backend}"
+                 f"（逐段 dense SDPA，数学恒等；xformers 路径不再使用）")
+
     def _emit_profile_summary(prof, wall_s: float):
         try:
             ka = prof.key_averages()
@@ -2892,7 +2911,14 @@ def main():
                     v = getattr(e, "self_cuda_time_total", 0)
                 return float(v or 0)
 
-            busy_s = sum(_dev_us(e) for e in ka) / 1e6
+            # 只统计 device 侧 kernel 事件——op 行（CPU 侧）的 self CUDA 是同一批
+            # kernel 的归属视图，混加会双计（2026-07-17 实测虚报 208%）。
+            try:
+                from torch.autograd import DeviceType
+                busy_s = sum(_dev_us(e) for e in ka
+                             if getattr(e, "device_type", None) == DeviceType.CUDA) / 1e6
+            except Exception:
+                busy_s = sum(_dev_us(e) for e in ka) / 1e6
             if busy_s < 1e-3:
                 emit("[stage_profile] ⚠ CUDA kernel 时间未被捕获（CUPTI 不可用？）——"
                      "忙碌占比无效，请改用 --stage-profile-trace 看时间线，或检查 torch/kineto。")

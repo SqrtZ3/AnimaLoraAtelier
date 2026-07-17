@@ -251,6 +251,8 @@ YAML_TO_ARGS = {
     "stage_timing_warmup": "stage_timing_warmup",
     "stage_profile_step": "stage_profile_step",
     "stage_profile_trace": "stage_profile_trace",
+    "navit_attn_backend": "navit_attn_backend",
+    "base_quant_fuse_act_quant": "base_quant_fuse_act_quant",
     # LoRA-One 谱对齐初始化 (arXiv 2502.01235, KPSVD→LoKr)
     "lora_one_init_steps": "lora_one_init_steps",
     "lora_one_init_scale": "lora_one_init_scale",
@@ -456,6 +458,10 @@ DEFAULTS = {
     # krea2=blocks.*/txtfusion.*/txtmlp.*（对齐推理端已验证画质的集合；
     # first/last/tproj/tmlp 保持 bf16），anima=blocks.*
     "base_quant_include": None,
+    # 激活量化融合：torch.compile 只编译量化纯函数（abs→amax→div→clamp→cast
+    # 融成 1-2 个 kernel），不碰模型整图。H20 profile 实测该链每步吃数秒。
+    # 数值可能有 ulp 级差异（启用探针校验 dequant allclose），默认关。
+    "base_quant_fuse_act_quant": False,
     # 在 include 基础上额外排除的 regex 列表（默认不排除）
     "base_quant_skip": None,
     "fit_packed_training": False,
@@ -689,6 +695,9 @@ DEFAULTS = {
     # 「kernel 间空隙（CPU/分配器）」；0=关（默认，行为中立）。trace=额外导出 chrome json。
     "stage_profile_step": 0,
     "stage_profile_trace": False,
+    # krea2 navit packed attention 后端：xformers（默认，历史行为逐 bit 不变）|
+    # sdpa_seg（逐段 dense SDPA/cudnn，数学恒等，H20 上更快）。
+    "navit_attn_backend": "xformers",
     "lora_one_init_steps": 0,
     "lora_one_init_scale": 0.01,
     "lwd_mask_enabled": False,

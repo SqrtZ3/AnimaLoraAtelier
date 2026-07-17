@@ -61,6 +61,36 @@ except Exception:  # pragma: no cover
 # None=未探针；True/False=探针结果。测试可显式覆写。
 _XF_GQA_5D_OK: Optional[bool] = None
 
+# ── packed attention 后端（opt-in，默认 xformers = 历史行为逐 bit 不变）────────
+# "sdpa_seg"：块对角 mask 换成逐段 dense SDPA（cudnn 后端）。段内全注意力 =
+# 块对角语义，数学恒等（有单测对拍）；H20 微基准 dense SDPA 比 xformers FA2
+# varlen 快 1.56×（fwd，三种段几何一致），且不依赖 xformers。
+# G 通常 2~10，逐段 launch 开销可忽略。该接缝同时是未来低比特 attention
+# 后端（如 SageBwd INT8）的插槽——任何"dense [B,H,L,D] 进出"的 kernel 都能挂。
+_PACKED_ATTN_BACKEND = "xformers"
+_PACKED_ATTN_BACKENDS = ("xformers", "sdpa_seg")
+
+
+def set_packed_attention_backend(name: str) -> None:
+    """训练入口调用（trainer 读 navit_attn_backend 配置）。非法值构造期 fail-fast。"""
+    global _PACKED_ATTN_BACKEND
+    name = (name or "xformers").lower()
+    if name not in _PACKED_ATTN_BACKENDS:
+        raise ValueError(
+            f"navit_attn_backend={name!r} 不认识；可选 {_PACKED_ATTN_BACKENDS}")
+    _PACKED_ATTN_BACKEND = name
+
+
+class _SegLens:
+    """packed 注意力的轻量段长标记（sdpa_seg 后端替代 BlockDiagonalMask/bool mask）。
+
+    attention() 检测到它时逐段调用 dense SDPA；持有 (s0, s1, ...) 段长元组。
+    """
+    __slots__ = ("seg_lens",)
+
+    def __init__(self, seg_lens):
+        self.seg_lens = tuple(int(s) for s in seg_lens)
+
 
 def _probe_xf_gqa_5d(device, dtype, headdim: int, rep: int) -> bool:
     """小张量探针：BMGHK 布局 + BlockDiagonalMask 的 forward+backward 是否可用。"""
@@ -176,7 +206,32 @@ def attention(
     - xformers 路径（BlockDiagonalMask，navit packed）：展开 KV 头后走
       memory_efficient_attention 的 varlen 快 kernel（musubi-tuner 对 GQA 同样做展开，
       与原生 GQA 数值一致）。
+    - _SegLens 路径（navit_attn_backend=sdpa_seg）：逐段 dense SDPA（cudnn），
+      段内全注意力 ≡ 块对角 mask，数学恒等（tests/test_sdpa_seg_attention.py 对拍）。
     """
+    if isinstance(mask, _SegLens):
+        outs = []
+        off = 0
+        for s in mask.seg_lens:
+            qs = q[:, :, off:off + s]
+            ks = k[:, :, off:off + s]
+            vs = v[:, :, off:off + s]
+            if gqa and ks.shape[1] != qs.shape[1]:
+                if _SDPA_HAS_GQA:
+                    o = F.scaled_dot_product_attention(qs, ks, vs, scale=scale,
+                                                       enable_gqa=True)
+                else:
+                    rep = qs.shape[1] // ks.shape[1]
+                    o = F.scaled_dot_product_attention(
+                        qs, ks.repeat_interleave(rep, dim=1),
+                        vs.repeat_interleave(rep, dim=1), scale=scale)
+            else:
+                o = F.scaled_dot_product_attention(qs, ks, vs, scale=scale)
+            outs.append(o)
+            off += s
+        x = torch.cat(outs, dim=2)
+        return rearrange(x, "B H L D -> B L (H D)")
+
     if _is_xformers_bias(mask):
         import xformers.ops as xops
 
@@ -818,9 +873,12 @@ class SingleStreamDiT(nn.Module):
             )
 
         use_xf = _xformers_available()
+        use_sdpa_seg = _PACKED_ATTN_BACKEND == "sdpa_seg"
 
         # ── 文本融合（varlen：refiner 阶段按 caption 块对角隔离）──────────────
-        if use_xf:
+        if use_sdpa_seg:
+            txt_bias = _SegLens(text_seqlens)
+        elif use_xf:
             txt_bias = cached_block_diag_mask(tuple(text_seqlens))
         else:
             txt_bias = block_diag_bool_mask(text_seqlens, device)
@@ -876,7 +934,9 @@ class SingleStreamDiT(nn.Module):
         counts = torch.tensor(seg_lens, device=device)
         mod_index = torch.repeat_interleave(torch.arange(G, device=device), counts)
 
-        if use_xf:
+        if use_sdpa_seg:
+            self_bias = _SegLens(seg_lens)
+        elif use_xf:
             self_bias = cached_block_diag_mask(tuple(seg_lens))
         else:
             self_bias = block_diag_bool_mask(seg_lens, device)

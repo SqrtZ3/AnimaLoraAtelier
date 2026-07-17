@@ -152,6 +152,45 @@ def _dequant_fp8(q: torch.Tensor, scale: torch.Tensor, out_dtype) -> torch.Tenso
     return (q.float() * scale).to(out_dtype)
 
 
+# ── 激活量化的可选融合（base_quant_fuse_act_quant，opt-in default-off）────────
+# 热路径的 abs→amax→div→clamp→cast 是 4-5 个分立 kernel（H20 profile 实测
+# div/clamp/mul 家族 ≈ 每步数秒）。torch.compile 只编译这两个纯函数（不碰模型
+# 整图，与 navit / torch_compile 互斥无关），把链融成 1-2 个 kernel。
+# 数值口径：运算顺序不变，inductor 融合可能在 ulp 级改变中间舍入（fp8 码字
+# 边界值可能差 1 码），启用探针里用 dequant 值 allclose 校验。
+# 关闭（默认）时下面两个指针就是 eager 原函数，行为逐 bit 不变。
+_act_quant_tensorwise = _quant_fp8_tensorwise
+_act_quant_rowwise = _quant_fp8_rowwise
+
+
+def enable_fused_act_quant() -> bool:
+    """尝试把激活量化原语切到 torch.compile 融合版；成功返回 True。
+
+    失败（无 triton / 编译异常 / 数值探针不过）自动留在 eager，非静默——
+    调用方负责把结果打到 stdout。dynamic=True 避免逐形状重编译（M 每步变）。
+    """
+    global _act_quant_rowwise, _act_quant_tensorwise
+    try:
+        crow = torch.compile(_quant_fp8_rowwise, dynamic=True)
+        cten = torch.compile(_quant_fp8_tensorwise, dynamic=True)
+        x = torch.randn(96, 128, device="cuda", dtype=torch.bfloat16)
+        for eager_fn, fused_fn in ((_quant_fp8_rowwise, crow),
+                                   (_quant_fp8_tensorwise, cten)):
+            for kw in ({}, {"fmax": _E5M2_MAX, "dtype": torch.float8_e5m2}):
+                q0, s0 = eager_fn(x, **kw)
+                q1, s1 = fused_fn(x, **kw)
+                assert q1.shape == q0.shape and q1.dtype == q0.dtype
+                d0 = q0.float() * s0
+                d1 = q1.float() * s1
+                assert torch.allclose(d0, d1, atol=1e-2, rtol=1e-2), \
+                    f"融合量化 dequant 偏差 {(d0 - d1).abs().max().item():.3e}"
+        _act_quant_rowwise, _act_quant_tensorwise = crow, cten
+        return True
+    except Exception as ex:  # noqa: BLE001 —— 速度旋钮，宁可回退不可崩
+        logger.warning("[base-quant] fuse_act_quant 启用失败，保持 eager：%s", ex)
+        return False
+
+
 # ──────────────────────────────────────────────────────────────────────
 # FP4（nvfp4 风格）量化 / 反量化 / swizzle
 # ──────────────────────────────────────────────────────────────────────
@@ -281,10 +320,10 @@ class _Fp8GemmLinearFn(torch.autograd.Function):
         ctx.qlin = qlin
         wq, ws = qlin.weight_q, qlin.weight_scale
         if qlin.fp8_rowwise:
-            xq, xs = _quant_fp8_rowwise(x2d)
+            xq, xs = _act_quant_rowwise(x2d)
             scale_b = ws.t()
         else:
-            xq, xs = _quant_fp8_tensorwise(x2d)
+            xq, xs = _act_quant_tensorwise(x2d)
             scale_b = ws
         return torch._scaled_mm(xq, wq.t(), scale_a=xs, scale_b=scale_b,
                                 bias=qlin.bias, out_dtype=x2d.dtype)
@@ -305,12 +344,12 @@ class _Fp8GemmLinearFn(torch.autograd.Function):
         if qlin.fp8_rowwise:
             # ws [N,1] 折进 gy 的列 → g̃ = gy * wsᵀ，再逐行 e5m2 量化
             g = gy * ws.t().to(gy.dtype)
-            gq, gs = _quant_fp8_rowwise(g, fmax=_E5M2_MAX, dtype=torch.float8_e5m2)
+            gq, gs = _act_quant_rowwise(g, fmax=_E5M2_MAX, dtype=torch.float8_e5m2)
             ones = ws.new_ones(1, wq.shape[1])
             gx = torch._scaled_mm(gq, wq_cm, scale_a=gs, scale_b=ones,
                                   out_dtype=gy.dtype)
         else:
-            gq, gs = _quant_fp8_tensorwise(gy, fmax=_E5M2_MAX,
+            gq, gs = _act_quant_tensorwise(gy, fmax=_E5M2_MAX,
                                            dtype=torch.float8_e5m2)
             gx = torch._scaled_mm(gq, wq_cm, scale_a=gs, scale_b=ws,
                                   out_dtype=gy.dtype)
@@ -589,6 +628,14 @@ def quantize_base_model(model, args, family: str = "anima"):
                  "全部量化层将走 dequant-bf16：显存照省，但**不会提速**（前向还会"
                  "略慢于纯 bf16）。检查 torch 版本与 GPU 架构，或显式设 "
                  "base_quant_gemm: off 消除本警告。", warn=True)
+        # ── 激活量化融合（opt-in）：只 compile 量化纯函数，不碰模型整图 ──────
+        if bool(getattr(args, "base_quant_fuse_act_quant", False)):
+            if gemm_ok:
+                _fused = enable_fused_act_quant()
+                _say("[base-quant] fuse_act_quant=%s%s"
+                     % (_fused, "" if _fused else "（编译/探针失败，已回退 eager，见日志）"))
+            else:
+                _say("[base-quant] fuse_act_quant 请求但 quant-GEMM 未启用，跳过")
     else:
         _say("[base-quant] 探测: fp4_scaled_mm=%s" % gemm_ok)
         _say("[base-quant] 决策: fmt=fp4 quant_gemm=%s（False=dequant-bf16，"

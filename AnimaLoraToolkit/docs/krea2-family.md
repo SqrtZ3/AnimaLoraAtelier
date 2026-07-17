@@ -28,7 +28,16 @@ cache_latents: true
 navit_packing: true
 navit_native_resolution: true
 navit_token_budget: <按显存定>
+navit_attn_backend: xformers   # xformers（默认，历史行为）| sdpa_seg
 ```
+
+- **`navit_attn_backend: sdpa_seg`**（opt-in）：packed 注意力从 xformers
+  BlockDiagonalMask varlen 换成**逐段 dense SDPA（cudnn）**。段内全注意力 ≡
+  块对角语义，数学恒等（`tests/test_sdpa_seg_attention.py` 前向+梯度对拍）；
+  H20 微基准 dense SDPA 比 xformers FA2 快 1.56×（云端 xformers 的 5D grouped
+  路径无 backward 算子，训练实际一直走 4D 物化）。G=2~10 时逐段 launch 开销
+  可忽略。该接缝同时是未来低比特 attention 后端（SageBwd INT8 等，2026-07 时
+  上游 kernel 尚未开源）的插槽。
 
 `text_encoder_path` / `t5_tokenizer_path` 在 krea2 下不使用。
 

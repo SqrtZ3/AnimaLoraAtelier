@@ -534,8 +534,19 @@ class TextFusionTransformer(torch.nn.Module):
         """
         b, l, n, d = x.shape
         x = x.reshape(b * l, n, d)
-        for block in self.layerwise_blocks:
-            x = block(x.contiguous(), mask=None)
+        # layerwise 阶段的 SDPA 形状极端：batch=B·L（navit packed 下=全部文本
+        # token 数，随 token budget 线性增长）、seqlen=n_layers（个位数）。
+        # RTX PRO 6000 (sm120) + torch 2.11 实测：该形状落 flash 后端时，
+        # batch≈6k×20 头起 backward 稳定 illegal memory access（budget 49152/65536
+        # step1 必崩，anomaly mode 两次指认 ScaledDotProductFlashAttentionBackward0
+        # 于本调用链），更小 batch 疑似偶发梯度写坏。seqlen=12 的 attention 用
+        # MATH 后端（纯 matmul+softmax，qkᵀ 仅 [.,.,12,12]）既绕开内核 bug 又
+        # 几乎零开销；flash 在这个 seqlen 本就无收益。
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        with sdpa_kernel([SDPBackend.MATH]):
+            for block in self.layerwise_blocks:
+                x = block(x.contiguous(), mask=None)
         x = rearrange(x, "(b l) n d -> b l d n", b=b, l=l)
         x = self.projector(x)
         x = x.squeeze(-1)

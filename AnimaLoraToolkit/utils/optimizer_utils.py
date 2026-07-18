@@ -52,6 +52,11 @@ except ImportError:  # pragma: no cover
     from automagic_optimizer import Automagic  # type: ignore
 
 try:
+    from .adamw_snr_optimizer import AdamWSNR
+except ImportError:  # pragma: no cover
+    from adamw_snr_optimizer import AdamWSNR  # type: ignore
+
+try:
     from .adopt_optimizer import ADOPT
 except ImportError:  # pragma: no cover
     from adopt_optimizer import ADOPT  # type: ignore
@@ -359,6 +364,23 @@ def create_optimizer(
         if "eps" in kwargs:
             eps = _coerce_float(kwargs.pop("eps"), "optimizer_args.eps")
         return create_muon_sf_optimizer(
+            params=params, lr=learning_rate, betas=betas,
+            weight_decay=weight_decay, eps=eps, **kwargs,
+        )
+
+    if optimizer_type in {"adamw_snr", "adamwsnr"}:
+        # 默认 cautious=False / snr_power=1.0 时与 adamw 数学恒等（行为中立）。
+        if "lr" in kwargs:
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
+        if "betas" in kwargs:
+            betas = _coerce_betas(kwargs.pop("betas"))
+        if "weight_decay" in kwargs:
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
+        if "eps" in kwargs:
+            eps = _coerce_float(kwargs.pop("eps"), "optimizer_args.eps")
+        return create_adamw_snr_optimizer(
             params=params, lr=learning_rate, betas=betas,
             weight_decay=weight_decay, eps=eps, **kwargs,
         )
@@ -845,6 +867,42 @@ def create_muon_optimizer(
         weight_decay=weight_decay,
         eps=eps,
         **muon_kwargs,
+    )
+
+
+# =============================================================================
+# AdamW-SNR (AdamW + cautious / SNR 锐化门控)
+# =============================================================================
+
+def create_adamw_snr_optimizer(
+    params: ParamInput,
+    lr: float = 1e-4,
+    betas: tuple = (0.9, 0.999),
+    weight_decay: float = 0.0,
+    eps: float = 1e-8,
+    **kwargs,
+) -> Optimizer:
+    valid_keys = {"cautious", "snr_power"}
+    snr_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+    ignored = [k for k in kwargs if k not in valid_keys]
+    if ignored:
+        logger.warning(f"[AdamW-SNR] Ignored unsupported params: {ignored}")
+
+    param_list = params if _is_param_groups(params) else list(params)
+    cautious = bool(snr_kwargs.get("cautious", False))
+    snr_power = float(snr_kwargs.get("snr_power", 1.0))
+    if not cautious and snr_power == 1.0:
+        logger.info(
+            "AdamW-SNR: cautious=False 且 snr_power=1.0 —— 与标准 adamw 数学恒等"
+            "（如需门控请设 cautious=true 或 snr_power>1）"
+        )
+    logger.info(
+        "Creating AdamW-SNR optimizer (lr=%s, betas=%s, wd=%s, cautious=%s, snr_power=%s)",
+        lr, betas, weight_decay, cautious, snr_power,
+    )
+    return AdamWSNR(
+        param_list, lr=lr, betas=betas, weight_decay=weight_decay, eps=eps,
+        **snr_kwargs,
     )
 
 

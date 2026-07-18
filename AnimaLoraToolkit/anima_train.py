@@ -2101,6 +2101,11 @@ def main():
     if opt_type == "emosens" and lr_sched != "none":
         logger.warning("EmoSens 内部会根据 loss 序列动态写入学习率，已将外部 lr_scheduler 设为 none")
         lr_sched = "none"
+    if opt_type == "automagic" and lr_sched != "none":
+        # Automagic 维护逐权重 lr mask，完全不读 group["lr"]；外部调度器改写
+        # group["lr"] 不会有任何效果，留着只会误导判读。
+        logger.warning("Automagic 自行维护逐权重学习率，外部 lr_scheduler 无效，已设为 none")
+        lr_sched = "none"
     
     if lr_sched == "cosine":
         eta_min = float(getattr(args, "lr_scheduler_eta_min", 0.0) or 0.0)

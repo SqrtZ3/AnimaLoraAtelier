@@ -47,6 +47,11 @@ except ImportError:  # pragma: no cover
     from muon_optimizer import Muon, MuonScheduleFree  # type: ignore
 
 try:
+    from .automagic_optimizer import Automagic
+except ImportError:  # pragma: no cover
+    from automagic_optimizer import Automagic  # type: ignore
+
+try:
     from .adopt_optimizer import ADOPT
 except ImportError:  # pragma: no cover
     from adopt_optimizer import ADOPT  # type: ignore
@@ -358,10 +363,29 @@ def create_optimizer(
             weight_decay=weight_decay, eps=eps, **kwargs,
         )
 
+    if optimizer_type == "automagic":
+        # Automagic 自己管每个权重的 lr：yaml 的 learning_rate 是**起始值**，
+        # 训练强度由 optimizer_args.max_lr 决定（见 automagic_optimizer 文档）。
+        if "lr" in kwargs:
+            learning_rate = _coerce_float(kwargs.pop("lr"), "optimizer_args.lr")
+        if "weight_decay" in kwargs:
+            weight_decay = _coerce_float(
+                kwargs.pop("weight_decay"), "optimizer_args.weight_decay"
+            )
+        if "eps" in kwargs:
+            eps = _coerce_float(kwargs.pop("eps"), "optimizer_args.eps")
+        else:
+            eps = 1e-30  # Adafactor 分解二阶矩的稳定项，与 AdamW 的 1e-8 语义不同
+        kwargs.pop("betas", None)  # 无一阶动量，betas 不适用；静默丢弃
+        return create_automagic_optimizer(
+            params=params, lr=learning_rate,
+            weight_decay=weight_decay, eps=eps, **kwargs,
+        )
+
     raise ValueError(
         f"Unknown optimizer type: {optimizer_type}. "
         f"Choose from: adamw8bit, adamw, prodigyplus, soap, soap_sf, "
-        f"muon, muon_sf, adopt, lion, clion, emosens"
+        f"muon, muon_sf, adopt, lion, clion, emosens, automagic"
     )
 
 
@@ -821,6 +845,40 @@ def create_muon_optimizer(
         weight_decay=weight_decay,
         eps=eps,
         **muon_kwargs,
+    )
+
+
+# =============================================================================
+# Automagic (逐元素自适应 lr)
+# =============================================================================
+
+def create_automagic_optimizer(
+    params: ParamInput,
+    lr: float = 1e-6,
+    weight_decay: float = 0.0,
+    eps: float = 1e-30,
+    **kwargs,
+) -> Optimizer:
+    valid_keys = {"min_lr", "max_lr", "lr_bump", "beta2", "clip_threshold"}
+    am_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+    ignored = [k for k in kwargs if k not in valid_keys]
+    if ignored:
+        logger.warning(f"[Automagic] Ignored unsupported params: {ignored}")
+
+    param_list = params if _is_param_groups(params) else list(params)
+    logger.info(
+        "Creating Automagic optimizer "
+        "(start_lr=%s, min_lr=%s, max_lr=%s, lr_bump=%s, beta2=%s, wd=%s) "
+        "-- lr 逐权重自适应，训练强度由 max_lr 决定",
+        lr,
+        am_kwargs.get("min_lr", 1e-7),
+        am_kwargs.get("max_lr", 1e-3),
+        am_kwargs.get("lr_bump", 1e-6),
+        am_kwargs.get("beta2", 0.999),
+        weight_decay,
+    )
+    return Automagic(
+        param_list, lr=lr, weight_decay=weight_decay, eps=eps, **am_kwargs,
     )
 
 

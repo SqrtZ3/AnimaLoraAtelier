@@ -20,6 +20,9 @@
 | `emosens` | Loss 序列驱动动态 LR | ⚠️ 仅设范围 | 2× 参数量 | github.com/muooon/EmoSens |
 | `muon` | 动量 + Newton-Schulz 正交化（2D）| ✅ 是（≈AdamW 量级）| 2× 参数量（momentum+master）| github.com/KellerJordan/Muon + arXiv:2502.16982 |
 | `muon_sf` | Muon + Schedule-Free 平均 | ✅ 是（无需调度）| 3× 参数量（z+y+momentum）| 同上 + arXiv:2405.15682 |
+| `automagic` | 逐元素自适应 lr（Adafactor 二阶矩 + 符号一致性）| ⚠️ lr 是**起点**，强度看 `max_lr` | ~2.25× 参数量（master+mask+polarity）| github.com/ostris/ai-toolkit |
+
+> ⛔ **muon / muon_sf 不适用于 LoRA 画风训练**（2026-07-18 实测结案，见 §8 警告框）。
 
 **共同实现细节**：SOAP / ADOPT / Lion / EmoSens 的**状态张量全部强制存 fp32**，即使参数是 bf16 也不例外——防止 bf16 下二阶矩精度损失。
 
@@ -455,9 +458,29 @@ optimizer_args:
 AdamW fallback。`muon_sf` 在此之上叠 Schedule-Free 平均（`lr_scheduler` 必须 `none`，
 任意 step `eval()` 拿平均 checkpoint；短跑 ≤100 步的滞后警告同 soap_sf）。
 
+> ⛔ **2026-07-18 实测结案：muon / muon_sf 不要用于 LoRA 画风训练。**
+> Krea2 c12port 配方下换 muon_sf 后几乎不拟合，lr 从 5e-5 一路试到 5e-4 全部无效。
+> 根因由同 epoch9 checkpoint 逐层取证锁定（`tools/lora_delta_forensics.py`）：
+>
+> | | 总 ‖ΔW‖² | top1 能量 | 谱条件数 | 有效秩 | 最强层 |
+> |---|---|---|---|---|---|
+> | adamw | 112.4 | **57.7%** | **22.1** | 8.3 | top1 98%, s_max 2.42 |
+> | muon_sf | 44.5 | **8.9%** | **1.7** | 25.0 | top1 3.5%, s_max 0.162 |
+>
+> Newton-Schulz 每步把更新矩阵的**所有奇异值拉到 1**——这是谱预条件的设计目的，
+> 对预训练全模型是优点，但 LoRA 画风增量的真实目标每层近似 **rank-1**（adamw 最强层
+> top1 占 98%），NS 会主动把预算平摊到全部 48 个方向。主方向幅度差 **15×**，
+> 这就是"不拟合"。**调 lr 治不了**：lr 只等比缩放全部奇异值（尺度问题），而这是
+> 形状问题——所以 5e-5→5e-4 全程无效。
+>
+> 附带修正：下方"直接用 AdamW 的经验值"这句**本身也不准确**。本地实测（真实
+> LoRA 形状拟合 rank-32 目标）追平 AdamW 5e-5 需要 muon_sf ≈ 3e-4，约 **4–6×**，
+> 而非 1:1。位移量级确实对齐（1.5× 内），但 ΔW=B@A 是两因子乘积，位移对齐 ≠
+> 拟合效率对齐。保留此条仅为历史记录，不建议按它调参。
+
 ```yaml
 optimizer_type: "muon_sf"        # 或 "muon"
-learning_rate: 1e-4              # moonlight 缩放下与 AdamW lr 同量级，直接用 AdamW 的经验值
+learning_rate: 1e-4              # ⚠ 见上方警告框：此口径不准确，实测需 4–6×
 lr_scheduler: "none"
 optimizer_args:
   betas: [0.9, 0.95]             # muon_sf: [SF 插值权重, 1D 二阶矩衰减]；muon: 1D AdamW betas
@@ -483,6 +506,59 @@ optimizer_args:
 > `state["y"]`），bf16 参数只是每步刷新的视图。数值复现：同 lr=1e-4 下修复前 AdamW
 > 对 down 矩阵的位移是 muon_sf 的 165 倍，修复后 bf16≡fp32、量级与 AdamW 相当
 > （tests/test_pissa_dora_muon_fixes.py::TestMuonRMSScaleAndMaster）。
+
+---
+
+### 9. `automagic` — 逐元素自适应学习率
+
+**核心思想**（移植自 [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit)
+`toolkit/optimizers/automagic.py`，Apache-2.0）：**每个权重一个独立的学习率**。
+本步更新符号与上步一致 → `lr += lr_bump`；符号翻转 → `lr -= lr_bump`；钳在
+`[min_lr, max_lr]`。直觉是：梯度方向被数据稳定支持的权重自动加速，被噪声驱动、
+符号来回翻转的权重 lr 衰减到 `min_lr`，**等于自动饿死噪声方向**。
+
+二阶矩用 **Adafactor 分解**（2D 参数只存行/列两个向量），并对更新做 RMS 裁剪
+（`clip_threshold=1.0`），量级语义与 AdamW 的 `m/sqrt(v)` (RMS≈1) 对齐。
+**无一阶动量**（与 AdamW/Lion 的关键差异，逐步更新噪声更大）。
+
+```yaml
+optimizer_type: "automagic"
+learning_rate: 1.0e-6          # ★这是【起始 lr】，不是训练强度
+lr_scheduler: "none"           # 自管逐权重 lr，外部调度器会被强制关掉
+optimizer_args:
+  min_lr: 1.0e-7
+  max_lr: 1.0e-4               # ★真正的强度旋钮（方向稳定的权重最终顶到这里）
+  lr_bump: 1.0e-6              # 每步调整量；从 lr 爬到 max_lr 需 (max_lr-lr)/lr_bump 步
+  beta2: 0.999
+  clip_threshold: 1.0
+  weight_decay: 0.00001        # 解耦，按逐元素 lr 缩放
+```
+
+**参数影响：**
+
+| 参数 | 影响 |
+|---|---|
+| `learning_rate` | **仅是起点**。构造期校验它必须落在 `[min_lr, max_lr]`，否则 fail-fast |
+| `max_lr` | 真正决定训练强度。RMS 裁剪使量级语义≈AdamW，可直接沿用 AdamW 已验证值 |
+| `lr_bump` | 爬升速度。太小则整个 run 都没爬到位（判读时先看 avg_lr，别误判成不拟合） |
+| `beta2` | 分解二阶矩衰减 |
+
+**判读**：日志会打 `avg_lr`（`optimizer.get_avg_learning_rate()`）。
+- avg_lr 绝大多数顶到 `max_lr` → 退化成固定 lr 的 Adafactor，逐元素机制没起作用；
+- avg_lr 明显低于 `max_lr` 且分布分化 → 机制在工作。
+
+> ⚠️ **本仓库改动：fp32 master（非上游写法）**。本仓库 LoRA 可训练参数是 bf16，
+> 起始 lr=1e-6 时每步更新 ≈1e-6，**低于 bf16 在 LoRA 参数量级(~6e-3)的 ulp(~3e-5)**，
+> 直接写 bf16 会被四舍五入全部吞掉——即 muon_sf 踩过的同款坑。上游用随机舍入
+> (`copy_stochastic`) 规避，本仓库统一用 fp32 master（`state["master"]`）。
+> `lr_mask` 同样强制 fp32：bf16 尾数仅 8 位，`1e-4 + 1e-6` 会直接舍回 1e-4，
+> lr_bump 机制会被静默废掉。回归测试见
+> `tests/test_automagic_optimizer.py::TestBf16MasterNoFreeze`。
+
+> **显存**：master 4B + lr_mask 4B + polarity 1B ≈ **9 B/param**，与 AdamW 的
+> 8 B/param 基本持平（本仓库 LoRA ~1.14 亿参数 → 约 1.0 GB）。
+> **不是省显存方案**——LoRA 训练的显存大头是激活（navit 实测 10GB + 0.52MB/token），
+> 优化器状态从来不是瓶颈。
 
 ---
 

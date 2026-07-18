@@ -46,6 +46,19 @@
 - **涉及文件**：
   - `utils/lion_optimizer.py`（Lion 类，`cautious=True` 即 C-Lion）
 
+## Automagic Optimizer (Apache-2.0)
+
+- **来源**：`ostris/ai-toolkit` 的 `toolkit/optimizers/automagic.py`
+  （逐元素自适应 lr：Adafactor 分解二阶矩 + 符号一致性 lr mask）
+- **许可**：Apache-2.0
+- **涉及文件**：
+  - `utils/automagic_optimizer.py`
+- **本地差异**：算法逻辑照搬上游；本仓库改用 **fp32 master** 累积更新，
+  替代上游的随机舍入（`copy_stochastic`）——本仓库 LoRA 参数为 bf16，
+  起始 lr 下每步更新低于 bf16 ulp，需防静默冻结（与 `muon_optimizer.py`
+  的同款修复保持一致）。未移植上游的 8-bit lr_mask 量化（`Auto8bitTensor`）
+  与参数交换（paramiter swapping）。
+
 ## EmoSens Optimizer (Apache-2.0)
 
 - **来源**：`muooon/EmoSens` official implementation

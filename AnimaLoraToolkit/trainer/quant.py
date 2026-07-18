@@ -60,9 +60,35 @@ _FP4_BLOCK = 16  # nvfp4 block 大小（沿 in_features/K 轴）
 _CAPS_CACHE: dict = {}
 _CAPS_ERR: dict = {}  # kind -> 最近一次探测失败的原因字符串（诊断用）
 
+# 探测的数值验收阈值：随机高斯数据下 fp8 量化 GEMM 的 relerr ≈ 0.037、
+# fp4 ≈ 0.13（本地/云端多平台实测）；内核"能跑但算错"时是 O(1) 或非有限。
+# 0.2 给足量化误差余量，同时能拦下任何真正失准的内核。
+_PROBE_RELERR_MAX = 0.2
+
+
+def _probe_check(y: torch.Tensor, ref: torch.Tensor, kind: str) -> None:
+    """探测 GEMM 的数值验收：非有限或相对逐元素 dequant 仿真失准即抛错。
+
+    背景：探测只 try/except「能不能跑」的话，"内核能跑但静默算错"的
+    平台组合（新架构 × 新 torch 常见）会溜过探测，训练首步直接 NaN
+    且极难归因——所以能跑只是必要条件，算得对才算可用。
+    """
+    if not torch.isfinite(y).all():
+        raise RuntimeError(f"{kind} 探测 GEMM 输出含非有限值（内核能跑但结果无效）")
+    ref = ref.float()
+    err = ((y.float() - ref).norm() / ref.norm().clamp(min=1e-12)).item()
+    if err > _PROBE_RELERR_MAX:
+        raise RuntimeError(
+            f"{kind} 探测 GEMM 数值失准：vs dequant 仿真 relerr={err:.3f} "
+            f"(> {_PROBE_RELERR_MAX})——内核能跑但算错，判为不可用")
+
 
 def _gemm_probe(kind: str) -> bool:
-    """kind: 'fp8_tensorwise' | 'fp8_rowwise' | 'fp4'。"""
+    """kind: 'fp8_tensorwise' | 'fp8_rowwise' | 'fp8_grad_*' | 'fp4'。
+
+    真实小 GEMM try/except + 数值验收（_probe_check）。形状取 256/512/256：
+    足够大到走真实 tile 路径（16³ 的角落形状可能命中特殊内核），又足够小
+    到探测耗时可忽略。"""
     if not torch.cuda.is_available():
         return False
     key = (kind, torch.cuda.current_device())
@@ -71,20 +97,22 @@ def _gemm_probe(kind: str) -> bool:
     ok = False
     try:
         dev = torch.device("cuda", torch.cuda.current_device())
-        M, K, N = 16, 32, 16
+        M, K, N = 256, 512, 256
         x = torch.randn(M, K, device=dev, dtype=torch.bfloat16)
         w = torch.randn(N, K, device=dev, dtype=torch.bfloat16)
         if kind == "fp8_tensorwise":
             xq, xs = _quant_fp8_tensorwise(x)
             wq, ws = _quant_fp8_tensorwise(w)
-            torch._scaled_mm(xq, wq.t(), scale_a=xs, scale_b=ws,
-                             out_dtype=torch.bfloat16)
+            y = torch._scaled_mm(xq, wq.t(), scale_a=xs, scale_b=ws,
+                                 out_dtype=torch.bfloat16)
+            _probe_check(y, (xq.float() * xs) @ (wq.float() * ws).t(), kind)
             ok = True
         elif kind == "fp8_rowwise":
             xq, xs = _quant_fp8_rowwise(x)
             wq, ws = _quant_fp8_rowwise(w)
-            torch._scaled_mm(xq, wq.t(), scale_a=xs, scale_b=ws.t(),
-                             out_dtype=torch.bfloat16)
+            y = torch._scaled_mm(xq, wq.t(), scale_a=xs, scale_b=ws.t(),
+                                 out_dtype=torch.bfloat16)
+            _probe_check(y, (xq.float() * xs) @ (wq.float() * ws).t(), kind)
             ok = True
         elif kind in ("fp8_grad_rowwise", "fp8_grad_tensorwise"):
             # 反向 dL/dx 的实际组合：e5m2 梯度 × e4m3 权重（部分平台的
@@ -97,14 +125,16 @@ def _gemm_probe(kind: str) -> bool:
                 gq, gs = _quant_fp8_rowwise(g, fmax=_E5M2_MAX,
                                             dtype=torch.float8_e5m2)
                 ones = ws.new_ones(1, wq.shape[1])
-                torch._scaled_mm(gq, wq_cm, scale_a=gs, scale_b=ones,
-                                 out_dtype=torch.bfloat16)
+                y = torch._scaled_mm(gq, wq_cm, scale_a=gs, scale_b=ones,
+                                     out_dtype=torch.bfloat16)
+                _probe_check(y, (gq.float() * gs) @ wq_cm.float(), kind)
             else:
                 gq, gs = _quant_fp8_tensorwise(g, fmax=_E5M2_MAX,
                                                dtype=torch.float8_e5m2)
                 _, ws_t = _quant_fp8_tensorwise(w)
-                torch._scaled_mm(gq, wq_cm, scale_a=gs, scale_b=ws_t,
-                                 out_dtype=torch.bfloat16)
+                y = torch._scaled_mm(gq, wq_cm, scale_a=gs, scale_b=ws_t,
+                                     out_dtype=torch.bfloat16)
+                _probe_check(y, (gq.float() * gs) @ (wq_cm.float() * ws_t), kind)
             ok = True
         elif kind == "fp4":
             if not hasattr(torch, "float4_e2m1fn_x2"):
@@ -112,11 +142,17 @@ def _gemm_probe(kind: str) -> bool:
             else:
                 xp, xbs, xts = _quant_nvfp4(x)
                 wp, wbs, wts = _quant_nvfp4(w)
-                torch._scaled_mm(
+                y = torch._scaled_mm(
                     xp.view(torch.float4_e2m1fn_x2),
                     wp.view(torch.float4_e2m1fn_x2).t(),
                     scale_a=_to_blocked(xbs), scale_b=_to_blocked(wbs),
                     out_dtype=torch.bfloat16)
+                # _scaled_mm 只吃 block scale；tensor scale 在外层另乘，
+                # 参考仿真同口径（ts 置 1 的 dequant）。
+                one = xts.new_tensor(1.0)
+                ref = (_dequant_nvfp4(xp, xbs, one, torch.float32)
+                       @ _dequant_nvfp4(wp, wbs, one, torch.float32).t())
+                _probe_check(y, ref, kind)
                 ok = True
         else:
             raise ValueError(f"未知 probe kind: {kind}")

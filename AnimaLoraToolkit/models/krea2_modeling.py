@@ -278,15 +278,23 @@ def attention(
     return rearrange(x, "B H L D -> B L (H D)")
 
 
-def _mask(mask: Tensor) -> Tensor:
+def _mask(mask: Tensor) -> Optional[Tensor]:
     """(B, L) key-padding mask → (B, 1, L, L) bool attention mask（外积）。
 
     与官方实现的唯一差异：对角线强制 True。全 False 行（padding 位置的 query）在
     math/efficient SDPA 后端会 softmax 出 NaN，并在下一层作为 value 污染有效 token
     （官方靠 CUDNN kernel 对全 mask 行输出 0 规避）。对角 True 后 pad 行只 attend 自己
     → 输出有限；有效 query 行的 masked key 集合不变，输出严格不变。
+
+    全可见（无任何 padding）时返回 None：attn_mask=None 数学上与全 True mask
+    严格等价，但允许 SDPA 走 flash 后端。非 None mask 会把 SDPA 排除出 flash，
+    某些平台（sm120 + torch 2.11 实测）进一步落到 math 后端，物化 heads×L² 的
+    注意力矩阵——eval/采样的 batch=1 长序列稠密前向因此单次分配 ~8GB 直接 OOM。
+    eval/采样恰好永远是无 padding 的满 mask，此返回 None 路径正中这两条链路。
     """
     m = mask.bool()
+    if bool(m.all()):
+        return None
     out = m.unsqueeze(1).unsqueeze(2) & m.unsqueeze(1).unsqueeze(3)
     L = m.shape[-1]
     idx = torch.arange(L, device=m.device)

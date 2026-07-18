@@ -603,6 +603,12 @@ def parse_args():
     p.add_argument("--no-browser", action="store_true", help="不自动打开监控面板浏览器")
     p.add_argument("--log-every", type=int, default=10, help="日志输出间隔")
     p.add_argument("--debug-first-batches", type=int, default=0, help="记录前 N 个优化步的张量统计，用于对齐 loss 标尺")
+    p.add_argument("--debug-nan-hooks", action="store_true",
+                   help="逐 module 探测 NaN/Inf 诞生点（诊断用，显著拖慢每步）。"
+                        "报告第一个『输入有限但输出非有限』的层，附带量化元信息。")
+    p.add_argument("--no-debug-nan-hooks-abort", dest="debug_nan_hooks_abort",
+                   action="store_false", default=True,
+                   help="配合 --debug-nan-hooks：抓到诞生点只记录不中止（默认抓到即中止，防现场被冲掉）。")
     p.add_argument("--grad-norm-log-every", type=int, default=0, help="每 N 个优化步记录梯度范数和裁切状态 (0=禁用)")
     p.add_argument("--keep-vae-on-gpu", action="store_true",
                    help="cache_latents=True 后仍让 VAE 留在 GPU，适合频繁采样，避免反复搬运。")
@@ -1324,6 +1330,14 @@ def main():
             _bq_stats["format"], _bq_stats["count"], _bq_stats["gemm"],
             _bq_stats["dequant"], _bq_stats["bytes_before"] / (1 << 30),
             _bq_stats["bytes_after"] / (1 << 30))
+
+    # ── NaN 诞生点探测（opt-in, default-off；见 trainer/nan_hooks.py）────────
+    # 装在量化之后：QuantLinear 已就位，hook 才能打印量化元信息（scale 粒度/范围）。
+    _nan_hook_state = None
+    if bool(getattr(args, "debug_nan_hooks", False)):
+        from trainer.nan_hooks import install_nan_hooks
+        _nan_hook_state = install_nan_hooks(
+            model, abort=bool(getattr(args, "debug_nan_hooks_abort", True)))
 
     # 数据集
     fit_packed_training = bool(getattr(args, "fit_packed_training", False))

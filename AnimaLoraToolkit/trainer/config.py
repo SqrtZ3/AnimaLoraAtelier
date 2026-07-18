@@ -214,6 +214,8 @@ YAML_TO_ARGS = {
     "monitor_port": "monitor_port",
     "no_browser": "no_browser",
     "debug_first_batches": "debug_first_batches",
+    "debug_nan_hooks": "debug_nan_hooks",
+    "debug_nan_hooks_abort": "debug_nan_hooks_abort",
     # 优化器配置映射
     "optimizer_type": "optimizer_type",
     "prodigyplus_d0": "prodigyplus_d0",
@@ -661,6 +663,8 @@ DEFAULTS = {
     "monitor_port": 8765,
     "no_browser": False,
     "debug_first_batches": 0,
+    "debug_nan_hooks": False,
+    "debug_nan_hooks_abort": True,
     "optimizer_type": "adamw",
     "prodigyplus_d0": 1e-6,
     "prodigyplus_use_stableadamw": True,

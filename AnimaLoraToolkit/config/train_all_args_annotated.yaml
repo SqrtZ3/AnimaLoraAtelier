@@ -38,7 +38,9 @@ model_family: "anima"
 # [krea2] Qwen3-VL-4B-Instruct 的 HuggingFace 目录（model_family=krea2 必填）。
 krea2_text_encoder_path: ""
 
-# [krea2] 官方 encoder 的用户文本 token 预算（模板前后缀之外）。默认 512=官方值。
+# [krea2] 官方 encoder 的用户文本 token 预算（模板前后缀之外）。默认 512=官方 encoder.py
+# 值（右截断，超长 caption 丢尾部）。设 <=0（如 0）=无上限：不截断、动态 pad，超长 caption
+# 全保留；仅在你的部署侧（ComfyUI/官方）同样不截时才用，否则训练/推理条件会不一致。
 krea2_text_max_length: 512
 
 # [krea2] 文本特征 LRU cache 条目数。每条 [L,12,2560] 压缩特征、典型 tag caption 数 MB；
@@ -659,3 +661,17 @@ stage_timing_warmup: 10
 #    - 自动 _find_factor 降级
 #    - ComfyUI 键名兼容（lokr_w1/w2_a/w2_b）
 #    小数据集若失败模式难解，可考虑后续接入 lycoris-lora 拿 Tucker 收益。
+
+# ══════════════════════════════════════════════════════════════════
+# 冻结底模量化（opt-in, default-off；详见 docs/base-quant.md）
+# ══════════════════════════════════════════════════════════════════
+# 只量化冻结底模的 Linear（LoRA adapter 全程 bf16）。none 时与历史逐 bit 等价。
+# 收益（krea2 12.9B）：fp8 权重 25.8→12.9GB（H20 可走 fp8 GEMM 提速）；
+# fp4 →6.8GB（H20 无 fp4 tensor core，自动退 dequant-bf16 = 纯省显存）。
+# fail-fast 组合：dora / lora_one_init_steps / torch_compile / 非 bf16。
+base_quant: "none"             # none | fp8 | fp4
+base_quant_gemm: "auto"        # auto=探测到 _scaled_mm 就走量化 GEMM；on=强制(失败报错)；off=只省显存
+base_quant_fp8_scale: "auto"   # auto=优先 rowwise(H20/sm90, torch>=2.5)，退 tensorwise
+base_quant_fp8_grad: false     # 反向 dL/dx 也走 fp8（e5m2 梯度；更快但多一层量化噪声，先 A/B）
+base_quant_include: null       # null=family 默认（krea2: blocks/txtfusion/txtmlp；anima: blocks）
+base_quant_skip: null          # 额外排除的 regex 列表（fullmatch 逻辑层名）

@@ -1237,6 +1237,19 @@ def main():
     if raw_include_patterns is not None:
         injector_kwargs["include_patterns"] = list(raw_include_patterns)
 
+    # lora_compress_replace_main 只写压缩件、不写满 rank 主件 → 满 rank 权重此后
+    # 只有 training_state(.pt) 一个副本。若 save_state_every<=0 就一份都不存，
+    # 续训能力会被永久丢弃且用户不会察觉，故构造期 fail-fast。
+    if bool(getattr(args, "lora_compress_replace_main", False)):
+        _sse = int(getattr(args, "save_state_every", 0) or 0)
+        if _sse <= 0:
+            raise ValueError(
+                "lora_compress_replace_main=true 要求 save_state_every>0。\n"
+                "  该模式下 epoch 成品是逐层截断的压缩件（不能续训），满 rank 权重"
+                "只存在于 training_state(.pt)；若不定期存 .pt，一旦中断就无法续训。\n"
+                "  请设 save_state_every（如按你的 40 步/epoch 设 40 = 每 epoch 一份），"
+                "或关掉 lora_compress_replace_main（改为主件+压缩件都写）。")
+
     raw_targets = getattr(args, "lora_targets", None)
     if raw_targets is not None:
         if isinstance(raw_targets, str):
@@ -1291,6 +1304,8 @@ def main():
         # Layer A：导出期 SVD 压缩
         lora_compress_energy=float(getattr(args, "lora_compress_energy", 1.0) or 1.0),
         lora_compress_max_rank=int(getattr(args, "lora_compress_max_rank", 0) or 0),
+        lora_compress_budget_mb=float(getattr(args, "lora_compress_budget_mb", 0.0) or 0.0),
+        lora_compress_replace_main=bool(getattr(args, "lora_compress_replace_main", False)),
         # Layer B：AC-LoRA 训练期 RESTART
         aclora_enabled=bool(getattr(args, "aclora_enabled", False)),
         aclora_restart_every=int(getattr(args, "aclora_restart_every", 200) or 0),

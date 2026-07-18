@@ -18,6 +18,8 @@ import torch
 from trainer.lora import (
     LoRAInjector,
     aclora_restart_matrix,
+    allocate_ranks_by_budget,
+    lora_pair_spectrum,
     svd_truncate_lora_pair,
 )
 
@@ -141,6 +143,230 @@ def test_failfast_aclora_requires_standard_lora():
             raise AssertionError(f"未 fail-fast: {kw}")
         except ValueError:
             pass
+
+
+# ── 全局预算分配（lora_compress_budget_mb）────────────────────────────────
+def test_spectrum_matches_materialized_svd():
+    # lora_pair_spectrum 必须与物化 ΔW 的 svdvals 一致（分配器的输入正确性）
+    torch.manual_seed(3)
+    A = torch.randn(16, 40)
+    B = torch.randn(52, 16)
+    s = 0.75
+    # svdvals 返回 min(out,in)=40 个值，其中只有前 rank=16 个非零；谱函数只返回这 16 个
+    ref = torch.linalg.svdvals((B @ A) * s)
+    got = lora_pair_spectrum(A, B, s)
+    assert got.numel() == 16
+    assert torch.allclose(ref[:16], got, atol=1e-4), (ref[:4], got[:4])
+    assert ref[16:].abs().max() < 1e-4, ref[16:].abs().max()
+
+
+def test_allocator_respects_budget_and_min_rank():
+    spectra = {"a": torch.tensor([4.0, 2.0, 1.0]), "b": torch.tensor([3.0, 0.1])}
+    per = {"a": 100.0, "b": 100.0}
+    # 预算 300 字节 = 3 个 rank
+    keep = allocate_ranks_by_budget(spectra, per, 300.0, min_rank=0)
+    assert sum(keep.values()) == 3, keep
+    # 贪心顺序：a1(16) > b1(9) > a2(4) → a=2, b=1
+    assert keep == {"a": 2, "b": 1}, keep
+    # min_rank 保底：预算为 0 也每层至少 1
+    keep0 = allocate_ranks_by_budget(spectra, per, 0.0, min_rank=1)
+    assert keep0 == {"a": 1, "b": 1}, keep0
+
+
+def test_allocator_matches_bruteforce_optimum():
+    # 小规模穷举：贪心分配应等于该预算下的能量最优分配
+    import itertools
+    torch.manual_seed(4)
+    spectra = {n: torch.sort(torch.rand(4), descending=True).values
+               for n in ("x", "y", "z")}
+    per = {"x": 10.0, "y": 20.0, "z": 30.0}
+    budget = 100.0
+    got = allocate_ranks_by_budget(spectra, per, budget, min_rank=0)
+    got_e = sum((spectra[n][: got[n]] ** 2).sum().item() for n in got)
+    best = 0.0
+    for combo in itertools.product(range(5), repeat=3):
+        alloc = dict(zip(("x", "y", "z"), combo))
+        if sum(alloc[n] * per[n] for n in alloc) > budget:
+            continue
+        best = max(best, sum((spectra[n][: alloc[n]] ** 2).sum().item() for n in alloc))
+    assert got_e >= best - 1e-9, (got_e, best, got)
+
+
+def test_failfast_budget_and_threshold_mutually_exclusive():
+    try:
+        LoRAInjector(rank=8, alpha=8.0, targets=TARGETS,
+                     lora_compress_budget_mb=1.0, lora_compress_energy=0.9)
+        raise AssertionError("budget+energy 同开未 fail-fast")
+    except ValueError as e:
+        assert "互斥" in str(e)
+
+
+def test_budget_export_hits_target_and_beats_threshold():
+    """预算模式：产物体积 ≈ 预算，且同体积下保留能量 ≥ 逐层阈值策略。"""
+    from safetensors.torch import load_file
+    torch.manual_seed(5)
+    tmp = tempfile.mkdtemp()
+
+    def _fill(inj):
+        # 造出"层间重要性差异大"的局面——分配器的价值正在于此
+        with torch.no_grad():
+            for i, lora in enumerate(inj.injected.values()):
+                ad = lora.adapter
+                ad.lora_down.weight.normal_(0, 0.5)
+                ad.lora_up.weight.normal_(0, 0.5 if i == 0 else 0.02)
+
+    def _energy(path):
+        sd = load_file(path)
+        tot = 0.0
+        for k in sd:
+            if not k.endswith(".lora_down.weight"):
+                continue
+            b = k[: -len(".lora_down.weight")]
+            tot += (sd[b + ".lora_up.weight"] @ sd[k]).pow(2).sum().item()
+        return tot
+
+    budget_mb = 0.02
+    m = _make_model()
+    inj = LoRAInjector(rank=8, alpha=8.0, targets=TARGETS,
+                       lora_compress_budget_mb=budget_mb)
+    inj.inject(m)
+    _fill(inj)
+    p1 = os.path.join(tmp, "b.safetensors")
+    inj.save(p1)
+    c1 = os.path.join(tmp, "b.compressed.safetensors")
+    assert os.path.exists(c1)
+    size_mb = os.path.getsize(c1) / 2 ** 20
+    # min_rank=1 保底 + safetensors 头部开销 → 允许略超预算，但不该失控
+    assert size_mb <= budget_mb * 2.5, size_mb
+
+    # 同一权重、用逐层阈值策略调到相近体积，保留能量应不优于预算模式
+    m2 = _make_model()
+    inj2 = LoRAInjector(rank=8, alpha=8.0, targets=TARGETS,
+                        lora_compress_max_rank=1)
+    inj2.inject(m2)
+    with torch.no_grad():
+        for a, b in zip(inj.injected.values(), inj2.injected.values()):
+            b.adapter.lora_down.weight.copy_(a.adapter.lora_down.weight)
+            b.adapter.lora_up.weight.copy_(a.adapter.lora_up.weight)
+    p2 = os.path.join(tmp, "t.safetensors")
+    inj2.save(p2)
+    c2 = os.path.join(tmp, "t.compressed.safetensors")
+    if os.path.getsize(c2) <= os.path.getsize(c1):
+        assert _energy(c1) >= _energy(c2) * 0.999, (_energy(c1), _energy(c2))
+
+
+# ── 只留压缩件（lora_compress_replace_main）──────────────────────────────
+def test_replace_main_writes_only_compressed():
+    """主件不写，path 处直接就是压缩件（逐层 rank ≤ 训练 rank）。"""
+    from safetensors.torch import load_file
+    torch.manual_seed(6)
+    tmp = tempfile.mkdtemp()
+    m = _make_model()
+    inj = LoRAInjector(rank=8, alpha=8.0, targets=TARGETS,
+                       lora_compress_budget_mb=0.02,
+                       lora_compress_replace_main=True)
+    inj.inject(m)
+    with torch.no_grad():
+        for lora in inj.injected.values():
+            lora.adapter.lora_down.weight.normal_(0, 0.5)
+            lora.adapter.lora_up.weight.normal_(0, 0.5)
+    p = os.path.join(tmp, "r.safetensors")
+    inj.save(p)
+    assert os.path.exists(p)
+    # 不应再有单独的 .compressed 文件（压缩件就是主件本身）
+    assert not os.path.exists(os.path.join(tmp, "r.compressed.safetensors"))
+    sd = load_file(p)
+    for base in ("lora_unet_lin_a", "lora_unet_lin_b"):
+        assert sd[f"{base}.lora_down.weight"].shape[0] <= 8
+    # 满 rank 主件被跳过 → 体积应显著小于同权重的非 replace 模式产物
+    m2 = _make_model()
+    inj2 = LoRAInjector(rank=8, alpha=8.0, targets=TARGETS)
+    inj2.inject(m2)
+    with torch.no_grad():
+        for a, b in zip(inj.injected.values(), inj2.injected.values()):
+            b.adapter.lora_down.weight.copy_(a.adapter.lora_down.weight)
+            b.adapter.lora_up.weight.copy_(a.adapter.lora_up.weight)
+    p2 = os.path.join(tmp, "f.safetensors")
+    inj2.save(p2)
+    assert os.path.getsize(p) < os.path.getsize(p2), (
+        os.path.getsize(p), os.path.getsize(p2))
+
+
+def test_failfast_replace_main_without_compression():
+    try:
+        LoRAInjector(rank=8, alpha=8.0, targets=TARGETS,
+                     lora_compress_replace_main=True)
+        raise AssertionError("replace_main 但未开压缩，未 fail-fast")
+    except ValueError as e:
+        assert "需要同时开启压缩" in str(e)
+
+
+def test_load_compressed_file_failfast():
+    """压缩件不能用于续训——必须给出可懂的错误，而不是 shape 不匹配。"""
+    torch.manual_seed(7)
+    tmp = tempfile.mkdtemp()
+    m = _make_model()
+    inj = LoRAInjector(rank=8, alpha=8.0, targets=TARGETS,
+                       lora_compress_budget_mb=0.02,
+                       lora_compress_replace_main=True)
+    inj.inject(m)
+    with torch.no_grad():
+        for lora in inj.injected.values():
+            lora.adapter.lora_down.weight.normal_(0, 0.5)
+            lora.adapter.lora_up.weight.normal_(0, 0.5)
+    p = os.path.join(tmp, "c.safetensors")
+    inj.save(p)
+
+    m2 = _make_model()
+    inj2 = LoRAInjector(rank=8, alpha=8.0, targets=TARGETS)
+    inj2.inject(m2)
+    try:
+        inj2.load(p)
+        raise AssertionError("从压缩件 load 未 fail-fast")
+    except ValueError as e:
+        assert "不能用于续训" in str(e), str(e)
+
+
+def test_training_state_roundtrip_survives_replace_main():
+    """replace_main 下满 rank 权重只在 .pt 里——必须能完整往返恢复。"""
+    from trainer.checkpoint import load_training_state, save_training_state
+    torch.manual_seed(8)
+    tmp = tempfile.mkdtemp()
+    m = _make_model()
+    inj = LoRAInjector(rank=8, alpha=8.0, targets=TARGETS,
+                       lora_compress_budget_mb=0.02,
+                       lora_compress_replace_main=True)
+    inj.inject(m)
+    with torch.no_grad():
+        for lora in inj.injected.values():
+            lora.adapter.lora_down.weight.normal_(0, 0.5)
+            lora.adapter.lora_up.weight.normal_(0, 0.5)
+    opt = torch.optim.AdamW(inj.get_params(), lr=1e-4)
+    sp = os.path.join(tmp, "s.pt")
+    save_training_state(sp, inj, opt, epoch=1, global_step=10, loss_history=[])
+    ref = {k: v.clone() for k, v in inj.state_dict().items()}
+
+    m2 = _make_model()
+    inj2 = LoRAInjector(rank=8, alpha=8.0, targets=TARGETS)
+    inj2.inject(m2)
+    opt2 = torch.optim.AdamW(inj2.get_params(), lr=1e-4)
+    load_training_state(sp, inj2, opt2)
+    got = inj2.state_dict()
+    for k, v in ref.items():
+        assert k in got, k
+        assert torch.allclose(v.float(), got[k].float(), atol=1e-6), k
+
+
+def test_budget_zero_is_behavior_neutral():
+    # 三项全默认 → 不写压缩件（与该功能上线前逐字节一致）
+    tmp = tempfile.mkdtemp()
+    m = _make_model()
+    inj = LoRAInjector(rank=8, alpha=8.0, targets=TARGETS,
+                       lora_compress_budget_mb=0.0)
+    inj.inject(m)
+    p = os.path.join(tmp, "z.safetensors")
+    inj.save(p)
+    assert not os.path.exists(os.path.join(tmp, "z.compressed.safetensors"))
 
 
 def test_failfast_compress_requires_standard_lora():

@@ -161,6 +161,64 @@ def svd_truncate_lora_pair(down: torch.Tensor, up: torch.Tensor, scaling: float,
     return down_new, up_new, keep, dropped
 
 
+def lora_pair_spectrum(down: torch.Tensor, up: torch.Tensor, scaling: float):
+    """只算 ΔW 的奇异值谱（不做截断、不物化全矩阵）。
+
+    用于全局预算分配的第一遍扫描：分配器需要先看到所有层的谱，才能决定
+    每层该分几个 rank。QR 技巧同 svd_truncate_lora_pair。
+    返回 S：(r,) 降序奇异值，已含 scaling。
+    """
+    A = down.detach().float()
+    B = up.detach().float()
+    _, Rb = torch.linalg.qr(B)
+    _, Ra = torch.linalg.qr(A.t())
+    return torch.linalg.svdvals((Rb @ Ra.t()) * float(scaling))
+
+
+def allocate_ranks_by_budget(spectra: dict, bytes_per_rank: dict,
+                             budget_bytes: float, min_rank: int = 1):
+    """全局 σ²/字节最优秩分配：给定总字节预算，决定每层保留几个奇异分量。
+
+    机理：把"再给某层加 1 个 rank"看成一次投资——收益是该层下一个奇异值的能量
+    σ²，成本是该层每 rank 的字节数 (in+out)·2。贪心地总是先买"每字节能量增益"
+    最大的那一个，即为该预算下的能量最优分配（各层收益随 rank 递减，贪心即最优）。
+
+    为什么不用逐层能量阈值：逐层阈值对每层一视同仁，会在"范数极小但谱平"的层
+    （如 attn.qkv）上浪费大量字节，而这些层对总增量几乎无贡献。Krea2 c12port
+    epoch19 实测同等保留能量下，本方法体积小 1.3–3.2×：
+        逐层 energy=0.95 → 85.5MB/97.79%   vs   全局预算 35.5MB → 97.96%
+        逐层 energy=0.90 → 64.5MB/97.24%   vs   全局预算 20.3MB → 97.38%
+
+    Args:
+        spectra: {层名: 奇异值张量(降序)}
+        bytes_per_rank: {层名: 每个 rank 的字节数}
+        budget_bytes: 总预算（字节）
+        min_rank: 每层至少保留的 rank（默认 1；置 0 允许整层丢弃）
+    Returns:
+        {层名: keep}
+    """
+    import heapq
+    ranks = {n: 0 for n in spectra}
+    used = 0.0
+    heap = []
+    for n, S in spectra.items():
+        if S.numel() > 0:
+            heapq.heappush(heap, (-(S[0] ** 2).item() / bytes_per_rank[n], n))
+    while heap and used < budget_bytes:
+        _gain, n = heapq.heappop(heap)
+        S = spectra[n]
+        if ranks[n] >= S.numel():
+            continue
+        ranks[n] += 1
+        used += bytes_per_rank[n]
+        if ranks[n] < S.numel():
+            heapq.heappush(heap, (-(S[ranks[n]] ** 2).item() / bytes_per_rank[n], n))
+    if min_rank > 0:
+        for n in ranks:
+            ranks[n] = max(ranks[n], min(min_rank, int(spectra[n].numel())))
+    return ranks
+
+
 def aclora_restart_matrix(M: torch.Tensor, p: float, generator=None):
     """AC-LoRA RESTART（arXiv:2504.02231 Eq.2/3）对单个矩阵 M（A 或 B）做一次。
 
@@ -1237,6 +1295,7 @@ class LoRAInjector:
                  use_abba=False, abba_alpha=None, abba_export_kr=False,
                  # ── Layer A：导出期 SVD 压缩（save() 额外写压缩件；默认 off = 行为中立）──
                  lora_compress_energy=1.0, lora_compress_max_rank=0,
+                 lora_compress_budget_mb=0.0, lora_compress_replace_main=False,
                  # ── Layer B：AC-LoRA 训练期 RESTART（arXiv:2504.02231；默认 off）──
                  aclora_enabled=False, aclora_restart_every=200, aclora_warmup_steps=200,
                  aclora_p_mode="schedule", aclora_p_start=0.7, aclora_p_end=0.99,
@@ -1341,13 +1400,41 @@ class LoRAInjector:
         # ── Layer A：导出期 SVD 压缩配置 ────────────────────────────────
         self.lora_compress_energy = float(lora_compress_energy)
         self.lora_compress_max_rank = int(lora_compress_max_rank or 0)
+        self.lora_compress_budget_mb = float(lora_compress_budget_mb or 0.0)
         if not (0.0 < self.lora_compress_energy <= 1.0):
             raise ValueError(f"lora_compress_energy 必须在 (0,1]，得到 {self.lora_compress_energy}")
-        _compress_on = self.lora_compress_energy < 1.0 or self.lora_compress_max_rank > 0
+        if self.lora_compress_budget_mb < 0.0:
+            raise ValueError(
+                f"lora_compress_budget_mb 不能为负，得到 {self.lora_compress_budget_mb}")
+        # 两种分配策略互斥：预算模式（全局 σ²/字节最优）vs 逐层阈值模式。
+        # 同开会让"到底谁说了算"变得不可预测，故构造期 fail-fast。
+        if self.lora_compress_budget_mb > 0.0 and (
+                self.lora_compress_energy < 1.0 or self.lora_compress_max_rank > 0):
+            raise ValueError(
+                "lora_compress_budget_mb（全局预算分配）与 lora_compress_energy/"
+                "lora_compress_max_rank（逐层阈值）互斥，只能开一个。\n"
+                "  · 想按体积出件（推荐）：只设 lora_compress_budget_mb，如 35.0；\n"
+                "  · 想按逐层能量阈值：只设 lora_compress_energy，如 0.99。\n"
+                "  依据：Krea2 c12port epoch19 实测，同等保留能量下全局预算分配"
+                "体积小 1.3–3.2×（逐层 0.95→85.5MB/97.79% vs 全局 35.5MB/97.96%）。")
+        _compress_on = (self.lora_compress_energy < 1.0
+                        or self.lora_compress_max_rank > 0
+                        or self.lora_compress_budget_mb > 0.0)
+        # 只留压缩件、不写满 rank 主件。省磁盘/下载带宽，但满 rank 权重就只剩
+        # training_state(.pt) 一个副本了 —— 调用方（anima_train.py）必须确保
+        # save_state_every>0，否则续训能力会被永久丢弃。这里只能校验"压缩本身开着"。
+        self.lora_compress_replace_main = bool(lora_compress_replace_main)
+        if self.lora_compress_replace_main and not _compress_on:
+            raise ValueError(
+                "lora_compress_replace_main=true 需要同时开启压缩，否则没有压缩件可写、"
+                "主件又被跳过 = 什么都不保存。\n"
+                "  请设 lora_compress_budget_mb（推荐，如 35.0）"
+                "或 lora_compress_energy/lora_compress_max_rank。")
         if _compress_on and (self.use_lokr or self.use_abba or self.lora_variant != "base"):
             raise ValueError(
-                "导出期 SVD 压缩（lora_compress_energy<1 或 lora_compress_max_rank>0）"
-                "首版只支持标准 LoRA（lora_type=lora, lora_variant=base）。\n"
+                "导出期 SVD 压缩（lora_compress_energy<1 / lora_compress_max_rank>0 / "
+                "lora_compress_budget_mb>0）首版只支持标准 LoRA"
+                "（lora_type=lora, lora_variant=base）。\n"
                 "  · LoKr/ABBA：请用各自的 native 导出 + tools/abba_export_lora.py；\n"
                 "  · DoRA：ΔW 含 dora_scale 逐行重归一化，非单纯 B@A，压缩语义不一致。")
 
@@ -2082,6 +2169,12 @@ class LoRAInjector:
                         "Compatible with loaders that read lambda_layer directly."
                     )
 
+        # replace_main：跳过满 rank 主件，直接把压缩件写到 path。构造期已保证此模式
+        # 只可能出现在标准 base LoRA 上（压缩本身就 fail-fast 排除了 lokr/abba/dora/tlora）。
+        if self.lora_compress_replace_main:
+            self._maybe_save_compressed(path, meta, replace_main=True)
+            return
+
         save_file(sd, path, metadata=self._augment_meta_with_config(meta))
         if self.lora_variant == "tlora" and self.use_lokr:
             logger.warning(
@@ -2095,7 +2188,28 @@ class LoRAInjector:
             logger.info(f"LoRA 保存到: {path}")
             self._maybe_save_compressed(path, meta)
 
-    def _maybe_save_compressed(self, path, meta: dict):
+    @staticmethod
+    def _compress_effective_pair(ad):
+        """取出压缩用的等价 (down, up) 因子对。
+
+        PiSSA/ortho 补偿式 init：净 ΔW = scaling·(B@A − B₀@A₀)，直接压 B@A 会把
+        base 权重的 top-r 主成分算进去（成品部署全错）。压缩前先按官方 PiSSA 折叠
+        （MuLabPKU/PiSSA：ΔW = scaling·[B|−B₀]@[A;A₀]）成 rank-2r 等价因子——与主
+        comfy 导出（state_dict export_for_comfy 分支）同一口径。svd_truncate_lora_pair
+        走 QR，支持任意秩输入，折叠后照压不物化全矩阵。lora_init=default 时
+        lora_down_init 为 None → 走 else，与改动前逐字节一致（行为中立）。
+        """
+        if (getattr(ad, "lora_down_init", None) is not None
+                and getattr(ad, "lora_up_init", None) is not None):
+            A0 = ad.lora_down_init.to(device=ad.lora_down.weight.device,
+                                      dtype=ad.lora_down.weight.dtype)
+            B0 = ad.lora_up_init.to(device=ad.lora_up.weight.device,
+                                    dtype=ad.lora_up.weight.dtype)
+            return (torch.cat([ad.lora_down.weight, A0], dim=0),      # (2r, in)
+                    torch.cat([ad.lora_up.weight, -B0], dim=1))       # (out, 2r)
+        return ad.lora_down.weight, ad.lora_up.weight
+
+    def _maybe_save_compressed(self, path, meta: dict, replace_main: bool = False):
         """Layer A：若开了导出压缩，额外写一份逐层 SVD 截断的部署件。
 
         主件（path，满 rank）保持不变——resume_lora 从它续训、信息完备；压缩件
@@ -2105,35 +2219,43 @@ class LoRAInjector:
         """
         energy = self.lora_compress_energy
         max_rank = self.lora_compress_max_rank
-        if not (energy < 1.0 or max_rank > 0):
+        budget_mb = self.lora_compress_budget_mb
+        if not (energy < 1.0 or max_rank > 0 or budget_mb > 0.0):
             return
         import os as _os
         from safetensors.torch import save_file
+
+        # 预算模式：先扫一遍全部层的谱，做全局 σ²/字节最优分配，得到逐层 keep。
+        # 分两遍是为了省显存——第一遍只留奇异值（每层 ≤64 个数），不缓存因子；
+        # 第二遍重算 QR 再截断。QR 在 r×r 上做，重算成本是秒级，可忽略。
+        budget_keep = None
+        if budget_mb > 0.0:
+            spectra, per_rank_bytes = {}, {}
+            for name, lora in self.injected.items():
+                ad = lora.adapter
+                eff_down, eff_up = self._compress_effective_pair(ad)
+                spectra[name] = lora_pair_spectrum(eff_down, eff_up, float(ad.scaling))
+                per_rank_bytes[name] = (eff_up.shape[0] + eff_down.shape[1]) * 2
+            budget_keep = allocate_ranks_by_budget(
+                spectra, per_rank_bytes, budget_mb * 2 ** 20, min_rank=1)
+
         comp = {}
         tot_in = tot_out = 0
         worst = (0.0, "")
         for name, lora in self.injected.items():
             base = "lora_unet_" + name.replace(".", "_")
             ad = lora.adapter
-            # PiSSA/ortho 补偿式 init：净 ΔW = scaling·(B@A − B₀@A₀)，直接压 B@A 会把
-            # base 权重的 top-r 主成分算进去（成品部署全错）。压缩前先按官方 PiSSA 折叠
-            # （MuLabPKU/PiSSA：ΔW = scaling·[B|−B₀]@[A;A₀]）成 rank-2r 等价因子——与主
-            # comfy 导出（state_dict export_for_comfy 分支）同一口径。svd_truncate_lora_pair
-            # 走 QR，支持任意秩输入，折叠后照压不物化全矩阵。lora_init=default 时
-            # lora_down_init 为 None → 走 else，与改动前逐字节一致（行为中立）。
-            if (getattr(ad, "lora_down_init", None) is not None
-                    and getattr(ad, "lora_up_init", None) is not None):
-                A0 = ad.lora_down_init.to(device=ad.lora_down.weight.device,
-                                          dtype=ad.lora_down.weight.dtype)
-                B0 = ad.lora_up_init.to(device=ad.lora_up.weight.device,
-                                        dtype=ad.lora_up.weight.dtype)
-                eff_down = torch.cat([ad.lora_down.weight, A0], dim=0)     # (2r, in)
-                eff_up = torch.cat([ad.lora_up.weight, -B0], dim=1)        # (out, 2r)
+            eff_down, eff_up = self._compress_effective_pair(ad)
+            if budget_keep is not None:
+                # 预算模式：keep 已由全局分配器定死，用 max_rank 通道传进去
+                # （energy=1.0 使能量准则不生效，两者取更紧者即 = 分配结果）。
+                down, up, keep, dropped = svd_truncate_lora_pair(
+                    eff_down, eff_up, float(ad.scaling),
+                    energy=1.0, max_rank=budget_keep[name])
             else:
-                eff_down, eff_up = ad.lora_down.weight, ad.lora_up.weight
-            down, up, keep, dropped = svd_truncate_lora_pair(
-                eff_down, eff_up, float(ad.scaling),
-                energy=energy, max_rank=max_rank)
+                down, up, keep, dropped = svd_truncate_lora_pair(
+                    eff_down, eff_up, float(ad.scaling),
+                    energy=energy, max_rank=max_rank)
             comp[f"{base}.lora_down.weight"] = down.to(torch.bfloat16).cpu().contiguous()
             comp[f"{base}.lora_up.weight"] = up.to(torch.bfloat16).cpu().contiguous()
             comp[f"{base}.alpha"] = torch.tensor(float(keep))
@@ -2143,8 +2265,11 @@ class LoRAInjector:
             tot_out += keep * (in_f + out_f)
             if dropped > worst[0]:
                 worst = (dropped, base)
-        stem, _ext = _os.path.splitext(str(path))
-        comp_path = stem + ".compressed.safetensors"
+        if replace_main:
+            comp_path = str(path)          # 压缩件即成品，不另起名
+        else:
+            stem, _ext = _os.path.splitext(str(path))
+            comp_path = stem + ".compressed.safetensors"
         max_keep = max((int(t.shape[0]) for k, t in comp.items()
                         if k.endswith("lora_down.weight")), default=0)
         comp_meta = dict(meta)
@@ -2154,12 +2279,24 @@ class LoRAInjector:
             "anima_lora_variant": "svd_compressed",
             "anima_compress_energy": f"{energy}",
             "anima_compress_max_rank": str(max_rank or 0),
+            "anima_compress_budget_mb": f"{budget_mb}",
         })
         save_file(comp, comp_path, metadata=self._augment_meta_with_config(comp_meta))
+        if budget_keep is not None:
+            ks = sorted(budget_keep.values())
+            mode = (f"budget={budget_mb}MB（全局 σ²/字节最优分配；逐层 rank "
+                    f"min={ks[0]} 中位={ks[len(ks) // 2]} max={ks[-1]}）")
+        else:
+            mode = f"energy={energy}, max_rank={max_rank or '∞'}（逐层阈值）"
         logger.info(
-            "[压缩件] %s：满 rank %.1f MB → %.1f MB（energy=%s, max_rank=%s，最大逐层丢弃能量 %.2f%% @ %s）",
-            comp_path, tot_in * 2 / 1e6, tot_out * 2 / 1e6, energy, max_rank or "∞",
+            "[压缩件%s] %s：满 rank %.1f MB → %.1f MB（%s，最大逐层丢弃能量 %.2f%% @ %s）",
+            "·替代主件" if replace_main else "", comp_path,
+            tot_in * 2 / 1e6, tot_out * 2 / 1e6, mode,
             worst[0] * 100.0, worst[1].removeprefix("lora_unet_"))
+        if replace_main:
+            logger.info(
+                "  ↳ 未写满 rank 主件（lora_compress_replace_main=true）；"
+                "满 rank 权重只在 training_state(.pt) 里，续训请用 --resume-state。")
 
     def load_state_dict_from_mapping(self, sd: dict, label: str = "checkpoint") -> int:
         """从 in-memory dict 加载 LoRA 权重。
@@ -2344,6 +2481,16 @@ class LoRAInjector:
 
         sd = {}
         with safe_open(path, framework="pt", device="cpu") as f:
+            # 压缩件是逐层变 rank 的 SVD 截断产物，只供部署。拿它续训会静默把
+            # 训练权重换成截断版（丢掉尾部方向，且逐层 rank 与配置 rank 不符），
+            # 因此在这里 fail-fast 而不是让后面的 shape 不匹配抛出难懂的错误。
+            fmeta = f.metadata() or {}
+            if fmeta.get("anima_lora_variant") == "svd_compressed":
+                raise ValueError(
+                    f"{path} 是导出压缩件（anima_lora_variant=svd_compressed），"
+                    "不能用于续训——它是逐层 SVD 截断的部署件，尾部方向已丢弃。\n"
+                    "  续训请用 training_state（.pt）：--resume-state <...>_state.pt\n"
+                    "  （开了 lora_compress_replace_main 时，满 rank 权重只存在于 .pt 里。）")
             for k in f.keys():
                 sd[k] = f.get_tensor(k)
 

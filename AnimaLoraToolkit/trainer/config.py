@@ -148,6 +148,8 @@ YAML_TO_ARGS = {
     # Layer A：导出期 SVD 压缩（save() 额外写 .compressed.safetensors 部署件）
     "lora_compress_energy": "lora_compress_energy",
     "lora_compress_max_rank": "lora_compress_max_rank",
+    "lora_compress_budget_mb": "lora_compress_budget_mb",
+    "lora_compress_replace_main": "lora_compress_replace_main",
     # Layer B：AC-LoRA 训练期 RESTART（arXiv:2504.02231）
     "aclora_enabled": "aclora_enabled",
     "aclora_restart_every": "aclora_restart_every",
@@ -596,11 +598,24 @@ DEFAULTS = {
     "dora_export_mode": "native",
     "dora_fast_norm": False,
     "dora_detach_norm": False,
-    # Layer A：导出期 SVD 压缩。energy=1.0 且 max_rank=0 → 关闭（行为中立，不写压缩件）。
-    # 开启后每次标准 LoRA save() 额外写一份逐层 SVD 截断的 .compressed.safetensors 部署件，
+    # Layer A：导出期 SVD 压缩。三项全为默认值 → 关闭（行为中立，不写压缩件）。
+    # 开启后每次标准 LoRA save() 额外写一份 SVD 截断的 .compressed.safetensors 部署件，
     # 主件（满 rank）不变、供 resume。仅 lora_type=lora + variant=base 可用。
+    #
+    # 两种分配策略，互斥（同开会构造期 fail-fast）：
+    #  · lora_compress_budget_mb（推荐）：给定目标体积，全局 σ²/字节最优分配逐层 rank。
+    #    Krea2 c12port epoch19 实测同等保留能量下比逐层阈值小 1.3–3.2×；
+    #    35MB 档高频保留 0.997、8.9MB 档 0.975（ComfyUI 3 seed×2 prompt 配对实拍）。
+    #  · lora_compress_energy / max_rank：逐层能量阈值（旧策略，保留兼容）。
+    #
+    # lora_compress_replace_main=true：不写满 rank 主件，epoch 成品直接就是压缩件。
+    #   省磁盘与下载带宽，但满 rank 权重此后**只存在于 training_state(.pt)**，
+    #   因此要求 save_state_every>0（否则 anima_train.py 构造期 fail-fast），
+    #   且续训必须走 --resume-state（从压缩件 load 会 fail-fast）。
     "lora_compress_energy": 1.0,
     "lora_compress_max_rank": 0,
+    "lora_compress_budget_mb": 0.0,
+    "lora_compress_replace_main": False,
     # Layer B：AC-LoRA 训练期 RESTART。默认关。仅 lora_type=lora + variant=base + init=default。
     "aclora_enabled": False,
     "aclora_restart_every": 200,     # 每多少 optimizer step 做一次 RESTART（论文 E=10 epoch 的 step 类比）

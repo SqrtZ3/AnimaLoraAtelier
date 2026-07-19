@@ -179,6 +179,7 @@ YAML_TO_ARGS = {
     "grad_clip_max_norm": "grad_clip_max_norm",
     "mixed_precision": "mixed_precision",
     "grad_checkpoint": "grad_checkpoint",
+    "grad_checkpoint_skip_last": "grad_checkpoint_skip_last",
     "num_workers": "num_workers",
     # 输出与保存
     "output_dir": "output_dir",
@@ -644,6 +645,12 @@ DEFAULTS = {
     "grad_clip_max_norm": 1.0,
     "mixed_precision": "bf16",
     "grad_checkpoint": False,
+    # 分块 grad checkpoint：最后 N 个 transformer block 不做 checkpoint（存全部激活、
+    # backward 不重算），其余照常。0 = 全部 checkpoint（默认，与改动前逐字节等价）。
+    # 用途：显存有富余时把它换成吞吐——每跳过一层省一次该层重算，数学恒等。
+    # 每层激活量随 pack token 数线性增长，设置前先按显存余量估算（krea2 12B @16k
+    # token 约 3.8GB/层）。仅 navit 打包路径 + krea2 模型族已接线。
+    "grad_checkpoint_skip_last": 0,
     "num_workers": 0,
     "output_dir": "./output",
     "output_name": "anima_lora",

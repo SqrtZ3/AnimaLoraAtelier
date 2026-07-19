@@ -719,8 +719,25 @@ class SingleStreamDiT(nn.Module):
             cross_mask=cross_mask, use_checkpoint=False,
         )
 
+    def _checkpoint_from_block(self, use_checkpoint: bool, skip_last: int) -> int:
+        """返回"从第几个 block 开始 checkpoint"的下标。
+
+        `skip_last=N` = 最后 N 个 block 不做 checkpoint（存全部激活、backward 不重算），
+        其余照常 checkpoint。数学上与全量 checkpoint 恒等，纯粹是显存/计算的取舍。
+
+        为什么把不 checkpoint 的层放在**末尾**而不是开头：backward 从后往前走，末尾这 N 层
+        的激活最先被消费并释放，等轮到前面 checkpoint 层重算时它们已经不占显存 → 峰值
+        ≈ N×每层激活（出现在 forward 末尾）。若放在开头，峰值会额外叠加一层重算的临时量。
+        """
+        n = len(self.blocks)
+        if not use_checkpoint:
+            return n            # 一个都不 checkpoint
+        skip = max(0, int(skip_last))
+        return max(0, n - skip)
+
     def forward_dense(self, x_B_C_T_H_W: Tensor, timesteps_B_T: Tensor, crossattn_emb: Tensor,
-                      cross_mask: Optional[Tensor] = None, use_checkpoint: bool = False) -> Tensor:
+                      cross_mask: Optional[Tensor] = None, use_checkpoint: bool = False,
+                      checkpoint_skip_last: int = 0) -> Tensor:
         x5d, t, context = self._normalize_inputs(x_B_C_T_H_W, timesteps_B_T, crossattn_emb)
         B, C, _T, H, W = x5d.shape
         p = self.config.patch
@@ -768,8 +785,9 @@ class SingleStreamDiT(nn.Module):
         )
         freqs = self.posemb(pos)
 
-        for block in self.blocks:
-            if use_checkpoint:
+        _ckpt_until = self._checkpoint_from_block(use_checkpoint, checkpoint_skip_last)
+        for _i, block in enumerate(self.blocks):
+            if _i < _ckpt_until:
                 combined = checkpoint(
                     lambda x_in, _b=block: _b(x_in, tvec, freqs, attn_mask),
                     combined, use_reentrant=False,
@@ -844,6 +862,7 @@ class SingleStreamDiT(nn.Module):
         visual_seqlens: Sequence[int],
         text_seqlens: Sequence[int],
         use_checkpoint: bool = False,
+        checkpoint_skip_last: int = 0,
     ) -> Tensor:
         """NaViT/Patch-n-Pack：G 张异构图打进一条单流序列，每图携带自己的 timestep。
 
@@ -962,10 +981,11 @@ class SingleStreamDiT(nn.Module):
 
         freqs = self.posemb(pos)
 
-        for block in self.blocks:
+        _ckpt_until = self._checkpoint_from_block(use_checkpoint, checkpoint_skip_last)
+        for _i, block in enumerate(self.blocks):
             def _run(x_in, _b=block):
                 return _b(x_in, tvec_1_G, freqs, self_bias, mod_index=mod_index)
-            if use_checkpoint:
+            if _i < _ckpt_until:
                 combined = checkpoint(_run, combined, use_reentrant=False)
             else:
                 combined = _run(combined)

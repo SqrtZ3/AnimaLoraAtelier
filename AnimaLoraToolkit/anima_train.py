@@ -511,6 +511,10 @@ def parse_args():
     p.add_argument("--max-img-w", type=int, default=0, help="同 max_img_h，宽度方向。")
     p.add_argument("--mixed-precision", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--grad-checkpoint", action="store_true", help="启用梯度检查点减少显存")
+    p.add_argument("--grad-checkpoint-skip-last", type=int, default=0,
+                   help="分块 grad checkpoint：最后 N 个 transformer block 不做 checkpoint"
+                        "（存全部激活、backward 不重算，数学恒等）。0=全部 checkpoint（默认）。"
+                        "显存有余时用它换吞吐；仅 navit 打包 + krea2 模型族已接线。")
     p.add_argument("--max-steps", type=int, default=0, help="最大训练步数 (0=无限制)")
     p.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
 
@@ -1424,6 +1428,30 @@ def main():
                 "navit_packing 需要显式设置 navit_token_budget（>0，按显存定，"
                 "见 docs/navit-packing.md 显存对照表）。"
             )
+    # ── 分块 grad checkpoint（grad_checkpoint_skip_last，opt-in，默认 0=行为中立）──
+    # 首版收窄变量面：只在 navit 打包 + krea2 模型族接线（该组合是显存富余最常见的场景，
+    # 也是 12B 宽 MLP 下重算开销最大的地方）。其余路径 fail-fast 并指出替代做法。
+    _ckpt_skip_last = int(getattr(args, "grad_checkpoint_skip_last", 0) or 0)
+    if _ckpt_skip_last < 0:
+        raise RuntimeError(
+            f"grad_checkpoint_skip_last={_ckpt_skip_last} 不能为负（0=全部 checkpoint）。")
+    if _ckpt_skip_last > 0:
+        if not bool(getattr(args, "grad_checkpoint", False)):
+            raise RuntimeError(
+                "grad_checkpoint_skip_last>0 需要 grad_checkpoint=true —— 它是在"
+                "「全部 checkpoint」基础上放开最后 N 层，grad_checkpoint=false 时本就"
+                "一层都不 checkpoint，该参数无意义。要全不 checkpoint 请直接设"
+                " grad_checkpoint=false。")
+        if not navit_packing:
+            raise RuntimeError(
+                "grad_checkpoint_skip_last 目前只在 navit 打包路径接线"
+                "（navit_packing=true）。ARB / fit 路径请暂时保持该值为 0。")
+        if str(getattr(args, "model_family", "") or "").lower() != "krea2":
+            raise RuntimeError(
+                "grad_checkpoint_skip_last 目前只支持 model_family=krea2"
+                f"（当前 {getattr(args, 'model_family', None)!r}）——其余模型族的"
+                " forward_packed_navit 尚未实现该参数。")
+
     # ── navit 多尺度阶梯（navit_multiscale，opt-in）：解析与校验 ──
     # 副本走 fit_plan 的 resize+crop 路径，v1 仅支持原生定尺寸（ARB 桶定尺寸下
     # bucket 在 __getitem__ 运行时决定，副本无法经 fit_plan 挂接）。
@@ -3449,6 +3477,7 @@ def main():
                         model, navit_latents, t, cross_packed, text_seqlens,
                         objective_cfg.noise, objective_cfg.loss,
                         use_checkpoint=bool(getattr(args, "grad_checkpoint", False)),
+                        checkpoint_skip_last=_ckpt_skip_last,
                         stage_timer=_stage_timer,
                     )
                     per_sample = _navit_info["per_image_loss"]

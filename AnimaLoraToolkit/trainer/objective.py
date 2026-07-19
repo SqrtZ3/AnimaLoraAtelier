@@ -1478,6 +1478,7 @@ def navit_packed_forward_and_loss(
     loss_cfg,
     noise_list=None,
     use_checkpoint=False,
+    checkpoint_skip_last=0,
     stage_timer=_NOOP_TIMER,
 ):
     """One NaViT/Patch-n-Pack training step core: ``G`` heterogeneous images packed into
@@ -1541,9 +1542,12 @@ def navit_packed_forward_and_loss(
     grid = torch.cat(grid_list, dim=2)               # [1, 2, ΣN]
 
     stage_timer.start("navit_model_forward")
+    # checkpoint_skip_last>0 时才传该 kwarg —— 未实现它的模型族（Anima 等）调用签名
+    # 保持逐字节不变，行为中立。构造期已在 anima_train.py 做过支持性校验。
+    _extra = {"checkpoint_skip_last": int(checkpoint_skip_last)} if checkpoint_skip_last else {}
     pred = model.forward_packed_navit(
         tokens, t_per_image, cross_packed, grid, vseq, [int(s) for s in text_seqlens],
-        use_checkpoint=use_checkpoint,
+        use_checkpoint=use_checkpoint, **_extra,
     )
     stage_timer.stop("navit_model_forward")
 

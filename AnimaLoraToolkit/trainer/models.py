@@ -221,6 +221,32 @@ def load_vae(vae_path, device, dtype, repo_root):
     return wrapper
 
 
+_QWEN_LEGACY_SUBDIR = "Qwen3-0.6B-Base"
+
+
+def _resolve_qwen_dir(qwen_path):
+    """兼容旧布局的路径解析。
+
+    Qwen3-0.6B 的权重/tokenizer 原本平铺在 `models/text_encoders/` 根目录，与 Krea2 的
+    `text_encoders/Qwen3-VL-4B-Instruct/` 层级不对称，已整理进 `text_encoders/Qwen3-0.6B-Base/`。
+    但训练 yaml 不随代码一起推送，云端可能仍写着旧的根目录路径 —— 这里做一次显式兜底：
+    只有当目标目录**没有** config.json、而其下 `Qwen3-0.6B-Base/` 有时才改写，并打 warning。
+    路径写对时本函数是恒等的，不引入任何行为变化。
+    """
+    p = Path(qwen_path)
+    if (p / "config.json").exists():
+        return qwen_path
+    legacy = p / _QWEN_LEGACY_SUBDIR
+    if (legacy / "config.json").exists():
+        logger.warning(
+            "text_encoder_path=%r 下没有 config.json，已自动改用 %r（Qwen3-0.6B 已从 "
+            "text_encoders/ 根目录整理进子目录）。建议更新 yaml 里的 text_encoder_path。",
+            str(p), str(legacy),
+        )
+        return str(legacy)
+    return qwen_path
+
+
 def load_text_encoders(qwen_path, t5_tokenizer_path, device, dtype):
     """加载文本编码器。
 
@@ -232,6 +258,7 @@ def load_text_encoders(qwen_path, t5_tokenizer_path, device, dtype):
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer, T5Tokenizer
 
+    qwen_path = _resolve_qwen_dir(qwen_path)
     qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_path, trust_remote_code=True)
 
     try:

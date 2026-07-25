@@ -105,3 +105,47 @@ def test_fp32_master_state_restored_to_fp32():
         assert st["exp_avg"].dtype == torch.float32, \
             "fp32 master 态没有被还原（会重新触发 muon ulp 冻结/ lerp 崩溃）"
         assert st["exp_avg_sq"].dtype == torch.float32
+
+
+def test_fp32_master_value_survives_resume():
+    """fp32 master 不仅 dtype 要回来，**数值低位**也必须回来。
+
+    历史 bug：复原逻辑写的是 `_cur_st[k] = _v.to(_sv.dtype)` —— 但 torch 的
+    load_state_dict 已经把 fp32 态降成参数 dtype（bf16）了，再转回 fp32 只恢复
+    容器类型，低位一去不返。实测复原后 master 与 bf16 参数逐元素相等，等于
+    master 被重置成参数值，fp32-master 防 ulp 冻结形同虚设。
+
+    这里在状态里塞一个远小于 bf16 ulp 的量（1e-4 vs O(1) 处 ulp≈8e-3），
+    往返后必须逐元素精确相等。
+    """
+    torch.manual_seed(2)
+    m, inj, params = _toy_setup()
+    opt = torch.optim.AdamW(params, lr=1e-3)
+    _one_step(m, params, opt)
+
+    expected = {}
+    for p, st in opt.state.items():
+        for k, v in list(st.items()):
+            if isinstance(v, torch.Tensor) and v.is_floating_point():
+                # fp32 master + 一个 bf16 表示不了的低位增量
+                st[k] = v.float() + 1e-4
+                expected[(id(p), k)] = st[k].clone()
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "state.pt"
+        save_training_state(path, inj, opt, epoch=1, global_step=1)
+
+        m2, inj2, params2 = _toy_setup()
+        opt2 = torch.optim.AdamW(params2, lr=1e-3)
+        _one_step(m2, params2, opt2)
+        load_training_state(path, inj2, opt2)
+
+    saved_vals = list(expected.values())
+    got_vals = [v for st in opt2.state.values() for k, v in st.items()
+                if isinstance(v, torch.Tensor) and v.is_floating_point()]
+    assert len(got_vals) == len(saved_vals) > 0, "状态张量数量对不上，测试前提失效"
+    for want, got in zip(saved_vals, got_vals):
+        assert got.dtype == torch.float32
+        assert torch.equal(got, want), (
+            "fp32 master 的数值低位在 resume 中丢失："
+            f"最大差 {(got - want).abs().max().item():.3e}（应为 0）")

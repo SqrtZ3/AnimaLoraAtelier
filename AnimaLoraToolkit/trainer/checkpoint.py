@@ -493,7 +493,12 @@ def load_training_state(path, injector, optimizer, scheduler=None):
             if (isinstance(_v, torch.Tensor) and isinstance(_sv, torch.Tensor)
                     and _v.is_floating_point() and _sv.is_floating_point()
                     and _v.dtype != _sv.dtype):
-                _cur_st[_k] = _v.to(_sv.dtype)
+                # ★ 必须从**磁盘上的原张量**搬值，不能 _v.to(_sv.dtype)：
+                #   torch 已经把 fp32 master 降成 bf16 了，再转回 fp32 只恢复容器
+                #   类型、低位一去不返（实测复原后 master 与 bf16 参数逐元素相等，
+                #   等于 master 被重置成参数值，fp32-master 防 ulp 冻结形同虚设）。
+                #   _sv 是 torch.load 出来的原始 fp32 张量，直接搬过来即可。
+                _cur_st[_k] = _sv.detach().to(device=_v.device)
                 _restored += 1
     if _restored:
         logger.info(f"优化器状态 dtype 复原: {_restored} 个浮点状态张量已转回保存时的 dtype"

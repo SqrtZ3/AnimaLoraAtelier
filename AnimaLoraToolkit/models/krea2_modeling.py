@@ -720,7 +720,7 @@ class SingleStreamDiT(nn.Module):
         )
 
     def _checkpoint_from_block(self, use_checkpoint: bool, skip_last: int) -> int:
-        """返回"从第几个 block 开始 checkpoint"的下标。
+        """返回 checkpoint 的**开区间上界**：下标 `_i < 返回值` 的 block 才做 checkpoint。
 
         `skip_last=N` = 最后 N 个 block 不做 checkpoint（存全部激活、backward 不重算），
         其余照常 checkpoint。数学上与全量 checkpoint 恒等，纯粹是显存/计算的取舍。
@@ -728,10 +728,15 @@ class SingleStreamDiT(nn.Module):
         为什么把不 checkpoint 的层放在**末尾**而不是开头：backward 从后往前走，末尾这 N 层
         的激活最先被消费并释放，等轮到前面 checkpoint 层重算时它们已经不占显存 → 峰值
         ≈ N×每层激活（出现在 forward 末尾）。若放在开头，峰值会额外叠加一层重算的临时量。
+
+        ★ 返回值语义是"checkpoint 到第几个 block 为止"，不是"从第几个开始"——
+          use_checkpoint=False 必须返回 0（一个都不 checkpoint）。曾经这里返回
+          len(self.blocks)，配合调用点的 `_i < 上界` 变成了"全部 checkpoint"，
+          与 use_checkpoint=False 的语义正好相反。
         """
         n = len(self.blocks)
         if not use_checkpoint:
-            return n            # 一个都不 checkpoint
+            return 0            # 一个都不 checkpoint
         skip = max(0, int(skip_last))
         return max(0, n - skip)
 

@@ -101,9 +101,14 @@ class CheckpointFromBlockSemanticsTests(unittest.TestCase):
         self.assertEqual(self.model._checkpoint_from_block(True, N_LAYERS + 10), 0)
 
     def test_checkpoint_disabled_ignores_skip(self):
-        """use_checkpoint=False 时无论 skip 多少都一层不 checkpoint。"""
+        """use_checkpoint=False 时无论 skip 多少都一层不 checkpoint。
+
+        返回值是"checkpoint 到第几个 block 为止"的开区间上界（调用点是
+        `_i < 返回值`），所以"一个都不 checkpoint" == 返回 0。曾经这里断言
+        N_LAYERS，把"全部 checkpoint"当成了"全不 checkpoint"，反而把 bug 锁死。
+        """
         for skip in (0, 2, 99):
-            self.assertEqual(self.model._checkpoint_from_block(False, skip), N_LAYERS)
+            self.assertEqual(self.model._checkpoint_from_block(False, skip), 0)
 
 
 @unittest.skipUnless(HAS_TORCH and HAS_CUDA, "needs torch + CUDA")

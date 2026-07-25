@@ -138,6 +138,8 @@ YAML_TO_ARGS = {
     "lora_alpha": "lora_alpha",
     "lora_dropout": "lora_dropout",
     "lokr_factor": "lokr_factor",
+    "lokr_w1_init_std": "lokr_w1_init_std",
+    "lokr_w1_lr_ratio": "lokr_w1_lr_ratio",
     "abba_alpha": "abba_alpha",
     "abba_export_kr": "abba_export_kr",
     "lora_variant": "lora_variant",
@@ -588,7 +590,20 @@ DEFAULTS = {
     "lora_rank": 32,
     "lora_alpha": 32.0,
     "lora_dropout": 0.0,
+    # LoKr 的 Kronecker 因子。in/out 各被切成 factor 份，ΔW=kron(w1(f,f), w2)。
+    # f 不能整除某层维度时会自动下调到 ≤f 的最大公约因子（启动日志里会列实际分布）。
+    # ★ f 直接决定"w1 冻在 init 时"的表达力上界 1/f²：f4=6.25% / f6=2.78% / f8=1.56%。
+    #   第三方成功的 Krea2 LoKr 等效 factor 只有 4~6。f 越小 → 约束越弱、w2 越大、体积越大。
     "lokr_factor": 8,
+    # w1 初始化的正态 std。默认 0.1（rms≈0.097）= 与改动前逐字节一致。
+    # 依据（本地取证）：第三方成功件学成后 |w1|rms 中位 0.49、90% 分位 1.63；
+    # w1 只有 f² 个参数、AdamW 每步至多走 lr，lr=1e-4 时从 0.097 爬到 0.49 要 ≥3900 步，
+    # 典型 run（数百~千步）来不及 → 把起点直接设到目标量级是最便宜的补救。
+    # step-0 中立只靠 w2_b=0 保证，与该值无关，怎么调都不破坏中立性。
+    "lokr_w1_init_std": 0.1,
+    # w1 的 lr 倍率，独立于 loraplus_lr_ratio（后者只抬 w2_b，**不抬 w1**）。
+    # 1.0 = 与改动前一致。w1 是乘性块间门控，抬太猛会让 ΔW 剧烈摆动，建议从 4~16 起试。
+    "lokr_w1_lr_ratio": 1.0,
     # ABBA（lora_type='abba'）：alpha1=alpha2 的统一覆盖；None → 官方口径 alpha=r（r=rank//2）
     "abba_alpha": None,
     # save() 是否额外写 KR 物化标准 LoRA 键（文件 ~8×，云端下载不友好）。

@@ -549,6 +549,13 @@ def parse_args():
     p.add_argument("--lora-alpha", type=float, default=32.0)
     p.add_argument("--lora-dropout", type=float, default=0.0)
     p.add_argument("--lokr-factor", type=int, default=8)
+    p.add_argument("--lokr-w1-init-std", type=float, default=0.1,
+                   help="LoKr w1 初始化正态 std（默认 0.1=行为中立）。w1 是 kron 的块间调制"
+                        "标量，冻在 init 时该结构表达力上界只有 1/f²；第三方成功件学成后"
+                        " |w1|rms 中位 0.49。仅 lora_type=lokr 生效。")
+    p.add_argument("--lokr-w1-lr-ratio", type=float, default=1.0,
+                   help="LoKr w1 的 lr 倍率（默认 1.0=行为中立）。独立于 loraplus_lr_ratio"
+                        "——后者只抬 w2_b，不抬 w1。仅 lora_type=lokr 生效。")
     p.add_argument("--lora-variant", choices=["base", "dora", "tlora"], default="base",
                    help="Adapter variant. 'dora' enables LyCORIS/ComfyUI-compatible DoRA-LoKr. "
                         "'tlora' enables timestep-dependent rank mask (arxiv:2507.05964); "
@@ -1291,6 +1298,8 @@ def main():
         abba_alpha=getattr(args, "abba_alpha", None),
         abba_export_kr=bool(getattr(args, "abba_export_kr", False)),
         factor=args.lokr_factor,
+        lokr_w1_init_std=float(getattr(args, "lokr_w1_init_std", 0.1) or 0.1),
+        lokr_w1_lr_ratio=float(getattr(args, "lokr_w1_lr_ratio", 1.0) or 1.0),
         rank_dropout=float(getattr(args, "rank_dropout", 0.0) or 0.0),
         module_dropout=float(getattr(args, "module_dropout", 0.0) or 0.0),
         loraplus_lr_ratio=float(getattr(args, "loraplus_lr_ratio", 1.0) or 1.0),

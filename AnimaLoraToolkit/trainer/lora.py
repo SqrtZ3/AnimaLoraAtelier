@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import collections
 import logging
 import math
 import re
@@ -715,13 +716,15 @@ class LoKrLayer(torch.nn.Module):
     def __init__(self, in_features, out_features, rank=4, alpha=1.0, factor=8, dropout=0.0,
                  rank_dropout=0.0, module_dropout=0.0,
                  tlora_enabled=False, tlora_rmin_ratio=0.5, tlora_alpha=1.0,
-                 tlora_lokr_ortho_init=False, device=None):
+                 tlora_lokr_ortho_init=False, device=None, w1_init_std=0.1):
         super().__init__()
         self.alpha = alpha
         self.in_features = in_features
         self.out_features = out_features
 
-        # 自动调整 factor 确保能整除
+        # 自动调整 factor 确保能整除。降级不是无害的（见 _find_factor 与 w1 的 1/f² 上界），
+        # 所以把请求值留下来，由 injector 汇总成一条日志，让用户看得见实际生效的结构。
+        self.requested_factor = int(factor)
         factor = self._find_factor(in_features, out_features, factor)
         self.factor = factor
 
@@ -752,8 +755,24 @@ class LoKrLayer(torch.nn.Module):
         self._md_keep: torch.Tensor | None = None
         self._md_compile_safe: bool = False
 
-        # ★ w1 用小 std 正态分布，配合 w2_b=0 初始时 ΔW=0；训练后 ΔW 量级由 scaling 控制
-        torch.nn.init.normal_(self.lokr_w1, mean=0.0, std=0.1)
+        # ★ w1 用正态分布，配合 w2_b=0 初始时 ΔW=0（step-0 中立只靠 w2_b=0，与 w1 无关，
+        #   所以 w1_init_std 怎么调都不破坏中立性）；训练后 ΔW 量级由 scaling 控制。
+        #
+        # 为什么这个 std 值要紧（2026-07-25 本地取证，见 memory
+        # krea2-lokr-fullw2-counterexample）：kron 的第 (i,j) 个块 = w1[i,j]·w2，即 f² 个块
+        # 全是同一个 w2 的标量倍，**w1 就是那 f² 个"块间调制标量"**。w1 若停在随机 init，
+        # 该结构的表达力上界是闭式的 1/f²（f=8 时仅 1.56%，实测贴合），而 w1 学到位时
+        # 最优可达 11–16% —— 差 7–10×。
+        # 而 w1 只有 f² 个参数、AdamW 每步至多走 lr：默认 std=0.1（rms≈0.097）距离第三方
+        # 成功件学成后的 |w1|rms 中位 0.49 差 5×，lr=1e-4 下要 ≥3900 步才爬得到，
+        # 典型 run（数百~千步）根本来不及。把起点直接设到目标量级是最便宜的补救。
+        # 默认保持 0.1 = 与改动前逐字节一致（行为中立）。
+        _w1_std = float(w1_init_std)
+        if not (_w1_std > 0.0):
+            raise ValueError(
+                f"lokr_w1_init_std 必须 > 0，得到 {_w1_std}。w1=0 会让 ΔW 恒为 0 且梯度全零"
+                "（kron 对 w2 的梯度正比于 w1），整个 LoKr 永久死掉。")
+        torch.nn.init.normal_(self.lokr_w1, mean=0.0, std=_w1_std)
 
         if self.tlora_enabled and bool(tlora_lokr_ortho_init):
             # 实验性 ortho init：在 (w2_a, w2_b) 的简化维度上套 SVD 方案；
@@ -774,8 +793,19 @@ class LoKrLayer(torch.nn.Module):
             self.lokr_w1_init = None
 
     def _find_factor(self, in_f, out_f, target_factor):
-        """找到能同时整除 in_features 和 out_features 的 factor"""
-        for f in [target_factor, 4, 2, 1]:
+        """找到能同时整除 in_features 和 out_features 的 factor（不超过 target）。
+
+        ★ 旧实现只试 `[target, 4, 2, 1]`：target 一旦不整除就直接跌到 4/2/1，中间那些
+          能整除的值（5、6、7…）全被跳过。后果不是报错而是**静默换结构** —— 例如
+          target=6 在 6144×16384 上会退到 4，w2 变大 2.25×、体积翻数倍，用户看不出来。
+          第三方成功件的等效 factor 正是 5、6 这类（w1 形状 (6,6)/(4,6)/(5,5)…）。
+
+        现在改为从 target 往下找**最大的**公约因子，只有真的一个都没有才退到 1。
+        f 的大小直接决定 w1 冻结时的表达力上界 1/f²（f=4→6.25%、f=8→1.56%），
+        所以"悄悄换成更大或更小的 f"是有实际代价的，这里返回后由调用方打日志。
+        """
+        target = max(1, int(target_factor))
+        for f in range(target, 0, -1):
             if in_f % f == 0 and out_f % f == 0:
                 return f
         return 1
@@ -1057,7 +1087,7 @@ class LoRALinear(torch.nn.Module):
                  dora_fast_norm=False, dora_detach_norm=False,
                  lora_init="default",
                  use_abba=False, abba_r1=None, abba_r2=None,
-                 abba_alpha1=None, abba_alpha2=None):
+                 abba_alpha1=None, abba_alpha2=None, lokr_w1_init_std=0.1):
         super().__init__()
         self.original = original
         self.use_lokr = use_lokr
@@ -1121,6 +1151,7 @@ class LoRALinear(torch.nn.Module):
                 tlora_alpha=tlora_alpha,
                 tlora_lokr_ortho_init=tlora_lokr_ortho_init,
                 device=svd_device,
+                w1_init_std=lokr_w1_init_std,
             )
         else:
             self.adapter = LoRALayer(
@@ -1293,6 +1324,11 @@ class LoRAInjector:
                  # 默认 False = 只存 native 因子（体积 = 同预算 LoRA），部署件
                  # 用 tools/abba_export_lora.py 在本地转换/压缩）。
                  use_abba=False, abba_alpha=None, abba_export_kr=False,
+                 # ── LoKr w1 的两个旋钮（默认值 = 与改动前逐字节一致）────────────────
+                 # w1 是 kron 的"块间调制标量"（f² 个），冻在 init 时该结构表达力上界
+                 # 只有 1/f²；而它参数少、AdamW 每步至多走 lr，典型 run 爬不到位。
+                 # 详见 LoKrLayer.__init__ 的 w1_init_std 注释与 get_param_groups。
+                 lokr_w1_init_std=0.1, lokr_w1_lr_ratio=1.0,
                  # ── Layer A：导出期 SVD 压缩（save() 额外写压缩件；默认 off = 行为中立）──
                  lora_compress_energy=1.0, lora_compress_max_rank=0,
                  lora_compress_budget_mb=0.0, lora_compress_replace_main=False,
@@ -1308,6 +1344,24 @@ class LoRAInjector:
         self.abba_alpha = float(abba_alpha) if abba_alpha else None
         self.abba_export_kr = bool(abba_export_kr)
         self.factor = factor
+        # ── LoKr w1 旋钮（校验放构造期，别等到跑起来才炸）────────────────────
+        self.lokr_w1_init_std = float(lokr_w1_init_std)
+        self.lokr_w1_lr_ratio = float(lokr_w1_lr_ratio)
+        if self.use_lokr:
+            if not (self.lokr_w1_init_std > 0.0):
+                raise ValueError(
+                    f"lokr_w1_init_std 必须 > 0，得到 {self.lokr_w1_init_std}。"
+                    "w1=0 会让 ΔW 恒为 0 且 w2 的梯度也恒为 0（kron 对 w2 的梯度正比于 w1），"
+                    "整个 LoKr 永久死掉。")
+            if not (self.lokr_w1_lr_ratio > 0.0):
+                raise ValueError(
+                    f"lokr_w1_lr_ratio 必须 > 0，得到 {self.lokr_w1_lr_ratio}"
+                    "（=1.0 表示与其余因子同 lr，即改动前的行为；<1 会更慢，通常不是你想要的）")
+        elif (self.lokr_w1_init_std != 0.1) or (self.lokr_w1_lr_ratio != 1.0):
+            # 非 LoKr 路径设这两个参数没有任何效果，静默忽略会让 A/B 白跑一轮
+            raise ValueError(
+                "lokr_w1_init_std / lokr_w1_lr_ratio 只对 lora_type='lokr' 生效"
+                f"（当前 lora_type 不是 lokr）。请去掉这两个参数，或改用 lora_type: lokr。")
         if self.use_abba:
             if self.use_lokr:
                 raise ValueError("lora_type='abba' 与 lokr 互斥")
@@ -1570,6 +1624,7 @@ class LoRAInjector:
                 tlora_lokr_ortho_init=self.tlora_lokr_ortho_init,
                 dora_fast_norm=self.dora_fast_norm,
                 dora_detach_norm=self.dora_detach_norm,
+                lokr_w1_init_std=self.lokr_w1_init_std,
                 **abba_kwargs,
             )
 
@@ -1603,6 +1658,22 @@ class LoRAInjector:
                 f"  ABBA: r1=r2=rank/2（全局 rank={self.rank} → {_r_half}，参数预算=同 rank 标准 LoRA），"
                 f"alpha1=alpha2={self.abba_alpha or float(_r_half):g}，"
                 f"init=SVD(W0)+B2=0（arXiv:2505.14238，KR 有效秩上限 {_r_half * _r_half}）"
+            )
+        if self.use_lokr:
+            # 实际生效的 factor 分布 + w1 旋钮。factor 会被 _find_factor 按整除性下调，
+            # 而 f 直接决定 w1 冻结时的表达力上界 1/f²，所以必须让用户看见实际值。
+            _facs = collections.Counter(
+                int(getattr(l.adapter, "factor", 0)) for l in self.injected.values())
+            _downgraded = sum(
+                c for fv, c in _facs.items() if fv != int(self.factor))
+            logger.info(
+                f"  LoKr: 请求 factor={self.factor} → 实际生效 {dict(sorted(_facs.items()))}"
+                + (f"（{_downgraded} 层因整除性被下调）" if _downgraded else "")
+            )
+            logger.info(
+                f"  LoKr w1: init_std={self.lokr_w1_init_std}（rms≈{self.lokr_w1_init_std:.3f}）, "
+                f"lr_ratio={self.lokr_w1_lr_ratio}；w1 冻结时表达力上界 1/f² = "
+                + ", ".join(f"f{fv}→{1.0 / (fv * fv) * 100:.2f}%" for fv in sorted(_facs))
             )
         if self.lora_variant == "tlora":
             r_min_example = max(int(round(self.rank * self.tlora_rmin_ratio)), 1)
@@ -1772,12 +1843,20 @@ class LoRAInjector:
     def get_param_groups(self, weight_decay, base_lr: float = 1.0, loraplus_lr_ratio=None):
         """获取参数组（支持 LoRA+、模块级 lr、LoKr w1 排除 weight_decay）"""
         ratio = max(float(loraplus_lr_ratio or self.loraplus_lr_ratio), 1.0)
+        # w1 的倍率独立于 LoRA+：LoRA+ 的理论针对的是"零初始化的那个因子"（这里是 w2_b），
+        # w1 是乘性门控、问题性质不同（量级不够而非从 0 起步），所以给它单独一个旋钮。
+        w1_ratio = float(getattr(self, "lokr_w1_lr_ratio", 1.0) or 1.0)
         groups_dict = {}  # (wd, lr_mult, custom_lr) -> [params]
 
         for name, lora in self.injected.items():
             custom_lr = self._module_lrs.get(name)
             if self.use_lokr:
-                key_w1 = (0.0, 1.0, custom_lr)
+                # w1 是 kron 的块间调制标量（只有 f² 个）。它冻在 init 时整个结构的
+                # 表达力上界是 1/f²（f=8 → 1.56%，本地闭式+数值双验证），而 w1 学到位
+                # 时最优可达 11–16%。它参数少、AdamW 每步至多走 lr，典型 run 爬不到
+                # 第三方成功件的量级（|w1|rms 中位 0.49 vs 我们 init 0.097）。
+                # ★ loraplus_lr_ratio 抬的是 w2_b，**不抬 w1** —— 想加速 w1 用这个。
+                key_w1 = (0.0, w1_ratio, custom_lr)
                 key_w2a = (weight_decay, 1.0, custom_lr)
                 key_w2b = (weight_decay, ratio, custom_lr)
                 groups_dict.setdefault(key_w1, []).append(lora.adapter.lokr_w1)
@@ -1832,7 +1911,9 @@ class LoRAInjector:
                 lr_target = "ABBA b2"
             else:
                 lr_target = "lora_up"
-            logger.info(f"[LoRA+] {lr_target} lr ×{ratio:.1f}")
+            logger.info(f"[LoRA+] {lr_target} lr ×{ratio:.1f}（注意：不作用于 LoKr w1）")
+        if self.use_lokr and w1_ratio != 1.0:
+            logger.info(f"[LoKr] w1 lr ×{w1_ratio:.1f}（块间调制标量，独立于 LoRA+）")
         return param_groups
 
     @staticmethod
@@ -2086,7 +2167,6 @@ class LoRAInjector:
             logger.info(f"LoRA diff 保存到: {path}")
             return
 
-        sd = self.state_dict(export_for_comfy=True)
         network_args = f'{{"algo": "lokr", "factor": {self.factor}}}' if self.use_lokr else "{}"
         if self.use_lokr and self.lora_variant == "dora":
             network_args = f'{{"algo": "lokr", "factor": {self.factor}, "dora_wd": true}}'
@@ -2171,10 +2251,13 @@ class LoRAInjector:
 
         # replace_main：跳过满 rank 主件，直接把压缩件写到 path。构造期已保证此模式
         # 只可能出现在标准 base LoRA 上（压缩本身就 fail-fast 排除了 lokr/abba/dora/tlora）。
+        # ★ 放在 state_dict() 之前：这个模式下满 rank 的 sd 根本用不上，264 层的
+        #   CPU 拷贝纯属浪费（_maybe_save_compressed 自己从 adapter 取因子）。
         if self.lora_compress_replace_main:
             self._maybe_save_compressed(path, meta, replace_main=True)
             return
 
+        sd = self.state_dict(export_for_comfy=True)
         save_file(sd, path, metadata=self._augment_meta_with_config(meta))
         if self.lora_variant == "tlora" and self.use_lokr:
             logger.warning(

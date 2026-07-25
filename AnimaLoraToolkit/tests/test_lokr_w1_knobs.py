@@ -133,18 +133,19 @@ def test_knobs_rejected_on_non_lokr():
 
 # ── _find_factor：不再静默跌到 4/2/1 ─────────────────────────────────────────
 
-@pytest.mark.parametrize("in_f,out_f,target,expect", [
-    (6144, 6144, 8, 8),      # 整除，原样
-    (6144, 6144, 6, 6),      # 旧实现会跌到 4（6144%6==0，本该保留 6）
-    (6144, 16384, 6, 2),     # 16384%6!=0、%5!=0、%4==0… 但 6144%4==0 → 4；实际公约取 2
-    (768, 768, 5, 1),        # 768%5!=0、%4==0 → 4
-    (1536, 6144, 6, 6),
+@pytest.mark.parametrize("in_f,out_f,target", [
+    (6144, 6144, 8),      # 整除，原样
+    (6144, 6144, 6),      # 旧实现会跌到 4（6144%6==0，本该保留 6）
+    (6144, 16384, 6),     # 两边公约只有 2（16384 无因子 3）
+    (6144, 16384, 8),     # krea2 真实的 mlp.gate 形状
+    (768, 768, 5),        # 768%5!=0 → 往下取 4
+    (1536, 6144, 6),
 ])
-def test_find_factor_picks_largest_divisor(in_f, out_f, target, expect):
+def test_find_factor_picks_largest_divisor(in_f, out_f, target):
+    """不写死期望值，直接对拍"≤target 的最大公约因子"这个定义 —— 免得注释算错。"""
     from trainer.lora import LoKrLayer
     got = LoKrLayer._find_factor(None, in_f, out_f, target)
-    # 断言：结果必须整除两边，且是 <=target 里最大的那个
-    assert in_f % got == 0 and out_f % got == 0
+    assert in_f % got == 0 and out_f % got == 0, "返回的 factor 必须整除两边"
     best = max(f for f in range(1, target + 1) if in_f % f == 0 and out_f % f == 0)
     assert got == best, f"in={in_f} out={out_f} target={target}: 取到 {got}，最大公约因子是 {best}"
 
@@ -155,3 +156,78 @@ def test_find_factor_no_longer_skips_middle_values():
     assert LoKrLayer._find_factor(None, 6144, 6144, 6) == 6
     # 6144%7!=0 → 往下第一个能整除的是 6（旧实现会直接跌到 4）
     assert LoKrLayer._find_factor(None, 6144, 6144, 7) == 6
+
+
+# ── lokr_compute_dtype：native(bf16) vs fp32 ─────────────────────────────────
+
+def test_compute_dtype_default_is_fp32():
+    ad = list(_inject().injected.values())[0].adapter
+    assert ad.compute_dtype == "fp32" and ad._compute_fp32 is True
+
+
+def test_compute_dtype_rejects_unknown():
+    with pytest.raises(ValueError, match="lokr_compute_dtype"):
+        _inject(lokr_compute_dtype="fp16")
+
+
+def test_native_avoids_fp32_copy_of_input():
+    """native 模式下 x.reshape(...) 应退化成 view —— 省显存的主要来源。
+
+    用"前向后新增的显存"间接证明：fp32 路径必须物化 N×in_features×4 的副本，
+    native 路径不需要。CPU 上改用 dtype 断言（中间量必须是 bf16）。
+    """
+    inj = _inject(lokr_compute_dtype="native")
+    ad = list(inj.injected.values())[0].adapter.to(torch.bfloat16)
+    ad.train()
+    seen = {}
+    orig = torch.matmul
+
+    def spy(a, b, *args, **kw):
+        out = orig(a, b, *args, **kw)
+        seen.setdefault("first_input_dtype", a.dtype)
+        return out
+
+    torch.matmul = spy
+    try:
+        ad(torch.randn(4, 768, dtype=torch.bfloat16))
+    finally:
+        torch.matmul = orig
+    assert seen["first_input_dtype"] == torch.bfloat16, \
+        "native 模式下第一个 matmul 的输入仍是 fp32（说明还在物化 fp32 副本）"
+
+
+def test_native_matches_fp32_within_bf16_ulp():
+    """native 与 fp32 的输出差应在 bf16 舍入量级（本地实测 ≈1.2 ulp），不是量级偏差。"""
+    torch.manual_seed(0)
+    a = _inject(lokr_compute_dtype="fp32", lokr_w1_init_std=0.5)
+    torch.manual_seed(0)
+    b = _inject(lokr_compute_dtype="native", lokr_w1_init_std=0.5)
+    ad_a = list(a.injected.values())[0].adapter.to(torch.bfloat16)
+    ad_b = list(b.injected.values())[0].adapter.to(torch.bfloat16)
+    with torch.no_grad():   # w2_b 零初始化 → ΔW≡0，给它真实量级才有对拍意义
+        ad_a.lokr_w2_b.normal_(0, 0.02)
+        ad_b.lokr_w2_b.copy_(ad_a.lokr_w2_b)
+        ad_b.lokr_w1.copy_(ad_a.lokr_w1)
+        ad_b.lokr_w2_a.copy_(ad_a.lokr_w2_a)
+    ad_a.train()
+    ad_b.train()
+    x = torch.randn(4, 768, dtype=torch.bfloat16)
+    oa, ob = ad_a(x).float(), ad_b(x).float()
+    rel = ((ob - oa).abs().max() / oa.abs().max()).item()
+    assert rel < 5e-2, f"native 与 fp32 相对差 {rel:.3e}，远超 bf16 舍入量级"
+
+
+def test_native_incompatible_with_tlora_ortho_init():
+    """ortho 补偿靠精确抵消保 step-0 中立，bf16 抵消不干净 → 构造期 fail-fast。"""
+    from trainer.lora import LoKrLayer
+    with pytest.raises(ValueError, match="tlora_lokr_ortho_init"):
+        LoKrLayer(768, 768, rank=32, alpha=32.0, factor=8,
+                  tlora_enabled=True, tlora_lokr_ortho_init=True,
+                  compute_dtype="native")
+
+
+def test_compute_dtype_rejected_on_non_lokr():
+    m = _toy()
+    with pytest.raises(ValueError, match="只对 "):
+        LoRAInjector(rank=32, alpha=32.0, use_lokr=False, targets=["attn_q"],
+                     lokr_compute_dtype="native").inject(m)

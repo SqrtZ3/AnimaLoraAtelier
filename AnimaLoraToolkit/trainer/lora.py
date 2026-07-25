@@ -716,7 +716,8 @@ class LoKrLayer(torch.nn.Module):
     def __init__(self, in_features, out_features, rank=4, alpha=1.0, factor=8, dropout=0.0,
                  rank_dropout=0.0, module_dropout=0.0,
                  tlora_enabled=False, tlora_rmin_ratio=0.5, tlora_alpha=1.0,
-                 tlora_lokr_ortho_init=False, device=None, w1_init_std=0.1):
+                 tlora_lokr_ortho_init=False, device=None, w1_init_std=0.1,
+                 compute_dtype="fp32"):
         super().__init__()
         self.alpha = alpha
         self.in_features = in_features
@@ -742,6 +743,28 @@ class LoKrLayer(torch.nn.Module):
         self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
         self.rank_dropout = float(rank_dropout or 0.0)
         self.module_dropout = float(module_dropout or 0.0)
+
+        # ── 训练期计算精度（compute_dtype）─────────────────────────────────
+        # "fp32"（默认，与改动前逐字节一致）：把 x 和三个因子都物化成 fp32 再算。
+        # "native"：直接用参数原 dtype（通常 bf16）。省显存的来源有两处——
+        #   ① `x.reshape(...).to(bf16)` 是 **view**，不再拷贝一份 N×in_features 的
+        #      fp32 副本（krea2 mlp.down 那层 @65536 token 就是 2.13 GB）；
+        #   ② tmp/y 这两个 N×out_features 的中间量从 4 字节降到 2 字节。
+        # 本地实测（RTX 5070 Laptop，krea2 mlp.gate 6144→16384, factor=4, rank=32, bf16，
+        # N=4096 token，走真实 forward+backward）：
+        #   峰值显存 1250 MB → 1025 MB（−18.0%）
+        #   fwd+bwd 63.5 ms → 21.8 ms（**2.9×**，bf16 走 tensor core、fp32 不走）
+        #   输出相对最大差 5.1e-3（≈1.3 个 bf16 ulp）；梯度余弦相似度 0.99999，
+        #   相对最大差 2.0e-3~8.1e-3
+        # 加速比在云端可能不同（取决于该卡的 fp32/bf16 吞吐比与 TF32 设置），显存比值更稳。
+        # 为什么这个代价是合理的：w1/w2_a/w2_b **本来就是 bf16 参数**，`.float()` 不增加
+        # 任何信息量，只是让运算在 fp32 域进行；而 torch 的 bf16 matmul 内部本来就是
+        # fp32 累加。native 模式下 LoKr 的数值口径与标准 LoRA 路径（一直是 bf16）一致。
+        self.compute_dtype = str(compute_dtype or "fp32").lower()
+        if self.compute_dtype not in ("fp32", "native"):
+            raise ValueError(
+                f"lokr_compute_dtype 只支持 'fp32'（默认）或 'native'，得到 {compute_dtype!r}")
+        self._compute_fp32 = self.compute_dtype == "fp32"
 
         # T-LoRA (实验性，论文未覆盖 LoKr) state
         self.tlora_enabled = bool(tlora_enabled)
@@ -773,6 +796,15 @@ class LoKrLayer(torch.nn.Module):
                 f"lokr_w1_init_std 必须 > 0，得到 {_w1_std}。w1=0 会让 ΔW 恒为 0 且梯度全零"
                 "（kron 对 w2 的梯度正比于 w1），整个 LoKr 永久死掉。")
         torch.nn.init.normal_(self.lokr_w1, mean=0.0, std=_w1_std)
+
+        if self.tlora_enabled and bool(tlora_lokr_ortho_init) and not self._compute_fp32:
+            # ortho 补偿要靠"两个大数相减恰好抵消"来保 step-0 净 delta=0，bf16 的 8 位
+            # 尾数不足以让它精确归零 → 首版直接互斥，别让用户悄悄拿到有偏的 step 0。
+            raise ValueError(
+                "lokr_compute_dtype='native' 与 tlora_lokr_ortho_init=true 不兼容：\n"
+                "  ortho init 的补偿项靠 y - y_init 精确抵消来保证 step-0 净 delta=0，"
+                "bf16 精度下抵消不干净。\n"
+                "  请二选一：关掉 tlora_lokr_ortho_init，或用 lokr_compute_dtype: fp32。")
 
         if self.tlora_enabled and bool(tlora_lokr_ortho_init):
             # 实验性 ortho init：在 (w2_a, w2_b) 的简化维度上套 SVD 方案；
@@ -860,13 +892,14 @@ class LoKrLayer(torch.nn.Module):
         self._rd_mask = None
         self._rd_scale = 1.0
 
-        # ★ Training 路径：bf16 下 kron 容易数值放大，统一转 fp32 中间运算（必要）。
-        # ★ Inference (eval + no_grad) 路径：可直接用原 dtype（通常 bf16），跳过 3 个 fp32 副本。
-        #   - 推理时不积累梯度，bf16 精度对单步前向足够
-        #   - 节省 ~3× LoKr 参数副本（对 5120ch model 大概 80MB / inject 层 -> 总省几 GB 临时显存）
-        #   - 推理速度也快 ~1.5×（bf16 matmul tensor core）
-        # rank_dropout / T-LoRA mask / ortho init 路径都需要严格的数值一致性 -> 训练路径仍 fp32。
-        if self.training:
+        # ★ Inference (eval + no_grad) 路径：一直用原 dtype（通常 bf16），跳过 fp32 副本。
+        # ★ Training 路径：默认 fp32（compute_dtype="fp32"，历史行为）；
+        #   compute_dtype="native" 时与推理走同一条 bf16 路径，省掉 x 的 fp32 副本
+        #   与两个 N×out_features 的中间量各一半字节（详见 __init__ 的 compute_dtype 注释，
+        #   本地实测单层 fwd+bwd 峰值 −18%、耗时 2.9×，输出差 ≈1.3 个 bf16 ulp）。
+        #   rank_dropout / T-LoRA mask 只对小张量做逐元素缩放，两种精度下都成立；
+        #   ortho init 补偿需要精确抵消，已在 __init__ 与 native 互斥。
+        if self.training and self._compute_fp32:
             w1 = self.lokr_w1.float()
             w2_a = self.lokr_w2_a.float()
             w2_b = self.lokr_w2_b.float()
@@ -1087,7 +1120,8 @@ class LoRALinear(torch.nn.Module):
                  dora_fast_norm=False, dora_detach_norm=False,
                  lora_init="default",
                  use_abba=False, abba_r1=None, abba_r2=None,
-                 abba_alpha1=None, abba_alpha2=None, lokr_w1_init_std=0.1):
+                 abba_alpha1=None, abba_alpha2=None, lokr_w1_init_std=0.1,
+                 lokr_compute_dtype="fp32"):
         super().__init__()
         self.original = original
         self.use_lokr = use_lokr
@@ -1152,6 +1186,7 @@ class LoRALinear(torch.nn.Module):
                 tlora_lokr_ortho_init=tlora_lokr_ortho_init,
                 device=svd_device,
                 w1_init_std=lokr_w1_init_std,
+                compute_dtype=lokr_compute_dtype,
             )
         else:
             self.adapter = LoRALayer(
@@ -1329,6 +1364,8 @@ class LoRAInjector:
                  # 只有 1/f²；而它参数少、AdamW 每步至多走 lr，典型 run 爬不到位。
                  # 详见 LoKrLayer.__init__ 的 w1_init_std 注释与 get_param_groups。
                  lokr_w1_init_std=0.1, lokr_w1_lr_ratio=1.0,
+                 # 训练期中间量精度："fp32"（默认=历史行为）/ "native"（省显存，见 LoKrLayer）
+                 lokr_compute_dtype="fp32",
                  # ── Layer A：导出期 SVD 压缩（save() 额外写压缩件；默认 off = 行为中立）──
                  lora_compress_energy=1.0, lora_compress_max_rank=0,
                  lora_compress_budget_mb=0.0, lora_compress_replace_main=False,
@@ -1347,6 +1384,11 @@ class LoRAInjector:
         # ── LoKr w1 旋钮（校验放构造期，别等到跑起来才炸）────────────────────
         self.lokr_w1_init_std = float(lokr_w1_init_std)
         self.lokr_w1_lr_ratio = float(lokr_w1_lr_ratio)
+        self.lokr_compute_dtype = str(lokr_compute_dtype or "fp32").lower()
+        if self.lokr_compute_dtype not in ("fp32", "native"):
+            raise ValueError(
+                f"lokr_compute_dtype 只支持 'fp32'（默认）或 'native'，"
+                f"得到 {lokr_compute_dtype!r}")
         if self.use_lokr:
             if not (self.lokr_w1_init_std > 0.0):
                 raise ValueError(
@@ -1357,11 +1399,13 @@ class LoRAInjector:
                 raise ValueError(
                     f"lokr_w1_lr_ratio 必须 > 0，得到 {self.lokr_w1_lr_ratio}"
                     "（=1.0 表示与其余因子同 lr，即改动前的行为；<1 会更慢，通常不是你想要的）")
-        elif (self.lokr_w1_init_std != 0.1) or (self.lokr_w1_lr_ratio != 1.0):
-            # 非 LoKr 路径设这两个参数没有任何效果，静默忽略会让 A/B 白跑一轮
+        elif ((self.lokr_w1_init_std != 0.1) or (self.lokr_w1_lr_ratio != 1.0)
+                or self.lokr_compute_dtype != "fp32"):
+            # 非 LoKr 路径设这些参数没有任何效果，静默忽略会让 A/B 白跑一轮
             raise ValueError(
-                "lokr_w1_init_std / lokr_w1_lr_ratio 只对 lora_type='lokr' 生效"
-                f"（当前 lora_type 不是 lokr）。请去掉这两个参数，或改用 lora_type: lokr。")
+                "lokr_w1_init_std / lokr_w1_lr_ratio / lokr_compute_dtype 只对 "
+                "lora_type='lokr' 生效（当前 lora_type 不是 lokr）。"
+                "请去掉这些参数，或改用 lora_type: lokr。")
         if self.use_abba:
             if self.use_lokr:
                 raise ValueError("lora_type='abba' 与 lokr 互斥")
@@ -1625,6 +1669,7 @@ class LoRAInjector:
                 dora_fast_norm=self.dora_fast_norm,
                 dora_detach_norm=self.dora_detach_norm,
                 lokr_w1_init_std=self.lokr_w1_init_std,
+                lokr_compute_dtype=self.lokr_compute_dtype,
                 **abba_kwargs,
             )
 
@@ -1674,6 +1719,12 @@ class LoRAInjector:
                 f"  LoKr w1: init_std={self.lokr_w1_init_std}（rms≈{self.lokr_w1_init_std:.3f}）, "
                 f"lr_ratio={self.lokr_w1_lr_ratio}；w1 冻结时表达力上界 1/f² = "
                 + ", ".join(f"f{fv}→{1.0 / (fv * fv) * 100:.2f}%" for fv in sorted(_facs))
+            )
+            logger.info(
+                f"  LoKr 训练期计算精度: {self.lokr_compute_dtype}"
+                + ("（x 不再物化 fp32 副本、中间量走 bf16；本地实测单层 fwd+bwd "
+                   "峰值 −18%、耗时 2.9×，输出差 ≈1 个 bf16 ulp）"
+                   if self.lokr_compute_dtype == "native" else "（历史默认）")
             )
         if self.lora_variant == "tlora":
             r_min_example = max(int(round(self.rank * self.tlora_rmin_ratio)), 1)

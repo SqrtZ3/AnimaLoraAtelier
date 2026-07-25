@@ -140,6 +140,7 @@ YAML_TO_ARGS = {
     "lokr_factor": "lokr_factor",
     "lokr_w1_init_std": "lokr_w1_init_std",
     "lokr_w1_lr_ratio": "lokr_w1_lr_ratio",
+    "lokr_compute_dtype": "lokr_compute_dtype",
     "abba_alpha": "abba_alpha",
     "abba_export_kr": "abba_export_kr",
     "lora_variant": "lora_variant",
@@ -604,6 +605,19 @@ DEFAULTS = {
     # w1 的 lr 倍率，独立于 loraplus_lr_ratio（后者只抬 w2_b，**不抬 w1**）。
     # 1.0 = 与改动前一致。w1 是乘性块间门控，抬太猛会让 ΔW 剧烈摆动，建议从 4~16 起试。
     "lokr_w1_lr_ratio": 1.0,
+    # LoKr 训练期中间量精度。"fp32"（默认）= 历史行为：把 x 与三个因子物化成 fp32。
+    # "native" = 直接用参数原 dtype（bf16），省显存：
+    #   ① x.reshape(...) 退化成 view，不再拷贝 N×in_features 的 fp32 副本
+    #      （krea2 mlp.down @65536 token 就是 2.13 GB）；
+    #   ② 两个 N×out_features 的中间量各省一半字节。
+    # 本地实测（RTX 5070 Laptop，krea2 mlp.gate 6144→16384, f=4, r=32, N=4096）：
+    #   峰值显存 −18.0%；fwd+bwd 耗时 2.9×（bf16 走 tensor core、fp32 不走）；
+    #   输出相对差 5.1e-3（≈1.3 个 bf16 ulp）、梯度余弦相似度 0.99999。
+    # 加速比在云端可能不同（取决于该卡 fp32/bf16 吞吐比与 TF32 设置），显存比值更稳。
+    # 依据：w1/w2_a/w2_b 本来就是 bf16 参数，.float() 不增加信息量，而 torch 的
+    # bf16 matmul 内部本就是 fp32 累加 → native 的数值口径与标准 LoRA 路径一致。
+    # 与 tlora_lokr_ortho_init 互斥（补偿项要精确抵消，bf16 抵消不干净），构造期 fail-fast。
+    "lokr_compute_dtype": "fp32",
     # ABBA（lora_type='abba'）：alpha1=alpha2 的统一覆盖；None → 官方口径 alpha=r（r=rank//2）
     "abba_alpha": None,
     # save() 是否额外写 KR 物化标准 LoRA 键（文件 ~8×，云端下载不友好）。

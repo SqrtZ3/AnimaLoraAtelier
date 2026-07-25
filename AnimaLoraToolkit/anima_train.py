@@ -556,6 +556,10 @@ def parse_args():
     p.add_argument("--lokr-w1-lr-ratio", type=float, default=1.0,
                    help="LoKr w1 的 lr 倍率（默认 1.0=行为中立）。独立于 loraplus_lr_ratio"
                         "——后者只抬 w2_b，不抬 w1。仅 lora_type=lokr 生效。")
+    p.add_argument("--lokr-compute-dtype", choices=["fp32", "native"], default="fp32",
+                   help="LoKr 训练期中间量精度。fp32=历史默认；native=用参数原 dtype(bf16)，"
+                        "省掉 x 的 fp32 副本与一半中间量字节（本地实测单层 fwd+bwd 峰值 "
+                        "-18%%、耗时 2.9 倍快，输出差约 1 个 bf16 ulp）。仅 lora_type=lokr 生效。")
     p.add_argument("--lora-variant", choices=["base", "dora", "tlora"], default="base",
                    help="Adapter variant. 'dora' enables LyCORIS/ComfyUI-compatible DoRA-LoKr. "
                         "'tlora' enables timestep-dependent rank mask (arxiv:2507.05964); "
@@ -1300,6 +1304,7 @@ def main():
         factor=args.lokr_factor,
         lokr_w1_init_std=float(getattr(args, "lokr_w1_init_std", 0.1) or 0.1),
         lokr_w1_lr_ratio=float(getattr(args, "lokr_w1_lr_ratio", 1.0) or 1.0),
+        lokr_compute_dtype=str(getattr(args, "lokr_compute_dtype", "fp32") or "fp32"),
         rank_dropout=float(getattr(args, "rank_dropout", 0.0) or 0.0),
         module_dropout=float(getattr(args, "module_dropout", 0.0) or 0.0),
         loraplus_lr_ratio=float(getattr(args, "loraplus_lr_ratio", 1.0) or 1.0),

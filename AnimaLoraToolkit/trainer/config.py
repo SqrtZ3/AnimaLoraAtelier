@@ -185,6 +185,7 @@ YAML_TO_ARGS = {
     "mixed_precision": "mixed_precision",
     "grad_checkpoint": "grad_checkpoint",
     "grad_checkpoint_skip_last": "grad_checkpoint_skip_last",
+    "grad_checkpoint_policy": "grad_checkpoint_policy",
     "num_workers": "num_workers",
     # 输出与保存
     "output_dir": "output_dir",
@@ -708,7 +709,24 @@ DEFAULTS = {
     # 用途：显存有富余时把它换成吞吐——每跳过一层省一次该层重算，数学恒等。
     # 每层激活量随 pack token 数线性增长，设置前先按显存余量估算（krea2 12B @16k
     # token 约 3.8GB/层）。仅 navit 打包路径 + krea2 模型族已接线。
+    # ⚠ H20 实测的「时间×显存」前沿上，skip_last=8/12 被 grad_checkpoint_policy 的
+    # sac_narrow **完全支配**（更慢且更占显存）——优先用下面那个键。
     "grad_checkpoint_skip_last": 0,
+    # 选择性激活重算（SAC）策略。full（默认）= 现状：checkpoint 丢掉 block 内全部中间量、
+    # backward 全部重算（重算代价 ≈ 一整个 forward，实测 bwd/fwd=2.73）。其余档保留贵的
+    # matmul/SDPA 输出、只重算便宜的 norm/silu/rope/逐元素，用显存换掉大部分重算。
+    # H20 28 块真栈实测（tests/diag_navit_ckpt_policy.py --g-sweep）：
+    #     策略          ms/token   激活 MB/token
+    #     full            0.674        0.72
+    #     sac_attn        0.653        1.03
+    #     sac_narrow      0.562        2.43     ← 稳妥档（+20% 吞吐）
+    #     sac_all         0.484        4.07     ← 激进档（+39% 吞吐）
+    #     (无 ckpt 对照)  0.465        7.52
+    # 关键：块对角 attention 下 per-token 代价只取决于每图 seqlen、与一包几张图无关
+    # （G=1..6 变化 <1%），所以**降 navit_token_budget 不损吞吐、只让出显存**——这正是
+    # 换取更便宜策略的本钱。用法：把 budget 降到 1~2 张图的 token 数，再开 sac_*。
+    # 数学恒等（只改哪些中间量被保存 vs 重算），有等价性单测。仅 krea2 模型族已接线。
+    "grad_checkpoint_policy": "full",
     "num_workers": 0,
     "output_dir": "./output",
     "output_name": "anima_lora",

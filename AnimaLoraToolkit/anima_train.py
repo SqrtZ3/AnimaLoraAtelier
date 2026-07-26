@@ -526,6 +526,15 @@ def parse_args():
                    help="分块 grad checkpoint：最后 N 个 transformer block 不做 checkpoint"
                         "（存全部激活、backward 不重算，数学恒等）。0=全部 checkpoint（默认）。"
                         "显存有余时用它换吞吐；仅 navit 打包 + krea2 模型族已接线。")
+    p.add_argument("--grad-checkpoint-policy",
+                   choices=["full", "sac_attn", "sac_narrow", "sac_all"], default="full",
+                   help="选择性激活重算（SAC）。full=现状（block 内全部中间量都重算）；"
+                        "sac_* 保留贵的 matmul/SDPA 输出、只重算便宜的 norm/silu/rope，"
+                        "数学恒等、用显存换重算。H20 28 块实测 ms/token：full 0.674 / "
+                        "sac_attn 0.653 / sac_narrow 0.562 / sac_all 0.484（无 ckpt 0.465）；"
+                        "对应激活 MB/token 0.72 / 1.03 / 2.43 / 4.07。因 per-token 代价与"
+                        "每包图数无关，正确用法是**先把 navit_token_budget 降到 1~2 张图**"
+                        "腾出显存再开。仅 krea2 模型族已接线。")
     p.add_argument("--max-steps", type=int, default=0, help="最大训练步数 (0=无限制)")
     p.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
 
@@ -1503,6 +1512,28 @@ def main():
                 "grad_checkpoint_skip_last 目前只支持 model_family=krea2"
                 f"（当前 {getattr(args, 'model_family', None)!r}）——其余模型族的"
                 " forward_packed_navit 尚未实现该参数。")
+
+    # ── 选择性激活重算（grad_checkpoint_policy，opt-in，默认 full=行为中立）──
+    # 与 skip_last 同样先收窄到 krea2（其 checkpoint 调用点已统一走 _ckpt 包装）。
+    _ckpt_policy = str(getattr(args, "grad_checkpoint_policy", "full") or "full").lower()
+    if _ckpt_policy != "full":
+        if not bool(getattr(args, "grad_checkpoint", False)):
+            raise RuntimeError(
+                f"grad_checkpoint_policy={_ckpt_policy} 需要 grad_checkpoint=true —— "
+                "它改的是 checkpoint 内部「哪些中间量保存、哪些重算」，不开 checkpoint "
+                "时无处施加。要完全不重算请直接设 grad_checkpoint=false。")
+        if str(getattr(args, "model_family", "") or "").lower() != "krea2":
+            raise RuntimeError(
+                f"grad_checkpoint_policy={_ckpt_policy} 目前只支持 model_family=krea2"
+                f"（当前 {getattr(args, 'model_family', None)!r}）——其余模型族的"
+                " checkpoint 调用点尚未接线。")
+        if int(getattr(args, "grad_checkpoint_skip_last", 0) or 0) > 0:
+            # 两者都在拿显存换重算，叠加会让峰值不可预测；且实测前沿上 skip_last
+            # 被 sac_narrow 支配，没有同开的理由。
+            raise RuntimeError(
+                "grad_checkpoint_policy 与 grad_checkpoint_skip_last 请勿同开："
+                "两者都用显存换重算，叠加后峰值不可预测。H20 实测前沿上 skip_last=8/12 "
+                "被 sac_narrow 完全支配（更慢且更占显存），建议 skip_last 设 0。")
 
     # ── navit 多尺度阶梯（navit_multiscale，opt-in）：解析与校验 ──
     # 副本走 fit_plan 的 resize+crop 路径，v1 仅支持原生定尺寸（ARB 桶定尺寸下
@@ -3181,6 +3212,17 @@ def main():
         else:
             emit(f"[navit-attn] packed attention backend = {_navit_attn_backend}"
                  f"（逐段 dense SDPA，数学恒等；xformers 路径不再使用）")
+
+    # ── 选择性激活重算（grad_checkpoint_policy，opt-in；构造期校验见上文）────────
+    # narrow_width 传模型 features：sac_narrow 由此放过比它更宽的中间量（krea2 是
+    # SwiGLU 的 16384 维，显存大头正在那里）。
+    if _ckpt_policy != "full":
+        from models.krea2_modeling import set_checkpoint_policy
+        _narrow_w = int(getattr(getattr(model, "config", None), "features", 0) or 0)
+        set_checkpoint_policy(_ckpt_policy, _narrow_w)   # 非法值/torch 太老 fail-fast
+        emit(f"[grad-ckpt] policy = {_ckpt_policy}"
+             + (f"（sac_narrow 保存宽度 ≤{_narrow_w} 的 mm 输出）" if _ckpt_policy == "sac_narrow" else "")
+             + "；数学恒等，用显存换重算。峰值显存必然上升，首跑请盯 nvidia-smi。")
 
     def _emit_profile_summary(prof, wall_s: float):
         try:

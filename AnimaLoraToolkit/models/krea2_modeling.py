@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from dataclasses import dataclass
@@ -42,6 +43,103 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
+
+# ── 梯度检查点策略（opt-in，默认 "full" = 历史行为逐字节不变）──────────────────
+# 全量 checkpoint 把一个 block 的**所有**中间量都丢掉、backward 全部重算；重算代价
+# ≈ 一整个 forward（实测 bwd/fwd=2.73≈3）。选择性重算（SAC）只丢便宜的（norm/silu/
+# rope/逐元素），保留贵的（matmul / SDPA 输出），用显存换掉大部分重算。
+#
+# H20 实测（28 块真栈，tests/diag_navit_ckpt_policy.py --g-sweep，ms/token 对 G 不敏感，
+# 故下表可直接按 token 数外推；截距均落在 22.6GiB=权重，自洽）：
+#
+#   策略            ms/token   激活 MB/token
+#   full(现状)        0.674        0.72
+#   sac_attn          0.653        1.03
+#   sac_narrow        0.562        2.43
+#   sac_all           0.484        4.07
+#   （对照）无 ckpt   0.465        7.52   ← 只比 sac_all 快 4%，显存 1.85×
+#
+# 关键前提：块对角 attention 下 **per-token 代价只取决于每图 seqlen，与一包装几张图
+# 无关**（同一策略在 G=1..6 上 ms/token 变化 <1%）。所以降 navit_token_budget 不损
+# 吞吐、只让出显存 —— 这正是换取更便宜策略的本钱。
+# 已发布的 grad_checkpoint_skip_last=8/12 在这张前沿上被 sac_narrow **完全支配**
+# （更慢且更占显存），不建议再用。
+_CKPT_POLICY = "full"
+_CKPT_POLICIES = ("full", "sac_attn", "sac_narrow", "sac_all")
+_CKPT_NARROW_WIDTH = 0          # 0 = 构造时按 config.features 定；见 set_checkpoint_policy
+
+
+def set_checkpoint_policy(name: str, narrow_width: int = 0) -> None:
+    """训练入口调用（trainer 读 grad_checkpoint_policy 配置）。非法值构造期 fail-fast。
+
+    ``narrow_width``：sac_narrow 保存 mm 输出的最大宽度（0=不限，由调用方传模型
+    features）。默认放过比它更宽的中间量 —— 对 Krea2 就是 SwiGLU 的 16384 维，
+    显存大头正在那里。
+    """
+    global _CKPT_POLICY, _CKPT_NARROW_WIDTH
+    name = (name or "full").lower()
+    if name not in _CKPT_POLICIES:
+        raise ValueError(
+            f"grad_checkpoint_policy={name!r} 不认识；可选 {_CKPT_POLICIES}")
+    if name != "full":
+        try:
+            from torch.utils.checkpoint import create_selective_checkpoint_contexts  # noqa: F401
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(
+                f"grad_checkpoint_policy={name} 需要 torch 的选择性重算 API "
+                "(torch.utils.checkpoint.create_selective_checkpoint_contexts)，"
+                "当前 torch 版本没有。请升级 torch 或用 full。"
+            ) from exc
+    _CKPT_POLICY = name
+    _CKPT_NARROW_WIDTH = int(narrow_width or 0)
+
+
+@functools.lru_cache(maxsize=8)
+def _sac_context_fn(policy: str, narrow_width: int):
+    """按策略构造 SAC 的 context_fn（纯 CPU 元数据，按 (policy,width) 缓存）。"""
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+
+    sdpa_ops = {
+        torch.ops.aten._scaled_dot_product_efficient_attention.default,
+        torch.ops.aten._scaled_dot_product_flash_attention.default,
+        torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+    }
+    mm_ops = {
+        torch.ops.aten.mm.default,
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.bmm.default,
+    }
+
+    def _out_width(op, args):
+        try:
+            if op is torch.ops.aten.addmm.default:
+                return int(args[2].shape[-1])
+            return int(args[1].shape[-1])
+        except Exception:  # noqa: BLE001
+            return 1 << 30      # 认不出形状就当"很宽"→ 重算（保守省显存）
+
+    def _policy(ctx, op, *args, **kwargs):
+        if op in sdpa_ops:
+            return CheckpointPolicy.MUST_SAVE
+        if op in mm_ops:
+            if policy == "sac_all":
+                return CheckpointPolicy.MUST_SAVE
+            if policy == "sac_narrow" and (
+                narrow_width <= 0 or _out_width(op, args) <= narrow_width
+            ):
+                return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return lambda: create_selective_checkpoint_contexts(_policy)
+
+
+def _ckpt(fn, *args):
+    """checkpoint 包装：policy=full 时与直接调用 checkpoint 完全一致（逐字节）。"""
+    if _CKPT_POLICY == "full":
+        return checkpoint(fn, *args, use_reentrant=False)
+    return checkpoint(fn, *args, use_reentrant=False,
+                      context_fn=_sac_context_fn(_CKPT_POLICY, _CKPT_NARROW_WIDTH))
+
 
 # torch >= 2.5 的 SDPA 原生支持 GQA（enable_gqa）；老版本退回手动展开 KV 头（数值相同）。
 try:
@@ -770,8 +868,8 @@ class SingleStreamDiT(nn.Module):
             return self.txtmlp(self.txtfusion(ctx_in, mask=txt_mask))
 
         if use_checkpoint:
-            img = checkpoint(_img_stack, img_tokens, use_reentrant=False)
-            txt = checkpoint(_text_stack, context, use_reentrant=False)
+            img = _ckpt(_img_stack, img_tokens)
+            txt = _ckpt(_text_stack, context)
         else:
             img = _img_stack(img_tokens)
             txt = _text_stack(context)
@@ -793,9 +891,8 @@ class SingleStreamDiT(nn.Module):
         _ckpt_until = self._checkpoint_from_block(use_checkpoint, checkpoint_skip_last)
         for _i, block in enumerate(self.blocks):
             if _i < _ckpt_until:
-                combined = checkpoint(
-                    lambda x_in, _b=block: _b(x_in, tvec, freqs, attn_mask),
-                    combined, use_reentrant=False,
+                combined = _ckpt(
+                    lambda x_in, _b=block: _b(x_in, tvec, freqs, attn_mask), combined,
                 )
             else:
                 combined = block(combined, tvec, freqs, attn_mask)
@@ -932,8 +1029,8 @@ class SingleStreamDiT(nn.Module):
             return self.txtmlp(self.txtfusion(ctx_in, mask=txt_bias))
 
         if use_checkpoint:
-            txt = checkpoint(_text_stack, crossattn_packed, use_reentrant=False)
-            img = checkpoint(self.first, tokens_1_N_M, use_reentrant=False)
+            txt = _ckpt(_text_stack, crossattn_packed)
+            img = _ckpt(self.first, tokens_1_N_M)
         else:
             txt = _text_stack(crossattn_packed)                 # [1, ΣL, features]
             img = self.first(tokens_1_N_M)                      # [1, ΣN, features]
@@ -991,7 +1088,7 @@ class SingleStreamDiT(nn.Module):
             def _run(x_in, _b=block):
                 return _b(x_in, tvec_1_G, freqs, self_bias, mod_index=mod_index)
             if _i < _ckpt_until:
-                combined = checkpoint(_run, combined, use_reentrant=False)
+                combined = _ckpt(_run, combined)
             else:
                 combined = _run(combined)
 

@@ -160,6 +160,49 @@ cost(n) = n · (1 + λ·n) / (1 + λ·n_ref)
 **注意：** 这只改变**批的组成**，不改任何数学；但批组成会影响 SGD 统计（和 `ffd` 同性质），
 所以首次开启建议按单变量 A/B 跑（只切这一个键），对比 imgs/s、峰值显存与 loss 曲线。
 
+### 2.5 用预算换重算：`grad_checkpoint_policy`（opt-in）
+
+**先记住一条实测事实：** 块对角注意力下，**per-token 代价只取决于每张图自己的 seqlen，
+与一个包里装几张图无关**——同一策略在 G=1/2/3/6 下 ms/token 变化 <1%（H20，28 块真栈，
+`tests/diag_navit_ckpt_policy.py --g-sweep`）。
+
+所以 **`navit_token_budget` 是纯粹的显存/粒度旋钮，降它不损吞吐**。而 checkpoint 策略
+恰恰只被显存卡住——这就构成一笔交换：**降预算 → 腾显存 → 换更便宜的重算策略 → 净提吞吐。**
+
+H20 28 块真栈实测的「时间×显存」前沿（截距均落在 22.6GiB=权重，自洽）：
+
+| `grad_checkpoint_policy` | ms/token | 激活 MB/token |
+|---|---|---|
+| `full`（默认，现状） | 0.674 | 0.72 |
+| `sac_attn` | 0.653 | 1.03 |
+| `sac_narrow` | **0.562** | 2.43 |
+| `sac_all` | **0.484** | 4.07 |
+| （对照）完全不 checkpoint | 0.465 | 7.52 |
+
+- `sac_*` 保留贵的 matmul / SDPA 输出，只重算便宜的 norm/silu/rope/逐元素；
+  `sac_narrow` 额外放过宽于 `features` 的中间量（Krea2 是 SwiGLU 的 16384 维，显存大头）。
+- **数学恒等**——只改"哪些中间量保存 vs 重算"，有等价性单测
+  （`tests/test_ckpt_policy_equivalence.py`，前向/输入梯度/参数梯度三样都对）。
+- 完全不 checkpoint 只比 `sac_all` 快 4%，却要 1.85× 显存 —— 没有采用价值。
+- **`grad_checkpoint_skip_last=8/12` 在这张前沿上被 `sac_narrow` 完全支配**（更慢且更占
+  显存），不建议再用；两者同开会 fail-fast。
+
+**怎么用（关键：预算和策略要一起改）：**
+
+```yaml
+grad_checkpoint: true
+grad_checkpoint_policy: sac_narrow    # 稳妥档；显存宽裕再上 sac_all
+navit_token_budget: 12288             # 降到 1~2 张图的 token 数，把显存让给上面
+grad_accum: 8                         # 用它把有效 batch 补回来
+```
+
+预算怎么定：`可用显存 - 权重 - (LoRA梯度/优化器/TE/VAE/碎片余量)` ÷ 上表的 MB/token。
+**首跑务必盯峰值显存**——上表的 MB/token 来自不含 LoRA/DoRA 的合成栈，真实训练更高。
+
+**副作用（要一起看）：** 每包图数变少 → 逐图 loss 的等权平均（`per_image.mean()`）在
+包之间的权重差异被放大；G=1 时反而彻底消失（每图权重恒为 1.0）。步数变多由 `grad_accum`
+补回有效 batch，optimizer 只占步时 0.19%，多出的步开销可忽略。
+
 ### 2.3 缓存分块 encode（`cache_encode_tiled`，opt-in）
 
 ```yaml

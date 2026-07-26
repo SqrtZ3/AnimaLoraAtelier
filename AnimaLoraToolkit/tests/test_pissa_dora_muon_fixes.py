@@ -13,6 +13,11 @@
      - dora_scale 恢复（折叠文件做逆换算回训练态幅度）
   5. LoRALayer.merged_row_norms 的 fast 参数真正生效（此前静默忽略）
   6. MuonScheduleFree：2D 路径 NS 输入有内层动量 buffer（momentum=0 可关）
+  8. module_dropout × DoRA（标准 LoRA）不再二次抽签：LoRALayer._compute 与
+     forward 分离，输出只可能是 base 或完整 DoRA（此前 25% 落到第三种状态）
+  9. rank_dropout × DoRA（标准 LoRA）：merged_row_norms 复用 _compute 的
+     rd mask，前向与朴素"用同一 mask 物化 ΔW"逐元素一致
+ 10. 训练态 state_dict 的 dora_scale 保 fp32（bf16 会吃掉学到的幅度增量）
 
 本地跑法：
     D:\\ArtificialIntelligence\\ComfyUI-aki-v1.5\\python\\python.exe -m pytest \\
@@ -212,6 +217,101 @@ class TestDoraScaleExport(unittest.TestCase):
             torch.allclose(injector2.injected["q_proj"].dora_scale, mag,
                            rtol=1e-2, atol=1e-2),
             "折叠文件的 dora_scale 逆换算应恢复训练态幅度（bf16 容差内）")
+
+
+# ---------------------------------------------------------------------------
+# 8/9/10. DoRA × dropout 交互 与 幅度存盘精度（标准 LoRA 路径）
+# ---------------------------------------------------------------------------
+@unittest.skipUnless(HAS_TORCH, "torch not available")
+class TestDoraDropoutInteraction(unittest.TestCase):
+    """DoRA 分支自己抽 module dropout 签、并在输出域做 keep 混合；adapter 的
+    delta 前向（_compute）必须**不再**抽第二次签，否则命中时 lora_out=0 但
+    幅度仍按含 ΔW 的 ‖W+ΔW‖ 归一 → 既非 base 也非 DoRA 的第三种权重。"""
+
+    def _lora(self, seed=11, **kw):
+        model, injector = _inject(seed=seed, lora_variant="dora", **kw)
+        _perturb(injector)
+        return injector.injected["q_proj"]
+
+    def test_module_dropout_only_two_outcomes(self):
+        lora = self._lora(module_dropout=0.5)
+        lora.train()
+        torch.manual_seed(7)
+        x = torch.randn(3, 24)
+        y_base = lora.original(x)
+        W = lora.merged_weight()
+        y_full = torch.nn.functional.linear(x, W, lora.original.bias)
+        n_base = n_full = n_other = 0
+        for _ in range(2000):
+            y = lora(x)
+            if torch.allclose(y, y_base, atol=1e-5):
+                n_base += 1
+            elif torch.allclose(y, y_full, atol=1e-5):
+                n_full += 1
+            else:
+                n_other += 1
+        self.assertEqual(n_other, 0,
+                         f"出现 {n_other}/2000 次既非 base 也非 DoRA 的输出（二次抽签）")
+        # 生效概率应是配置的 p，而不是 1-(1-p)²
+        self.assertAlmostEqual(n_base / 2000.0, 0.5, delta=0.05)
+
+    def test_rank_dropout_norm_uses_same_mask(self):
+        lora = self._lora(rank_dropout=0.5)
+        lora.train()
+        torch.manual_seed(5)
+        x = torch.randn(4, 24)
+        y = lora(x)
+
+        ad = lora.adapter
+        self.assertIsNotNone(ad._rd_mask, "_compute 应记录 rank dropout mask")
+        A = ad.lora_down.weight.float() * (ad._rd_mask.float() * ad._rd_scale).unsqueeze(1)
+        delta = torch.matmul(ad.lora_up.weight.float(), A) * ad.scaling
+        merged = lora.original.weight.float() + delta
+        merged = merged * (lora.dora_scale.float().view(-1, 1)
+                           / merged.norm(dim=1, keepdim=True).clamp(min=1e-6))
+        y_ref = torch.nn.functional.linear(x, merged, lora.original.bias)
+        self.assertTrue(
+            torch.allclose(y, y_ref, rtol=1e-4, atol=1e-5),
+            f"DoRA 前向与'同一 rd mask 物化 ΔW'不一致，max abs diff="
+            f"{(y - y_ref).abs().max().item()}")
+
+    def test_eval_does_not_reuse_stale_rd_mask(self):
+        lora = self._lora(rank_dropout=0.5)
+        lora.train()
+        lora(torch.randn(2, 24))          # 抽一次 mask
+        lora.eval()
+        x = torch.randn(4, 24)
+        y = lora(x)
+        self.assertIsNone(lora.adapter._rd_mask, "eval 的 _compute 必须清掉 mask")
+        y_ref = torch.nn.functional.linear(x, lora.merged_weight(), lora.original.bias)
+        self.assertTrue(torch.allclose(y, y_ref, rtol=1e-4, atol=1e-5))
+
+
+@unittest.skipUnless(HAS_TORCH, "torch not available")
+class TestDoraScaleCheckpointPrecision(unittest.TestCase):
+    def test_raw_state_dict_keeps_fp32_magnitude(self):
+        """dora_scale 是适配器里唯一的 fp32 参数；训练态存盘降 bf16 会吃掉
+        学到的幅度增量（1% 增量在 bf16 往返后误差 ~50%）。"""
+        model, injector = _inject(lora_variant="dora")
+        lora = injector.injected["q_proj"]
+        mag0 = lora.dora_scale.detach().clone()
+        with torch.no_grad():          # 模拟训练把幅度动了 1%
+            lora.dora_scale.mul_(1.01)
+        sd = injector.state_dict(export_for_comfy=False)
+        saved = sd["lora_unet_q_proj.dora_scale"]
+        self.assertEqual(saved.dtype, torch.float32)
+        self.assertTrue(torch.equal(saved, lora.dora_scale.detach().cpu()),
+                        "训练态幅度存盘必须逐 bit 无损")
+
+        # resume 往返后学到的增量必须保住
+        model2, injector2 = _inject(lora_variant="dora")
+        injector2.load_state_dict_from_mapping(sd)
+        got = injector2.injected["q_proj"].dora_scale.detach()
+        learned_ref = lora.dora_scale.detach() - mag0
+        learned_got = got - mag0
+        self.assertTrue(
+            torch.allclose(learned_got, learned_ref, rtol=1e-6, atol=1e-8),
+            "resume 后学到的幅度增量应无损恢复")
 
 
 # ---------------------------------------------------------------------------

@@ -292,6 +292,10 @@ class LoRALayer(torch.nn.Module):
         self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
         self.rank_dropout = float(rank_dropout or 0.0)
         self.module_dropout = float(module_dropout or 0.0)
+        # 最近一次 _compute() 抽到的 rank dropout mask（供 DoRA 的 merged_row_norms
+        # 复用同一 mask；语义同 LoKrLayer）。每次 _compute 开头重置，eval 下恒为 None。
+        self._rd_mask: torch.Tensor | None = None
+        self._rd_scale: float = 1.0
 
         # T-LoRA state
         self.tlora_enabled = bool(tlora_enabled)
@@ -420,6 +424,27 @@ class LoRALayer(torch.nn.Module):
                 and torch.rand(1).item() < self.module_dropout):
             return torch.zeros(*x.shape[:-1], self.lora_up.out_features,
                                device=x.device, dtype=x.dtype)
+        out = self._compute(x)
+        if self._md_keep is not None:
+            out = out * self._md_keep.to(out.dtype)
+        return out
+
+    def _compute(self, x):
+        """纯 delta 前向：**不含** module dropout 抽签与 `_md_keep` 缩放。
+
+        ★ 必须与 forward 分离（语义同 LoKrLayer._compute）。DoRA 分支
+        （LoRALinear.forward）自己已经抽过 module dropout 签、并在输出域做
+        keep 混合；若这里再调 forward，会二次抽签：命中时返回 zeros，
+        DoRA 分支仍按含 ΔW 的 ‖W+ΔW‖ 重归一化 base，得到既非 base 也非
+        DoRA 的第三种权重。实测 module_dropout=0.5 时 25.3% 的前向落到该状态。
+        （LoKr 路径原本就是分离的，所以只有标准 LoRA + DoRA 中招。）
+
+        同时把 rank dropout 的 mask 记在 `_rd_mask`/`_rd_scale` 上，供随后的
+        merged_row_norms() 复用 —— 否则 DoRA 的幅度重归一化会用"未 mask 的
+        ΔW 范数"去除"已 mask 的 ΔW"，两者对不上。
+        """
+        self._rd_mask = None
+        self._rd_scale = 1.0
         x_drop = self.dropout(x)
         h = self.lora_down(x_drop)
 
@@ -459,6 +484,10 @@ class LoRALayer(torch.nn.Module):
             h = h * rd_mask * inv_keep
             if h_init is not None:
                 h_init = h_init * rd_mask.to(h_init.dtype) * inv_keep
+            # 记下来给 merged_row_norms（DoRA）复用：h 上乘 rd_mask 等价于
+            # 权重空间的 ΔW = B·diag(rd_mask·inv_keep)·A
+            self._rd_mask = rd_mask
+            self._rd_scale = inv_keep
 
         # ★ 防御性 cast：极端情况下（用户在 forward 前手工改了 dtype，或某些 hook 上溯精度）
         # 也能保证 lora_up 不会因 dtype mismatch 崩；正常路径下这是 no-op
@@ -473,20 +502,12 @@ class LoRALayer(torch.nn.Module):
                 h_init = h_init.to(dtype=self.lora_up_init.dtype)
             out = out - F.linear(h_init, self.lora_up_init) * self.scaling
 
-        if self._md_keep is not None:
-            out = out * self._md_keep.to(out.dtype)
         return out
 
-    # ── DoRA 支持：标准 LoRA 路径的 _compute / merged_row_norms ──────────
-    # 这些方法让 lora_type="lora" + lora_variant="dora" 可用（此前仅 LoKr 支持 DoRA）。
+    # ── DoRA 支持：标准 LoRA 路径的 merged_row_norms ──────────────────────
+    # 让 lora_type="lora" + lora_variant="dora" 可用（此前仅 LoKr 支持 DoRA）。
     # LoKr 版通过 Kronecker 结构避免全矩阵物化；标准 LoRA 版更简单，直接低秩收缩。
-
-    def _compute(self, x):
-        """LoRA delta output without base -- for DoRA forward path.
-
-        等价于 self.forward(x)（adapter forward 只返回 delta，不含 base）。
-        """
-        return self.forward(x)
+    # （delta-only 前向见上面的 _compute。）
 
     def merged_row_norms(self, base_weight, base_row_sq=None, fast=False):
         """||W + ΔW|| per row for DoRA, without materializing full (out, in) matrix.
@@ -499,6 +520,10 @@ class LoRALayer(torch.nn.Module):
         detached 引用而非每层一份 fp32 拷贝（12B/264 targets 下这是 GB 级差异）。
         范数相对误差 ~1e-3。语义与 LoKrLayer.merged_row_norms 的 fast 一致。
         此前该参数在标准 LoRA 路径上被静默忽略（只有 LoKr 实现了）。
+
+        ★ 与 LoKr 版同约定：**必须在 _compute() 之后调用**，以复用同一 rank
+        dropout mask。否则 forward 用的是 rank-dropout 后的 ΔW、而幅度重归一化
+        除的是未 dropout 的 ‖W+ΔW‖，两者对不上。
         """
         Wd = base_weight.detach()
         if base_row_sq is None:
@@ -508,6 +533,13 @@ class LoRALayer(torch.nn.Module):
                 base_row_sq = Wd.float().pow(2).sum(dim=1)
         A = self.lora_down.weight.float()  # (rank, in)
         B = self.lora_up.weight.float()    # (out, rank)
+        # 复用 _compute() 抽到的 rank dropout mask：h 上的逐通道缩放等价于
+        # 在权重空间对 A 的对应行缩放（ΔW = B·diag(mask·scale)·A）。
+        # init 补偿支路在 forward 里用的是同一个 mask，下面 A_i 同样处理。
+        _rd = getattr(self, "_rd_mask", None)
+        if _rd is not None:
+            _rd_col = (_rd.float() * self._rd_scale).unsqueeze(1)  # (rank, 1)
+            A = A * _rd_col
         s = self.scaling
         W = None if fast else Wd.float()
         # ⟨W, s·B@A⟩ per row = s * (B * (W @ A.T)).sum(dim=1)
@@ -527,6 +559,8 @@ class LoRALayer(torch.nn.Module):
         if self.lora_down_init is not None and self.lora_up_init is not None:
             A_i = self.lora_down_init.float()
             B_i = self.lora_up_init.float()
+            if _rd is not None:
+                A_i = A_i * _rd_col   # forward 的 h_init 用的是同一个 mask
             # ⟨W, -s·B_i@A_i⟩ per row
             if fast:
                 WA_i = torch.matmul(Wd, A_i.t().to(Wd.dtype)).float()  # (out, rank)
@@ -2031,11 +2065,16 @@ class LoRAInjector:
                 sd[f"{base}.lokr_w2_b"] = lora.adapter.lokr_w2_b.data.clone().bfloat16().cpu()
                 if getattr(lora, "use_dora", False):
                     if export_for_comfy:
-                        dora_scale = self.comfy_native_dora_scale(lora).bfloat16().cpu()
+                        dora_scale = self.comfy_native_dora_scale(lora).bfloat16().cpu().view(-1, 1)
                     else:
-                        dora_scale = lora.dora_scale.data.clone().bfloat16().cpu()
-                    if export_for_comfy:
-                        dora_scale = dora_scale.view(-1, 1)
+                        # ★ 训练态存盘保持参数自身 dtype（fp32）：dora_scale 是整个
+                        # 适配器里唯一的 fp32 参数（A/B/w1/w2 都是 bf16，存 bf16 无损），
+                        # 且它的初值 ≈‖W‖、训练只在其上叠很小的增量。降到 bf16 会让
+                        # resume 丢掉学到的幅度：本地实测幅度整体动 1% 时，bf16 往返后
+                        # 该增量的最大相对误差 ~50%（bf16 ulp 3.9e-3 vs 1% 增量）。
+                        # 语义同已修的"resume 丢 fp32 master"。体积代价 264 层 ×
+                        # out_features × 4B ≈ 数 MB，可忽略。
+                        dora_scale = lora.dora_scale.data.detach().clone().cpu()
                     sd[f"{base}.dora_scale"] = dora_scale
                 # T-LoRA ortho init buffers（persistent=False，不存的话 resume 会重新
                 # 随机 _ortho_lora_init → 补偿基准漂移，续训语义偏离原 run）。
@@ -2125,7 +2164,8 @@ class LoRAInjector:
                         if export_for_comfy:
                             dora_scale = self.comfy_native_dora_scale(lora).bfloat16().cpu().view(-1, 1)
                         else:
-                            dora_scale = lora.dora_scale.data.clone().bfloat16().cpu()
+                            # fp32 存训练态幅度，理由同 LoKr 分支的同名注释
+                            dora_scale = lora.dora_scale.data.detach().clone().cpu()
                         sd[f"{base}.dora_scale"] = dora_scale
         return sd
 

@@ -200,6 +200,17 @@ def main():
                     help="SAC-窄mm 保存的最大输出宽度（默认 6144，即放过 16384 维 MLP 中间量）")
     ap.add_argument("--skip-list", type=str, default="4,8,12",
                     help="要测的 grad_checkpoint_skip_last 值")
+    ap.add_argument("--g-sweep", type=str, default="",
+                    help="用 token 预算换 checkpoint 策略：给一串 G（如 '1,2,3,6'），"
+                         "**固定每图 seqlen**（--seg-tokens）只改每包图数 → N=G×seg。"
+                         "因为块对角 attention 让 per-token 代价只取决于每图 seqlen、"
+                         "与预算无关（S5 实测 seg 固定时 ms/token 恒定），所以降预算不损"
+                         "吞吐、却可能换来更便宜的 checkpoint 策略。判据是 ms/token 而非 ms/step。")
+    ap.add_argument("--seg-tokens", type=int, default=0,
+                    help="--g-sweep 用的每图 token 数；0=取 --tokens/--groups。")
+    ap.add_argument("--vram-budget", type=float, default=0.0,
+                    help="可用显存上限 GiB（超过即视为不可选）；0=自动取总显存的 80%%，"
+                         "给 LoRA 梯度/优化器态/VAE/TE/碎片留余量。")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -227,14 +238,18 @@ def main():
     w_gib = sum(p.numel() * p.element_size() for b in blocks for p in b.parameters()) / 2 ** 30
     print(f"  权重常驻 {w_gib:.1f} GiB\n")
 
-    segs = seg_split(args.tokens, args.groups)
-    x = torch.randn(1, args.tokens, FEATURES, device=DEV, dtype=DTYPE, requires_grad=True)
-    vec = torch.randn(1, args.groups, FEATURES * 6, device=DEV, dtype=DTYPE)
-    mod_index = torch.repeat_interleave(
-        torch.arange(args.groups, device=DEV), torch.tensor(segs, device=DEV))
-    freqs = make_freqs(args.tokens)
-    mask = _SegLens(segs)
-    common = dict(blocks=blocks, x=x, vec=vec, freqs=freqs, mask=mask, mod_index=mod_index)
+    vram_cap = float(args.vram_budget) if args.vram_budget > 0 else total * 0.80
+
+    def build_inputs(n_tok: int, g: int):
+        segs = seg_split(n_tok, g)
+        x = torch.randn(1, n_tok, FEATURES, device=DEV, dtype=DTYPE, requires_grad=True)
+        vec = torch.randn(1, g, FEATURES * 6, device=DEV, dtype=DTYPE)
+        mod_index = torch.repeat_interleave(
+            torch.arange(g, device=DEV), torch.tensor(segs, device=DEV))
+        return dict(blocks=blocks, x=x, vec=vec, freqs=make_freqs(n_tok),
+                    mask=_SegLens(segs), mod_index=mod_index)
+
+    common = build_inputs(args.tokens, args.groups)
 
     cases = [
         ("P0 全ckpt(现状)", dict(mode="full")),
@@ -266,6 +281,50 @@ def main():
         scale = args.blocks / KREA2_LARGE_WIDE.layers
         save = save / scale if scale else save
         print(f"{label:<22}{ms:9.1f}ms{peak:10.1f}GiB{sp:>9}{save:9.1f}%")
+
+    # ── 用 token 预算换 checkpoint 策略（--g-sweep）────────────────────────────
+    if args.g_sweep.strip():
+        seg = int(args.seg_tokens or (args.tokens // max(1, args.groups)))
+        g_list = [int(v) for v in args.g_sweep.split(",") if v.strip()]
+        print()
+        print("=" * 78)
+        print(f"用预算换策略：固定每图 seqlen={seg}（per-token 代价只取决于它，与预算无关），")
+        print(f"只改每包图数 G → N=G×seg。判据是 **ms/token**，显存上限取 {vram_cap:.0f} GiB。")
+        print("=" * 78)
+        print(f"{'G':>3}{'N':>8}  {'策略':<22}{'耗时':>10}{'ms/token':>11}{'峰值':>9}{'可用':>6}")
+        print("-" * 78)
+        best = []
+        for g in g_list:
+            n_tok = g * seg
+            inputs = build_inputs(n_tok, g)
+            for label, kw in cases:
+                free_mem()
+                torch.cuda.reset_peak_memory_stats()
+                ms, peak = measure(f"G={g} {label}", **inputs, **kw)
+                if ms is None:
+                    continue
+                per_tok = ms / n_tok
+                ok = peak <= vram_cap
+                print(f"{g:>3}{n_tok:>8}  {label:<22}{ms:8.0f}ms{per_tok:10.4f}{peak:8.1f}G"
+                      f"{'  ✓' if ok else '  ✗':>6}")
+                if ok:
+                    best.append((per_tok, g, n_tok, label, ms, peak))
+            inputs = None
+            free_mem()
+        print("-" * 78)
+        if best:
+            best.sort()
+            b0 = best[0]
+            print(f"最优（显存内）：G={b0[1]} N={b0[2]} {b0[3]} → {b0[0]:.4f} ms/token，峰值 {b0[5]:.1f} GiB")
+            cur = [r for r in best if r[3].startswith("P0")]
+            if cur:
+                base_pt = min(r[0] for r in cur)
+                print(f"对比现状（P0 全ckpt）最优 {base_pt:.4f} ms/token → "
+                      f"吞吐提升 {(base_pt / b0[0] - 1) * 100:.1f}%")
+                print("  换算：同样的图/秒下整步时间按此比例下降；步数变多由 grad_accum 补回"
+                      "有效 batch（optimizer 只占步时 0.19%，多出的步开销可忽略）。")
+        else:
+            print("没有任何组合落在显存预算内 —— 提高 --vram-budget 或降 --seg-tokens 复测。")
 
     print("-" * 78)
     print("读法：")

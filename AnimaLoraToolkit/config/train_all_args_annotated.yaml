@@ -538,6 +538,13 @@ save_state_every: 500
 # 从完整训练状态恢复。空字符串表示不用。
 resume_state: ""
 
+# resume 时是否跳过 checkpoint 所在 epoch 内已消费的 batch（默认 true = 从中断处接续）。
+# 依据：三个 batch sampler 的洗牌都只用 random.Random(seed + epoch)，同一 epoch 号的
+# batch 序列逐 batch 可复现，所以"跳过前 N 个"是精确的。数据集或分批配置变了（指纹不
+# 匹配）、或读到旧版本存的 state（没有位置信息）时会自动放弃 skip 并打印告警。
+# 设 false 回到旧行为：从该 epoch 开头重跑整个 epoch（那一段数据会被重复训练）。
+resume_skip_consumed_batches: true
+
 # 随机种子。固定可复现预览；不同 seed 可检查泛化稳定性。
 seed: 42
 
@@ -563,6 +570,38 @@ sample_prompts:
   - "newest, safe, 1girl, masterpiece, best quality"
   - "newest, safe, 1girl, cinematic lighting, backlit, detailed background"
   - "newest, safe, 1girl, bright sunlight, outdoor, dynamic pose"
+
+# ── 预览提示词取自训练集 caption（opt-in，默认 off = 与不写这些键完全等价）──
+# 动机：手写 prompt 与训练分布有距离，看到的"没还原"可能只是 prompt 不在分布内。
+# 直接用训练集的打标做预览，看的是"同一条 caption，底模 vs 当前 LoRA"的差别。
+#
+#   off  —— 只用上面的 sample_prompts（默认）
+#   mix  —— 每次采样以 sample_dataset_prompt_ratio 的概率改从训练集 caption 随机取，
+#           其余走 sample_prompts；手写与训练集分布对照着看
+#   only —— 全部取自训练集 caption（sample_prompts 可留空）
+sample_dataset_prompts: "off"
+
+# mix 模式下取训练集 caption 的概率（0~1）。off/only 时无效。
+sample_dataset_prompt_ratio: 0.5
+
+# each —— 每次采样都重新随机抽一条（多样性高，但每张预览的 prompt 不同，跨 step 不可比）
+# once —— 训练开始时随机抽定 N 条，之后全程在这 N 条里轮换（跨 step 可比，推荐用来看还原度）
+sample_dataset_prompt_pick: "each"
+
+# pick=once 时抽定的条数。多于 caption 池大小会被截断。
+sample_dataset_prompt_count: 4
+
+# 追加到训练集 caption 末尾的固定后缀（例如 ",a"）。留空=原样使用。
+sample_dataset_prompt_suffix: ""
+#
+# 说明：
+# - 取的是打标文件里的**原文**，不做 shuffle_caption / tag_dropout（预览要可比）；
+#   JSON caption 走 caption_utils 组装但 shuffle/dropout 全关。
+# - 同一张图被 `10_xxx` 目录前缀重复计入时只算一条，避免随机抽样被加权。
+# - 抽词用独立 RNG，不动全局 random / torch RNG，因此不影响训练数值；
+#   sample_seed 非 0 时取词序列跨 run 可复现。
+# - 非 off 时，每张预览图旁会写一个同名 .txt 记录本次实际用的 prompt。
+# - 开启但读不到任何 caption 会在模型加载前直接报错退出（fail-fast），不静默回退。
 
 # CFG。Anima 常用 3.5-5。过高会硬、糊或过饱和；过低 prompt 服从弱。
 sample_cfg_scale: 4.0

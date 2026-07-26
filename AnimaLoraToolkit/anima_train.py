@@ -312,6 +312,7 @@ from trainer.data import (
     FitTokenBatchSampler,
     NavitPackBatchSampler,
     CachedLatentDataset,
+    collect_dataset_captions,
     compute_sample_accumulation_steps,
     collate_fn,
     collate_fn_fit_packed,
@@ -599,6 +600,18 @@ def parse_args():
     p.add_argument("--sample-infer-steps", type=int, default=25, help="采样推理步数（对齐 ComfyUI 默认 25）")
     p.add_argument("--sample-sampler-name", default="er_sde", help="采样器名称（对齐 ComfyUI: er_sde）")
     p.add_argument("--sample-scheduler", default="simple", help="采样 scheduler（对齐 ComfyUI: simple）")
+    # 预览提示词取自训练集 caption（opt-in，默认 off = 与改动前逐字等价）
+    p.add_argument("--sample-dataset-prompts", default="off", choices=["off", "mix", "only"],
+                   help="预览提示词是否从训练集 caption 随机取："
+                        "off=只用 sample_prompts（默认）；mix=按 ratio 概率混用；only=全部取自训练集")
+    p.add_argument("--sample-dataset-prompt-ratio", type=float, default=0.5,
+                   help="mix 模式下取训练集 caption 的概率（0~1）")
+    p.add_argument("--sample-dataset-prompt-pick", default="each", choices=["each", "once"],
+                   help="each=每次采样都重新随机抽（多样性）；once=训练开始时抽定 N 条后全程轮换（跨 step 可比）")
+    p.add_argument("--sample-dataset-prompt-count", type=int, default=4,
+                   help="pick=once 时抽定的 caption 条数")
+    p.add_argument("--sample-dataset-prompt-suffix", default="",
+                   help="追加到训练集 caption 末尾的固定后缀（如 ',a'）。留空=不追加")
 
     # 保存参数
     p.add_argument("--save-every", type=int, default=0, help="每 N 个 epoch 保存 (0=仅结束时)")
@@ -1619,6 +1632,40 @@ def main():
         logger.info("\n%s", base_dataset.bucket_report(label="train"))
     dataset = base_dataset
 
+    # ── 预览提示词取自训练集 caption（opt-in，默认 off）────────────────────
+    # 在这里构建 pool（而不是推迟到训练循环前）：一旦配置与数据对不上就在模型加载前
+    # 报错，不浪费一次云端启动。off 时不读任何文件，与改动前完全等价。
+    sample_ds_prompt_mode = str(getattr(args, "sample_dataset_prompts", "off") or "off").strip().lower()
+    if sample_ds_prompt_mode not in ("off", "mix", "only"):
+        raise SystemExit(
+            f"sample_dataset_prompts 只接受 off/mix/only，收到 '{sample_ds_prompt_mode}'"
+        )
+    dataset_prompt_pool = []
+    if sample_ds_prompt_mode != "off":
+        _pick = str(getattr(args, "sample_dataset_prompt_pick", "each") or "each").strip().lower()
+        if _pick not in ("each", "once"):
+            raise SystemExit(
+                f"sample_dataset_prompt_pick 只接受 each/once，收到 '{_pick}'"
+            )
+        args.sample_dataset_prompt_pick = _pick
+        _ratio = float(getattr(args, "sample_dataset_prompt_ratio", 0.5) or 0.0)
+        if sample_ds_prompt_mode == "mix" and not (0.0 <= _ratio <= 1.0):
+            raise SystemExit(
+                f"sample_dataset_prompt_ratio 必须在 [0,1]，收到 {_ratio}"
+            )
+        dataset_prompt_pool = collect_dataset_captions(base_dataset)
+        if not dataset_prompt_pool:
+            raise SystemExit(
+                f"sample_dataset_prompts={sample_ds_prompt_mode} 但从 {args.data_dir} "
+                "没读到任何非空 caption。请检查打标文件（.txt/.caption/.json）是否存在。"
+            )
+        logger.info(
+            "[sample_prompts] 训练集 caption 池: %d 条（mode=%s, pick=%s）。示例: %s",
+            len(dataset_prompt_pool), sample_ds_prompt_mode,
+            str(getattr(args, "sample_dataset_prompt_pick", "each")),
+            dataset_prompt_pool[0][:80],
+        )
+
     # token_bucket 满覆盖前提的自检：每张图的 token 数都应落在配置的桶集合里。非桶尺寸图
     # 会各自成组（torch_compile 下多一张编译图），并可能与 cache/aux 的满覆盖假设不一致。
     if fit_packed_training and bool(getattr(args, "token_bucket", False)):
@@ -2394,6 +2441,39 @@ def main():
         sample_prompts = [args.sample_prompt]
     sample_prompt_idx = 0
 
+    # ── 训练集 caption 作为预览提示词（pool 已在 dataset 构建处备好）────────
+    # RNG 用独立实例，不碰全局 random（数据集 tag dropout 用的是全局）也不碰 torch RNG。
+    # sample_seed 非 0 时取词序列跨 run 可复现；为 0 时每次启动不同。
+    _ds_prompt_ratio = float(getattr(args, "sample_dataset_prompt_ratio", 0.5) or 0.0)
+    _ds_prompt_suffix = str(getattr(args, "sample_dataset_prompt_suffix", "") or "")
+    _ds_prompt_rng = random.Random(int(getattr(args, "sample_seed", 0) or 0) or None)
+
+    def _decorate_ds_prompt(text):
+        return f"{text}{_ds_prompt_suffix}" if _ds_prompt_suffix else text
+
+    # pick=once：开跑时抽定 N 条，之后只在这 N 条里轮换 —— 预览跨 step 可比
+    _ds_prompt_fixed = []
+    if sample_ds_prompt_mode != "off" and \
+            str(getattr(args, "sample_dataset_prompt_pick", "each")).lower() == "once":
+        _n_fixed = max(1, int(getattr(args, "sample_dataset_prompt_count", 4) or 4))
+        _n_fixed = min(_n_fixed, len(dataset_prompt_pool))
+        _ds_prompt_fixed = [
+            _decorate_ds_prompt(p)
+            for p in _ds_prompt_rng.sample(dataset_prompt_pool, _n_fixed)
+        ]
+        for _i, _p in enumerate(_ds_prompt_fixed):
+            logger.info("[sample_prompts] 抽定 #%d: %s", _i, _p[:100])
+    _ds_fixed_idx = 0
+
+    def _next_dataset_prompt():
+        """从训练集 caption 池取一条（already decorated）。"""
+        nonlocal _ds_fixed_idx
+        if _ds_prompt_fixed:
+            p = _ds_prompt_fixed[_ds_fixed_idx % len(_ds_prompt_fixed)]
+            _ds_fixed_idx += 1
+            return p
+        return _decorate_ds_prompt(_ds_prompt_rng.choice(dataset_prompt_pool))
+
     def _sample_with_vae_swap(*args_pos, **kwargs_pos):
         """sample_image 的薄包装：如果 VAE 被 offload 到 CPU 了，临时搬回 GPU 出图，
         出完再搬回去，省显存。否则直接透传。"""
@@ -2488,16 +2568,29 @@ def main():
     )
 
     def get_next_sample_prompt():
-        """获取下一个采样提示词（轮换）"""
+        """获取下一个采样提示词，返回 (prompt, 是否来自训练集 caption)。
+
+        sample_dataset_prompts=off（默认）时行为与改动前逐字相同：在 sample_prompts
+        列表里顺序轮换。mix 时按 ratio 概率改从训练集 caption 池随机取；only 时全部
+        取自 caption 池。手写列表为空且 pool 非空时，一律走 pool。
+        """
         nonlocal sample_prompt_idx
+        if dataset_prompt_pool:
+            use_ds = (
+                sample_ds_prompt_mode == "only"
+                or not sample_prompts
+                or (sample_ds_prompt_mode == "mix" and _ds_prompt_rng.random() < _ds_prompt_ratio)
+            )
+            if use_ds:
+                return _next_dataset_prompt(), True
         if not sample_prompts:
-            return "1girl, masterpiece"
+            return "1girl, masterpiece", False
         prompt = sample_prompts[sample_prompt_idx % len(sample_prompts)]
         sample_prompt_idx += 1
-        return prompt
+        return prompt, False
 
     def run_sample_checkpoint(label, filename_stem):
-        prompt = get_next_sample_prompt()
+        prompt, prompt_from_dataset = get_next_sample_prompt()
         prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
         emit(f"采样中 ({label}): {prompt_short}")
         model.eval()
@@ -2523,6 +2616,12 @@ def main():
         )
         sample_path = sample_dir / f"{filename_stem}.png"
         img.save(sample_path)
+        # 随机取词时预览图的 prompt 每次都不同，光靠日志滚动后无从对上号 → 写同名 .txt 旁挂
+        if prompt_from_dataset:
+            try:
+                sample_path.with_suffix(".txt").write_text(prompt, encoding="utf-8")
+            except Exception as e:
+                logger.warning(f"预览 prompt 旁挂文件写入失败（忽略）: {e}")
         emit(f"采样保存: {sample_path.name}")
         if monitor_server:
             try:
@@ -2564,7 +2663,20 @@ def main():
         s_sampler = str(getattr(args, "sample_sampler_name", "er_sde") or "er_sde")
         s_sched = str(getattr(args, "sample_scheduler", "simple") or "simple")
         _baseline_n = max(int(getattr(args, "baseline_sample_count", 3) or 3), 1)
-        for i, prompt in enumerate(sample_prompts[:_baseline_n]):
+        # only 模式下手写列表可能为空 —— 基线也从训练集 caption 抽（pick=once 时就用抽定的那几条，
+        # 这样 step 0 基线与后续预览是同一组 prompt，可直接对比）
+        _baseline_prompts = list(sample_prompts[:_baseline_n])
+        if sample_ds_prompt_mode == "only" and dataset_prompt_pool:
+            if _ds_prompt_fixed:
+                _baseline_prompts = _ds_prompt_fixed[:_baseline_n]
+            else:
+                _baseline_prompts = [
+                    _decorate_ds_prompt(p)
+                    for p in _ds_prompt_rng.sample(
+                        dataset_prompt_pool, min(_baseline_n, len(dataset_prompt_pool))
+                    )
+                ]
+        for i, prompt in enumerate(_baseline_prompts):
             if s_seed:
                 torch.manual_seed(s_seed + i)
             img = _sample_with_vae_swap(
@@ -2580,6 +2692,11 @@ def main():
             )
             sample_path = sample_dir / f"step_0_baseline_{i}.png"
             img.save(sample_path)
+            if sample_ds_prompt_mode == "only" and dataset_prompt_pool:
+                try:
+                    sample_path.with_suffix(".txt").write_text(prompt, encoding="utf-8")
+                except Exception as e:
+                    logger.warning(f"预览 prompt 旁挂文件写入失败（忽略）: {e}")
             emit(f"基线采样保存: step_0_baseline_{i}.png")
             if monitor_server:
                 try:

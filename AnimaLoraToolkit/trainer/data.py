@@ -9,6 +9,8 @@
 - `BucketBatchSampler` —— 把同桶样本聚一个 batch，避免 ARB 不同尺寸混 batch；
   `__len__` 用预计算的 per-bucket 加和（drop_last 在每个桶独立生效，旧的 `n // bs`
   实现在多桶时高估批数）
+- `collect_dataset_captions` —— 抽出数据集原始 caption 列表（不做 shuffle/dropout），
+  供训练期预览采样从训练集随机取 prompt
 - `CachedLatentDataset` —— Kohya 风格 .npz 缓存，与上游 ImageDataset 共享 samples 列表
 - `collate_fn` / `collate_fn_cached` —— 同 batch 内尺寸一致性检查 + 标准 stack
 
@@ -1061,6 +1063,79 @@ class ImageDataset(Dataset):
         tensor = torch.from_numpy(arr).permute(2, 0, 1)
 
         return {"pixel_values": tensor, "caption": caption, "image": str(sample["image"])}
+
+
+def collect_dataset_captions(dataset, max_count: int = 0):
+    """抽出数据集里每张图的 **原始** caption 文本，供训练期预览采样随机取用。
+
+    与 `ImageDataset.__getitem__` 的 caption 路径的差别（有意为之）：
+      - 不做 shuffle_caption / tag_dropout / caption_override 之外的任何随机化。
+        预览图的用途是"这条 caption 现在被还原成什么样"，如果每次取到的还是被 dropout
+        过的残缺 caption，不同 step 的预览就失去可比性，也看不出真实条件下的还原度。
+      - JSON caption 走 `caption_utils.build`，但 shuffle_* 全 False、tag_dropout=0。
+      - 按图片路径去重：目录名 `10_xxx` 前缀会把同一张图重复进 `samples`，
+        不去重会让这些图在随机抽样里被加权。
+
+    Args:
+        dataset: `ImageDataset` 实例（只用到 `.samples` / `.caption_override` /
+            `.caption_utils`，其它包装类请传底层的 base dataset）。
+        max_count: >0 时最多返回前 N 条（按扫描顺序截断）。0 = 不限。
+
+    Returns:
+        list[str]：去重后的 caption 列表，空 caption 已剔除；顺序稳定（跟随扫描顺序）。
+    """
+    samples = getattr(dataset, "samples", None) or []
+    override = getattr(dataset, "caption_override", None)
+    cap_utils = getattr(dataset, "caption_utils", None)
+
+    captions = []
+    seen_images = set()
+    for sample in samples:
+        img_key = str(sample.get("image", ""))
+        if img_key and img_key in seen_images:
+            continue
+        seen_images.add(img_key)
+
+        text = None
+        if override is not None:
+            text = override
+        elif sample.get("json_path") and cap_utils is not None:
+            try:
+                normalized = sample.get("normalized_json")
+                if normalized is None:
+                    raw_json = cap_utils["load_json"](sample["json_path"])
+                    if raw_json is not None:
+                        if "tags" in raw_json and "meta" in raw_json:
+                            normalized = raw_json
+                        else:
+                            normalized = cap_utils["normalize"](raw_json)
+                if normalized is not None:
+                    text = cap_utils["build"](
+                        normalized,
+                        shuffle_appearance=False,
+                        shuffle_tags=False,
+                        shuffle_environment=False,
+                        tag_dropout=0.0,
+                    )
+            except Exception as e:  # 单条坏 JSON 不该让整个 pool 构建失败
+                logger.warning(f"[sample_prompts] JSON caption 读取失败 {sample.get('json_path')}: {e}")
+                text = None
+
+        if text is None and sample.get("txt_path"):
+            try:
+                text = Path(sample["txt_path"]).read_text(encoding="utf-8").strip()
+            except Exception as e:
+                logger.warning(f"[sample_prompts] TXT caption 读取失败 {sample.get('txt_path')}: {e}")
+                text = None
+
+        text = (text or "").strip()
+        if not text:
+            continue
+        captions.append(text)
+        if max_count > 0 and len(captions) >= max_count:
+            break
+
+    return captions
 
 
 class RepeatDataset(Dataset):

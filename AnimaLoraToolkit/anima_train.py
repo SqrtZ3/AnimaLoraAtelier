@@ -332,6 +332,7 @@ from trainer.checkpoint import (
     _load_weights_best_effort,
     save_training_state,
     load_training_state,
+    dataloader_fingerprint,
 )
 from trainer.models import (
     find_diffusion_pipe_root,
@@ -606,6 +607,10 @@ def parse_args():
                    help="每 N 个 reference step 保存 LoRA。reference step 按旧 batch/grad_accum 分桶模拟。0=禁用")
     p.add_argument("--save-state-every", type=int, default=0, help="每 N 步保存完整训练状态（可断点续训）")
     p.add_argument("--resume-state", default="", help="从训练状态恢复（.pt 文件路径）")
+    p.add_argument("--no-resume-skip-consumed-batches", dest="resume_skip_consumed_batches",
+                   action="store_false", default=True,
+                   help="resume 时不跳过该 epoch 内已消费的 batch，回到旧行为："
+                        "从 checkpoint 所在 epoch 的开头重跑整个 epoch（默认是从中断处接续）")
     p.add_argument("--seed", type=int, default=42)
 
     # 进度显示
@@ -2221,7 +2226,21 @@ def main():
     reference_batch_size = int(getattr(args, "reference_batch_size", 0) or 0)
     reference_grad_accum = max(1, int(getattr(args, "reference_grad_accum", 1) or 1))
     reference_tracker = ReferenceStepTracker(grad_accum=reference_grad_accum)
-    
+
+    # ── epoch 内位置（断点续训用）──────────────────────────────────────────
+    # 只存"最后一次完成 optimizer step 时"的位置，而不是当前 micro-batch：
+    # Ctrl+C 可能落在梯度累积周期中间，那些 micro-batch 的梯度被丢弃、没进权重，
+    # 所以 resume 必须重跑它们，跳过就等于丢数据。
+    ckpt_epoch = start_epoch
+    ckpt_batch_in_epoch = 0
+    ckpt_accum_pending = 0
+    ckpt_accum_offset_at_epoch_start = 0
+    # resume 时在 start_epoch 内要跳过的 batch 数（0=不跳，等于旧行为）
+    resume_skip_batches = 0
+    resume_accum_pending = 0
+    resume_accum_offset = 0
+    data_fingerprint = dataloader_fingerprint(dataloader, grad_accum=args.grad_accum)
+
     # 从训练状态恢复（断点续训）
     if getattr(args, "resume_state", "") and Path(args.resume_state).exists():
         (
@@ -2231,9 +2250,11 @@ def main():
             saved_monitor_state,
             saved_samples_seen,
             saved_reference_state,
+            saved_epoch_position,
         ) = load_training_state(
             args.resume_state, injector, optimizer, scheduler
         )
+        ckpt_epoch = start_epoch
         if saved_samples_seen is not None:
             samples_seen = int(saved_samples_seen)
         elif sample_accum_enabled:
@@ -2245,7 +2266,35 @@ def main():
             reference_tracker.grad_batches_pending = int(saved_reference_state.get("grad_batches_pending", 0) or 0)
             reference_tracker.grad_accum = int(saved_reference_state.get("grad_accum", reference_grad_accum) or reference_grad_accum)
         emit(f"从断点恢复训练: epoch={start_epoch}, step={global_step}")
-        
+
+        # ── epoch 内位置恢复 ─────────────────────────────────────────────
+        # 旧 state 文件没有 epoch_position → 只能回到"从该 epoch 开头重跑"的旧行为。
+        # 指纹不匹配（换了数据集 / 改了 batch_size、seed、drop_last…）时 batch 序列
+        # 不再可复现，skip 会跳到错误的样本上 —— 宁可重跑也不静默跳错，明确告警。
+        _want_skip = bool(getattr(args, "resume_skip_consumed_batches", True))
+        if not _want_skip:
+            emit("resume_skip_consumed_batches=false：将从该 epoch 开头重跑（旧行为）")
+        elif not isinstance(saved_epoch_position, dict):
+            emit("⚠ 该训练状态没有 epoch 内位置信息（旧版本存的 state）："
+                 f"将从 epoch {start_epoch} 开头重跑整个 epoch")
+        else:
+            _saved_fp = saved_epoch_position.get("fingerprint")
+            _saved_batch = int(saved_epoch_position.get("batch_in_epoch", 0) or 0)
+            if _saved_fp is not None and _saved_fp != data_fingerprint:
+                _diff = [k for k in set(_saved_fp) | set(data_fingerprint)
+                         if _saved_fp.get(k) != data_fingerprint.get(k)]
+                emit(f"⚠ 数据/分批配置与保存时不一致（差异字段: {_diff}）："
+                     f"batch 序列无法复现，放弃 epoch 内接续，从 epoch {start_epoch} 开头重跑")
+            elif _saved_batch > 0:
+                resume_skip_batches = _saved_batch
+                resume_accum_pending = int(saved_epoch_position.get("accum_pending", 0) or 0)
+                resume_accum_offset = int(saved_epoch_position.get("accum_offset_at_epoch_start", 0) or 0)
+                ckpt_batch_in_epoch = resume_skip_batches
+                ckpt_accum_pending = resume_accum_pending
+                ckpt_accum_offset_at_epoch_start = resume_accum_offset
+                emit(f"epoch 内接续: 跳过 epoch {start_epoch} 内已消费的 {resume_skip_batches} 个 batch"
+                     f"（快进期间不做前向/反向，但仍会走一遍 dataloader 取数）")
+
         # 恢复监控面板的历史数据（loss 曲线等）
         if monitor_server and saved_monitor_state:
             try:
@@ -2269,6 +2318,19 @@ def main():
             except Exception as e:
                 emit(f"监控数据恢复失败: {e}")
     
+    def _epoch_position():
+        """打包"最后一次完成 optimizer step"时的 epoch 内位置（供 resume 精确接续）。
+
+        注意用的是 ckpt_* 而不是当前 micro-batch 的位置——见上面 ckpt_* 的定义注释。
+        """
+        return {
+            "epoch": int(ckpt_epoch),
+            "batch_in_epoch": int(ckpt_batch_in_epoch),
+            "accum_pending": int(ckpt_accum_pending),
+            "accum_offset_at_epoch_start": int(ckpt_accum_offset_at_epoch_start),
+            "fingerprint": data_fingerprint,
+        }
+
     # Ctrl+C 信号处理：保存状态后退出
     interrupted = False
     current_epoch = start_epoch
@@ -2289,8 +2351,10 @@ def main():
                 monitor_data = get_state()
             except Exception:
                 pass
+        # ★ epoch 号用 ckpt_epoch 而不是 current_epoch：Ctrl+C 可能落在新 epoch 刚开头、
+        #   而最后一次完成的 step 还在上一个 epoch 末尾，两者必须成对，否则 skip 会错位。
         save_training_state(
-            state_path, injector, optimizer, current_epoch, global_step,
+            state_path, injector, optimizer, ckpt_epoch, global_step,
             loss_history, monitor_state=monitor_data, scheduler=scheduler,
             samples_seen=samples_seen,
             reference_state={
@@ -2298,6 +2362,7 @@ def main():
                 "grad_batches_pending": reference_tracker.grad_batches_pending,
                 "grad_accum": reference_tracker.grad_accum,
             },
+            epoch_position=_epoch_position(),
         )
         # 同时保存 LoRA 权重
         lora_path = output_dir / f"{args.output_name}_interrupted_step{global_step}.safetensors"
@@ -3194,11 +3259,48 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         current_epoch = epoch
+        # ── 断点续训：本 epoch 内要快进的 batch 数（只对 resume 的第一个 epoch 生效）──
+        _skip_until = resume_skip_batches if epoch == start_epoch else 0
+        if _skip_until:
+            # 切分 batch 的 accumulation_offset 必须复原成**该 epoch 开始时**的值，
+            # 否则 sample-window 切分序列与原始 run 不同，快进的 batch 就对不上了。
+            # 快进结束后再把 pending 拨回保存时刻的值（见下方 _skip_until 消费处）。
+            sample_accum_pending = resume_accum_offset
+            resume_skip_batches = 0  # 一次性，防止后续 epoch 再触发
         if hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_epoch"):
             dataloader.batch_sampler.set_epoch(epoch)
         if sample_accum_enabled and hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_accumulation_offset"):
             dataloader.batch_sampler.set_accumulation_offset(sample_accum_pending)
+        # 本 epoch 切分 batch 时用的 offset —— 存进 state，resume 才能复现同一切分序列
+        _accum_offset_this_epoch = sample_accum_pending
+        if _skip_until:
+            # 保存点恰好是该 epoch 的最后一个 batch（save_state_every 正好等于每 epoch
+            # 步数时很常见）——整个 epoch 已经训完了，直接进下一个 epoch，不必空转一遍
+            # dataloader。sampler 此时已 set_epoch/set_accumulation_offset，len() 就是
+            # 本 epoch 的真实 batch 数。
+            try:
+                _n_batches = len(dataloader)
+            except TypeError:
+                _n_batches = None
+            if _n_batches is not None and _skip_until >= _n_batches:
+                sample_accum_pending = resume_accum_pending
+                emit(f"epoch {epoch} 在断点处已训完（{_n_batches} 个 batch），直接进入下一个 epoch")
+                _skip_until = 0
+                current_epoch = epoch + 1
+                continue
+            _skip_t0 = time.perf_counter()
         for batch_idx, batch in enumerate(dataloader):
+            # ── 快进已消费的 batch：放在循环最前，跳过全部前向/反向/计时/采样分支。
+            # batch_idx 是绝对索引，所以 grad_accum 边界判定（batch_idx % grad_accum）
+            # 在快进后仍然与原始 run 同余；RNG 也不被这些 batch 消耗（保存时的 RNG
+            # 本就对应快进后的这一刻）。
+            if batch_idx < _skip_until:
+                if batch_idx + 1 == _skip_until:
+                    sample_accum_pending = resume_accum_pending
+                    emit(f"epoch 内快进完成: 已跳过 {_skip_until} 个 batch"
+                         f"（{time.perf_counter() - _skip_t0:.1f}s），从 batch {_skip_until} 继续")
+                    _skip_until = 0  # 快进已结束，本 epoch 剩余部分正常训练
+                continue
             # 在累积周期开始时记录时间 + 重置 clean 标志
             if sample_accum_enabled:
                 if sample_accum_pending == 0:
@@ -4201,6 +4303,16 @@ def main():
                     legacy_accum_samples = 0
                 samples_seen += max(0, committed_samples)
 
+                # ── 断点续训锚点：记下"最后一次完成 optimizer step"时的 epoch 内位置。
+                # 梯度已进权重、已 zero_grad、累积窗口也已结算（sample_accum_pending 上面
+                # 刚清零），所以下一个要跑的 batch 就是 batch_idx+1 —— 存这个位置，resume
+                # 才既不重跑已生效的 batch、也不丢掉未生效的 batch。
+                # 放在这里而不是 global_step+=1 处：那时 sample_accum_pending 还没结算。
+                ckpt_epoch = epoch
+                ckpt_batch_in_epoch = batch_idx + 1
+                ckpt_accum_pending = sample_accum_pending
+                ckpt_accum_offset_at_epoch_start = _accum_offset_this_epoch
+
                 # AC-LoRA 训练期 RESTART（arXiv:2504.02231）：每 aclora_restart_every 步
                 # 对每层 A/B 做信号-噪声重置。默认关（aclora_active()=False → 直接短路）。
                 # 放在 optimizer.step + zero_grad 之后：grad 已清、参数刚更新，就地改 .data 安全。
@@ -4316,7 +4428,7 @@ def main():
                         except Exception:
                             pass
                     save_training_state(
-                        state_path, injector, optimizer, epoch, global_step,
+                        state_path, injector, optimizer, ckpt_epoch, global_step,
                         loss_history, monitor_state=monitor_data, scheduler=scheduler,
                         samples_seen=samples_seen,
                         reference_state={
@@ -4324,6 +4436,7 @@ def main():
                             "grad_batches_pending": reference_tracker.grad_batches_pending,
                             "grad_accum": reference_tracker.grad_accum,
                         },
+                        epoch_position=_epoch_position(),
                     )
                     # 同时保存 LoRA 权重
                     lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
@@ -4361,6 +4474,12 @@ def main():
             # 检查 max_steps（global_step 只在边界步递增，非边界步该条件恒不变）
             if step_boundary and args.max_steps and global_step >= args.max_steps:
                 break
+
+        # 快进覆盖了整个 epoch（最后一次 step 恰好是该 epoch 的最后一个 batch）时，
+        # 循环里的"快进完成"分支不会被触发 —— 在这里补上 pending 复原。
+        if _skip_until:
+            sample_accum_pending = resume_accum_pending
+            _skip_until = 0
 
         if sample_accum_enabled and sample_accum_pending > 0 and args.max_steps and global_step >= args.max_steps:
             logger.info(

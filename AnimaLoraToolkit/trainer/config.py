@@ -192,6 +192,9 @@ YAML_TO_ARGS = {
     "save_every_reference_steps": "save_every_reference_steps",
     "save_state_every": "save_state_every",
     "resume_state": "resume_state",
+    # resume 时是否跳过该 epoch 内已消费的 batch（默认 true = 从中断处接续）。
+    # 设 false 回到旧行为：从 checkpoint 所在 epoch 的开头重跑整个 epoch。
+    "resume_skip_consumed_batches": "resume_skip_consumed_batches",
     "seed": "seed",
     # 采样
     "sample_every": "sample_every",
@@ -688,6 +691,7 @@ DEFAULTS = {
     "save_every_reference_steps": 0,
     "save_state_every": 0,
     "resume_state": "",
+    "resume_skip_consumed_batches": True,
     "seed": 42,
     "sample_every": 0,
     "sample_steps": 0,

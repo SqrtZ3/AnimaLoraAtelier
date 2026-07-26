@@ -389,10 +389,51 @@ def _load_weights_best_effort(model: torch.nn.Module, sd: dict, label: str) -> d
 # Training state save / load
 # ============================================================================
 
+def dataloader_fingerprint(dataloader, grad_accum=1):
+    """数据/分批配置的指纹，用于判断 resume 时 batch 序列能否精确对齐。
+
+    三个 batch sampler 的洗牌都只用 `random.Random(self.seed + self.epoch)`
+    （data.py 的 BucketBatchSampler / FitTokenBatchSampler / NavitPackBatchSampler），
+    不依赖全局 RNG —— 只要数据集与这些字段没变，同一个 epoch 号产出的 batch 序列
+    就逐 batch 可复现，"跳过前 N 个 batch"才是精确的。任一字段变了（换数据集、
+    改 batch_size/seed/drop_last…）指纹就不匹配，调用方放弃 skip。
+    """
+    sampler = getattr(dataloader, "batch_sampler", None)
+    dataset = getattr(dataloader, "dataset", None)
+    try:
+        dataset_len = len(dataset) if dataset is not None else None
+    except TypeError:
+        dataset_len = None
+    fp = {
+        "sampler_class": type(sampler).__name__ if sampler is not None else None,
+        "dataset_len": dataset_len,
+        "grad_accum": int(grad_accum or 1),
+    }
+    for key in ("batch_size", "seed", "shuffle", "drop_last",
+                "effective_batch_size", "reference_batch_size",
+                "max_tokens_per_batch", "token_budget"):
+        if sampler is not None and hasattr(sampler, key):
+            value = getattr(sampler, key)
+            if isinstance(value, bool):
+                fp[key] = bool(value)
+            elif isinstance(value, (int, float)):
+                fp[key] = value
+    return fp
+
+
 def save_training_state(path, injector, optimizer, epoch, global_step,
                         loss_history=None, rng_state=None, monitor_state=None,
-                        scheduler=None, samples_seen=None, reference_state=None):
-    """保存完整训练状态，支持断点续训"""
+                        scheduler=None, samples_seen=None, reference_state=None,
+                        epoch_position=None):
+    """保存完整训练状态，支持断点续训
+
+    `epoch_position`（可选 dict）记录 **epoch 内**的消费位置，让 resume 能从中断处
+    接续而不是把该 epoch 从头重跑一遍。字段见 `anima_train.py` 的 `_epoch_position()`：
+      - batch_in_epoch: 最后一次完成 optimizer step 时已消费的 batch 数（= batch_idx+1）
+      - accum_pending / accum_offset_at_epoch_start: sample-window accumulation 的切分状态
+      - fingerprint: 数据/分批配置指纹，resume 时不匹配就放弃 skip（fail-safe 回旧行为）
+    缺省 None 时行为与旧版存盘完全一致（老 state 文件也照常能读，只是没有 skip 信息）。
+    """
     state = {
         "lora_state_dict": injector.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -400,6 +441,7 @@ def save_training_state(path, injector, optimizer, epoch, global_step,
         "global_step": global_step,
         "samples_seen": samples_seen,
         "reference_state": reference_state,
+        "epoch_position": epoch_position,
         "loss_history": loss_history or [],
         "rng_state": {
             "torch": torch.get_rng_state(),
@@ -411,11 +453,15 @@ def save_training_state(path, injector, optimizer, epoch, global_step,
     if scheduler is not None:
         state["scheduler_state_dict"] = scheduler.state_dict()
     torch.save(state, path)
-    logger.info(f"训练状态已保存: {path} (epoch={epoch}, step={global_step})")
+    _pos = ""
+    if isinstance(epoch_position, dict) and epoch_position.get("batch_in_epoch"):
+        _pos = f", batch_in_epoch={epoch_position['batch_in_epoch']}"
+    logger.info(f"训练状态已保存: {path} (epoch={epoch}, step={global_step}{_pos})")
 
 
 def load_training_state(path, injector, optimizer, scheduler=None):
-    """加载训练状态，返回 (epoch, global_step, loss_history, monitor_state, samples_seen, reference_state)。
+    """加载训练状态，返回 (epoch, global_step, loss_history, monitor_state, samples_seen,
+    reference_state, epoch_position)。
 
     ★ 旧实现这里有一份独立的 "拷贝 lora_w1/w2_a/w2_b" 逻辑，与 `LoRAInjector.load()`
     几乎完全重复。任何对 LoRA 存盘格式的修改（如 T-LoRA q/p_layer 命名、DoRA scale 维度）
@@ -529,6 +575,10 @@ def load_training_state(path, injector, optimizer, scheduler=None):
     logger.info(f"训练状态已恢复: epoch={epoch}, step={global_step}")
     samples_seen = state.get("samples_seen")
     reference_state = state.get("reference_state")
+    # 旧 state 文件没有这个键 → None，调用方据此回退到"从 epoch 头开始"的旧行为。
+    epoch_position = state.get("epoch_position")
+    if not isinstance(epoch_position, dict):
+        epoch_position = None
 
     # Free the CPU-side checkpoint copy and any intermediate GPU tensors
     # (e.g. bf16 casts from load_state_dict) before training begins.
@@ -537,4 +587,5 @@ def load_training_state(path, injector, optimizer, scheduler=None):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return epoch, global_step, loss_history, monitor_state, samples_seen, reference_state
+    return (epoch, global_step, loss_history, monitor_state, samples_seen,
+            reference_state, epoch_position)

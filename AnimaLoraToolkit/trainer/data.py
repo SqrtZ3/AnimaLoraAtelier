@@ -1614,27 +1614,91 @@ class FitTokenBatchSampler:
         return total
 
 
-def pack_indices_by_budget(token_counts, token_budget, order, max_images_per_pack=0):
-    """Greedy next-fit packing of sample indices into packs whose *summed* token count
-    stays within ``token_budget``.
+def navit_pack_costs(token_counts, cost_lambda=0.0, cost_ref_tokens=0):
+    """Per-image *cost* used as the packing "volume" — token count by default.
+
+    Why a cost instead of the raw token count: a pack's step time is **not** linear in
+    its summed tokens. The attention term is quadratic in each image's own sequence
+    length, so at a fixed ΣN a pack of few large images is far more expensive than one
+    of many small images. Measured on the training card (H20, Krea2 12B, one real
+    ``SingleStreamBlock``, ``tests/diag_navit_speed.py`` S5): at ΣN = 55778 the
+    fwd+bwd time is 3960 ms at G=1 versus 1719 ms at G=16 — a 2.3× spread at *identical*
+    token count. Fitting ``t = a·ΣN + b·ΣN_i²`` gives R²=0.9999 with
+    ``λ = b/a = 2.742e-05``; independently fitting whole-step times from a real run's
+    ``stage_timing.csv`` gives ``λ = 3.279e-05`` (R²=0.972) — the two agree within 16%.
+    (Same semi-empirical form as KnapFormer, arXiv 2508.06001, whose workload model is
+    ``k·(24·L·d² + 4γ·L²·d)``.)
+
+    So with ``cost_lambda > 0`` the packer budgets on::
+
+        cost(n) = n · (1 + λ·n) / (1 + λ·n_ref)
+
+    The ``n_ref`` normalisation keeps an image of the *reference* size costing exactly
+    its token count, so a dataset of uniformly-sized images keeps its current pack
+    capacity and only the size *spread* is repriced: images larger than the reference
+    cost more (fewer per pack ⇒ no step-time / VRAM spike), smaller ones cost less
+    (more per pack ⇒ higher throughput). Without it, enabling λ would silently shrink
+    every pack, which reads as a regression rather than a rebalance.
+
+    ``cost_lambda=0`` (default) returns the token counts unchanged, so every existing
+    config packs byte-identically.
+
+    Args:
+        token_counts: per-index token counts.
+        cost_lambda: λ in equivalent-tokens per token. 0 disables (default).
+        cost_ref_tokens: n_ref; 0 = auto (median of the positive token counts).
+
+    Returns:
+        (costs, budget_scale, ref) — ``costs`` is a float list aligned with
+        ``token_counts``; ``budget_scale`` is 1.0 (the budget stays in token units by
+        construction); ``ref`` is the reference size actually used (for logging).
+    """
+    lam = float(cost_lambda or 0.0)
+    # fail-fast：负值是笔误，静默按 0/自动兜底会让用户以为开关生效了。
+    if lam < 0.0:
+        raise ValueError(f"navit_pack_cost_lambda 必须 ≥0（0=关），收到 {lam}")
+    if int(cost_ref_tokens or 0) < 0:
+        raise ValueError(
+            f"navit_pack_cost_ref_tokens 必须 ≥0（0=自动取数据集中位数），收到 {cost_ref_tokens}"
+        )
+    if lam == 0.0:
+        return [float(int(c)) for c in token_counts], 1.0, 0
+    pos = sorted(int(c) for c in token_counts if int(c) > 0)
+    ref = int(cost_ref_tokens or 0)
+    if ref <= 0:
+        ref = pos[len(pos) // 2] if pos else 0
+    denom = 1.0 + lam * float(ref)          # lam>0 且 ref≥0 ⇒ denom ≥ 1
+    return [float(c) * (1.0 + lam * float(c)) / denom
+            for c in (int(x) for x in token_counts)], 1.0, ref
+
+
+def pack_indices_by_budget(token_counts, token_budget, order, max_images_per_pack=0,
+                           costs=None):
+    """Greedy next-fit packing of sample indices into packs whose *summed* cost stays
+    within ``token_budget``.
 
     NaViT block-diagonal packing carries no padding, so a pack's cost is the exact sum
     of its images' token counts (unlike the padded FiT path, whose cost is
     ``max_tokens * n_images``). ``order`` is the already-shuffled index sequence; an
     image whose own token count exceeds the budget becomes a singleton pack (the caller
     warns). The result covers every index in ``order`` exactly once, order-preserving.
+
+    ``costs`` (optional) replaces the raw token count as the packing volume — see
+    :func:`navit_pack_costs`. ``None`` (default) means "cost == token count", which is
+    the historical behaviour bit-for-bit.
     """
     packs = []
-    cur, cur_sum = [], 0
+    cur, cur_sum = [], 0.0
     cap = int(max_images_per_pack or 0)
-    budget = int(token_budget)
+    budget = float(token_budget)
+    vol = costs if costs is not None else token_counts
     for idx in order:
-        n = int(token_counts[idx])
+        n = float(vol[idx])
         over_budget = bool(cur) and (cur_sum + n > budget)
         over_count = cap > 0 and len(cur) >= cap
         if over_budget or over_count:
             packs.append(cur)
-            cur, cur_sum = [], 0
+            cur, cur_sum = [], 0.0
         cur.append(idx)
         cur_sum += n
     if cur:
@@ -1643,7 +1707,7 @@ def pack_indices_by_budget(token_counts, token_budget, order, max_images_per_pac
 
 
 def pack_indices_ffd_windowed(token_counts, token_budget, order,
-                              max_images_per_pack=0, window=0):
+                              max_images_per_pack=0, window=0, costs=None):
     """First-Fit-Decreasing packing within windows of the (already-shuffled) ``order``.
 
     Classic FFD (sort items by descending size, drop each into the first bin that fits)
@@ -1661,11 +1725,16 @@ def pack_indices_ffd_windowed(token_counts, token_budget, order,
 
     Covers every index in ``order`` exactly once. An image larger than the budget becomes
     its own pack (the caller warns), matching :func:`pack_indices_by_budget`.
+
+    ``costs`` (optional) replaces the raw token count as the packing volume — both the
+    decreasing sort key and the bin fill test use it. See :func:`navit_pack_costs`;
+    ``None`` keeps the historical token-count behaviour bit-for-bit.
     """
-    budget = int(token_budget)
+    budget = float(token_budget)
     cap = int(max_images_per_pack or 0)
     win = int(window or 0)
     order = list(order)
+    vol = costs if costs is not None else token_counts
     if win <= 0:
         windows = [order]
     else:
@@ -1673,10 +1742,10 @@ def pack_indices_ffd_windowed(token_counts, token_budget, order,
 
     packs = []
     for w in windows:
-        items = sorted(w, key=lambda i: int(token_counts[i]), reverse=True)
-        bins = []  # each: [list_of_indices, summed_tokens]
+        items = sorted(w, key=lambda i: float(vol[i]), reverse=True)
+        bins = []  # each: [list_of_indices, summed_cost]
         for idx in items:
-            n = int(token_counts[idx])
+            n = float(vol[idx])
             placed = False
             for b in bins:
                 over_count = cap > 0 and len(b[0]) >= cap
@@ -1780,7 +1849,8 @@ class NavitPackBatchSampler:
 
     def __init__(self, dataset, token_budget, max_images_per_pack=0,
                  shuffle=True, seed=42, drop_last=False,
-                 strategy="next_fit", ffd_window=256):
+                 strategy="next_fit", ffd_window=256,
+                 cost_lambda=0.0, cost_ref_tokens=0):
         self.dataset = dataset
         self.token_budget = int(token_budget)
         self.max_images_per_pack = int(max_images_per_pack or 0)
@@ -1806,12 +1876,18 @@ class NavitPackBatchSampler:
                 "bucket_for_index 都不可用/全 0）。NaViT 打包需要缓存数据集 "
                 "（cache_latents=true）以拿到每图 latent 形状。"
             )
+        # 按代价装包（opt-in）：cost_lambda=0 时 costs ≡ token_counts，逐字节等价。
+        self.cost_lambda = float(cost_lambda or 0.0)
+        self.costs, _scale, self.cost_ref = navit_pack_costs(
+            self.token_counts, self.cost_lambda, cost_ref_tokens,
+        )
         mx = max(self.token_counts) if self.token_counts else 0
-        if self.token_counts and self.token_budget < mx:
+        mx_cost = max(self.costs) if self.costs else 0.0
+        if self.token_counts and self.token_budget < mx_cost:
             logger.warning(
-                "[NavitPack] token_budget=%d < 最大单图 token=%d：该图将单独成包，"
-                "可能超出预算并 OOM。建议 token_budget >= 最大单图 token。",
-                self.token_budget, mx,
+                "[NavitPack] token_budget=%d < 最大单图代价=%.0f（token=%d）：该图将单独成包，"
+                "可能超出预算并 OOM。建议 token_budget >= 最大单图代价。",
+                self.token_budget, mx_cost, mx,
             )
         logger.info(
             "[NavitPack] dataset_len=%d token_budget=%d max_images_per_pack=%s "
@@ -1821,6 +1897,14 @@ class NavitPackBatchSampler:
             (self.ffd_window or "全局") if self.strategy == "ffd" else "-",
             min(self.token_counts) if self.token_counts else 0, mx,
         )
+        if self.cost_lambda > 0.0:
+            logger.info(
+                "[NavitPack] 按代价装包已启用：λ=%.4g，参考尺寸 n_ref=%d token"
+                "（该尺寸的图代价=token 数，容量不变）；代价范围 %.0f..%.0f。"
+                "大图代价上浮=每包少装（消步时/显存尖峰），小图下浮=每包多装（提吞吐）。",
+                self.cost_lambda, self.cost_ref,
+                min(self.costs) if self.costs else 0.0, mx_cost,
+            )
         if self.strategy == "ffd" and self.ffd_window <= 0:
             logger.warning(
                 "[NavitPack] strategy=ffd 且 ffd_window<=0（全局 FFD）：每 epoch 的包将完全相同"
@@ -1835,17 +1919,23 @@ class NavitPackBatchSampler:
         order = list(range(len(self.token_counts)))
         if self.shuffle:
             random.Random(self.seed + self.epoch).shuffle(order)
+        # cost_lambda=0 时 self.costs 就是 token_counts 的浮点副本 → 装包结果逐包等价。
+        _costs = self.costs if self.cost_lambda > 0.0 else None
         if self.strategy == "ffd":
             packs = pack_indices_ffd_windowed(
                 self.token_counts, self.token_budget, order,
-                self.max_images_per_pack, self.ffd_window,
+                self.max_images_per_pack, self.ffd_window, costs=_costs,
             )
         else:
             packs = pack_indices_by_budget(
-                self.token_counts, self.token_budget, order, self.max_images_per_pack
+                self.token_counts, self.token_budget, order,
+                self.max_images_per_pack, costs=_costs,
             )
         if self.drop_last and len(packs) > 1:
-            last_sum = sum(self.token_counts[i] for i in packs[-1])
+            # 「未满」按与装包同一口径判断（开了 cost_lambda 就用代价），否则末包会被
+            # 用另一套尺度误判。
+            _vol = self.costs if self.cost_lambda > 0.0 else self.token_counts
+            last_sum = sum(_vol[i] for i in packs[-1])
             if last_sum < self.token_budget:
                 packs = packs[:-1]
         return packs

@@ -34,15 +34,14 @@ navit_max_images_per_pack: 0   # 单 pack 最多几张图，0=不限（仅受 to
 ### 提速/打包旋钮（均 opt-in，关时与上面的基础路径逐字节等价）
 
 ```yaml
-navit_text_trim_padding: false # 块对角 cross-attn 按每图 T5 有效长度打包文本，去 512-pad。
-                               #   开启 = 不再对文本 padding 位做注意力（cross-attn 提速，
-                               #   anime tag caption 通常仅几十 token → 文本侧 token 砍约一个量级）。
-                               #   小行为改变：标准/ARB 路径本就注意 padding 文本位，开启后不再注意。
+navit_text_trim_padding: false # ⚠ 实测有害，保持 false。见下方“2.0 为什么不要开 text-trim”。
 navit_pack_strategy: next_fit  # 打包策略：next_fit（默认，顺序贪心）/ ffd（窗口内 First-Fit-
                                #   Decreasing，包更满、step 更少）。next-fit 在"图相对 budget 很小"时
                                #   已接近满（收尾浪费 ≤ 一张图）；ffd 主要在图尺寸异质时收益大。
 navit_pack_ffd_window: 256     # ffd 的窗口大小（张）：每 epoch 洗牌后切窗、窗内 FFD，使包仍逐 epoch
                                #   变化（保 SGD 多样性）。0=全局窗口（最满但 epoch 间包固定）。
+navit_pack_cost_lambda: 0.0    # 按代价装包（0=关，与改动前逐包等价）。见下方“2.4 按代价装包”。
+navit_pack_cost_ref_tokens: 0  # 代价归一的参考尺寸（token）；0=自动取数据集中位数。
 navit_drop_last: false         # 是否丢弃每 epoch 最后那个未满预算的包。默认不丢（打包路径下末包
                                #   总含真实图，丢了在小数据上是浪费）。与 bucket_drop_last 解耦。
 navit_native_resolution: false # 单图按原生分辨率定尺寸，只受 VAE+patch 的 16px 整倍数约束，
@@ -51,6 +50,20 @@ navit_multiscale: false        # 多尺度阶梯：为大图追加低 token 档�
                                #   填满大图包剩余预算 + 缓解大图训练/小图推理的尺度偏移
                                #   （见下方“2.2 多尺度阶梯”；需 navit_native_resolution）。
 ```
+
+### 2.0 为什么不要开 `navit_text_trim_padding`
+
+这个开关早期被描述为“小行为改变换 cross-attn 提速”。**两边都测过之后，这个权衡不成立**：
+
+- **收益侧接近零。** 真实训练的 `stage_timing.csv`（Krea2 12B / navit / budget≈55k token）里
+  `text_encode` 只占整步 **0.23%**，而文本 token 在单流序列里只是 ΣL 的一小截；trim 能省的
+  量级在零点几个百分点。
+- **代价侧是已实证的训练/评估条件不一致。** 训练时去掉 512-pad、而 eval / 采样 / ARB 路径
+  仍带 pad → cross-attn 的条件分布不一致，A/B 实测表现为 eval_loss 冲高 + 拟合变差；关掉后
+  eval_loss 恢复单调下降并追平 ARB 基线。
+
+也就是说这不是“提速 vs 轻微行为改变”的取舍，而是**收益≈0、代价已知为负**。保持 `false`；
+训练启动时若检测到它被打开会打 warning。
 
 ### 2.1 原生分辨率（`navit_native_resolution`，opt-in）
 
@@ -103,6 +116,49 @@ resolution-sampling 是同一思路的随机版。
 - eval loss 的随机子集取自展开后的数据集，副本会进入 eval 分布（各尺度都被评到）。
 - 超大原生图**首次**缓存编码的 VAE 峰值显存不因此下降（原生份仍按原生编码）；
   解法见下方 2.3 `cache_encode_tiled`。
+
+### 2.4 按代价装包（`navit_pack_cost_lambda`，opt-in）
+
+**解决什么问题：** `navit_token_budget` 只约束 ΣN，但**一个包的步时不是 ΣN 的线性函数**——
+attention 对每张图**自身**的序列长度是二次的，所以同样的 ΣN，装少数大图远比装很多小图贵。
+
+实测（H20 / Krea2 12B / 一个真 `SingleStreamBlock`，`tests/diag_navit_speed.py` S5，
+ΣN=55778 固定）：
+
+| G | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| block fwd+bwd | 3960 ms | 2749 | 2150 | 1851 | **1719** |
+
+**同样的 token 数，G=1 比 G=16 慢 2.3×。** 把 `t = a·ΣN + b·ΣN_i²` 拟合到这张网格得
+R²=0.9999、`λ = b/a = 2.742e-05`；再独立地把同一张卡上真实训练的 `stage_timing.csv`
+按整步拟合，得 `λ = 3.279e-05`（R²=0.972）——两条路径相差 16%，互为佐证。
+（同一半经验形式见 KnapFormer，arXiv 2508.06001：`k·(24·L·d² + 4γ·L²·d)`。）
+
+**怎么做：** 装包时把每张图的“体积”从 token 数换成
+
+```
+cost(n) = n · (1 + λ·n) / (1 + λ·n_ref)
+```
+
+`n_ref` 归一的用意是**行为中立的起点**：恰好 `n_ref` 大小的图代价等于它的 token 数，所以
+尺寸均匀的数据集容量不变，只有尺寸**差异**被重新定价——大图占更多预算（每包少装 → 消掉
+步时与显存尖峰），小图占更少（每包多装 → 提吞吐）。若不做归一，开 λ 会让**所有**包一起
+缩水，看起来像退步而不是再平衡。
+
+**怎么设：**
+
+- `navit_pack_cost_lambda`：Krea2 12B 在 H20 上是 **2.7e-05**；换模型/换卡请用
+  `tests/diag_navit_speed.py --only s5` 重新拟合（它直接打印推荐值）。
+- `navit_pack_cost_ref_tokens`：留 0（自动取数据集 token 中位数）即可；想让某个尺寸档
+  严格保持现有容量时才手动指定。
+- `0.0`（默认）= 关闭，装包结果与改动前**逐包等价**。
+
+**收益量级：** 以 λ=2.74e-05 计，4096-token 图的代价系数是 1.112、13944-token 图是 1.382
+——同等步时预算下，小图为主的包能多装约 24% 的 token。对尺寸均匀的数据集则近似无变化，
+主要价值是消除 `G=1` 那种 2.3× 的步时/显存尖峰。
+
+**注意：** 这只改变**批的组成**，不改任何数学；但批组成会影响 SGD 统计（和 `ffd` 同性质），
+所以首次开启建议按单变量 A/B 跑（只切这一个键），对比 imgs/s、峰值显存与 loss 曲线。
 
 ### 2.3 缓存分块 encode（`cache_encode_tiled`，opt-in）
 

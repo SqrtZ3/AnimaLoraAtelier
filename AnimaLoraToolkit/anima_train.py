@@ -428,6 +428,15 @@ def parse_args():
     p.add_argument("--navit-pack-ffd-window", type=int, default=256,
                    help="ffd 策略的窗口大小（张）。每 epoch 洗牌后按此切窗、窗内 FFD，使包仍逐 epoch 变化。"
                         "0=全局窗口（最满但 epoch 间包固定）。strategy!=ffd 时忽略。")
+    p.add_argument("--navit-pack-cost-lambda", type=float, default=0.0,
+                   help="按代价装包（opt-in，0=关，与现状逐包等价）。包的步时不是 token 数的线性函数——"
+                        "attention 对每图自身序列长度是二次的，同 ΣN 下少数大图远贵于多数小图"
+                        "（H20/Krea2 实测 ΣN=55778 时 G=1 比 G=16 慢 2.3×）。开启后预算按 "
+                        "cost(n)=n·(1+λn)/(1+λ·n_ref) 计：大图占更多预算（消步时/显存尖峰），"
+                        "小图占更少（每步多装图）。Krea2 12B 拟合 λ≈2.7e-05，见 docs/navit-packing.md。")
+    p.add_argument("--navit-pack-cost-ref-tokens", type=int, default=0,
+                   help="上面代价归一的参考尺寸（token）：该尺寸的图代价恰等于其 token 数，"
+                        "故均匀尺寸数据集容量不变、只对尺寸差异重新定价。0=自动取数据集中位数。")
     p.add_argument("--navit-drop-last", action="store_true",
                    help="丢弃每 epoch 最后一个（未满预算的）包。默认关：打包路径下末包总含真实图，"
                         "丢了在小数据上是浪费。与 bucket_drop_last（丢残缺 ARB 批）解耦。")
@@ -1460,6 +1469,17 @@ def main():
                 "navit_packing 需要显式设置 navit_token_budget（>0，按显存定，"
                 "见 docs/navit-packing.md 显存对照表）。"
             )
+        # text-trim 是已实证有害的开关：收益 ≈ 0（text_encode 只占真实步时 0.23%），
+        # 代价是训练/评估条件不一致（训练去 512-pad、eval/采样/ARB 仍带 pad → cross-attn
+        # 条件分布不一致；A/B 实测 eval_loss 冲高 + 拟合变差，关掉即恢复）。不 fail-fast，
+        # 因为它不影响可跑性，也可能有人在做对照实验——但必须显式提醒。
+        if bool(getattr(args, "navit_text_trim_padding", False)):
+            logger.warning(
+                "[navit] navit_text_trim_padding=true：该开关已被 A/B 实测判定为有害"
+                "（训练去 512-pad 而 eval/采样/ARB 仍带 pad → cross-attn 条件不一致，"
+                "eval_loss 冲高、拟合变差），而提速收益不足 1%%（text_encode 仅占步时 0.23%%）。"
+                "除非你正在做该开关本身的对照实验，否则请设为 false。见 docs/navit-packing.md §2.0。"
+            )
     # ── 分块 grad checkpoint（grad_checkpoint_skip_last，opt-in，默认 0=行为中立）──
     # 首版收窄变量面：只在 navit 打包 + krea2 模型族接线（该组合是显存富余最常见的场景，
     # 也是 12B 宽 MLP 下重算开销最大的地方）。其余路径 fail-fast 并指出替代做法。
@@ -1885,6 +1905,9 @@ def main():
             drop_last=bool(getattr(args, "navit_drop_last", False)),
             strategy=str(getattr(args, "navit_pack_strategy", "next_fit") or "next_fit"),
             ffd_window=int(getattr(args, "navit_pack_ffd_window", 256) or 0),
+            # 按代价装包（opt-in）：0.0 = 关，装包结果与改动前逐包等价。
+            cost_lambda=float(getattr(args, "navit_pack_cost_lambda", 0.0) or 0.0),
+            cost_ref_tokens=int(getattr(args, "navit_pack_cost_ref_tokens", 0) or 0),
         )
         dataloader = DataLoader(
             dataset, batch_sampler=batch_sampler,

@@ -109,6 +109,8 @@ YAML_TO_ARGS = {
     "navit_text_trim_padding": "navit_text_trim_padding",
     "navit_pack_strategy": "navit_pack_strategy",
     "navit_pack_ffd_window": "navit_pack_ffd_window",
+    "navit_pack_cost_lambda": "navit_pack_cost_lambda",
+    "navit_pack_cost_ref_tokens": "navit_pack_cost_ref_tokens",
     "navit_drop_last": "navit_drop_last",
     "navit_native_resolution": "navit_native_resolution",
     "navit_multiscale": "navit_multiscale",
@@ -501,11 +503,13 @@ DEFAULTS = {
     "navit_token_budget": 0,
     "navit_max_images_per_pack": 0,
     # When True, pack each image's caption to its *valid* T5 length (from the T5
-    # attention mask) instead of the full 512-pad — block-diagonal cross-attn then
-    # spends no compute on padding text tokens. Default False keeps the navit text
-    # packing byte-identical to the legacy 512-pad path (which attends padding exactly
-    # like the standard/ARB path); enabling it is a small behavior change (padding text
-    # positions are no longer attended) traded for a faster cross-attention.
+    # attention mask) instead of the full 512-pad. KEEP THIS OFF — the trade it was
+    # meant to make does not exist: the upside is a fraction of a percent (text_encode
+    # is 0.23% of a real navit step) while the downside is a measured train/eval
+    # condition mismatch (training drops the 512-pad, eval/sampling/ARB keep it → the
+    # cross-attn conditioning differs; A/B showed eval_loss spiking and worse fitting,
+    # which reverted when turned off). Default False = byte-identical to the legacy
+    # 512-pad path. See docs/navit-packing.md §2.0.
     "navit_text_trim_padding": False,
     # Pack-assembly strategy. "next_fit" (default) = the original order-preserving greedy
     # packer (byte-identical to before). "ffd" = First-Fit-Decreasing within shuffled
@@ -516,6 +520,21 @@ DEFAULTS = {
     # size and FFD runs inside each, so packs still vary across epochs. 0 = one global
     # window (max fill but epoch-static packs). Ignored when strategy != "ffd".
     "navit_pack_ffd_window": 256,
+    # Cost-based packing (opt-in, default-off / byte-identical at 0.0). A pack's step time
+    # is NOT linear in its summed tokens: attention is quadratic in each image's own
+    # sequence length, so at a fixed ΣN a pack of few large images costs far more than one
+    # of many small images (measured on H20 / Krea2 12B: 3960 ms at G=1 vs 1719 ms at
+    # G=16 for the same ΣN=55778 — a 2.3× spread). With λ>0 the packer budgets on
+    # cost(n) = n·(1+λ·n)/(1+λ·n_ref) instead of n, so oversized images take up more of
+    # the budget (no step-time / VRAM spikes) and small ones take less (more images per
+    # step). Fitted λ ≈ 2.7e-05 for Krea2 12B from tests/diag_navit_speed.py S5
+    # (R²=0.9999), independently corroborated at 3.3e-05 by fitting a real run's
+    # stage_timing.csv (R²=0.972). Re-fit it per model/card; see docs/navit-packing.md.
+    "navit_pack_cost_lambda": 0.0,
+    # Reference image size (tokens) for the cost normalisation above: an image of exactly
+    # this size costs exactly its token count, so a uniformly-sized dataset keeps today's
+    # pack capacity and only the size *spread* is repriced. 0 = auto (dataset median).
+    "navit_pack_cost_ref_tokens": 0,
     # Drop the final (under-budget) pack each epoch. Default False: for packing the last
     # pack always holds real images, so dropping it wastes data on small datasets. This
     # is navit-specific and decoupled from bucket_drop_last (which drops incomplete ARB

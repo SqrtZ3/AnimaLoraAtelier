@@ -44,6 +44,19 @@ def set_xformers_enabled(enabled: bool) -> bool:
     return _USE_XFORMERS
 
 
+# attn_force_autocast_dtype（opt-in, default-off）：见 _unify_attn_dtype 的 docstring。
+# 关 = 只在 q/k/v dtype 不一致时归一（修 xformers 崩，其余逐 bit 不变）；
+# 开 = autocast 开着时一律按 autocast dtype 算注意力（把 NaViT 块对角路径从 fp32
+# 拉回 bf16，与 dense/eval/采样的 SDPA 口径一致）。
+_ATTN_FORCE_AUTOCAST_DTYPE = False
+
+
+def set_attn_force_autocast_dtype(enabled: bool) -> bool:
+    global _ATTN_FORCE_AUTOCAST_DTYPE
+    _ATTN_FORCE_AUTOCAST_DTYPE = bool(enabled)
+    return _ATTN_FORCE_AUTOCAST_DTYPE
+
+
 def _is_xformers_attn_bias(m) -> bool:
     """True iff ``m`` is an xformers attention-bias object (e.g. ``BlockDiagonalMask``).
 
@@ -79,8 +92,17 @@ def _unify_attn_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     统一口径：autocast 开着就按 autocast dtype（= SDPA 在 dense 路径的既有行为，训练/
     评估两条路的注意力精度因此一致）；autocast 关着（eval/采样）才按最宽 dtype 提升，
     不静默降精度。
+
+    ``set_attn_force_autocast_dtype(True)``（YAML: ``attn_force_autocast_dtype``，
+    默认关）时更进一步：三者**已经**同为 fp32 也拉回 autocast dtype。这一条针对的是
+    NaViT 块对角路径的 self-attn —— 注入 LoRA 后 q/k/v 全是 fp32（同 dtype，xformers
+    不报错），于是整条自注意力跑 fp32 kernel；而 dense/eval/采样走 SDPA（autocast
+    算子）一直是 bf16。开了它两条路口径才真的一致，代价是 navit 的注意力数值从 fp32
+    变 bf16（本地 SDPA 代理测量 S=4096：fp32 比 bf16 慢 3.2×、峰值显存 1.84×；
+    xformers 真实核未在本地验证）。
     """
-    if q.dtype == k.dtype == v.dtype:
+    same = q.dtype == k.dtype == v.dtype
+    if same and not _ATTN_FORCE_AUTOCAST_DTYPE:
         return q, k, v
     target = None
     dev_type = q.device.type
@@ -90,6 +112,10 @@ def _unify_attn_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     except TypeError:  # torch < 2.4：无 device_type 形参
         if dev_type == "cuda" and torch.is_autocast_enabled():
             target = torch.get_autocast_gpu_dtype()
+    if same:
+        # force 模式：autocast 关着（eval/采样/no_grad）时不动，保持既有精度
+        return (q, k, v) if target is None or target == q.dtype else (
+            q.to(target), k.to(target), v.to(target))
     if target is None:
         target = torch.promote_types(torch.promote_types(q.dtype, k.dtype), v.dtype)
     return q.to(target), k.to(target), v.to(target)

@@ -1219,6 +1219,20 @@ def main():
             max_img_h=max_img_h, max_img_w=max_img_w,
         )
 
+    # 注意力精度口径（opt-in, default-off；见 models/anima_modeling_core._unify_attn_dtype）。
+    # 只对 Anima family 有效——krea2 有自己的 attention 实现，开在那里是静默空操作。
+    if bool(getattr(args, "attn_force_autocast_dtype", False)):
+        if is_krea2:
+            raise ValueError(
+                "attn_force_autocast_dtype 只对 Anima family 生效（krea2 用 "
+                "models/krea2_modeling.py 的 attention，不经过该开关）。请去掉该键。")
+        from models.anima_modeling_core import set_attn_force_autocast_dtype
+        set_attn_force_autocast_dtype(True)
+        logger.info(
+            "[attn] attn_force_autocast_dtype=true：autocast 开着时 q/k/v 一律按 "
+            "autocast dtype 计算（NaViT 块对角自注意力从 fp32 拉回 bf16，与 "
+            "dense/eval/采样的 SDPA 口径一致）")
+
     logger.info("加载 VAE...")
     vae = load_vae(args.vae, device, dtype, repo_root)
 

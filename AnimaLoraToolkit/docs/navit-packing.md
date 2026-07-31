@@ -268,6 +268,25 @@ rank、grad_checkpoint、底模大小（2048 vs 5120 通道）都会左右它，
 - 想要更平滑的梯度：用 `grad_accum` 跨步累积到目标有效 batch（navit 下 `batch_size` 被忽略，
   每步图片数由 budget 决定）。
 
+### 2.x 注意力精度：`attn_force_autocast_dtype`（opt-in, default-off）
+
+注入 LoRA/LoKr/DoRA 后，autocast(bf16) 下的 dtype 链条是：`nn.LayerNorm` 属 autocast 的
+fp32 策略 → `normalized_x` 是 fp32 → 被包住的 Linear 把输出 cast 回**输入** dtype
+（`trainer/lora.py` 的 `y.to(dtype=x.dtype)`）→ `q/k/v_proj` 全吐 fp32。后果两条：
+
+1. **cross-attn 崩**：k/v 来自 bf16 的 `crossattn_emb` → q=fp32、k=v=bf16，而
+   `xops.memory_efficient_attention` 不是 autocast 算子，`validate_inputs` 直接
+   `ValueError`。dense 路径走 SDPA（autocast 算子，自己会统一）所以从没暴露。
+   → 这条**无条件修复**（`_unify_attn_dtype`，dtype 不一致时归一），与开关无关。
+2. **self-attn 悄悄跑 fp32**：三者同为 fp32，xformers 不报错，但整条自注意力是 fp32
+   kernel；而 dense/eval/采样一直是 bf16。开 `attn_force_autocast_dtype: true` 后
+   autocast 期间一律按 autocast dtype 计算，两条路口径一致，并省下 navit 注意力的
+   时间/显存（本地 SDPA 代理测量 S=4096：fp32 比 bf16 慢 3.2×、峰值显存 1.84×；
+   xformers 真实核未本地验证）。默认 false = 保持现状（fp32），改动逐 bit 中立。
+
+只对 Anima family 生效；krea2 用 `models/krea2_modeling.py` 自己的 attention，配在
+krea2 上会 fail-fast。
+
 ## 3. v1 支持范围与门控（重要）
 
 NaViT 改变了 batch 语义（一包异构图、逐图 t），许多按“`[B,C,T,h,w]` 批量网格 + 逐 batch 单

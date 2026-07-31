@@ -66,6 +66,42 @@ class UnifyAttnDtypeTests(unittest.TestCase):
         self.assertEqual(ov.dtype, torch.bfloat16)
 
 
+@unittest.skipUnless(HAS_CUDA, "needs torch + CUDA for autocast")
+class ForceAutocastDtypeTests(unittest.TestCase):
+    """attn_force_autocast_dtype=true：同为 fp32 的 q/k/v 也拉回 autocast dtype。"""
+
+    def tearDown(self):
+        core.set_attn_force_autocast_dtype(False)
+
+    def _fp32_triplet(self):
+        return tuple(torch.randn(1, 4, 2, 8, device="cuda", dtype=torch.float32)
+                     for _ in range(3))
+
+    def test_off_keeps_fp32(self):
+        core.set_attn_force_autocast_dtype(False)
+        q, k, v = self._fp32_triplet()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            oq, ok, ov = core._unify_attn_dtype(q, k, v)
+        self.assertIs(oq, q)                       # 默认关 = 逐 bit 不变
+        self.assertEqual((oq.dtype, ok.dtype, ov.dtype),
+                         (torch.float32,) * 3)
+
+    def test_on_downcasts_under_autocast(self):
+        core.set_attn_force_autocast_dtype(True)
+        q, k, v = self._fp32_triplet()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            oq, ok, ov = core._unify_attn_dtype(q, k, v)
+        self.assertEqual((oq.dtype, ok.dtype, ov.dtype),
+                         (torch.bfloat16,) * 3)
+
+    def test_on_is_noop_without_autocast(self):
+        core.set_attn_force_autocast_dtype(True)
+        q, k, v = self._fp32_triplet()
+        oq, ok, ov = core._unify_attn_dtype(q, k, v)   # eval/采样：autocast 关
+        self.assertIs(oq, q)
+        self.assertEqual(oq.dtype, torch.float32)
+
+
 class _StrictXops:
     """复刻 xformers ``validate_inputs`` 的 dtype 校验（本地无 xformers 也能测）。"""
 
@@ -85,6 +121,9 @@ class _StrictXops:
 @unittest.skipUnless(HAS_CUDA, "needs torch + CUDA")
 class LoraInjectedCrossAttnDtypeTests(unittest.TestCase):
     """端到端：LoKr+DoRA 注入后走块对角（xformers）分支不能再因 dtype 崩。"""
+
+    def tearDown(self):
+        core.set_attn_force_autocast_dtype(False)
 
     def _block_forward(self, inject: bool):
         torch.manual_seed(0)
@@ -130,6 +169,16 @@ class LoraInjectedCrossAttnDtypeTests(unittest.TestCase):
         for qd, kd, vd in calls:
             self.assertEqual(qd, kd)
             self.assertEqual(kd, vd)
+
+    def test_force_autocast_dtype_makes_self_attn_bf16(self):
+        # 默认关：self_attn 三者同为 fp32（xformers 不报错，但跑的是 fp32 kernel）
+        calls = self._block_forward(inject=True)
+        self.assertEqual(calls[0], (torch.float32,) * 3)
+        # 开：self_attn 也拉回 bf16，与 dense/eval 的 SDPA 口径一致
+        core.set_attn_force_autocast_dtype(True)
+        calls = self._block_forward(inject=True)
+        for qkv in calls:
+            self.assertEqual(qkv, (torch.bfloat16,) * 3)
 
     def test_base_model_unchanged(self):
         # 未注入 LoRA 时本来就全 bf16，修复对它必须是 no-op

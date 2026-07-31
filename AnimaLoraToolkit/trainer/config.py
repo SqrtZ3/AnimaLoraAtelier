@@ -273,6 +273,7 @@ YAML_TO_ARGS = {
     "stage_profile_step": "stage_profile_step",
     "stage_profile_trace": "stage_profile_trace",
     "navit_attn_backend": "navit_attn_backend",
+    "attn_force_autocast_dtype": "attn_force_autocast_dtype",
     "base_quant_fuse_act_quant": "base_quant_fuse_act_quant",
     # LoRA-One 谱对齐初始化 (arXiv 2502.01235, KPSVD→LoKr)
     "lora_one_init_steps": "lora_one_init_steps",
@@ -461,6 +462,14 @@ DEFAULTS = {
     "torch_compile": False,
     "compile_mode": None,
     "compile_dynamic": None,
+    # ── 注意力精度口径（Anima family；opt-in, default-off）──────────────────
+    # false（默认）= 只在 q/k/v dtype 不一致时归一（那是 LoRA 注入后 xformers 直接
+    # ValueError 的必需修复，其余路径逐 bit 不变）。
+    # true = autocast 开着时一律按 autocast dtype 算注意力。针对 NaViT 块对角路径：
+    # 注入 LoRA 后 LayerNorm(fp32) → 被包的 q/k/v_proj 全吐 fp32 → 自注意力跑 fp32
+    # kernel，而 dense/eval/采样走 SDPA 一直是 bf16。开了两条路口径才一致，并省下
+    # navit 注意力的时间/显存；代价是该处数值从 fp32 变 bf16（需要 A/B 复核画质）。
+    "attn_force_autocast_dtype": False,
     # ── 冻结底模 Linear 量化（opt-in, default-off）──────────────────────────
     # "none"（默认，行为与历史逐 bit 等价）/ "fp8"（e4m3 权重，H20 可走 fp8 GEMM）
     # / "fp4"（nvfp4 权重，Blackwell 可走 fp4 GEMM；H20 上自动退 dequant-bf16，

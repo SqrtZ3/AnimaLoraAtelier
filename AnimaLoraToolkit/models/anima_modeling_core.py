@@ -62,6 +62,39 @@ def _is_xformers_attn_bias(m) -> bool:
     return isinstance(m, AttentionBias)
 
 
+def _unify_attn_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """把 q/k/v 统一到同一 dtype；三者本就同 dtype 时原样返回（零拷贝、行为不变）。
+
+    为什么需要：autocast(bf16) 下 ``nn.LayerNorm`` 产出 **fp32**（PyTorch 的 autocast
+    fp32 策略，本地 torch 2.9 实测），而被 LoRA/LoKr/DoRA 包住的 Linear 会把输出 cast
+    回**输入** dtype（``trainer/lora.py`` 的 ``y.to(dtype=x.dtype)`` / DoRA 分支的
+    ``.to(dtype=x.dtype)``）——于是 ``q_proj(normalized_x)`` 吐 fp32，而 cross-attn 的
+    ``k_proj/v_proj`` 吃的是 bf16 的 ``crossattn_emb`` → 吐 bf16。未打 LoRA 时 Linear 走
+    autocast 恒输出 bf16，三者一致，所以这条不一致只在注入 LoRA 后出现。
+
+    SDPA 是 autocast 算子，会自己把三者统一成 bf16（dense 路径因此一直没暴露问题）；
+    ``xops.memory_efficient_attention`` 不是 autocast 算子，``validate_inputs`` 直接
+    ValueError —— NaViT 块对角路径必走它，于是训练第一步就崩。
+
+    统一口径：autocast 开着就按 autocast dtype（= SDPA 在 dense 路径的既有行为，训练/
+    评估两条路的注意力精度因此一致）；autocast 关着（eval/采样）才按最宽 dtype 提升，
+    不静默降精度。
+    """
+    if q.dtype == k.dtype == v.dtype:
+        return q, k, v
+    target = None
+    dev_type = q.device.type
+    try:
+        if torch.is_autocast_enabled(dev_type):
+            target = torch.get_autocast_dtype(dev_type)
+    except TypeError:  # torch < 2.4：无 device_type 形参
+        if dev_type == "cuda" and torch.is_autocast_enabled():
+            target = torch.get_autocast_gpu_dtype()
+    if target is None:
+        target = torch.promote_types(torch.promote_types(q.dtype, k.dtype), v.dtype)
+    return q.to(target), k.to(target), v.to(target)
+
+
 @functools.lru_cache(maxsize=256)
 def _cached_block_diag_mask(q_seqlens: tuple, kv_seqlens: Optional[tuple] = None):
     """Build (and memoize) an xformers ``BlockDiagonalMask`` for the given seqlens.
@@ -186,6 +219,10 @@ def torch_attention_op(
     # cross-image leakage and no O(N²) dense mask. Requires xformers; raise loudly if
     # a bias was requested but xformers is unavailable (silently falling back to dense
     # SDPA would defeat the purpose and could OOM on long packed sequences).
+    # LoRA 注入后 q 与 k/v 可能一个 fp32 一个 bf16（见 _unify_attn_dtype）。SDPA 自己会
+    # 统一，xformers 不会——两条分支都先归一，保证走哪个后端语义一致。
+    q_B_S_H_D, k_B_S_H_D, v_B_S_H_D = _unify_attn_dtype(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D)
+
     if _is_xformers_attn_bias(attn_mask):
         if xops is None:
             raise RuntimeError(

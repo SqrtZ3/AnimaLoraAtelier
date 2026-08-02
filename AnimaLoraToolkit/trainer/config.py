@@ -194,6 +194,9 @@ YAML_TO_ARGS = {
     "save_every_steps": "save_every_steps",
     "save_every_reference_steps": "save_every_reference_steps",
     "save_state_every": "save_state_every",
+    # 每 N 个 epoch 存一次完整训练状态（与按 step 的 save_state_every 独立，可同开）。
+    # 0=禁用；两者都>0 时各存各的，文件名不同（step{N}.pt vs epoch{E}_step{N}.pt）。
+    "save_state_every_epochs": "save_state_every_epochs",
     "resume_state": "resume_state",
     # resume 时是否跳过该 epoch 内已消费的 batch（默认 true = 从中断处接续）。
     # 设 false 回到旧行为：从 checkpoint 所在 epoch 的开头重跑整个 epoch。
@@ -679,7 +682,8 @@ DEFAULTS = {
     #
     # lora_compress_replace_main=true：不写满 rank 主件，epoch 成品直接就是压缩件。
     #   省磁盘与下载带宽，但满 rank 权重此后**只存在于 training_state(.pt)**，
-    #   因此要求 save_state_every>0（否则 anima_train.py 构造期 fail-fast），
+    #   因此要求 save_state_every>0 或 save_state_every_epochs>0（否则 anima_train.py
+    #   构造期 fail-fast），
     #   且续训必须走 --resume-state（从压缩件 load 会 fail-fast）。
     "lora_compress_energy": 1.0,
     "lora_compress_max_rank": 0,
@@ -743,6 +747,7 @@ DEFAULTS = {
     "save_every_steps": 0,
     "save_every_reference_steps": 0,
     "save_state_every": 0,
+    "save_state_every_epochs": 0,
     "resume_state": "",
     "resume_skip_consumed_batches": True,
     "seed": 42,

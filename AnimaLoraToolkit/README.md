@@ -211,6 +211,7 @@ output_name: "my_lora"
 save_every: 0              # 每 N epoch 保存 LoRA (0=禁用)
 save_every_steps: 500      # 每 N step 保存 LoRA (推荐)
 save_state_every: 1000     # 每 N step 保存完整训练状态（可断点续训）
+save_state_every_epochs: 0 # 每 N epoch 保存完整训练状态（0=禁用；与上一条独立，可同开）
 
 # === 继续训练 ===
 resume_lora: ""            # 从已有 LoRA 继续训练
@@ -222,6 +223,7 @@ seed: 42
 **保存文件说明**：
 - `{name}_step{N}.safetensors` - LoRA 权重，可直接在 ComfyUI 使用
 - `training_state_step{N}.pt` - 完整训练状态（优化器、随机数、loss 历史）
+- `training_state_epoch{E}_step{N}.pt` - 同上，由 `save_state_every_epochs` 在 epoch 末尾产出
 
 ### 采样配置
 

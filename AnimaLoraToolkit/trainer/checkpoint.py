@@ -475,7 +475,9 @@ def load_training_state(path, injector, optimizer, scheduler=None):
             "这是 LoRA 权重成品，不是训练状态。两者的用法：\n"
             "  - 只从权重继续（优化器从零）: resume_lora 填该 .safetensors，resume_state 留空\n"
             "  - 完整断点续训（含优化器/step/RNG）: resume_state 填 output 目录下的 "
-            "training_state_step{N}.pt（由 save_state_every 产出，其中已含 LoRA 权重）"
+            "training_state_step{N}.pt（save_state_every 产出）或 "
+            "training_state_epoch{E}_step{N}.pt（save_state_every_epochs 产出），"
+            "其中已含 LoRA 权重"
         )
     state = torch.load(path, map_location="cpu", weights_only=False)
 

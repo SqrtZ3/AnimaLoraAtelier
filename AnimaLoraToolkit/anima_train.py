@@ -637,6 +637,9 @@ def parse_args():
     p.add_argument("--save-every-reference-steps", type=int, default=0,
                    help="每 N 个 reference step 保存 LoRA。reference step 按旧 batch/grad_accum 分桶模拟。0=禁用")
     p.add_argument("--save-state-every", type=int, default=0, help="每 N 步保存完整训练状态（可断点续训）")
+    p.add_argument("--save-state-every-epochs", type=int, default=0,
+                   help="每 N 个 epoch 保存完整训练状态（可断点续训）。0=禁用。"
+                        "与 --save-state-every（按 step）独立，可同时开")
     p.add_argument("--resume-state", default="", help="从训练状态恢复（.pt 文件路径）")
     p.add_argument("--no-resume-skip-consumed-batches", dest="resume_skip_consumed_batches",
                    action="store_false", default=True,
@@ -1307,12 +1310,14 @@ def main():
     # 续训能力会被永久丢弃且用户不会察觉，故构造期 fail-fast。
     if bool(getattr(args, "lora_compress_replace_main", False)):
         _sse = int(getattr(args, "save_state_every", 0) or 0)
-        if _sse <= 0:
+        _sse_ep = int(getattr(args, "save_state_every_epochs", 0) or 0)
+        if _sse <= 0 and _sse_ep <= 0:
             raise ValueError(
-                "lora_compress_replace_main=true 要求 save_state_every>0。\n"
+                "lora_compress_replace_main=true 要求 save_state_every>0 或 "
+                "save_state_every_epochs>0。\n"
                 "  该模式下 epoch 成品是逐层截断的压缩件（不能续训），满 rank 权重"
                 "只存在于 training_state(.pt)；若不定期存 .pt，一旦中断就无法续训。\n"
-                "  请设 save_state_every（如按你的 40 步/epoch 设 40 = 每 epoch 一份），"
+                "  请设 save_state_every_epochs: 1（每 epoch 一份）或按步数设 save_state_every，"
                 "或关掉 lora_compress_replace_main（改为主件+压缩件都写）。")
 
     raw_targets = getattr(args, "lora_targets", None)
@@ -2710,6 +2715,45 @@ def main():
         if hasattr(optimizer, "train"):
             optimizer.train()
         return lora_path
+
+    def save_state_checkpoint(tag, lora_stem=None):
+        """保存完整训练状态 → `training_state_{tag}.pt`（含 LoRA/优化器/scheduler/RNG/监控）。
+
+        `lora_stem` 非空时另写一份 LoRA 成品 `{output_name}_{lora_stem}.safetensors`
+        （None = 不写，用于"本 epoch 的成品已由 save_every 写过"的情形，避免同内容存两份）。
+
+        epoch 号一律用 `ckpt_epoch` 而不是当前 epoch 变量：它与 `_epoch_position()` 记录的
+        batch 位置成对，都是"最后一次完成 optimizer step"时的锚点 —— 两者必须同源，
+        否则 resume 的 epoch 内快进会错位（同 signal_handler 里的注释）。
+        """
+        if hasattr(optimizer, "eval"):
+            optimizer.eval()
+        state_path = output_dir / f"training_state_{tag}.pt"
+        # 获取监控面板数据用于恢复 loss 曲线
+        monitor_data = None
+        if monitor_server:
+            try:
+                from train_monitor import get_state
+                monitor_data = get_state()
+            except Exception:
+                pass
+        save_training_state(
+            state_path, injector, optimizer, ckpt_epoch, global_step,
+            loss_history, monitor_state=monitor_data, scheduler=scheduler,
+            samples_seen=samples_seen,
+            reference_state={
+                "step": reference_tracker.step,
+                "grad_batches_pending": reference_tracker.grad_batches_pending,
+                "grad_accum": reference_tracker.grad_accum,
+            },
+            epoch_position=_epoch_position(),
+        )
+        if lora_stem:
+            lora_path = output_dir / f"{args.output_name}_{lora_stem}.safetensors"
+            injector.save(lora_path, model=model)
+        if hasattr(optimizer, "train"):
+            optimizer.train()
+        return state_path
 
     # Step 0 初始采样（基线效果，测试所有提示词）
     # 只在新训练时执行（global_step == 0），resume 时跳过
@@ -4613,31 +4657,9 @@ def main():
                 # 定期保存训练状态（断点续训）
                 save_state_every = getattr(args, "save_state_every", 0)
                 if save_state_every > 0 and global_step % save_state_every == 0:
-                    if hasattr(optimizer, "eval"): optimizer.eval()
-                    state_path = output_dir / f"training_state_step{global_step}.pt"
-                    # 获取监控面板数据用于恢复 loss 曲线
-                    monitor_data = None
-                    if monitor_server:
-                        try:
-                            from train_monitor import get_state
-                            monitor_data = get_state()
-                        except Exception:
-                            pass
-                    save_training_state(
-                        state_path, injector, optimizer, ckpt_epoch, global_step,
-                        loss_history, monitor_state=monitor_data, scheduler=scheduler,
-                        samples_seen=samples_seen,
-                        reference_state={
-                            "step": reference_tracker.step,
-                            "grad_batches_pending": reference_tracker.grad_batches_pending,
-                            "grad_accum": reference_tracker.grad_accum,
-                        },
-                        epoch_position=_epoch_position(),
-                    )
-                    # 同时保存 LoRA 权重
-                    lora_path = output_dir / f"{args.output_name}_step{global_step}.safetensors"
-                    injector.save(lora_path, model=model)
-                    if hasattr(optimizer, "train"): optimizer.train()
+                    # 同时保存 LoRA 权重（文件名与旧版一致）
+                    save_state_checkpoint(f"step{global_step}",
+                                          lora_stem=f"step{global_step}")
 
             # ── 分阶段计时：micro-batch 末尾 flush（采样步触发一次 sync，写 CSV）。
             # 不再要求采样步撞上优化器边界（按 micro-batch 计数的 cadence 与 grad_accum
@@ -4692,8 +4714,22 @@ def main():
         current_epoch = epoch + 1
         if not args.max_steps or global_step < args.max_steps:
             # 保存 checkpoint
-            if args.save_every > 0 and current_epoch % args.save_every == 0:
+            _lora_saved_this_epoch = args.save_every > 0 and current_epoch % args.save_every == 0
+            if _lora_saved_this_epoch:
                 save_lora_checkpoint(f"epoch{current_epoch}")
+
+            # 每 N 个 epoch 保存完整训练状态（断点续训）。与按 step 的 save_state_every
+            # 独立：两者都开就各存各的（文件名不同，互不覆盖）。
+            # 此刻 ckpt_* 记的仍是"最后一次完成 optimizer step"的位置（不是 epoch 末尾），
+            # 两种落点都正确：末尾 batch 恰好完成 step → resume 走"该 epoch 已训完、直接进
+            # 下一个 epoch"的快进分支；末尾还剩未进权重的 micro-batch（grad_accum 不整除）
+            # → resume 快进到那一处、把它重跑一遍（它的梯度本就还没进权重）。
+            _sse_epochs = int(getattr(args, "save_state_every_epochs", 0) or 0)
+            if _sse_epochs > 0 and current_epoch % _sse_epochs == 0:
+                # LoRA 成品若已由 save_every 在本 epoch 写过，就不再重复写一份同内容的
+                _stem = None if _lora_saved_this_epoch else f"epoch{current_epoch}"
+                save_state_checkpoint(f"epoch{current_epoch}_step{global_step}",
+                                      lora_stem=_stem)
 
             # 采样（轮换提示词）
             if args.sample_every > 0 and current_epoch % args.sample_every == 0:

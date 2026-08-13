@@ -42,9 +42,31 @@ ANIMA_NPU=1 python anima_train.py --config config/xxx.yaml
 | `navit_packing` + `navit_attn_backend: xformers` | 昇腾无 xformers | 换后端，**不用关 navit**（见下） |
 | `torch_compile` | 昇腾支持度未验证 | `torch_compile: false` |
 | 8-bit 优化器（bitsandbytes） | 无昇腾后端 | `adamw` / `adamw_snr` / `automagic` 等纯 torch 实现 |
+| `aux_perceptual_enabled`（LPIPS / DINOv2） | 硬依赖 torchvision，装它会换掉 torch（见 §6） | `false`；确需则用 `npu_setup_image.sh --with-perceptual`（带 constraints）自行验证 |
 
 未拦但**需要探针确认**的：`torch.fft`（spectral aux loss 依赖）、稠密 mask 下的 SDPA 后端与显存、
 `torch.npu.Event`（`stage_timing_every > 0` 才用到，默认关）。
+
+### 2.2 广播 attn_mask 要展开（`expand_attn_mask`）
+
+昇腾把 SDPA 落到 `aclnnFlashAttentionScore`，它**只接受** `[B,N,Sq,Skv]` / `[B,1,Sq,Skv]` /
+`[1,1,Sq,Skv]` / `[Sq,Skv]` —— `Sq` 必须是真实 query 长度。而 PyTorch SDPA 允许在 query 维广播，
+仓库的 key-padding mask 正是 `[B,1,1,Skv]`（`LLMAdapter.forward` 的两次 `unsqueeze(1)`），真机报：
+
+    get unsupported atten_mask shape, the shape is [1, 1, 1, 251].
+
+`utils/npu_compat.expand_attn_mask()` 在 NPU 上把它展开成 `[B,1,Sq,Skv]` 并 `contiguous()`
+（`expand` 出的 stride=0 维对融合算子不安全）。要点：
+
+- **展开点在 `LLMAdapter.forward`，不在 attention 层**：self-attn 与 cross-attn 的 query 都是 `x`，
+  两个 mask 的 `Sq` 相同且整个 block 栈不变，一次展开即可（放在 attention 里会重复 2×num_layers 次）。
+- **行为中立 + 语义等价**：未 `enable()` 时是恒等映射；启用后 `LLMAdapter` 输出与展开前**逐 bit 相同**
+  （`tests/test_npu_mask_compat.py`，两份实现都测，含真实 padding）。
+- **体积闸门**：DiT 稠密分支（`torch_attention_op`）拿到的是 **bf16 加性** mask，Skv=打包序列长度 N，
+  展开是 O(B·N²)（N=8192→134 MB/样本，N=32768→2.1 GB）。超过 256 MB 直接抛错并指向变长打包路径，
+  不静默物化；阈值可用 `ANIMA_NPU_MASK_EXPAND_MAX_BYTES` 调。当前昇腾配方走 `navit_packing: true`
+  的 `_SegLens` 变长分支，根本到不了这条路。
+- **未验证**：真机是否还有其它 mask 形状触发同一限制（目前只覆盖 Sq=1 这一种）。
 
 ### 2.1 NaViT 打包在昇腾上是**可用**的（不是必须放弃）
 
@@ -84,10 +106,19 @@ site-packages 是否会随镜像提交、网络能不能拉代码。
 
 它不加载任何底模、几十秒跑完，逐项实测并打汇总表：torch/torch_npu/CANN 版本、`npu-smi`、
 bf16/fp32 matmul 数值、`autocast("npu")`、SDPA（无 mask / bool mask / additive mask，含 backward
-与峰值显存）、`torch_npu.npu_fusion_attention`、`torch.fft`、Conv/GroupNorm/SiLU、
+与峰值显存）、**SDPA key-padding mask 的语义与极性**（见下）、
+`torch_npu.npu_fusion_attention`、`torch.fft`、Conv/GroupNorm/SiLU、
 `torch.utils.checkpoint`、AdamW 单步、Event 计时、显存 API、bf16 粗略 TFLOPS，以及依赖包可用性。
 
 **FAIL 项就是这台机器的真实限制**，配方必须绕开它，不要靠猜。
+
+**mask 极性探针（`SDPA key-padding mask 语义/极性`）单独说一句**：另外三条 SDPA 用例是全 True /
+全 0 的 mask，只测形状能否被接受和快不快，**对极性完全不敏感**。而昇腾 `aclnnFlashAttentionScore`
+的 `atten_mask` 约定是 `True=屏蔽`，与 PyTorch SDPA 的 `True=保留` 相反（转换由 torch_npu 负责）。
+若这层没做对，训练会照跑、loss 照降、不报任何错——只是文本条件变成"只看 padding"。该探针用真实
+padding 的 mask 与 fp64 CPU 参考对拍，并同时算一份**反转极性**的参考：哪一份更接近就给出裁决。
+配套的 `SDPA 广播 key-padding mask` 用例记录未展开的 `[B,1,1,Skv]` 是否仍被拒——哪天不再被拒且
+数值正确，§2.2 的展开就可以整体去掉。
 
 ## 4. 还没做的（诚实清单）
 
@@ -266,8 +297,17 @@ constraints 钉死 `torch` / `torch-npu` / `numpy<2`（torch 2.1.x 按 numpy 1.x
 `F.interpolate(mode="nearest")`（本地对 8 组形状/dtype 与 torchvision 逐 bit 对拍一致），
 并从 `anima_train.py` 的依赖预检里移除。**昇腾上不要装 torchvision** —— 它会连带把 torch
 换成 CUDA 构建。
+"唯一用途"是就**默认路径**而言：开 `aux_perceptual_enabled` 时 torchvision 会从两个方向回来
+（`lpips` 包自身、以及 `torch.hub.load` 加载的 DINOv2 仓库代码 `models/perceptual/hub/**` 顶层
+`from torchvision import transforms`）。所以 `guard_unsupported()` 现在直接拦掉这个开关，
+而不是等运行时 ImportError 或让用户去 `pip install torchvision` 把环境废掉。
 `bitsandbytes`（`utils/optimizer_utils.py:76`）与 `lpips`（`trainer/aux_losses.py:344`）
 都是 try/except 可选导入，昇腾上不装即可。
+
+**这两个 bug（`torchvision` / `sentencepiece`）是同一个根因**：手工维护的 REQUIRED 清单与真实
+依赖会漂移，而 AST 扫描看不见 `requires_backends` 这类运行时门控、也看不见动态加载的模块。
+上面那份"真实依赖"清单是**经验清单，不是推导结论**——真机报缺包时先查它是不是又漏了一项，
+别急着照错误提示 `pip install`（在昇腾上照做一次就可能废掉环境）。
 
 **site-packages 位置陷阱**：NPU 环境下 `/home/ma-user/work` 不入镜像。若解释器的
 site-packages 落在那里，装的包提交镜像后全部丢失——脚本第 1 步会检查并报警。

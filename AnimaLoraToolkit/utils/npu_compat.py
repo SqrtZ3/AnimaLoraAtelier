@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 _NPU_ENABLED = False
 _NPU_INFO: dict = {}
 
+# ``expand_attn_mask()`` 允许物化的稠密 mask 上限（字节）。默认 256 MB：文本编码器那种
+# 几百 KB 的 mask 随便过，DiT 侧 O(N²) 的加性 mask 会在失控前 fail-fast。见该函数 docstring。
+_MASK_EXPAND_MAX_BYTES = int(os.environ.get("ANIMA_NPU_MASK_EXPAND_MAX_BYTES", str(256 * 1024 * 1024)))
+
 
 def npu_requested(device_backend: str | None = None) -> bool:
     """是否请求了 NPU 后端（env 或配置字段任一命中）。"""
@@ -74,8 +78,17 @@ def expand_attn_mask(mask, q_len: int):
         B=[1], N=[16], Sq=[251], Skv=[251]
 
     展开后语义完全相同（广播本来就是把这一维复制 Sq 份）。`.contiguous()` 是因为
-    `expand` 出来的那一维 stride=0，融合算子对非连续输入的支持没有保证；bool mask
-    在文本长度这个量级上只有几十~几百 KB，代价可忽略。
+    `expand` 出来的那一维 stride=0，融合算子对非连续输入的支持没有保证。
+
+    **代价是 O(B·Sq·Skv)，必须看调用点**：
+
+    * 文本编码器（``LLMAdapter``）：Sq=Skv≈文本长度（几百），bool → 几十~几百 KB，可忽略。
+    * DiT 稠密分支（``torch_attention_op``）：mask 来自
+      ``anima_modeling_core.py:_build_packed_masks``，是 **bf16 加性** mask，Skv=打包序列长度 N。
+      展开成 ``[B,1,N,N]`` 的体积是 B·N²·2 字节 —— N=8192 时每样本 134 MB，N=32768 时 2.1 GB。
+      所以这里**不静默展开**：超过 ``_MASK_EXPAND_MAX_BYTES`` 直接抛错（fail-fast，符合本仓库
+      "不静默吃掉资源" 的偏好），并在错误信息里给出替代路径。当前昇腾配置
+      （``navit_packing: true``）走 ``_SegLens`` 变长分支，根本到不了这条路。
 
     CUDA/CPU 上直接原样返回 —— 未 `enable()` 时本函数是恒等映射，行为逐字节不变。
     """
@@ -87,7 +100,21 @@ def expand_attn_mask(mask, q_len: int):
         return mask
     if mask.shape[-2] != 1 or int(q_len) == 1:
         return mask
-    return mask.expand(mask.shape[0], mask.shape[1], int(q_len), mask.shape[-1]).contiguous()
+    q_len = int(q_len)
+    nbytes = mask.shape[0] * mask.shape[1] * q_len * mask.shape[-1] * mask.element_size()
+    if nbytes > _MASK_EXPAND_MAX_BYTES:
+        raise RuntimeError(
+            f"昇腾 SDPA 需要把广播 attn_mask {tuple(mask.shape)} 展开成 "
+            f"[{mask.shape[0]}, {mask.shape[1]}, {q_len}, {mask.shape[-1]}]"
+            f"（dtype={mask.dtype}，{nbytes / 1e9:.2f} GB），超过上限 "
+            f"{_MASK_EXPAND_MAX_BYTES / 1e9:.2f} GB。\n"
+            "原因：昇腾把 SDPA 落到 aclnnFlashAttentionScore，它不接受 Sq=1 的广播 mask，"
+            "而稠密 mask 的体积是 O(B·Sq·Skv)。\n"
+            "解决：改用变长打包路径（navit_packing: true + navit_attn_backend: npu_tnd/sdpa_seg），"
+            "它按段长走变长注意力、根本不物化稠密 mask；或缩小序列长度。\n"
+            "确需放行可调大环境变量 ANIMA_NPU_MASK_EXPAND_MAX_BYTES（字节）。"
+        )
+    return mask.expand(mask.shape[0], mask.shape[1], q_len, mask.shape[-1]).contiguous()
 
 
 def device_str() -> str:
@@ -220,6 +247,21 @@ def guard_unsupported(args) -> None:
 
     if _on("torch_compile"):
         problems.append("torch_compile 在昇腾上未验证，首版禁止。请设 torch_compile: false。")
+
+    if _on("aux_perceptual_enabled"):
+        # LPIPS 与 DINOv2 两条路都硬依赖 torchvision：lpips 包自身 import 它，
+        # DINOv2 走 torch.hub.load（trainer/aux_losses.py:391-430）加载的仓库代码
+        # （models/perceptual/hub/facebookresearch_dinov2_main/**）顶层也 import 它。
+        # 而昇腾上装 torchvision 会从 PyPI 连带拉 CUDA 构建的 torch 覆盖掉 torch_npu
+        # 配套版本（docs/ascend-npu.md §6「最大的环境杀手」）——这是环境级破坏，
+        # 不是"少个包"，所以在这里拦住而不是等到运行时 ImportError。
+        problems.append(
+            "aux_perceptual_enabled（LPIPS / DINOv2 perceptual aux loss）依赖 torchvision，"
+            "而昇腾上装 torchvision 会连带把 torch 换成 CUDA 构建、废掉 torch_npu 环境"
+            "（docs/ascend-npu.md §6）。请设 aux_perceptual_enabled: false；"
+            "确需在昇腾上用，只能先用 npu_setup_image.sh --with-perceptual"
+            "（它带 constraints 钉死 torch）装好并自行验证。"
+        )
 
     opt = str(getattr(args, "optimizer_type", "") or "").lower()
     if "8bit" in opt or "bnb" in opt:

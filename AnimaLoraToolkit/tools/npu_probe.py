@@ -204,6 +204,87 @@ def probe_sdpa_add() -> str:
     return _sdpa_case("additive")
 
 
+def _keypad_mask_case(expand: bool):
+    """构造带真实 padding 的 key-padding mask，返回 (NPU 输出, fp64 CPU 参考, 极性反转参考)。
+
+    ``expand=True`` 模拟 ``utils/npu_compat.expand_attn_mask`` 展开后的形状
+    ``[B,1,Sq,Skv]``；``expand=False`` 是仓库原本的广播形状 ``[B,1,1,Skv]``。
+    """
+    import torch
+    import torch.nn.functional as F
+    d = _dev()
+    B, H, S, E, VALID = 1, 16, 251, 128, 151      # 与真机报错时的形状一致（Sq=Skv=251）
+    torch.manual_seed(0)
+    q = torch.randn(B, H, S, E, dtype=torch.bfloat16)
+    k = torch.randn(B, H, S, E, dtype=torch.bfloat16)
+    v = torch.randn(B, H, S, E, dtype=torch.bfloat16)
+    keep = torch.zeros(B, S, dtype=torch.bool)
+    keep[:, :VALID] = True                        # 前 VALID 个是真 token，其余是 padding
+    mask = keep[:, None, None, :]                 # [B,1,1,Skv]，torch 语义：True=保留
+    if expand:
+        mask = mask.expand(B, 1, S, S).contiguous()
+
+    out = F.scaled_dot_product_attention(
+        q.to(d), k.to(d), v.to(d), attn_mask=mask.to(d)
+    ).float().cpu().double()
+
+    # fp64 CPU 参考：手写 softmax，两种极性各算一份
+    qd, kd, vd = q.double(), k.double(), v.double()
+    scores = (qd @ kd.transpose(-1, -2)) / (E ** 0.5)
+    keep4 = keep[:, None, None, :].expand(B, H, S, S)
+    ref_ok = (torch.softmax(scores.masked_fill(~keep4, float("-inf")), dim=-1) @ vd)
+    ref_inv = (torch.softmax(scores.masked_fill(keep4, float("-inf")), dim=-1) @ vd)
+    return out, ref_ok, ref_inv
+
+
+@probe("SDPA key-padding mask 语义/极性（展开后 [B,1,Sq,Skv]）")
+def probe_sdpa_keypad_semantics() -> str:
+    """**这条才是 mask 的正确性检查**，上面三条只测了形状能不能被接受和快不快。
+
+    背景：昇腾 ``aclnnFlashAttentionScore`` 的 ``atten_mask`` 约定是 **True=屏蔽**，
+    与 PyTorch SDPA 的 **True=保留** 相反。这层转换由 torch_npu 负责，正常应当没问题，
+    但如果没做，训练会照跑、loss 照降、不报任何错——只是文本条件变成"只看 padding"。
+    全 True / 全 0 的 mask 对极性完全不敏感，测不出来，所以这里用真实 padding 对拍。
+    """
+    import torch
+    out, ref_ok, ref_inv = _keypad_mask_case(expand=True)
+    # 全部 query 行都用同一套 keep 集合（无整行被屏蔽的情况），所以不会出现 NaN 行，
+    # NPU 输出与参考逐行可比。
+    err_ok = ((out - ref_ok).norm() / ref_ok.norm()).item()
+    err_inv = ((out - ref_inv).norm() / ref_inv.norm()).item()
+    if not torch.isfinite(out).all():
+        raise RuntimeError("输出含 NaN/Inf —— 全屏蔽行或 mask 处理有问题")
+    if err_ok > 5e-2:
+        if err_inv < err_ok:
+            raise RuntimeError(
+                f"mask 极性疑似反了！rel_err(torch 语义 True=保留)={err_ok:.3e} "
+                f"> rel_err(反转语义)={err_inv:.3e}。"
+                "若确认，昇腾上必须在下发前对 bool mask 取反，否则文本条件是错的。"
+            )
+        raise RuntimeError(f"key-padding mask 结果与 fp64 参考不符 rel_err={err_ok:.3e}")
+    return (f"rel_err={err_ok:.3e}（反转极性参考 {err_inv:.3e}，差 "
+            f"{err_inv / max(err_ok, 1e-12):.0f}×）→ 极性与 torch 语义一致")
+
+
+@probe("SDPA 广播 key-padding mask [B,1,1,Skv]（记录昇腾是否仍拒收）")
+def probe_sdpa_keypad_broadcast() -> str:
+    """记录**未展开**的广播 mask 在当前 CANN/torch_npu 上是否还会被拒。
+
+    真机曾报 ``get unsupported atten_mask shape ... [1,1,1,251]``，这是
+    ``utils/npu_compat.expand_attn_mask`` 存在的唯一理由。如果某天这条变成 OK 且数值
+    正确，那个展开（以及它 O(B·Sq·Skv) 的物化代价）就可以整体去掉。
+    """
+    try:
+        out, ref_ok, ref_inv = _keypad_mask_case(expand=False)
+    except Exception as e:  # 预期路径：昇腾拒收该形状
+        return f"仍不支持（expand_attn_mask 有必要）：{type(e).__name__}: {str(e)[:200]}"
+    err_ok = ((out - ref_ok).norm() / ref_ok.norm()).item()
+    err_inv = ((out - ref_inv).norm() / ref_inv.norm()).item()
+    ok = "数值正确" if err_ok < 5e-2 else f"但数值不对 rel_err={err_ok:.3e}"
+    return (f"本机接受广播 mask，{ok}（反转极性参考 {err_inv:.3e}）"
+            "→ 可考虑去掉 npu_compat.expand_attn_mask 的展开")
+
+
 @probe("torch_npu.npu_fusion_attention（昇腾融合注意力，BSH）")
 def probe_fusion_attn() -> str:
     import torch

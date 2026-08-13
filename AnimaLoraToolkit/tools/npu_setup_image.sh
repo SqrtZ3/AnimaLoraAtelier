@@ -312,7 +312,21 @@ if [ "$WITH_WORKBENCH" = "1" ]; then
       CS_URL="https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VER}/code-server-${CODE_SERVER_VER}-linux-${CS_ARCH}.tar.gz"
       echo "   下载 $CS_URL"
       mkdir -p /opt
-      if curl -fL --retry 3 "$CS_URL" | tar xz -C /opt; then
+      # 下载器三选一：启智的 NPU 镜像里 curl 和 wget **都可能没有**（实测
+      # cann8.2.rc2-ms2.7-py3.11-910b 两个都缺），python 标准库是唯一保底。
+      fetch_stdout() {
+        if command -v curl >/dev/null 2>&1; then curl -fL --retry 3 "$1"
+        elif command -v wget >/dev/null 2>&1; then wget -qO- "$1"
+        else "$PYBIN" -c 'import sys,urllib.request as u
+r=u.urlopen(u.Request(sys.argv[1], headers={"User-Agent":"anima-lora-train"}), timeout=60)
+b=sys.stdout.buffer
+while True:
+    c=r.read(1<<20)
+    if not c: break
+    b.write(c)' "$1"
+        fi
+      }
+      if fetch_stdout "$CS_URL" | tar xz -C /opt; then
         echo "   ✓ 解包到 $CS_DIR"
       else
         echo "   ⚠ code-server 下载/解包失败（非致命）"

@@ -268,6 +268,16 @@ YAML_TO_ARGS = {
     "csflow_pixels_per_degree": "csflow_pixels_per_degree",
     "csflow_rapsd_max_images": "csflow_rapsd_max_images",
     # 训练内遥测总线（trainer/telemetry.py，图盲 opt-in default-off）
+    # wandb 接线（opt-in，默认关；见 trainer/wandb_logger.py）。云平台不给暴露端口时
+    # 内置的 train_monitor(6006) 看不到，用它把指标推出去。
+    "wandb_enabled": "wandb_enabled",
+    "wandb_project": "wandb_project",
+    "wandb_entity": "wandb_entity",
+    "wandb_run_name": "wandb_run_name",
+    "wandb_mode": "wandb_mode",
+    "wandb_dir": "wandb_dir",
+    "wandb_log_every": "wandb_log_every",
+    "wandb_log_images": "wandb_log_images",
     "telemetry_enabled": "telemetry_enabled",
     "telemetry_freq_bands": "telemetry_freq_bands",
     "telemetry_slope_window": "telemetry_slope_window",
@@ -819,6 +829,15 @@ DEFAULTS = {
     "csflow_alpha": 1.0,
     "csflow_pixels_per_degree": 50.0,
     "csflow_rapsd_max_images": 512,
+    # wandb（opt-in，默认关；enabled=False 时连 import wandb 都不发生）
+    "wandb_enabled": False,
+    "wandb_project": "anima-lora",
+    "wandb_entity": "",           # 空=用登录账号的默认 entity
+    "wandb_run_name": "",         # 空=取 output_name，便于与磁盘上的权重对号
+    "wandb_mode": "online",       # online / offline（先落盘，事后 wandb sync）/ disabled
+    "wandb_dir": "",              # 空=output_dir
+    "wandb_log_every": 1,         # >1 时逐步指标抽稀
+    "wandb_log_images": True,     # 采样预览图是否上传
     "telemetry_enabled": False,
     "telemetry_freq_bands": 3,
     "telemetry_slope_window": 6,

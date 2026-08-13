@@ -282,6 +282,7 @@ from trainer.objective import (
     masked_token_loss,
     validate_compile_requirements,
 )
+from trainer import wandb_logger  # opt-in，默认关；未开启时所有调用点都是 no-op
 from trainer.lora import LoRALayer, LoKrLayer, LoRALinear, LoRAInjector
 from trainer.gaf import GafController
 from trainer.dpo import DpoController
@@ -1151,6 +1152,13 @@ def main():
             })
         except Exception as e:
             logger.warning(f"监控面板启动失败: {e}")
+
+    # wandb 接线（opt-in，默认关）。与 monitor_server 相互独立：不给暴露端口的云平台上
+    # 6006 面板看不到，wandb 是训练进程主动外推。未开启时下面每个调用点都是 no-op。
+    wandb_logger.init(args, extra_config={
+        k: v for k, v in vars(args).items()
+        if isinstance(v, (int, float, str, bool, type(None)))
+    })
 
     # 查找模型代码
     repo_root = find_diffusion_pipe_root()
@@ -2518,6 +2526,8 @@ def main():
                 shutdown_monitor_server(monitor_server)
             except Exception:
                 pass
+        # offline 模式下 finish() 才把 run 目录写完整 —— Ctrl+C 这条路径同样要收尾
+        wandb_logger.finish()
         sys.exit(0)
 
     import signal
@@ -2723,6 +2733,7 @@ def main():
                 update_monitor(sample_path=sample_path)
             except Exception:
                 pass
+        wandb_logger.log_image(sample_path, step=global_step, caption=prompt)
         if hasattr(optimizer, "train"):
             optimizer.train()
         model.train()
@@ -2837,6 +2848,7 @@ def main():
                     update_monitor(sample_path=sample_path)
                 except Exception:
                     pass
+            wandb_logger.log_image(sample_path, step=0, caption=f"baseline {prompt}")
                     
         model.train()
     elif global_step > 0 and sampling_enabled:
@@ -3393,6 +3405,7 @@ def main():
             if write_header:
                 f.write("step,mean," + ",".join(f"t{tv:g}" for tv in _eval_t_grid) + "\n")
             f.write(f"{step},{mean_v:.6f}," + ",".join(f"{v:.6f}" for v in per_t) + "\n")
+        wandb_logger.log_eval(step, mean_v, per_t, list(_eval_t_grid))
         if per_t_band_sums is not None:
             per_t_bands = [[s / n for s in row] for row in per_t_band_sums]
             _freq_probe.record(step, per_t_bands, per_t_loss=per_t)
@@ -4644,6 +4657,11 @@ def main():
                         )
                     except Exception:
                         pass
+                wandb_logger.log_step(
+                    step=global_step, loss=loss_val, lr=float(lr),
+                    speed=float(speed_ema or 0), epoch=epoch + 1,
+                    samples_seen=samples_seen, ref_step=ref_step,
+                )
                 dt_step = now - step_start_time
                 steps_per_sec = (1.0 / dt_step) if dt_step > 0 else 0.0
                 speed_ema = steps_per_sec if speed_ema is None else (0.9 * speed_ema + 0.1 * steps_per_sec)
@@ -4862,6 +4880,8 @@ def main():
             shutdown_monitor_server(monitor_server)
         except Exception:
             pass
+
+    wandb_logger.finish()
 
 
 if __name__ == "__main__":

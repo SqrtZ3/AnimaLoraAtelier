@@ -1065,7 +1065,16 @@ def main():
     # 启用 TensorFloat-32，单乘 ~8× 加速 fp32 路径，bf16 路径不受影响。
     # 训练里 fp32 残留路径主要在 loss 计算和某些 reduce 上，开 high 是安全的零代价收益。
     # 旧 GPU（V100、Turing）这些调用是 no-op，不会出错。
-    if torch.cuda.is_available():
+    # ★ 后端选择：默认 auto = 有 CUDA 走 CUDA（与本段加入前逐字节等价）；
+    # device_backend: npu / ANIMA_NPU=1 时切昇腾 Ascend（见 docs/ascend-npu.md）。
+    # 必须在下面第一次碰设备之前完成。
+    from utils import npu_compat
+    if npu_compat.npu_requested(getattr(args, "device_backend", "auto")):
+        npu_compat.enable()
+        npu_compat.guard_unsupported(args)
+        npu_compat.set_allocator_env()
+
+    if not npu_compat.is_npu() and torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
         # 显式开 matmul + cudnn 的 TF32 flag。`high` 已经等价启用 matmul TF32，但
         # PyTorch 在不同小版本里的默认值会漂移；写出来更稳定。cudnn 那个 flag 对 conv 也生效，
@@ -1086,11 +1095,14 @@ def main():
     # 设置 expandable_segments=True 让 PyTorch caching allocator 用增长式 segment 而非
     # 每个新 shape 都开新 block；减少 OOM 风险 + 降低分配延迟。
     # 仅在用户没显式设过 PYTORCH_CUDA_ALLOC_CONF 时设置。
-    if torch.cuda.is_available() and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    if (not npu_compat.is_npu()) and torch.cuda.is_available() and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         logger.info("Allocator: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (ARB 多 bucket 友好)")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = npu_compat.device_str()
+    # autocast 的 device_type 字符串：CUDA 上恒为 "cuda"（逐字节等价），NPU 上为 "npu"。
+    # 不依赖 transfer_to_npu 是否覆盖 autocast——各版本行为不一致，这里显式取。
+    autocast_dev = npu_compat.autocast_device_type()
     dtype = torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
 
     # 创建输出目录
@@ -3344,7 +3356,7 @@ def main():
                     _tt = torch.full((1,), float(_tv), device=device)
                     _noisy = (1 - _tv) * _lat + _tv * _nz
                     _tgt = _nz - _lat
-                    with torch.autocast("cuda", dtype=dtype):
+                    with torch.autocast(autocast_dev, dtype=dtype):
                         _pr = forward_with_optional_checkpoint(
                             model, _noisy, _tt.view(-1, 1), _cross, _pm, use_checkpoint=False)
                     per_t_sums[_j] += float(per_sample_loss(_pr, _tgt, loss_type="mse").item())
@@ -3465,7 +3477,7 @@ def main():
             _lnoisy = (1 - _lte) * _llat + _lte * _lnoise
             _ltarget = _lnoise - _llat
             _lpad = torch.zeros(_lbs, 1, _llat.shape[-2], _llat.shape[-1], device=device, dtype=dtype)
-            with torch.autocast("cuda", dtype=dtype):
+            with torch.autocast(autocast_dev, dtype=dtype):
                 _lpred = forward_with_optional_checkpoint(
                     model, _lnoisy, _lt.view(-1, 1), _lcross, _lpad,
                     use_checkpoint=bool(args.grad_checkpoint))
@@ -3798,7 +3810,7 @@ def main():
                 gaf_ctrl.before_forward(global_step)
             _stage_timer.stop("timestep")
             _stage_timer.start("forward")
-            with torch.autocast("cuda", dtype=dtype):
+            with torch.autocast(autocast_dev, dtype=dtype):
                 if navit_packing:
                     # NaViT block-diagonal pack: per-image noise + one packed forward.
                     # block-diagonal cross-attn isolates each image to its own caption.
@@ -4172,7 +4184,7 @@ def main():
                         _sp_params = [p for _, p in trainable_named_params]
                         injector.set_current_t(_t_enc)
                         try:
-                            with torch.autocast("cuda", dtype=dtype):
+                            with torch.autocast(autocast_dev, dtype=dtype):
                                 with torch.no_grad():
                                     _feat_t = perceptual_features(
                                         model, _x0t_enc, _t_enc.view(-1, 1),
@@ -4249,7 +4261,7 @@ def main():
             # 取该 block 隐表征做"无正样本对排斥"。dense 路径、bs>1、非 leap/dpo 步才生效。
             # current_t 已是 t（与主前向一致，line ~2680），无需切换。
             if _disp_active and not _skip_main_extras and not fit_packed_training and bs > 1:
-                with torch.autocast("cuda", dtype=dtype):
+                with torch.autocast(autocast_dev, dtype=dtype):
                     _disp_z = perceptual_features(
                         model, noisy, t.view(-1, 1), cross, pad_mask, _disp_tap,
                     )

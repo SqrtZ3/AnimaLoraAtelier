@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# PEP 563：注解延迟求值。forward() 签名用了 ``X | Y``，Python 3.9 求值注解会 TypeError。
+from __future__ import annotations
+
 import math
 from typing import Any, Callable, List, Optional, Tuple, Union
 

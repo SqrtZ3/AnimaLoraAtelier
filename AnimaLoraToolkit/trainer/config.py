@@ -183,6 +183,9 @@ YAML_TO_ARGS = {
     "weight_decay": "weight_decay",
     "grad_clip_max_norm": "grad_clip_max_norm",
     "mixed_precision": "mixed_precision",
+    # 计算后端：auto（默认，= 有 CUDA 走 CUDA、否则 CPU，与历史行为一致）/ npu（昇腾
+    # Ascend 910B，需要 torch_npu，见 docs/ascend-npu.md）。也可用环境变量 ANIMA_NPU=1。
+    "device_backend": "device_backend",
     "grad_checkpoint": "grad_checkpoint",
     "grad_checkpoint_skip_last": "grad_checkpoint_skip_last",
     "grad_checkpoint_policy": "grad_checkpoint_policy",
@@ -716,6 +719,7 @@ DEFAULTS = {
     "weight_decay": 0.01,
     "grad_clip_max_norm": 1.0,
     "mixed_precision": "bf16",
+    "device_backend": "auto",
     "grad_checkpoint": False,
     # 分块 grad checkpoint：最后 N 个 transformer block 不做 checkpoint（存全部激活、
     # backward 不重算），其余照常。0 = 全部 checkpoint（默认，与改动前逐字节等价）。

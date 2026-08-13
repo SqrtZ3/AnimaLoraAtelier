@@ -29,6 +29,14 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+# autocast 的 device_type：CUDA 上恒为 "cuda"（与本行加入前逐字节等价），
+# 昇腾 NPU 上为 "npu"。见 utils/npu_compat.py。
+try:
+    from utils.npu_compat import autocast_device_type as _autocast_dev
+except ImportError:  # pragma: no cover - 独立跑单测时的兜底
+    def _autocast_dev() -> str:
+        return "cuda"
+
 logger = logging.getLogger(__name__)
 _SPECTRAL_AMP_EPS = 1e-12
 
@@ -444,7 +452,7 @@ class PerceptualLossModule(torch.nn.Module):
         z = z.to(dtype=self.compute_dtype)
 
         ctx = contextlib.nullcontext() if with_grad else torch.no_grad()
-        with ctx, torch.autocast("cuda", dtype=self.compute_dtype):
+        with ctx, torch.autocast(_autocast_dev(), dtype=self.compute_dtype):
             pixels = self.vae_wrapper.model.decode(z, self.vae_wrapper.scale)
         # decoder 输出 (B, 3, T_out, H_out, W_out)，单图情况 T_out=1
         if pixels.ndim == 5 and pixels.shape[2] == 1:
@@ -483,7 +491,7 @@ class PerceptualLossModule(torch.nn.Module):
         pixels_pred_lp = self._lpips_downsample(pixels_pred)
         pixels_target_lp = self._lpips_downsample(pixels_target)
 
-        with torch.autocast("cuda", dtype=self.compute_dtype):
+        with torch.autocast(_autocast_dev(), dtype=self.compute_dtype):
             l_lpips = self.lpips_fn(pixels_pred_lp, pixels_target_lp)
         l_lpips = l_lpips.view(l_lpips.shape[0]).float()
         per_sample = float(self.cfg.perceptual_lambda_lpips) * l_lpips
@@ -491,7 +499,7 @@ class PerceptualLossModule(torch.nn.Module):
         if self.use_dino:
             p_pred = self._dino_pixels(pixels_pred, pixels_pred_lp)
             p_target = self._dino_pixels(pixels_target, pixels_target_lp)
-            with torch.autocast("cuda", dtype=self.compute_dtype):
+            with torch.autocast(_autocast_dev(), dtype=self.compute_dtype):
                 feat_pred = self.dino.forward_features(p_pred)["x_norm_patchtokens"]
                 with torch.no_grad():
                     feat_target = self.dino.forward_features(p_target)["x_norm_patchtokens"]
@@ -513,14 +521,14 @@ class PerceptualLossModule(torch.nn.Module):
         pixels_pred = self._decode_to_pixel(x0_pred, with_grad=True)
         pixels_pred_lp = self._lpips_downsample(pixels_pred)
 
-        with torch.autocast("cuda", dtype=self.compute_dtype):
+        with torch.autocast(_autocast_dev(), dtype=self.compute_dtype):
             l_lpips = self.lpips_fn(pixels_pred_lp, pixels_target_lp)
         l_lpips = l_lpips.view(l_lpips.shape[0]).float()
         per_sample = float(self.cfg.perceptual_lambda_lpips) * l_lpips
 
         if self.use_dino and dino_feat_target is not None:
             p_pred = self._dino_pixels(pixels_pred, pixels_pred_lp)
-            with torch.autocast("cuda", dtype=self.compute_dtype):
+            with torch.autocast(_autocast_dev(), dtype=self.compute_dtype):
                 feat_pred = self.dino.forward_features(p_pred)["x_norm_patchtokens"]
             cos = F.cosine_similarity(feat_pred.float(), dino_feat_target.float(), dim=-1)
             l_dino = (1.0 - cos).mean(dim=-1)
@@ -581,7 +589,7 @@ class PerceptualLossModule(torch.nn.Module):
                     dino_feat_i = None
                     if self.use_dino:
                         p_t = self._dino_pixels(pt_i, pt_lp_i)
-                        with torch.autocast("cuda", dtype=self.compute_dtype):
+                        with torch.autocast(_autocast_dev(), dtype=self.compute_dtype):
                             dino_feat_i = self.dino.forward_features(p_t)["x_norm_patchtokens"]
                     pre_target.append((pt_lp_i, dino_feat_i))
                     del pt_i  # 释放原始分辨率 target pixels
@@ -706,7 +714,7 @@ class LatentPerceptualLossModule(torch.nn.Module):
                  for m in self._tap_modules]
         try:
             ctx = contextlib.nullcontext() if with_grad else torch.no_grad()
-            with ctx, torch.autocast("cuda", dtype=self.compute_dtype):
+            with ctx, torch.autocast(_autocast_dev(), dtype=self.compute_dtype):
                 self.vae_wrapper.model.decode(z, self.vae_wrapper.scale)
         finally:
             for h in hooks:

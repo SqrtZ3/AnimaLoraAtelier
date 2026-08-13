@@ -3,3 +3,5 @@
 *.pth filter=lfs diff=lfs merge=lfs -text
 *.pt filter=lfs diff=lfs merge=lfs -text
 *.zip filter=lfs diff=lfs merge=lfs -text
+# 昇腾/Linux 上要执行的脚本强制 LF —— Windows 下 CRLF 会导致 bad interpreter: ...^M
+AnimaLoraToolkit/tools/*.sh text eol=lf

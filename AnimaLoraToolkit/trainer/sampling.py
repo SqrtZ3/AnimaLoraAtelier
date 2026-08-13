@@ -304,7 +304,14 @@ def sample_latent(
         logger.info(f"[Debug] Latents init: {x.shape}, mean={x.mean().item():.4f}, std={x.std().item():.4f}")
 
         pad_mask = torch.zeros(1, 1, lat_h, lat_w, device=device, dtype=dtype)
-        device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+        # autocast 的 device_type 必须与实际设备一致：cuda / npu（昇腾）/ cpu。
+        _dev_s = str(device)
+        if _dev_s.startswith("cuda"):
+            device_type = "cuda"
+        elif _dev_s.startswith("npu"):
+            device_type = "npu"
+        else:
+            device_type = "cpu"
         use_cfg = (cross_uncond is not None) and (float(cfg_scale) != 1.0)
 
         def denoise_fn(x_in: torch.Tensor, sigma_in: torch.Tensor) -> torch.Tensor:

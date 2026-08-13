@@ -17,6 +17,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# PEP 563：注解延迟求值。本文件的 forward() 签名用了 ``X | Y`` 写法，Python 3.9
+# 运行时求值注解会 TypeError（昇腾镜像里 Python 常见为 3.9）。加这一行后注解只作为
+# 字符串保存，不改变任何运行时行为。
+from __future__ import annotations
+
 import functools
 import math
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union

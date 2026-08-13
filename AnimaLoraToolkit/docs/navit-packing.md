@@ -42,6 +42,8 @@ navit_pack_ffd_window: 256     # ffd 的窗口大小（张）：每 epoch 洗牌
                                #   变化（保 SGD 多样性）。0=全局窗口（最满但 epoch 间包固定）。
 navit_pack_cost_lambda: 0.0    # 按代价装包（0=关，与改动前逐包等价）。见下方“2.4 按代价装包”。
 navit_pack_cost_ref_tokens: 0  # 代价归一的参考尺寸（token）；0=自动取数据集中位数。
+navit_pack_token_cap: 0        # 双约束的第二条：ΣN 上限（管显存）。0=自动=token_budget。
+                               #   仅在 cost_lambda>0 时生效。见“2.4.1 为什么代价预算不够”。
 navit_drop_last: false         # 是否丢弃每 epoch 最后那个未满预算的包。默认不丢（打包路径下末包
                                #   总含真实图，丢了在小数据上是浪费）。与 bucket_drop_last 解耦。
 navit_native_resolution: false # 单图按原生分辨率定尺寸，只受 VAE+patch 的 16px 整倍数约束，
@@ -153,12 +155,43 @@ cost(n) = n · (1 + λ·n) / (1 + λ·n_ref)
   严格保持现有容量时才手动指定。
 - `0.0`（默认）= 关闭，装包结果与改动前**逐包等价**。
 
-**收益量级：** 以 λ=2.74e-05 计，4096-token 图的代价系数是 1.112、13944-token 图是 1.382
-——同等步时预算下，小图为主的包能多装约 24% 的 token。对尺寸均匀的数据集则近似无变化，
-主要价值是消除 `G=1` 那种 2.3× 的步时/显存尖峰。
+**收益量级：** 以 λ=2.74e-05 计，4096-token 图的代价系数是 1.112、13944-token 图是 1.382。
+对尺寸均匀的数据集近似无变化；**主要价值是消除 `G=1` 那种 2.3× 的步时/显存尖峰**。
 
 **注意：** 这只改变**批的组成**，不改任何数学；但批组成会影响 SGD 统计（和 `ffd` 同性质），
 所以首次开启建议按单变量 A/B 跑（只切这一个键），对比 imgs/s、峰值显存与 loss 曲线。
+
+### 2.4.1 双约束：为什么只卡代价预算不够（`navit_pack_token_cap`）
+
+**此前这里写着"小图为主的包能多装约 24% 的 token"，并把它当成纯收益——那句话漏了代价侧。**
+`cost(n)` 对**小于 `n_ref`** 的图低于其 token 数，所以只测试 `Σcost ≤ budget` 时，
+一包小图的 **ΣN 会超出 `navit_token_budget`**，倍数上界是
+
+```
+ΣN_max / budget = (1 + λ·n_ref) / (1 + λ·n_min)
+```
+
+λ=2.742e-05、n_ref=13944、n=4096 时是 **1.243×**。本地实跑（`tests/test_navit_pack_token_cap.py`
+的同一数据集，budget=49152、全 3072~4608 token 的小图、ffd）实测 **ΣN 峰值 61440 = 1.250×
+budget**。而步显存对 ΣN 线性（memory 实测 ≈ 10GB + 0.52MB/token），**12288 个超额 token
+≈ +6.4GB 峰值显存**——显存对照表承诺的还是 budget 那一档。所以那不是白捡的吞吐，
+是**未入账的显存超支**（本质是拿显存换吞吐，只是没写在账上）。
+
+修法与 AdaptiveLoad（arXiv 2605.17923）的双约束一致——计算上限与显存上限同时卡
+（`B = max(1, min(⌊M_mem/S⌋, ⌊M_comp/S^p⌋))`）。装包现在要求**两条同时成立**：
+
+```
+Σcost ≤ navit_token_budget      （管步时；attention 二次项）
+ΣN    ≤ navit_pack_token_cap    （管显存；激活对 ΣN 线性）
+```
+
+- `navit_pack_token_cap: 0`（默认）= 自动取 `navit_token_budget` → ΣN 不再越过预算。
+- 想**明知地**拿显存换吞吐，就把它显式设成大于 budget 的值（例如 `1.25 × budget`），
+  这时超支是你选的、写在配置里的，而不是隐式发生的。
+- `cost_lambda = 0` 时 cost ≡ token，两条约束是同一条，本键不生效，**装包结果逐包等价**。
+
+（历史说明：改动落地时仓库里没有任何 config 设过 `navit_pack_cost_lambda > 0`，
+所以没有既有 run 的行为被改变。）
 
 ### 2.5 用预算换重算：`grad_checkpoint_policy`（opt-in）
 
@@ -347,6 +380,35 @@ ARB bs=4 ≈ 0.33 it/s，步时 +32%）；剩余部分的归因需要云端 `sta
 `test_navit_per_image_adaln` 固化 Block/FinalLayer 两布局一致，含 use_adaln_lora 两分支；
 model 级等价仍由 `test_packed_navit_forward` 覆盖）。legacy 逐 token 布局（`mod_index=None`）
 保留，ARB/token-bucket 路径逐字节不变。
+
+**尚未落地的已知开销：gather 是物化的。** 当前 `Block.forward_tokens` /
+`SingleStreamBlock.forward` 拿到 per-image 调制行后，用 `index_select(...).unsqueeze(0)`
+**把 6 个 `(1, ΣN, D)` 张量全部物化**再喂逐元素运算。这些张量每行都是同一图的常数，
+信息量只有 `G×D`，却按 `ΣN×D` 落了盘——Krea2 `D=6144`、`ΣN=55778` 时是
+**6×55778×6144×2B ≈ 4.1 GB**（另加 RMSNorm 内部 fp32 中间量约 1.4 GB）。
+
+本地已量过天花板（`tests/diag_navit_adaln_gather.py`，RTX 5070 Laptop / torch 2.9.1 /
+真实宽度 D=6144 / G=4，只测被改动的算子链、不含 attention/SwiGLU/LoRA）：
+
+| 变体 | fwd (ΣN=8192) | fwd+bwd | 峰值显存 |
+|---|---|---|---|
+| 现状（6× index_select 物化） | 19.5 ms | 59.5 ms | 2449 MiB |
+| 表达式内就地 gather | 19.5 ms（1.00×） | 66.0 ms（0.90×） | 2449 MiB |
+| `torch.compile(dynamic=True)` 融合 RMSNorm+gather+仿射 | **4.5 ms（4.35×）** | **32.6 ms（1.79×）** | **1585 MiB（−35%）** |
+
+数值上不是"更准/更错"而是**舍入路径不同**：以全 fp32 为参考，现状与融合版的相对误差都是
+5.4e-03，同为 bf16 eps（3.9e-03）量级（脚本已把这个判据固化，不再拿现状当参考对拍）。
+`dynamic=True` 下三个不同 ΣN 只产生 2 张图，**没有逐形状重编译**（`unique_graphs=2`）。
+
+同一位置正是 AdaptiveLoad（arXiv 2605.17923）写 fused LayerNorm-Modulate CUDA kernel 的
+地方（其报该算子 fwd 3.21–3.39×、激活 −61.9%，与本地这条 pure-PyTorch 路线量级一致）。
+
+**诚实标注：这是算子链自身的倍数，不是整步收益。** 该链在整步里占多少、云端卡（H20 /
+sm120）上带宽比不同会把倍数移到哪，都需要云端 `stage_timing` 才能定。文档 §4.1 记录的
+云端 +32% 步时差里仍有未归因的部分，这是其中一个**合理嫌疑人，但尚未证实**。
+另需注意：全局 `torch_compile` 在 navit 下是 fail-fast 的（整模型动态形状），
+这里用的是**叶子级纯逐元素函数的局部编译**，是另一回事——真要落地仍须先确认它与
+`grad_checkpoint` / LoRA 注入的实跑交互。
 
 顺手的小优化（同 commit）：`_packed_rope_from_grid` 两次 `.item()` 同步合并为一次 +
 freqs 按 (device, NTK) 缓存；`BlockDiagonalMask` 按 seqlens 元组 lru 缓存（纯 CPU 元数据，

@@ -177,9 +177,12 @@ class TestABBA(unittest.TestCase):
             dst = os.path.join(td, "lora.safetensors")
             injector.save(src)
             tool = str(ROOT / "tools" / "abba_export_lora.py")
+            # 显式 utf-8 解码：子进程输出含中文/非 ASCII 字节，Windows 默认 locale
+            # 编码（GBK）会在 reader 线程里抛 UnicodeDecodeError 并把 stdout 置 None
             r = subprocess.run([_sys.executable, tool, src, dst, "--device", "cpu"],
-                               capture_output=True, text=True)
-            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+            self.assertEqual(r.returncode, 0, (r.stdout or "") + (r.stderr or ""))
             from safetensors import safe_open
             with safe_open(dst, "pt") as f:
                 keys = list(f.keys())

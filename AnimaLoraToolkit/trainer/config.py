@@ -111,6 +111,7 @@ YAML_TO_ARGS = {
     "navit_pack_ffd_window": "navit_pack_ffd_window",
     "navit_pack_cost_lambda": "navit_pack_cost_lambda",
     "navit_pack_cost_ref_tokens": "navit_pack_cost_ref_tokens",
+    "navit_pack_token_cap": "navit_pack_token_cap",
     "navit_drop_last": "navit_drop_last",
     "navit_native_resolution": "navit_native_resolution",
     "navit_multiscale": "navit_multiscale",
@@ -551,6 +552,17 @@ DEFAULTS = {
     # this size costs exactly its token count, so a uniformly-sized dataset keeps today's
     # pack capacity and only the size *spread* is repriced. 0 = auto (dataset median).
     "navit_pack_cost_ref_tokens": 0,
+    # Second (memory) ceiling used together with the cost budget above — the packer must
+    # satisfy BOTH Σcost <= navit_token_budget AND ΣN <= this. Only takes effect when
+    # navit_pack_cost_lambda > 0 (with λ=0 cost ≡ tokens and the two are the same
+    # constraint). 0 = auto = navit_token_budget. Why it exists: repricing makes images
+    # smaller than n_ref cost *less* than their tokens, so a cost-only budget lets ΣN
+    # exceed navit_token_budget by up to (1+λ·n_ref)/(1+λ·n_min) — ~1.24x at λ=2.742e-05,
+    # n_ref=13944, n=4096. Step VRAM is linear in ΣN (~10GB + 0.52MB/token measured), so
+    # that is an unbudgeted overshoot, not free throughput. Raise it above the budget
+    # only as a deliberate VRAM-for-throughput trade. Dual-constraint balancing follows
+    # AdaptiveLoad (arXiv 2605.17923).
+    "navit_pack_token_cap": 0,
     # Drop the final (under-budget) pack each epoch. Default False: for packing the last
     # pack always holds real images, so dropping it wastes data on small datasets. This
     # is navit-specific and decoupled from bucket_drop_last (which drops incomplete ARB
@@ -821,8 +833,11 @@ DEFAULTS = {
     # 「kernel 间空隙（CPU/分配器）」；0=关（默认，行为中立）。trace=额外导出 chrome json。
     "stage_profile_step": 0,
     "stage_profile_trace": False,
-    # krea2 navit packed attention 后端：xformers（默认，历史行为逐 bit 不变）|
-    # sdpa_seg（逐段 dense SDPA/cudnn，数学恒等，H20 上更快）。
+    # navit packed attention 后端（三者语义相同：块对角，只是换 kernel）：
+    #   xformers  默认，历史行为逐 bit 不变；昇腾无此包
+    #   sdpa_seg  逐段 dense SDPA，数学恒等（krea2 + anima 均支持，H20 上比 xformers 快）
+    #   npu_tnd   torch_npu.npu_fusion_attention 的 TND 变长融合注意力（仅 anima family，
+    #             昇腾原生；真机可用性先跑 tools/npu_probe.py）
     "navit_attn_backend": "xformers",
     "lora_one_init_steps": 0,
     "lora_one_init_scale": 0.01,

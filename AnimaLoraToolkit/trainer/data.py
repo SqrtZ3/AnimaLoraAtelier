@@ -1673,7 +1673,7 @@ def navit_pack_costs(token_counts, cost_lambda=0.0, cost_ref_tokens=0):
 
 
 def pack_indices_by_budget(token_counts, token_budget, order, max_images_per_pack=0,
-                           costs=None):
+                           costs=None, token_cap=None):
     """Greedy next-fit packing of sample indices into packs whose *summed* cost stays
     within ``token_budget``.
 
@@ -1686,28 +1686,43 @@ def pack_indices_by_budget(token_counts, token_budget, order, max_images_per_pac
     ``costs`` (optional) replaces the raw token count as the packing volume — see
     :func:`navit_pack_costs`. ``None`` (default) means "cost == token count", which is
     the historical behaviour bit-for-bit.
+
+    ``token_cap`` (optional) is a *second, independent* ceiling on the pack's summed raw
+    **token** count ΣN. It only matters when ``costs`` is given: repricing by cost makes
+    ΣN and Σcost different quantities, and images smaller than ``n_ref`` cost *less* than
+    their tokens, so a cost-only budget lets ΣN drift above ``token_budget`` — by up to
+    ``(1+λ·n_ref)/(1+λ·n_min)`` (≈1.24× at λ=2.742e-05, n_ref=13944, n=4096). Activation
+    memory is linear in ΣN, so that drift is an unbudgeted VRAM overshoot, not free
+    throughput. Constraining compute *and* memory at once is AdaptiveLoad's
+    dual-constraint formulation (arXiv 2605.17923, ``B = min(⌊M_mem/S⌋, ⌊M_comp/S^p⌋)``).
+    ``None`` (default) = no token ceiling, i.e. the historical single-constraint packing.
     """
     packs = []
-    cur, cur_sum = [], 0.0
+    cur, cur_sum, cur_tok = [], 0.0, 0.0
     cap = int(max_images_per_pack or 0)
     budget = float(token_budget)
+    tcap = float(token_cap) if token_cap is not None else None
     vol = costs if costs is not None else token_counts
     for idx in order:
         n = float(vol[idx])
+        raw = float(token_counts[idx])
         over_budget = bool(cur) and (cur_sum + n > budget)
+        over_tokens = tcap is not None and bool(cur) and (cur_tok + raw > tcap)
         over_count = cap > 0 and len(cur) >= cap
-        if over_budget or over_count:
+        if over_budget or over_tokens or over_count:
             packs.append(cur)
-            cur, cur_sum = [], 0.0
+            cur, cur_sum, cur_tok = [], 0.0, 0.0
         cur.append(idx)
         cur_sum += n
+        cur_tok += raw
     if cur:
         packs.append(cur)
     return packs
 
 
 def pack_indices_ffd_windowed(token_counts, token_budget, order,
-                              max_images_per_pack=0, window=0, costs=None):
+                              max_images_per_pack=0, window=0, costs=None,
+                              token_cap=None):
     """First-Fit-Decreasing packing within windows of the (already-shuffled) ``order``.
 
     Classic FFD (sort items by descending size, drop each into the first bin that fits)
@@ -1729,9 +1744,15 @@ def pack_indices_ffd_windowed(token_counts, token_budget, order,
     ``costs`` (optional) replaces the raw token count as the packing volume — both the
     decreasing sort key and the bin fill test use it. See :func:`navit_pack_costs`;
     ``None`` keeps the historical token-count behaviour bit-for-bit.
+
+    ``token_cap`` (optional) adds a second ceiling on the bin's summed raw token count
+    ΣN, so a bin must satisfy *both* Σcost ≤ ``token_budget`` and ΣN ≤ ``token_cap``.
+    See :func:`pack_indices_by_budget` for why the cost-only budget is not enough once
+    ``costs`` is in play. ``None`` (default) = no token ceiling (historical behaviour).
     """
     budget = float(token_budget)
     cap = int(max_images_per_pack or 0)
+    tcap = float(token_cap) if token_cap is not None else None
     win = int(window or 0)
     order = list(order)
     vol = costs if costs is not None else token_counts
@@ -1743,19 +1764,22 @@ def pack_indices_ffd_windowed(token_counts, token_budget, order,
     packs = []
     for w in windows:
         items = sorted(w, key=lambda i: float(vol[i]), reverse=True)
-        bins = []  # each: [list_of_indices, summed_cost]
+        bins = []  # each: [list_of_indices, summed_cost, summed_raw_tokens]
         for idx in items:
             n = float(vol[idx])
+            raw = float(token_counts[idx])
             placed = False
             for b in bins:
                 over_count = cap > 0 and len(b[0]) >= cap
-                if (not over_count) and (b[1] + n <= budget):
+                over_tokens = tcap is not None and (b[2] + raw > tcap)
+                if (not over_count) and (not over_tokens) and (b[1] + n <= budget):
                     b[0].append(idx)
                     b[1] += n
+                    b[2] += raw
                     placed = True
                     break
             if not placed:
-                bins.append([[idx], n])
+                bins.append([[idx], n, raw])
         packs.extend(b[0] for b in bins)
     return packs
 
@@ -1850,7 +1874,7 @@ class NavitPackBatchSampler:
     def __init__(self, dataset, token_budget, max_images_per_pack=0,
                  shuffle=True, seed=42, drop_last=False,
                  strategy="next_fit", ffd_window=256,
-                 cost_lambda=0.0, cost_ref_tokens=0):
+                 cost_lambda=0.0, cost_ref_tokens=0, token_cap=0):
         self.dataset = dataset
         self.token_budget = int(token_budget)
         self.max_images_per_pack = int(max_images_per_pack or 0)
@@ -1881,8 +1905,24 @@ class NavitPackBatchSampler:
         self.costs, _scale, self.cost_ref = navit_pack_costs(
             self.token_counts, self.cost_lambda, cost_ref_tokens,
         )
+        # 双约束（AdaptiveLoad, arXiv 2605.17923）：代价预算管步时，token 上限管显存。
+        # cost_lambda=0 时 cost≡token，第二个约束是同一条，传 None 保持逐包等价。
+        if int(token_cap or 0) < 0:
+            raise ValueError(
+                f"navit_pack_token_cap 必须 ≥0（0=自动取 navit_token_budget），收到 {token_cap}"
+            )
+        if self.cost_lambda > 0.0:
+            self.token_cap = int(token_cap or 0) or self.token_budget
+        else:
+            self.token_cap = None
         mx = max(self.token_counts) if self.token_counts else 0
         mx_cost = max(self.costs) if self.costs else 0.0
+        if self.token_cap is not None and mx > self.token_cap:
+            logger.warning(
+                "[NavitPack] 最大单图 token=%d > token 上限=%d：该图将单独成包并超出上限"
+                "（显存按 ΣN 线性），建议提高 navit_token_budget 或 navit_pack_token_cap。",
+                mx, self.token_cap,
+            )
         if self.token_counts and self.token_budget < mx_cost:
             logger.warning(
                 "[NavitPack] token_budget=%d < 最大单图代价=%.0f（token=%d）：该图将单独成包，"
@@ -1901,9 +1941,10 @@ class NavitPackBatchSampler:
             logger.info(
                 "[NavitPack] 按代价装包已启用：λ=%.4g，参考尺寸 n_ref=%d token"
                 "（该尺寸的图代价=token 数，容量不变）；代价范围 %.0f..%.0f。"
-                "大图代价上浮=每包少装（消步时/显存尖峰），小图下浮=每包多装（提吞吐）。",
+                "大图代价上浮=每包少装（消步时/显存尖峰）；小图代价下浮本可多装，但受"
+                "ΣN ≤ %d 的 token 上限约束（显存对 ΣN 线性，抬这个上限=拿显存换吞吐）。",
                 self.cost_lambda, self.cost_ref,
-                min(self.costs) if self.costs else 0.0, mx_cost,
+                min(self.costs) if self.costs else 0.0, mx_cost, self.token_cap,
             )
         if self.strategy == "ffd" and self.ffd_window <= 0:
             logger.warning(
@@ -1925,18 +1966,25 @@ class NavitPackBatchSampler:
             packs = pack_indices_ffd_windowed(
                 self.token_counts, self.token_budget, order,
                 self.max_images_per_pack, self.ffd_window, costs=_costs,
+                token_cap=self.token_cap,
             )
         else:
             packs = pack_indices_by_budget(
                 self.token_counts, self.token_budget, order,
                 self.max_images_per_pack, costs=_costs,
+                token_cap=self.token_cap,
             )
         if self.drop_last and len(packs) > 1:
             # 「未满」按与装包同一口径判断（开了 cost_lambda 就用代价），否则末包会被
-            # 用另一套尺度误判。
+            # 用另一套尺度误判。双约束下「满」= 任一约束吃满，两条都没吃满才算未满包。
             _vol = self.costs if self.cost_lambda > 0.0 else self.token_counts
             last_sum = sum(_vol[i] for i in packs[-1])
-            if last_sum < self.token_budget:
+            under_cost = last_sum < self.token_budget
+            under_tokens = (
+                self.token_cap is None
+                or sum(self.token_counts[i] for i in packs[-1]) < self.token_cap
+            )
+            if under_cost and under_tokens:
                 packs = packs[:-1]
         return packs
 

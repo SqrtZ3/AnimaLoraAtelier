@@ -220,6 +220,12 @@ REQUIRED=(
   "PyYAML"
   "rich"
   "einops"
+  # ⚠ sentencepiece：AST 扫描**看不见**它。transformers 的 T5Tokenizer 用
+  # requires_backends 做运行时门控，源码里没有 `import sentencepiece`，
+  # 直到 trainer/models.py:279 真正 from_pretrained 才 ImportError ——
+  # 而那已经是加载完 DiT + Qwen 之后了。requirements.txt 一直列着它，
+  # 是这份精简清单漏了。无 torch 依赖，装它不会动 torch。
+  "sentencepiece"
 )
 # 可选组
 PERCEPTUAL=( "lpips" )          # trainer/aux_losses.py，仅 perceptual aux loss 用；会拉 torchvision（危险，已被 constraints 挡住）
@@ -237,6 +243,8 @@ cat <<'EOF'
                       (cosmos_predict2_modeling.py 顶层 import)，该处已改纯 torch 实现
    diffusers / accelerate / peft / lycoris-lora / pytorch-fid
                    —— AST 扫描确认运行路径未 import，纯占镜像体积
+   （accelerate 缺席会打一条 WARNING：Qwen 的 device_map 路径失败、回退 .to(device)，
+     "CPU RAM 会临时翻倍"。TE 只有 1.1GB 而机器 192GB RAM —— 属预期行为，不是错误。）
 EOF
 
 if [ "$CHECK_ONLY" = "1" ]; then

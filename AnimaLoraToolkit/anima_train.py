@@ -121,6 +121,11 @@ def ensure_dependencies(auto_install=False):
         "safetensors": "safetensors",
         "transformers": "transformers",
         "einops": "einops",
+        # sentencepiece：transformers 的 T5Tokenizer 用 requires_backends 做**运行时**
+        # 门控，源码里没有显式 import，所以静态扫描看不见它。不在这里预检的话，
+        # 报错会推迟到 trainer/models.py:279 —— 那时 DiT 与 Qwen 都已经加载完，
+        # 白等几分钟。requirements.txt 一直列着它（sentencepiece>=0.1.99）。
+        "sentencepiece": "sentencepiece",
         # torchvision 已从必需项移除：运行路径上唯一的用途（cosmos_predict2_modeling
         # 里给 padding_mask 做最近邻 resize）已改成纯 torch 实现。它仍是 lpips /
         # perceptual aux loss 的间接依赖，但那条路是 try/except 可选导入。

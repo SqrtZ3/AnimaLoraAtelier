@@ -26,7 +26,34 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
 from torch.distributed import get_process_group_ranks
-from torchvision import transforms
+
+
+def _resize_nearest(x: torch.Tensor, size) -> torch.Tensor:
+    """最近邻 resize 到 (H, W)，纯 torch 实现。
+
+    原实现是 ``torchvision.transforms.functional.resize(x, size, interpolation=NEAREST)``，
+    而这是**整个仓库运行路径上唯一一处 torchvision 使用**（`padding_mask` 对齐到 latent
+    分辨率，见 `_augment_image_dim` 调用点）。为它装 torchvision 在昇腾上是净负债：
+    pip 会连带把 torch 换成 CUDA 构建，torch_npu 当场不认（见 docs/ascend-npu.md §6
+    「最大的环境杀手」）。
+
+    数值等价性：torchvision 对 tensor 输入的 NEAREST 分支内部就是走
+    ``F.interpolate(mode="nearest")``（NEAREST 不做 antialias），所以这里是同一个
+    kernel、同一套取整规则。差别只在接口——torchvision 接受任意前导维 (..., H, W)，
+    ``F.interpolate`` 的 2D 空间插值只吃 4D，故这里把前导维折叠再还原。
+    本地对 8 组形状/dtype（identity / 上下采样 / 非整数比 / 3D / bf16 / 多通道）与
+    torchvision 逐 bit 对拍，全部相同。
+
+    旁证：``models/anima_modeling_core.py:1542``（Anima 实际走的那份）对同一处逻辑
+    本来就写的是 ``F.interpolate(..., mode="nearest")``。这里只是把旧文件对齐过去。
+    """
+    h, w = int(size[0]), int(size[1])
+    if x.shape[-2] == h and x.shape[-1] == w:
+        return x                      # 尺寸已对齐（训练/采样路径的常态）→ 直接返回
+    lead = x.shape[:-2]
+    flat = x.reshape(-1, 1, x.shape[-2], x.shape[-1])
+    out = torch.nn.functional.interpolate(flat, size=(h, w), mode="nearest")
+    return out.reshape(*lead, h, w)
 
 
 @contextlib.contextmanager
@@ -1396,9 +1423,7 @@ class MiniTrainDIT(nn.Module):
             - Otherwise, the positional embeddings are generated without considering fps.
         """
         if self.concat_padding_mask:
-            padding_mask = transforms.functional.resize(
-                padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
-            )
+            padding_mask = _resize_nearest(padding_mask, list(x_B_C_T_H_W.shape[-2:]))
             x_B_C_T_H_W = torch.cat(
                 [x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1
             )

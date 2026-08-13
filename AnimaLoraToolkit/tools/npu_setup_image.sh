@@ -12,8 +12,12 @@
 #      torch / torch_npu / numpy 版本钉死——否则任何一个依赖（尤其 torchvision）
 #      都可能从 PyPI 拉一个 CUDA 版 torch 覆盖掉 torch_npu，环境当场报废。
 #   2. 只装**真实运行路径**用得到的包。requirements.txt 里的 diffusers /
-#      accelerate / peft / lycoris-lora / torchvision / pytorch-fid 经 AST 扫描
-#      确认未被 import，一律不装（镜像有 20GB/40GB 上限）。
+#      accelerate / peft / lycoris-lora / pytorch-fid 经 AST 扫描确认未被 import，
+#      一律不装（镜像有 20GB/40GB 上限）。
+#      ⚠ torchvision 一度也被列在这里，那是**错的**：models/cosmos_predict2_modeling.py
+#      顶层 `from torchvision import transforms` 是运行路径必经的（trainer/models.py:105
+#      动态加载它），anima_train.py 的依赖预检会直接 fail。现已把那处唯一用途
+#      （padding_mask 最近邻 resize）改成纯 torch 实现，torchvision 才真正成为非必需。
 #   3. 幂等：可重复执行。
 #   4. 会检查 site-packages 是否落在「不随镜像提交」的目录里——NPU 环境下
 #      /home/ma-user/work 不入镜像，装在那儿的包提交完就没了。
@@ -229,7 +233,8 @@ cat <<'EOF'
    bitsandbytes    —— 无昇腾后端；utils/optimizer_utils.py:76 是 try/except 可选导入
    triton          —— 昇腾无
    flash-attn      —— 昇腾无
-   torchvision     —— 运行路径未 import；且极易连带把 torch 换成 CUDA 版
+   torchvision     —— 极易连带把 torch 换成 CUDA 版。曾是运行路径硬依赖
+                      (cosmos_predict2_modeling.py 顶层 import)，该处已改纯 torch 实现
    diffusers / accelerate / peft / lycoris-lora / pytorch-fid
                    —— AST 扫描确认运行路径未 import，纯占镜像体积
 EOF

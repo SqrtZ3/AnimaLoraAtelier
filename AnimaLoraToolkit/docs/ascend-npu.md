@@ -257,7 +257,15 @@ constraints 钉死 `torch` / `torch-npu` / `numpy<2`（torch 2.1.x 按 numpy 1.x
 **真实依赖比 `requirements.txt` 小得多**（AST 扫描运行路径得出）：必需只有
 `numpy<2` / `Pillow` / `safetensors` / `transformers>=4.51,<5` / `PyYAML` / `rich` / `einops`。
 `transformers>=4.51` 是硬下限（Qwen3 架构支持）。`diffusers` / `accelerate` / `peft` /
-`lycoris-lora` / `torchvision` / `pytorch-fid` 运行路径未 import，不装。
+`lycoris-lora` / `pytorch-fid` 运行路径未 import，不装。
+
+⚠ **本文档早期版本把 `torchvision` 也列进了"未 import"，那是错的**（真机上跑出
+`Missing dependencies: torchvision` 才发现）：`models/cosmos_predict2_modeling.py` 顶层有
+`from torchvision import transforms`，而 `trainer/models.py:105` 会动态加载该模块——是运行
+路径必经的。它的**唯一**用途是给 `padding_mask` 做一次最近邻 resize，现已改成纯 torch 的
+`F.interpolate(mode="nearest")`（本地对 8 组形状/dtype 与 torchvision 逐 bit 对拍一致），
+并从 `anima_train.py` 的依赖预检里移除。**昇腾上不要装 torchvision** —— 它会连带把 torch
+换成 CUDA 构建。
 `bitsandbytes`（`utils/optimizer_utils.py:76`）与 `lpips`（`trainer/aux_losses.py:344`）
 都是 try/except 可选导入，昇腾上不装即可。
 

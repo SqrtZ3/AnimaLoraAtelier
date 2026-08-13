@@ -121,7 +121,11 @@ def ensure_dependencies(auto_install=False):
         "safetensors": "safetensors",
         "transformers": "transformers",
         "einops": "einops",
-        "torchvision": "torchvision",
+        # torchvision 已从必需项移除：运行路径上唯一的用途（cosmos_predict2_modeling
+        # 里给 padding_mask 做最近邻 resize）已改成纯 torch 实现。它仍是 lpips /
+        # perceptual aux loss 的间接依赖，但那条路是 try/except 可选导入。
+        # 昇腾上尤其不能装：pip 会连带把 torch 换成 CUDA 构建，torch_npu 当场不认
+        #（docs/ascend-npu.md §6）。
         "yaml": "pyyaml",
     }
     missing = []

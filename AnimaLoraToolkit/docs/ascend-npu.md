@@ -39,19 +39,48 @@ ANIMA_NPU=1 python anima_train.py --config config/xxx.yaml
 | 功能 | 状态 | 替代 |
 |---|---|---|
 | `base_quant`（FP8/FP4 冻结底模量化） | 910B 无 FP8 张量核 | `base_quant: none` |
-| `navit_packing`（Anima family） | 依赖 xformers `BlockDiagonalMask`，昇腾无 xformers | 关 navit，走 ARB 稠密路径 |
-| `navit_packing`（krea2 family） | 同上 | `navit_attn_backend: sdpa_seg`（逐段 dense SDPA，与块对角语义数学恒等，有单测对拍） |
+| `navit_packing` + `navit_attn_backend: xformers` | 昇腾无 xformers | 换后端，**不用关 navit**（见下） |
 | `torch_compile` | 昇腾支持度未验证 | `torch_compile: false` |
 | 8-bit 优化器（bitsandbytes） | 无昇腾后端 | `adamw` / `adamw_snr` / `automagic` 等纯 torch 实现 |
 
 未拦但**需要探针确认**的：`torch.fft`（spectral aux loss 依赖）、稠密 mask 下的 SDPA 后端与显存、
 `torch.npu.Event`（`stage_timing_every > 0` 才用到，默认关）。
 
-## 3. 上机第一件事：跑探针
+### 2.1 NaViT 打包在昇腾上是**可用**的（不是必须放弃）
+
+"没有 xformers" 只否掉了默认的那个 kernel，没有否掉块对角打包本身。三个后端算的是同一件事
+——打包序列里每张图只看自己的 token、段间零泄漏、不物化 O(ΣN²) 稠密 mask：
+
+| `navit_attn_backend` | 实现 | family | 状态 |
+|---|---|---|---|
+| `xformers`（默认） | `BlockDiagonalMask` + varlen 快核 | anima / krea2 | CUDA 历史行为，逐 bit 不变 |
+| `npu_tnd` | `torch_npu.npu_fusion_attention(input_layout="TND")` + `actual_seq_qlen/kvlen` 累加和 | **anima** | 昇腾原生变长融合注意力；**真机未验证**，先跑探针 |
+| `sdpa_seg` | 逐段 dense SDPA | anima / krea2 | 不依赖任何专有算子的保底路径 |
+
+`npu_tnd` 与 `sdpa_seg` 都支持 cross-attn 的 **q/kv 段长不等**（Anima 的 visual↔text 必需）。
+
+**本地已验证**（`tests/test_anima_packed_attn_backends.py`，CPU）：
+
+- `sdpa_seg` 与稠密 bool 块对角 mask 的前向/反向逐元素一致（<1e-5）
+- 段间零泄漏：换掉别段的 k/v，本段输出逐 bit 不变
+- 整条 `forward_packed_navit` 端到端：**G 张图打包的输出与每张图单独打包完全相同（max_abs_diff = 0.0）**，
+  覆盖块对角 self/cross attention + per-image AdaLN(`mod_index`) + 每图独立 RoPE
+
+**未验证**：`npu_tnd` 需要真机（本地无 `torch_npu`，单测自动 skip）；`xformers` 路径本地无法回归
+（无 CUDA/xformers，相关单测全部 skip）——但该分支代码未改动，只是加了前置的后端判断。
+
+## 3. 上机第一件事：先侦察，再跑探针
 
 ```bash
+bash tools/npu_recon.sh            # 只读侦察，不装任何东西
 python tools/npu_probe.py --json /tmp/npu_probe.json
 ```
+
+`npu_recon.sh` 回答的是决定后面所有事的问题：CPU 架构（决定 torch 装法）、CANN 实际版本
+（决定 torch 版本上限）、宿主 driver 版本（决定 CANN 能不能升）、有没有 torch/torch_npu、
+site-packages 是否会随镜像提交、网络能不能拉代码。
+
+探针跑完会直接打一行 **NaViT 路径裁决**，把结果翻译成该往 yaml 里写什么。
 
 它不加载任何底模、几十秒跑完，逐项实测并打汇总表：torch/torch_npu/CANN 版本、`npu-smi`、
 bf16/fp32 matmul 数值、`autocast("npu")`、SDPA（无 mask / bool mask / additive mask，含 backward
@@ -63,11 +92,23 @@ bf16/fp32 matmul 数值、`autocast("npu")`、SDPA（无 mask / bool mask / addi
 ## 4. 还没做的（诚实清单）
 
 - 未在真机跑过任何一步训练；步时/显存/收敛全部未知。
-- Anima family 在昇腾上**没有** NaViT 打包的等价路径（krea2 的 `sdpa_seg` 只在 krea2 接线）。
-  如果要在 NPU 上跑 Anima + navit，需要把 `sdpa_seg` 那套逐段 dense SDPA 移植到
-  `models/anima_modeling_core.py`——这是一笔独立工作，尚未做。
+- `npu_tnd` 后端的真机可用性未验证（探针的 TND 项就是为它准备的）。
 - 分布式（多卡 HCCL）未接线；当前只考虑单卡。
 - `trainer/quant.py` 全部走 CUDA 专用路径，NPU 上由守卫拦掉，未做适配。
+- 文本编码器：平台的 Anima 仓库给的是 ComfyUI 单文件，需要用
+  `tools/convert_comfy_te_to_hf.py` 转成 HF 目录（转换工具本地已用合成模型验证过
+  键名/形状/逐 bit 一致，但**没有用真实的 `qwen_3_06b_base.safetensors` 跑过**——
+  真文件的键名前缀属于哪一种变换，要转的时候才知道；工具在配不上时会打出两边的键样本
+  并拒绝产出半成品）。
+
+## 4.1 NPU 侧顺手修掉的一个真 bug
+
+`RMSNorm.forward` 原本是 `@torch.autocast('cuda', dtype=torch.float32)` 装饰器
+（`models/anima_modeling_core.py`、`models/cosmos_predict2_modeling.py` 各一处）。设备串写死在
+**类定义期**，在昇腾上等于给 npu 张量开了个 cuda autocast 区域，完全不生效——`output * self.weight`
+会跟着外层 bf16 autocast 走，而不是原意的 fp32。已改成按张量实际设备取 `device_type`。
+CUDA 上 `device_type == 'cuda'`，与原装饰器等价；CPU 上原来就无效果（cuda autocast 不作用于 cpu
+张量），新实现显式跳过，保持无效果。
 
 ## 5. OpenI/启智 侧的事实（2026-08 查自平台帮助文档与镜像列表）
 
@@ -82,7 +123,12 @@ bf16/fp32 matmul 数值、`autocast("npu")`、SDPA（无 mask / bool mask / addi
 `cann8_3_rc1_nnal` CANN 8.3.RC1 Py3.11「只能用于 D910B」）**可能**另含 torch-npu 环境
 ——未验证，上机 `conda env list` 才算数。
 
-**torch 2.1.0 的影响**：`F.scaled_dot_product_attention(enable_gqa=)` 需要 torch≥2.5，但
+除这两个之外，另有第三方管理员镜像（`/explore/images` 能搜到），例如
+`cann8.2.rc2-ms2.7-py3.11-910b`（CANN 8.2.RC2 / MindSpore 2.7 / Python 3.11）——CANN 档次
+高得多，但**镜像名里的 `ms` 是 MindSpore，不是 torch**，torch/torch_npu 大概率要自己装
+（`npu_setup_image.sh` 会按 CANN 自动选版本）。是否真含可用 torch 环境，上机 `conda env list` 才算数。
+
+**低版本 torch 的影响**：`F.scaled_dot_product_attention(enable_gqa=)` 需要 torch≥2.5，但
 `models/krea2_modeling.py:146` 已有版本探测与手动展开 KV 头的 fallback（数值相同），
 不是阻塞项。为兼容 Python 3.9，仓库里 4 处 PEP 604 注解所在文件已补
 `from __future__ import annotations`（行为中立）：`models/anima_modeling_core.py`、
@@ -113,8 +159,19 @@ openi dataset upload <owner>/<数据集名> <本地路径> -w 100
 `text_encoders/qwen_3_06b_base.safetensors`(1.11GiB)、`vae/qwen_image_vae.safetensors`(242MiB)。
 ⚠ 该 TE 是 ComfyUI 单文件格式，而 `trainer/models.py:259` 走 `AutoModelForCausalLM`
 需要 HF 目录（`config.json` + tokenizer）；仓库内 `models/text_encoders/Qwen3-0.6B-Base/`
-的 tokenizer 齐但 `model.safetensors` 只有 135 字节（LFS 指针，非权重）。**需要一次
-单文件→HF 目录的键名转换**，同 memory `[[comfyui-te-key-namespace]]` 记的那类工作。
+的 tokenizer 齐但 `model.safetensors` 只有 135 字节（LFS 指针，非权重）。
+
+用 `tools/convert_comfy_te_to_hf.py` 转（**建议在本地转好再上传**，别在 4 小时的调试任务里现场折腾）：
+
+```bash
+python tools/convert_comfy_te_to_hf.py \
+    --src /path/to/qwen_3_06b_base.safetensors \
+    --out models/text_encoders/Qwen3-0.6B-Base-full --dry-run   # 先只校验键名/形状
+```
+
+它不硬编码键名表：期望键集从 `config.json` 反推（meta device 实例化取 state_dict），
+前缀差异只用**整体统一变换**修复（要么全对要么全错，可验证），逐键形状全部校验，
+配不上就打出两边的键样本并拒绝产出。写出走流式（峰值内存 ≈ 最大单个张量）。
 
 ## 6. 镜像装配
 
@@ -125,10 +182,30 @@ bash tools/npu_setup_image.sh --check     # 只体检
 bash tools/npu_setup_image.sh             # 装必需依赖 + 跑探针
 ```
 
-**Python 版本决策：锁 3.9，不升级。** 昇腾上绑死的是「Python ABI × torch 版本 ×
-CANN 版本」三元组，换 Python 就要重新对齐另外两个，而 CANN 自带 Python 包
-（`te` / `op_compile`，由 `set_env.sh` 注入 PYTHONPATH）是否跨版本通用**未验证**。
-收益侧为零——AST 全量扫描已确认仓库在 3.9 上可跑。
+**版本决策：真正的硬约束是 CANN，不是 Python。**
+
+查官方版本配套表（`Ascend/pytorch` 的 `COMPATIBILITY.md`），Python 是**独立的一根轴**——
+同一个 CANN 8.0.RC1 下，torch_npu 2.1.0.post4 官方就支持到 Python 3.11。所以"换 Python 就要
+重新对齐 torch 和 CANN"是**不成立**的（本文档早期版本这么写过，是错的）。
+
+真正卡住 torch 版本的是 CANN：
+
+| CANN | 可用的 torch_npu / PyTorch | Python |
+|---|---|---|
+| 8.0.RC1 | 2.2.0 / 2.1.0.post4 | 3.8–3.10 / 3.8–3.11 |
+| 8.0.RC3 | 2.4.0 / 2.3.1.post2 / 2.1.0.post8 | 3.8–3.11 |
+| 8.0.0 | 2.4.0.post2 / 2.3.1.post4 / 2.1.0.post10 | 3.8–3.11 |
+| 8.1.RC1 | 2.5.1 / 2.4.0.post4 | 3.9–3.11 |
+| 8.2.RC1 | 2.6.0 / 2.5.1.post1 | 3.9–3.11 |
+| 8.3.RC1 | 2.8.0 / 2.7.1 / 2.6.0.post3 | 3.9–3.11+ |
+
+推论：**选镜像 = 选 CANN = 选 torch 上限**。在旧镜像里升 CANN 受宿主 driver/firmware 版本卡
+（容器内改不了驱动），所以正确做法是**直接挑一个自带高版本 CANN 的镜像**，而不是在低版本镜像里
+折腾。`tools/npu_setup_image.sh` 已按这张表实现「读 CANN 实际版本 → 选配套 torch」。
+
+**架构决定 torch 的安装源**（最容易废掉环境的一步）：`x86_64` 走默认 PyPI 会拉到 **CUDA 构建**的
+torch（几个 GB 且 torch_npu 不认），必须 `--index-url https://download.pytorch.org/whl/cpu`；
+`aarch64` 的 PyPI wheel 本来就是 CPU 构建，直接装。脚本已按 `uname -m` 分支。
 
 **最大的环境杀手**：`pip install torchvision`（或任何间接依赖 torch 的包）会从 PyPI
 拉 CUDA 版 torch 覆盖掉 torch_npu 配套的那个，环境当场报废。脚本用动态生成的

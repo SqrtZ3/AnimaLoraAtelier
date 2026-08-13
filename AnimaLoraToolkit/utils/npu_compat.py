@@ -17,8 +17,10 @@
 
 已知约束（在 NPU 上必须关掉的功能，见 ``guard_unsupported()``）
 ------------------------------------------------------------
-* ``xformers``：昇腾无此包 → NaViT 块对角打包路径（Anima family）不可用。
-  krea2 family 有数学恒等的 ``packed_attn_backend: sdpa_seg`` 替代路径。
+* ``xformers``：昇腾无此包 → 默认的 NaViT 块对角打包后端不可用。**但打包本身可用**：
+  Anima family 有 ``navit_attn_backend: npu_tnd``（torch_npu 原生 TND 变长融合注意力）
+  与 ``sdpa_seg``（逐段 dense SDPA 保底）两条数学恒等的替代路径；krea2 family 有
+  ``sdpa_seg``。真机可用性由 ``tools/npu_probe.py`` 实测，不在这里假设。
 * FP8/FP4 冻结底模量化（``base_quant``）：910B 无 FP8 张量核。
 * ``bitsandbytes`` 8-bit 优化器：无昇腾后端。
 * ``torch.compile`` / triton：昇腾上支持度未验证，默认禁止。
@@ -174,16 +176,17 @@ def guard_unsupported(args) -> None:
     if _on("navit_packing"):
         family = str(getattr(args, "model_family", "anima") or "anima").lower()
         backend = str(getattr(args, "navit_attn_backend", "xformers") or "xformers").lower()
-        if family != "krea2":
+        # 昇腾没有 xformers，但块对角打包本身是可行的——两条等价路径见
+        # models/anima_modeling_core.py 顶部的后端说明。只拦真正依赖 xformers 的取值。
+        allowed = ("sdpa_seg",) if family == "krea2" else ("sdpa_seg", "npu_tnd")
+        if backend not in allowed:
             problems.append(
-                "navit_packing 在 Anima family 走 xformers BlockDiagonalMask，昇腾无 "
-                "xformers。请设 navit_packing: false，改走 ARB 稠密路径。"
-            )
-        elif backend != "sdpa_seg":
-            problems.append(
-                f"navit_packing + navit_attn_backend={backend} 依赖 xformers。"
-                "krea2 family 请改用 navit_attn_backend: sdpa_seg（逐段 dense SDPA，"
-                "与块对角语义数学恒等，有单测对拍）。"
+                f"navit_packing + navit_attn_backend={backend} 依赖 xformers（昇腾无此包）。"
+                f"{family} family 在昇腾上可选 {allowed}："
+                "npu_tnd = torch_npu.npu_fusion_attention 的 TND 变长融合注意力"
+                "（昇腾原生，先用 tools/npu_probe.py 确认真机可用）；"
+                "sdpa_seg = 逐段 dense SDPA 保底路径（不依赖专有算子，数学恒等，有单测对拍）。"
+                "两条都不通再设 navit_packing: false 走 ARB 稠密路径。"
             )
 
     if _on("torch_compile"):

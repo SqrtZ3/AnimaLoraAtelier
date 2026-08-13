@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import platform
@@ -203,7 +204,7 @@ def probe_sdpa_add() -> str:
     return _sdpa_case("additive")
 
 
-@probe("torch_npu.npu_fusion_attention（昇腾融合注意力）")
+@probe("torch_npu.npu_fusion_attention（昇腾融合注意力，BSH）")
 def probe_fusion_attn() -> str:
     import torch
     import torch_npu
@@ -217,6 +218,190 @@ def probe_fusion_attn() -> str:
     out = torch_npu.npu_fusion_attention(q, k, v, H, input_layout="BSH")
     o = out[0] if isinstance(out, (tuple, list)) else out
     return f"输出 shape={tuple(o.shape)}（可作为 SDPA 的昇腾专用替代后端）"
+
+
+# ── 2b. TND 变长打包注意力：NaViT 在昇腾上能不能活，全看这几项 ────────────────
+# 语义目标：等价于 xformers BlockDiagonalMask —— 每张图只看自己的 token，段间零泄漏，
+# 且不物化 O(ΣN²) 的稠密 mask。昇腾侧对应 npu_fusion_attention 的 input_layout="TND"
+# + actual_seq_qlen / actual_seq_kvlen（累加和形式，host 侧 int 列表）。
+# 几何取 Anima base 的真实形状：H=16、head_dim=128（model_channels=2048 / 16 头）。
+
+_ANIMA_H, _ANIMA_D = 16, 128
+
+
+def _seg_reference(q, k, v, q_lens, kv_lens, scale):
+    """逐段 dense SDPA 参考实现（fp32）。段内全注意力 ≡ 块对角 mask。
+
+    q: [Tq, H, D]，k/v: [Tkv, H, D]（TND 布局）。返回 [Tq, H, D] fp32。
+    """
+    import torch
+    import torch.nn.functional as F
+
+    outs = []
+    qo = ko = 0
+    for sq, sk in zip(q_lens, kv_lens):
+        qs = q[qo:qo + sq].float().transpose(0, 1).unsqueeze(0)   # [1,H,sq,D]
+        ks = k[ko:ko + sk].float().transpose(0, 1).unsqueeze(0)
+        vs = v[ko:ko + sk].float().transpose(0, 1).unsqueeze(0)
+        o = F.scaled_dot_product_attention(qs, ks, vs, scale=scale)
+        outs.append(o.squeeze(0).transpose(0, 1))                 # [sq,H,D]
+        qo += sq
+        ko += sk
+    return torch.cat(outs, dim=0)
+
+
+def _tnd_case(q_lens, kv_lens, want_grad: bool) -> str:
+    import math
+    import torch
+    import torch_npu
+
+    d = _dev()
+    if not hasattr(torch_npu, "npu_fusion_attention"):
+        raise _Skip("该 torch_npu 版本无 npu_fusion_attention")
+    H, E = _ANIMA_H, _ANIMA_D
+    scale = 1.0 / math.sqrt(E)
+    Tq, Tkv = sum(q_lens), sum(kv_lens)
+    torch.manual_seed(0)
+    q = torch.randn(Tq, H, E, device=d, dtype=torch.bfloat16, requires_grad=want_grad)
+    k = torch.randn(Tkv, H, E, device=d, dtype=torch.bfloat16, requires_grad=want_grad)
+    v = torch.randn(Tkv, H, E, device=d, dtype=torch.bfloat16, requires_grad=want_grad)
+
+    # actual_seq_* 要的是**累加和**，不是每段长度本身。
+    cu_q = list(itertools.accumulate(q_lens))
+    cu_kv = list(itertools.accumulate(kv_lens))
+
+    torch.npu.reset_peak_memory_stats()
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    out = torch_npu.npu_fusion_attention(
+        q, k, v, H,
+        input_layout="TND",
+        scale=scale,
+        actual_seq_qlen=cu_q,
+        actual_seq_kvlen=cu_kv,
+    )
+    o = out[0] if isinstance(out, (tuple, list)) else out
+    grad_note = "无（未测反向）"
+    if want_grad:
+        o.float().sum().backward()
+        missing = [n for n, t in (("q", q), ("k", k), ("v", v)) if t.grad is None]
+        if missing:
+            raise RuntimeError(f"反向未产生梯度：{missing}（该算子在本版本不可微 → 训练不可用）")
+        grad_note = (f"‖dq‖={q.grad.float().norm():.3e} ‖dk‖={k.grad.float().norm():.3e} "
+                     f"‖dv‖={v.grad.float().norm():.3e}")
+    torch.npu.synchronize()
+    dt = (time.perf_counter() - t0) * 1000
+    peak = torch.npu.max_memory_allocated() / 1e9
+
+    if tuple(o.shape) != (Tq, H, E):
+        raise RuntimeError(f"输出 shape={tuple(o.shape)}，期望 {(Tq, H, E)}")
+
+    # 数值对拍：段内全注意力 vs 逐段 dense SDPA 参考
+    ref = _seg_reference(q.detach(), k.detach(), v.detach(), q_lens, kv_lens, scale)
+    got = o.detach().float()
+    rel = ((got - ref).norm() / ref.norm()).item()
+    verdict = "数值一致" if rel < 2e-2 else f"⚠ 相对误差偏大 rel={rel:.3e}，别直接上生产"
+
+    # 段间泄漏检查：把第 2 段的 k/v 换掉，第 1 段输出必须逐 bit 不变
+    leak = "未测"
+    if len(q_lens) > 1:
+        k2 = k.detach().clone()
+        v2 = v.detach().clone()
+        k2[kv_lens[0]:] = torch.randn_like(k2[kv_lens[0]:])
+        v2[kv_lens[0]:] = torch.randn_like(v2[kv_lens[0]:])
+        out2 = torch_npu.npu_fusion_attention(
+            q.detach(), k2, v2, H, input_layout="TND", scale=scale,
+            actual_seq_qlen=cu_q, actual_seq_kvlen=cu_kv,
+        )
+        o2 = out2[0] if isinstance(out2, (tuple, list)) else out2
+        same = torch.equal(o.detach()[:q_lens[0]], o2[:q_lens[0]])
+        leak = "无泄漏（第1段逐bit不变）" if same else "⚠⚠ 段间有泄漏，语义不等于块对角！"
+
+    return (f"rel_err={rel:.3e}（{verdict}）| {leak} | fwd{'+bwd' if want_grad else ''} "
+            f"{dt:.1f} ms, peak {peak:.2f} GB | grad: {grad_note}")
+
+
+@probe("TND 变长 self-attn（q=kv 段长，含反向）★ NaViT 主路径")
+def probe_tnd_self() -> str:
+    segs = [1024, 2048, 1024]
+    return _tnd_case(segs, segs, want_grad=True) + f" | 段长={segs}"
+
+
+@probe("TND 变长 cross-attn（q/kv 段长不等，含反向）★ Anima 必需")
+def probe_tnd_cross() -> str:
+    q_segs = [1024, 2048, 1024]
+    kv_segs = [128, 256, 96]
+    return _tnd_case(q_segs, kv_segs, want_grad=True) + f" | q={q_segs} kv={kv_segs}"
+
+
+@probe("TND 显存线性性（budget 32k vs 8k，判断是否物化 O(ΣN²)）")
+def probe_tnd_scaling() -> str:
+    import math
+    import torch
+    import torch_npu
+
+    d = _dev()
+    if not hasattr(torch_npu, "npu_fusion_attention"):
+        raise _Skip("该 torch_npu 版本无 npu_fusion_attention")
+    H, E = _ANIMA_H, _ANIMA_D
+    scale = 1.0 / math.sqrt(E)
+    notes = []
+    for total, nseg in ((8192, 4), (32768, 8)):
+        seg = total // nseg
+        lens = [seg] * nseg
+        cu = list(itertools.accumulate(lens))
+        torch.npu.empty_cache()
+        torch.npu.reset_peak_memory_stats()
+        q = torch.randn(total, H, E, device=d, dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(total, H, E, device=d, dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(total, H, E, device=d, dtype=torch.bfloat16, requires_grad=True)
+        out = torch_npu.npu_fusion_attention(
+            q, k, v, H, input_layout="TND", scale=scale,
+            actual_seq_qlen=cu, actual_seq_kvlen=cu,
+        )
+        o = out[0] if isinstance(out, (tuple, list)) else out
+        o.float().sum().backward()
+        torch.npu.synchronize()
+        notes.append(f"ΣN={total}({nseg}段) peak={torch.npu.max_memory_allocated()/1e9:.2f}GB")
+        del q, k, v, out, o
+    return " | ".join(notes) + "（peak 应近似线性；若 4× token 带来 ~16× 显存说明落到稠密实现）"
+
+
+@probe("逐段 dense SDPA 保底路径（不依赖昇腾专有算子）")
+def probe_sdpa_seg_fallback() -> str:
+    """TND 挂了也要有活路：逐段 dense SDPA，段内全注意力 ≡ 块对角，数学恒等。"""
+    import math
+    import torch
+    import torch.nn.functional as F
+
+    d = _dev()
+    H, E = _ANIMA_H, _ANIMA_D
+    scale = 1.0 / math.sqrt(E)
+    q_lens = [1024, 2048, 1024]
+    kv_lens = [128, 256, 96]
+    torch.manual_seed(0)
+    q = torch.randn(sum(q_lens), H, E, device=d, dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(sum(kv_lens), H, E, device=d, dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(sum(kv_lens), H, E, device=d, dtype=torch.bfloat16, requires_grad=True)
+    torch.npu.reset_peak_memory_stats()
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    outs = []
+    qo = ko = 0
+    for sq, sk in zip(q_lens, kv_lens):
+        qs = q[qo:qo + sq].transpose(0, 1).unsqueeze(0)
+        ks = k[ko:ko + sk].transpose(0, 1).unsqueeze(0)
+        vs = v[ko:ko + sk].transpose(0, 1).unsqueeze(0)
+        outs.append(F.scaled_dot_product_attention(qs, ks, vs, scale=scale)
+                    .squeeze(0).transpose(0, 1))
+        qo += sq
+        ko += sk
+    o = torch.cat(outs, dim=0)
+    o.float().sum().backward()
+    torch.npu.synchronize()
+    dt = (time.perf_counter() - t0) * 1000
+    peak = torch.npu.max_memory_allocated() / 1e9
+    return f"fwd+bwd {dt:.1f} ms, peak {peak:.2f} GB（与上面 TND 的耗时/显存直接可比）"
 
 
 # ── 3. 训练器实际用到的算子 ────────────────────────────────────────────────────
@@ -366,6 +551,10 @@ def main() -> int:
     probe_sdpa_bool()
     probe_sdpa_add()
     probe_fusion_attn()
+    probe_tnd_self()
+    probe_tnd_cross()
+    probe_tnd_scaling()
+    probe_sdpa_seg_fallback()
     probe_fft()
     probe_vae_ops()
     probe_grad_ckpt()
@@ -385,6 +574,27 @@ def main() -> int:
         for r in RESULTS:
             if r["status"] == "FAIL":
                 print(f"  - {r['name']}: {r['detail']}")
+
+    # ── NaViT 路径裁决：把探针结果直接翻译成该往 yaml 里写什么 ──────────────────
+    def _st(prefix: str) -> str:
+        for r in RESULTS:
+            if r["name"].startswith(prefix):
+                return r["status"]
+        return "MISSING"
+
+    tnd_self = _st("TND 变长 self-attn")
+    tnd_cross = _st("TND 变长 cross-attn")
+    seg_ok = _st("逐段 dense SDPA 保底路径")
+    print("\nNaViT 打包路径裁决：")
+    if tnd_self == "OK" and tnd_cross == "OK":
+        print("  ✓ TND 变长融合注意力可用（含反向、q/kv 不等长）")
+        print("    → navit_packing: true + navit_attn_backend: npu_tnd")
+    elif seg_ok == "OK":
+        print(f"  ✗ TND 不可用（self={tnd_self} cross={tnd_cross}），但逐段 dense SDPA 通过")
+        print("    → navit_packing: true + navit_attn_backend: sdpa_seg（慢一些，语义等价）")
+    else:
+        print(f"  ✗ TND({tnd_self}/{tnd_cross}) 与逐段 SDPA({seg_ok}) 都不可用")
+        print("    → navit_packing: false，退回 ARB 稠密路径")
     print("=" * 78)
 
     if args.json:

@@ -437,6 +437,13 @@ def parse_args():
     p.add_argument("--navit-pack-cost-ref-tokens", type=int, default=0,
                    help="上面代价归一的参考尺寸（token）：该尺寸的图代价恰等于其 token 数，"
                         "故均匀尺寸数据集容量不变、只对尺寸差异重新定价。0=自动取数据集中位数。")
+    p.add_argument("--navit-pack-token-cap", type=int, default=0,
+                   help="按代价装包时的第二条约束（管显存）：包必须同时满足 Σcost ≤ navit_token_budget "
+                        "与 ΣN ≤ 本值。0=自动取 navit_token_budget。仅在 navit_pack_cost_lambda>0 时生效"
+                        "（λ=0 时 cost≡token，两条是同一约束）。为什么要它：重定价后小于 n_ref 的图代价"
+                        "低于其 token 数，只卡代价会让 ΣN 超出 budget 达 (1+λ·n_ref)/(1+λ·n_min) 倍"
+                        "（λ=2.742e-05、n_ref=13944、n=4096 时约 1.24×），而步显存对 ΣN 线性 —— 那是"
+                        "未入账的显存超支而非白捡的吞吐。设成大于 budget 的值 = 明知地拿显存换吞吐。")
     p.add_argument("--navit-drop-last", action="store_true",
                    help="丢弃每 epoch 最后一个（未满预算的）包。默认关：打包路径下末包总含真实图，"
                         "丢了在小数据上是浪费。与 bucket_drop_last（丢残缺 ARB 批）解耦。")
@@ -1970,6 +1977,9 @@ def main():
             # 按代价装包（opt-in）：0.0 = 关，装包结果与改动前逐包等价。
             cost_lambda=float(getattr(args, "navit_pack_cost_lambda", 0.0) or 0.0),
             cost_ref_tokens=int(getattr(args, "navit_pack_cost_ref_tokens", 0) or 0),
+            # 双约束的第二条（ΣN 上限，管显存）；只在 cost_lambda>0 时生效，
+            # 0 = 自动取 navit_token_budget。
+            token_cap=int(getattr(args, "navit_pack_token_cap", 0) or 0),
         )
         dataloader = DataLoader(
             dataset, batch_sampler=batch_sampler,
@@ -3269,19 +3279,27 @@ def main():
     _prof_micro_count = 0
     _prof_wall0 = 0.0
 
-    # ── krea2 navit packed attention 后端（opt-in，默认 xformers 行为不变）────
+    # ── navit packed attention 后端（opt-in，默认 xformers 行为不变）──────────
+    # 两个 family 各有一份独立的模块级状态，按 model_family 分发：
+    #   krea2 : xformers / sdpa_seg
+    #   anima : xformers / sdpa_seg / npu_tnd（昇腾原生 TND 变长融合注意力）
+    # 非法值在这里构造期 fail-fast（各自的 setter 负责校验）。
     _navit_attn_backend = str(getattr(args, "navit_attn_backend", "xformers")
                               or "xformers").lower()
     if _navit_attn_backend != "xformers":
-        from models.krea2_modeling import set_packed_attention_backend
-        set_packed_attention_backend(_navit_attn_backend)  # 非法值 fail-fast
-        if str(getattr(args, "model_family", "anima")).lower() != "krea2":
-            logger.warning("[navit-attn] navit_attn_backend=%s 目前只作用于 krea2 "
-                           "packed 前向；当前 family 非 krea2，该设置无效果。",
-                           _navit_attn_backend)
+        _family = str(getattr(args, "model_family", "anima") or "anima").lower()
+        if _family == "krea2":
+            from models.krea2_modeling import set_packed_attention_backend
+            set_packed_attention_backend(_navit_attn_backend)
+            emit(f"[navit-attn] krea2 packed attention backend = {_navit_attn_backend}"
+                 f"（与块对角 mask 数学恒等；xformers 路径不再使用）")
         else:
-            emit(f"[navit-attn] packed attention backend = {_navit_attn_backend}"
-                 f"（逐段 dense SDPA，数学恒等；xformers 路径不再使用）")
+            from models.anima_modeling_core import set_packed_attention_backend
+            set_packed_attention_backend(_navit_attn_backend)
+            _note = ("昇腾原生 TND 变长融合注意力" if _navit_attn_backend == "npu_tnd"
+                     else "逐段 dense SDPA")
+            emit(f"[navit-attn] anima packed attention backend = {_navit_attn_backend}"
+                 f"（{_note}，与块对角 mask 数学恒等；xformers 路径不再使用）")
 
     # ── 选择性激活重算（grad_checkpoint_policy，opt-in；构造期校验见上文）────────
     # narrow_width 传模型 features：sac_narrow 由此放过比它更宽的中间量（krea2 是

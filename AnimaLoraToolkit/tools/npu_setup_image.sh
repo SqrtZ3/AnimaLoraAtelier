@@ -83,16 +83,95 @@ if command -v conda >/dev/null 2>&1; then
 fi
 
 # ── 2. torch / torch_npu 现状 ─────────────────────────────────────────────────
-say "2. torch / torch_npu 现状（本脚本绝不修改它们）"
+# 规则：**已经装了 torch 就绝不动它**（换版本 = 赌上整个环境）。只有完全没有 torch
+# 时才按「CANN 版本 → 配套 torch 版本」+「CPU 架构 → 装哪个源」自动装一套。
+say "2. torch / torch_npu 现状"
+ARCH="$(uname -m)"
 TORCH_VER="$("$PYBIN" -c 'import torch;print(torch.__version__)' 2>/dev/null)"
-if [ -z "$TORCH_VER" ]; then
-  echo "   ✗ 导不进 torch。这个镜像不适合，换 torch-npu-cann8-debug。"; exit 1
-fi
 TORCH_NPU_VER="$("$PYBIN" -c 'import torch_npu;print(torch_npu.__version__)' 2>/dev/null)"
 NUMPY_VER="$("$PYBIN" -c 'import numpy;print(numpy.__version__)' 2>/dev/null)"
-echo "   torch      = $TORCH_VER"
+PYVER="$("$PYBIN" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+echo "   架构       = $ARCH"
+echo "   python     = $PYVER"
+echo "   torch      = ${TORCH_VER:-<未安装>}"
 echo "   torch_npu  = ${TORCH_NPU_VER:-<未安装 / 导入失败>}"
 echo "   numpy      = ${NUMPY_VER:-<未安装>}"
+
+# CANN 实际版本（install.info 里的 version= 才是权威，镜像名不可信）
+CANN_VER=""
+for f in /usr/local/Ascend/ascend-toolkit/latest/*/ascend_toolkit_install.info \
+         /usr/local/Ascend/ascend-toolkit/latest/ascend_toolkit_install.info; do
+  [ -f "$f" ] || continue
+  CANN_VER="$(grep -iE '^version=' "$f" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+  [ -n "$CANN_VER" ] && break
+done
+echo "   CANN       = ${CANN_VER:-<读不到 install.info>}"
+
+# 官方版本配套表（Ascend/pytorch 的 COMPATIBILITY.md）。CANN 是硬上限：
+#   CANN 8.3.RC1 → torch 2.8.0 / 2.7.1 / 2.6.0.post3
+#   CANN 8.2.RC1 → torch 2.6.0 / 2.5.1.post1
+#   CANN 8.1.RC1 → torch 2.5.1 / 2.4.0.post4
+#   CANN 8.0.0   → torch 2.4.0.post2 / 2.3.1.post4
+#   CANN 8.0.RC3 → torch 2.4.0 / 2.3.1.post2
+#   CANN 8.0.RC1 → torch 2.2.0 / 2.1.0.post4
+# 取每档里**偏保守的一个**（不取最新那个），少踩 post 版本的坑。
+pick_torch_for_cann() {
+  case "${1:-}" in
+    8.3*)            echo "2.7.1  2.7.1" ;;
+    8.2*)            echo "2.6.0  2.6.0" ;;
+    8.1*)            echo "2.5.1  2.5.1" ;;
+    8.0.0*)          echo "2.3.1  2.3.1.post4" ;;
+    8.0.RC3*|8.0.rc3*) echo "2.3.1  2.3.1.post2" ;;
+    8.0.RC1*|8.0.rc1*) echo "2.1.0  2.1.0.post4" ;;
+    *)               echo "" ;;
+  esac
+}
+
+if [ -z "$TORCH_VER" ]; then
+  say "2b. 没有 torch —— 按 CANN/架构自动装一套"
+  if [ -z "$CANN_VER" ]; then
+    echo "   ✗ 读不到 CANN 版本，无法决定 torch 版本。先跑 tools/npu_recon.sh 看第 2 节。"
+    exit 1
+  fi
+  read -r WANT_TORCH WANT_TORCH_NPU <<<"$(pick_torch_for_cann "$CANN_VER")"
+  if [ -z "${WANT_TORCH:-}" ]; then
+    echo "   ✗ CANN=$CANN_VER 不在已知配套表里。"
+    echo "     查 https://github.com/Ascend/pytorch 的 COMPATIBILITY.md，手动指定："
+    echo "     ANIMA_TORCH=2.6.0 ANIMA_TORCH_NPU=2.6.0 bash tools/npu_setup_image.sh"
+    exit 1
+  fi
+  WANT_TORCH="${ANIMA_TORCH:-$WANT_TORCH}"
+  WANT_TORCH_NPU="${ANIMA_TORCH_NPU:-$WANT_TORCH_NPU}"
+  echo "   CANN=$CANN_VER → 选定 torch==$WANT_TORCH / torch-npu==$WANT_TORCH_NPU"
+
+  # 架构决定装哪个源。这是最容易废掉环境的一步：
+  #   x86_64 走默认 PyPI 会拿到**CUDA 构建**的 torch（几个 GB，且 torch_npu 不认）。
+  #   aarch64 的 PyPI wheel 本来就是 CPU 构建，直接装即可。
+  case "$ARCH" in
+    x86_64)
+      echo "   x86_64 → 强制走 CPU 专用源，避免拉到 CUDA 构建"
+      $PYBIN -m pip install "torch==${WANT_TORCH}" \
+        --index-url https://download.pytorch.org/whl/cpu || { echo "✗ torch 安装失败"; exit 1; }
+      ;;
+    aarch64)
+      echo "   aarch64 → PyPI wheel 即 CPU 构建"
+      $PYBIN -m pip install --index-url "$PIP_INDEX" "torch==${WANT_TORCH}" \
+        || { echo "✗ torch 安装失败"; exit 1; }
+      ;;
+    *)
+      echo "   ✗ 未知架构 $ARCH，不敢自动装。手动确认有对应 wheel 再来。"; exit 1 ;;
+  esac
+  $PYBIN -m pip install --index-url "$PIP_INDEX" "torch-npu==${WANT_TORCH_NPU}" \
+    || { echo "✗ torch-npu 安装失败（确认该版本有 cp${PYVER//./} 的 $ARCH wheel）"; exit 1; }
+
+  TORCH_VER="$("$PYBIN" -c 'import torch;print(torch.__version__)' 2>/dev/null)"
+  TORCH_NPU_VER="$("$PYBIN" -c 'import torch_npu;print(torch_npu.__version__)' 2>/dev/null)"
+  echo "   装完：torch=${TORCH_VER:-失败} torch_npu=${TORCH_NPU_VER:-失败}"
+  [ -n "$TORCH_VER" ] || { echo "   ✗ 装完还是导不进 torch"; exit 1; }
+else
+  echo "   → 已有 torch，本脚本不会改动它（换版本 = 赌上整个环境）"
+fi
+
 if [ -z "$TORCH_NPU_VER" ]; then
   echo "   ✗ torch_npu 不可用 —— 后面所有 NPU 训练都无从谈起，先解决这个。"
 fi
@@ -100,11 +179,17 @@ fi
 # ── 3. constraints：钉死 torch 系，防止被依赖解析悄悄换掉 ─────────────────────
 say "3. 生成 pip constraints（防止 torchvision 等把 torch 换成 CUDA 版）"
 CONS="/tmp/anima_npu_constraints.txt"
+# numpy 上限跟 torch 走：torch 2.1/2.2 按 numpy 1.x ABI 编译，numpy 2 会在运行期报
+# _ARRAY_API 错误；torch>=2.3 官方支持 numpy 2，不该无谓钉死。
+NUMPY_PIN="numpy<2"
+case "${TORCH_VER%%+*}" in
+  2.1.*|2.2.*|1.*) NUMPY_PIN="numpy<2" ;;
+  *)               NUMPY_PIN="numpy" ;;
+esac
 {
   echo "torch==$TORCH_VER"
   [ -n "$TORCH_NPU_VER" ] && echo "torch-npu==$TORCH_NPU_VER"
-  # torch 2.1.x 是按 numpy 1.x ABI 编译的，numpy 2 会在运行期报 _ARRAY_API 错误
-  echo "numpy<2"
+  [ "$NUMPY_PIN" = "numpy<2" ] && echo "numpy<2"
 } > "$CONS"
 cat "$CONS" | sed 's/^/   /'
 
@@ -116,7 +201,7 @@ PIP_ARGS="--index-url $PIP_INDEX --constraint $CONS"
 # transformers>=4.51 是硬下限：trainer/models.py:259 用 AutoModelForCausalLM 加载
 # Qwen3-0.6B，更早的版本不认识 Qwen3 架构。
 REQUIRED=(
-  "numpy<2"
+  "$NUMPY_PIN"
   "Pillow"
   "safetensors"
   "transformers>=4.51,<5"

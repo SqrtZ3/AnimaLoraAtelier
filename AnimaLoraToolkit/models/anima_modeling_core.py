@@ -22,6 +22,7 @@
 # 字符串保存，不改变任何运行时行为。
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
@@ -60,6 +61,134 @@ def set_attn_force_autocast_dtype(enabled: bool) -> bool:
     global _ATTN_FORCE_AUTOCAST_DTYPE
     _ATTN_FORCE_AUTOCAST_DTYPE = bool(enabled)
     return _ATTN_FORCE_AUTOCAST_DTYPE
+
+
+# ── NaViT 打包注意力后端（opt-in，默认 xformers = 历史行为逐 bit 不变）───────────
+#
+# 三个后端算的是**同一件事**：块对角注意力 —— 打包序列里每张图只看自己的 token，
+# 段间零泄漏，且不物化 O(ΣN²) 的稠密 mask。区别只在用什么 kernel：
+#
+#   "xformers"  BlockDiagonalMask + memory_efficient_attention 的 varlen 快核。
+#               历史默认，CUDA 上逐 bit 不变。昇腾无此包。
+#   "npu_tnd"   torch_npu.npu_fusion_attention(input_layout="TND")，昇腾**原生**变长
+#               融合注意力：actual_seq_qlen / actual_seq_kvlen 传累加和，语义与
+#               BlockDiagonalMask 等价（cross-attn 的 q/kv 段长不等也支持）。
+#               可用性必须由 tools/npu_probe.py 在真机上实测，不在这里假设。
+#   "sdpa_seg"  逐段 dense SDPA。段内全注意力 ≡ 块对角，数学恒等（本文件的对拍单测
+#               tests/test_anima_packed_attn_backends.py 用稠密 bool mask 对拍）。
+#               不依赖任何专有算子，是 TND 挂掉时的保底路径。
+#
+# 与 krea2 的同名开关（models/krea2_modeling.py）是**各自独立**的模块级状态，训练入口
+# 按 model_family 分别设置。
+_PACKED_ATTN_BACKEND = "xformers"
+_PACKED_ATTN_BACKENDS = ("xformers", "sdpa_seg", "npu_tnd")
+
+
+def set_packed_attention_backend(name: str) -> str:
+    """训练入口调用（trainer 读 ``navit_attn_backend``）。非法值构造期 fail-fast。"""
+    global _PACKED_ATTN_BACKEND
+    name = (name or "xformers").lower()
+    if name not in _PACKED_ATTN_BACKENDS:
+        raise ValueError(
+            f"navit_attn_backend={name!r} 不认识；Anima family 可选 {_PACKED_ATTN_BACKENDS}")
+    _PACKED_ATTN_BACKEND = name
+    return _PACKED_ATTN_BACKEND
+
+
+def get_packed_attention_backend() -> str:
+    return _PACKED_ATTN_BACKEND
+
+
+class _SegLens:
+    """打包注意力的轻量段长标记（替代 xformers ``BlockDiagonalMask``）。
+
+    纯 CPU 元数据：``q_seqlens`` 是每张图的 visual token 数，``kv_seqlens`` 在 self-attn
+    等于前者、在 cross-attn 是每条 caption 的文本 token 数。``torch_attention_op``
+    检测到它就走 sdpa_seg / npu_tnd 后端。
+    """
+    __slots__ = ("q_seqlens", "kv_seqlens")
+
+    def __init__(self, q_seqlens, kv_seqlens=None):
+        self.q_seqlens = tuple(int(s) for s in q_seqlens)
+        self.kv_seqlens = (self.q_seqlens if kv_seqlens is None
+                           else tuple(int(s) for s in kv_seqlens))
+        if len(self.q_seqlens) != len(self.kv_seqlens):
+            raise ValueError(
+                f"q/kv 段数不一致：{len(self.q_seqlens)} vs {len(self.kv_seqlens)}")
+
+    def __repr__(self) -> str:  # pragma: no cover - 仅调试用
+        return f"_SegLens(q={self.q_seqlens}, kv={self.kv_seqlens})"
+
+
+@functools.lru_cache(maxsize=256)
+def _cached_seg_lens(q_seqlens: tuple, kv_seqlens: Optional[tuple] = None) -> _SegLens:
+    """按 seqlens 缓存 ``_SegLens``，与 ``_cached_block_diag_mask`` 同样的复用理由。"""
+    return _SegLens(q_seqlens, kv_seqlens)
+
+
+def _packed_attention_seg(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D, seg: _SegLens):
+    """逐段 dense SDPA。输入/输出均为 [B, S, H, D]（打包路径 B==1）。"""
+    outs = []
+    qo = ko = 0
+    for sq, sk in zip(seg.q_seqlens, seg.kv_seqlens):
+        # [B, s, H, D] -> [B, H, s, D]
+        qs = q_B_S_H_D[:, qo:qo + sq].transpose(1, 2)
+        ks = k_B_S_H_D[:, ko:ko + sk].transpose(1, 2)
+        vs = v_B_S_H_D[:, ko:ko + sk].transpose(1, 2)
+        o = F.scaled_dot_product_attention(qs, ks, vs)
+        outs.append(o.transpose(1, 2))                       # 回 [B, s, H, D]
+        qo += sq
+        ko += sk
+    return torch.cat(outs, dim=1)
+
+
+def _packed_attention_npu_tnd(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D, seg: _SegLens):
+    """昇腾原生变长融合注意力（TND）。输入/输出 [B, S, H, D]，要求 B==1。
+
+    TND 布局就是把 batch 维去掉的 [ΣS, H, D]；段边界由 ``actual_seq_*`` 的**累加和**
+    给出。这与打包路径的内存布局天然一致，无需任何转置/拷贝。
+    """
+    import torch_npu  # 只有该后端需要；导入失败要吵，不静默回退
+
+    B = q_B_S_H_D.shape[0]
+    if B != 1:
+        raise RuntimeError(f"npu_tnd 后端只支持打包路径的 B=1，收到 B={B}")
+    H = q_B_S_H_D.shape[-2]
+    D = q_B_S_H_D.shape[-1]
+    q = q_B_S_H_D.reshape(-1, H, D)
+    k = k_B_S_H_D.reshape(-1, H, D)
+    v = v_B_S_H_D.reshape(-1, H, D)
+
+    cu_q, cu_kv, acc_q, acc_kv = [], [], 0, 0
+    for sq, sk in zip(seg.q_seqlens, seg.kv_seqlens):
+        acc_q += sq
+        acc_kv += sk
+        cu_q.append(acc_q)
+        cu_kv.append(acc_kv)
+
+    out = torch_npu.npu_fusion_attention(
+        q, k, v, H,
+        input_layout="TND",
+        scale=1.0 / math.sqrt(D),          # 与 SDPA / xformers 的默认缩放一致
+        actual_seq_qlen=cu_q,
+        actual_seq_kvlen=cu_kv,
+    )
+    o = out[0] if isinstance(out, (tuple, list)) else out
+    return o.reshape(B, -1, H, D)
+
+
+@contextlib.contextmanager
+def _fp32_autocast(dev_type: str):
+    """在支持 autocast 的加速器上开一个 fp32 autocast 区域；其余设备是 no-op。
+
+    只对 ``cuda`` / ``npu`` 生效：CPU autocast 只支持 bf16/fp16，开 fp32 会报错，而
+    原来的 ``@torch.autocast('cuda', ...)`` 装饰器在 CPU 上本来就无效果——保持一致。
+    """
+    if dev_type in ("cuda", "npu"):
+        with torch.autocast(dev_type, dtype=torch.float32):
+            yield
+    else:
+        yield
 
 
 def _is_xformers_attn_bias(m) -> bool:
@@ -179,10 +308,16 @@ class RMSNorm(torch.nn.Module):
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    @torch.autocast('cuda', dtype=torch.float32)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        # 原实现是 `@torch.autocast('cuda', dtype=torch.float32)` 装饰器——设备串写死
+        # 在**类定义期**，在昇腾上等于给 npu 张量开了一个 cuda autocast 区域，
+        # 完全不起作用（`output * self.weight` 会跟着外层 bf16 autocast 走，而不是
+        # 原意的 fp32）。改成按张量实际设备取 device_type。
+        # 行为中立性：CUDA 上 device_type=='cuda'，与原装饰器逐字节等价；CPU 上原来
+        # 也是无效果（cuda autocast 不作用于 cpu 张量），这里显式跳过，保持无效果。
+        with _fp32_autocast(x.device.type):
+            output = self._norm(x.float()).type_as(x)
+            return output * self.weight
 
 
 # ---------------------- Feed Forward Network -----------------------
@@ -253,6 +388,15 @@ def torch_attention_op(
     # LoRA 注入后 q 与 k/v 可能一个 fp32 一个 bf16（见 _unify_attn_dtype）。SDPA 自己会
     # 统一，xformers 不会——两条分支都先归一，保证走哪个后端语义一致。
     q_B_S_H_D, k_B_S_H_D, v_B_S_H_D = _unify_attn_dtype(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D)
+
+    # NaViT 打包路径的非 xformers 后端：``attn_mask`` 是 ``_SegLens``（纯段长元数据）。
+    # 语义与 BlockDiagonalMask 完全相同，只是换 kernel。
+    if isinstance(attn_mask, _SegLens):
+        if _PACKED_ATTN_BACKEND == "npu_tnd":
+            out = _packed_attention_npu_tnd(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D, attn_mask)
+        else:
+            out = _packed_attention_seg(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D, attn_mask)
+        return rearrange(out, "b s h d -> b s (h d)")
 
     if _is_xformers_attn_bias(attn_mask):
         if xops is None:
@@ -1659,13 +1803,26 @@ class MiniTrainDIT(nn.Module):
         varlen kernel — there is no O(ΣN²) dense mask and no cross-image leakage (the
         invariant is asserted bit-for-bit in ``test_packed_block_diag_attention``).
         """
-        try:  # fail-fast 可用性检查；实际构建走 _cached_block_diag_mask（按 seqlens 缓存）
-            from xformers.ops.fmha import BlockDiagonalMask  # noqa: F401
-        except Exception as exc:  # pragma: no cover - exercised only without xformers
-            raise RuntimeError(
-                "forward_packed_navit requires xformers (BlockDiagonalMask) for "
-                "block-diagonal packed attention; it is unavailable."
-            ) from exc
+        # 后端可用性 fail-fast。xformers 只在 xformers 后端才是硬依赖——sdpa_seg /
+        # npu_tnd 用 _SegLens 走等价路径（昇腾上没有 xformers，这是 NaViT 能活的前提）。
+        if _PACKED_ATTN_BACKEND == "xformers":
+            try:  # 实际构建走 _cached_block_diag_mask（按 seqlens 缓存）
+                from xformers.ops.fmha import BlockDiagonalMask  # noqa: F401
+            except Exception as exc:  # pragma: no cover - exercised only without xformers
+                raise RuntimeError(
+                    "forward_packed_navit requires xformers (BlockDiagonalMask) for "
+                    "block-diagonal packed attention; it is unavailable. "
+                    "在没有 xformers 的平台（如昇腾 NPU）请设 "
+                    "navit_attn_backend: npu_tnd 或 sdpa_seg。"
+                ) from exc
+        elif _PACKED_ATTN_BACKEND == "npu_tnd":
+            try:
+                import torch_npu  # noqa: F401
+            except Exception as exc:  # pragma: no cover - 只在非昇腾机器触发
+                raise RuntimeError(
+                    "navit_attn_backend=npu_tnd 需要 torch_npu；导入失败。"
+                    "非昇腾平台请用 xformers（CUDA）或 sdpa_seg（通用）。"
+                ) from exc
 
         visual_seqlens = [int(s) for s in visual_seqlens]
         text_seqlens = [int(s) for s in text_seqlens]
@@ -1717,10 +1874,15 @@ class MiniTrainDIT(nn.Module):
         rope_emb = self._packed_rope_from_grid(grid_1_2_N)
         # BlockDiagonalMask 只依赖 seqlens（纯 CPU 元数据对象，块内已跨 28 block +
         # checkpoint 重算复用），按 seqlens 元组缓存避免每步重建。
-        self_bias = _cached_block_diag_mask(tuple(visual_seqlens))
-        cross_bias = _cached_block_diag_mask(
-            tuple(visual_seqlens), tuple(text_seqlens)
-        )
+        if _PACKED_ATTN_BACKEND == "xformers":
+            self_bias = _cached_block_diag_mask(tuple(visual_seqlens))
+            cross_bias = _cached_block_diag_mask(
+                tuple(visual_seqlens), tuple(text_seqlens)
+            )
+        else:
+            # sdpa_seg / npu_tnd：同样是纯 CPU 元数据，同样按 seqlens 缓存复用
+            self_bias = _cached_seg_lens(tuple(visual_seqlens))
+            cross_bias = _cached_seg_lens(tuple(visual_seqlens), tuple(text_seqlens))
 
         for block in self.blocks:
             def _run(x_in, blk=block):

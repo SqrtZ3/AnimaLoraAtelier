@@ -16,6 +16,7 @@
 # PEP 563：注解延迟求值。forward() 签名用了 ``X | Y``，Python 3.9 求值注解会 TypeError。
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import Any, Callable, List, Optional, Tuple, Union
 
@@ -26,6 +27,20 @@ from einops.layers.torch import Rearrange
 from torch import nn
 from torch.distributed import get_process_group_ranks
 from torchvision import transforms
+
+
+@contextlib.contextmanager
+def _fp32_autocast(dev_type: str):
+    """在支持 autocast 的加速器上开 fp32 autocast 区域；其余设备 no-op。
+
+    与 ``models/anima_modeling_core._fp32_autocast`` 同义（两个文件互不 import，
+    刻意各留一份而不是跨模块依赖）。
+    """
+    if dev_type in ("cuda", "npu"):
+        with torch.autocast(dev_type, dtype=torch.float32):
+            yield
+    else:
+        yield
 
 
 def _rotate_half(x: torch.Tensor, interleaved: bool) -> torch.Tensor:
@@ -236,10 +251,12 @@ class RMSNorm(torch.nn.Module):
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    @torch.autocast('cuda', dtype=torch.float32)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        # 同 models/anima_modeling_core.py 的 RMSNorm：设备串不能写死在类定义期，
+        # 否则昇腾上这个 fp32 autocast 区域完全不生效。CUDA 上逐字节等价。
+        with _fp32_autocast(x.device.type):
+            output = self._norm(x.float()).type_as(x)
+            return output * self.weight
 
 
 # ---------------------- Feed Forward Network -----------------------

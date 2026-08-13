@@ -5,6 +5,7 @@
 #     bash tools/npu_setup_image.sh            # 装必需依赖
 #     bash tools/npu_setup_image.sh --check    # 只体检，不装任何东西
 #     bash tools/npu_setup_image.sh --with-perceptual --with-jxl
+#     bash tools/npu_setup_image.sh --with-workbench   # + wandb + code-server + /proxy 通道
 #
 # 设计要点：
 #   1. **绝不碰 torch / torch_npu**。生成一份 pip constraints 把已装的
@@ -25,15 +26,22 @@ CHECK_ONLY=0
 WITH_PERCEPTUAL=0
 WITH_JXL=0
 WITH_EXTRA_OPT=0
+WITH_WANDB=0
+WITH_WORKBENCH=0
 for arg in "$@"; do
   case "$arg" in
     --check)            CHECK_ONLY=1 ;;
     --with-perceptual)  WITH_PERCEPTUAL=1 ;;
     --with-jxl)         WITH_JXL=1 ;;
     --with-extra-opt)   WITH_EXTRA_OPT=1 ;;
+    --with-wandb)       WITH_WANDB=1 ;;
+    --with-workbench)   WITH_WORKBENCH=1; WITH_WANDB=1 ;;
     *) echo "未知参数: $arg"; exit 2 ;;
   esac
 done
+
+# code-server 版本：改这里就能换。aarch64 用 linux-arm64 包。
+CODE_SERVER_VER="${CODE_SERVER_VER:-4.132.0}"
 
 PYBIN="${PYBIN:-python3}"
 PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
@@ -251,6 +259,78 @@ if [ "$WITH_EXTRA_OPT" = "1" ]; then
   say "5d. 安装第三方优化器组"
   # shellcheck disable=SC2086
   $PIP install $PIP_ARGS "${EXTRA_OPT[@]}" || echo "   ⚠ 优化器组安装失败（非致命，用内置 adamw）"
+fi
+
+if [ "$WITH_WANDB" = "1" ]; then
+  say "5e. 安装 wandb（配 config 的 wandb_enabled: true；见 trainer/wandb_logger.py）"
+  # shellcheck disable=SC2086
+  $PIP install $PIP_ARGS wandb || echo "   ⚠ wandb 安装失败（非致命，训练不受影响）"
+fi
+
+# ── 5f. 工作台组（opt-in）──────────────────────────────────────────────────────
+# 解决两个平台限制：① JupyterLab 3 的文件浏览器不支持上传目录；② 平台不暴露额外端口，
+# 内置的 train_monitor(6006) 看不到。jupyter-server-proxy 把容器内任意本地端口挂到
+# **平台自己那个 HTTPS 地址**的 /proxy/<port>/ 下（不出平台域名，不是内网穿透），
+# code-server 则提供 VS Code 网页版（其资源管理器支持拖入整个文件夹）。
+#
+# 注意：装完**必须提交镜像 + 新建任务**才生效——jupyter server 扩展只在 server 启动时
+# 加载，而 server 是平台拉起来的，在跑着的任务里重启它有丢会话的风险。
+if [ "$WITH_WORKBENCH" = "1" ]; then
+  say "5f. 安装工作台组（jupyter-server-proxy + code-server）"
+
+  # jupyter-server-proxy 4.x 要求 jupyter-server>=1.24；低于它退回 3.2.4。
+  # **不升级 jupyter-server / jupyterlab**：平台的启动命令可能带 jupyter-server 1.x
+  #  专属参数，升到 2.x 会让 server 起不来——那样提交出去的镜像是个进不去的砖。
+  JS_VER="$("$PYBIN" -c 'import importlib.metadata as m;print(m.version("jupyter-server"))' 2>/dev/null || echo "0")"
+  echo "   已装 jupyter-server: ${JS_VER:-无}"
+  PROXY_SPEC="jupyter-server-proxy"
+  case "$JS_VER" in
+    0|"") PROXY_SPEC="jupyter-server-proxy" ;;
+    1.*)
+      JS_MINOR="$(echo "$JS_VER" | cut -d. -f2)"
+      if [ "${JS_MINOR:-0}" -lt 24 ]; then
+        PROXY_SPEC="jupyter-server-proxy==3.2.4"
+        echo "   jupyter-server < 1.24 → 装 $PROXY_SPEC（4.x 要求 >=1.24）"
+      fi
+      ;;
+  esac
+  # shellcheck disable=SC2086
+  $PIP install $PIP_ARGS "$PROXY_SPEC" jupyter-codeserver-proxy \
+    || echo "   ⚠ proxy 安装失败（非致命，只是没有 /proxy/<port>/ 通道）"
+
+  ARCH="$(uname -m)"
+  case "$ARCH" in
+    aarch64|arm64) CS_ARCH="arm64" ;;
+    x86_64|amd64)  CS_ARCH="amd64" ;;
+    *) CS_ARCH="" ; echo "   ⚠ 未知架构 $ARCH，跳过 code-server" ;;
+  esac
+  if [ -n "$CS_ARCH" ]; then
+    CS_DIR="/opt/code-server-${CODE_SERVER_VER}-linux-${CS_ARCH}"
+    if [ -x "$CS_DIR/bin/code-server" ]; then
+      echo "   ✓ code-server 已存在：$CS_DIR"
+    else
+      CS_URL="https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VER}/code-server-${CODE_SERVER_VER}-linux-${CS_ARCH}.tar.gz"
+      echo "   下载 $CS_URL"
+      mkdir -p /opt
+      if curl -fL --retry 3 "$CS_URL" | tar xz -C /opt; then
+        echo "   ✓ 解包到 $CS_DIR"
+      else
+        echo "   ⚠ code-server 下载/解包失败（非致命）"
+      fi
+    fi
+    # /usr/local/bin 进镜像；jupyter-codeserver-proxy 靠 PATH 找 code-server
+    [ -x "$CS_DIR/bin/code-server" ] && ln -sf "$CS_DIR/bin/code-server" /usr/local/bin/code-server
+    command -v code-server >/dev/null && code-server --version | head -1
+  fi
+
+  cat <<'EOF'
+
+   用法（**提交镜像 → 新建任务**之后才生效）：
+     code-server --auth none --bind-addr 127.0.0.1:8080 /tmp/code
+     然后把浏览器里 JupyterLab 地址的 /lab 换成 /proxy/8080/
+     训练监控同理：不设 no_monitor，访问 /proxy/6006/
+   ⚠ 平台的 nginx 是否放行 /proxy/ 子路径未验证——这是整条通道的单点，先小成本试。
+EOF
 fi
 
 # ── 6. 安装后校验：torch 有没有被换掉 ────────────────────────────────────────

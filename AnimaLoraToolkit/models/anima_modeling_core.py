@@ -420,6 +420,9 @@ def torch_attention_op(
     q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
     k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
     v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
+    # 昇腾：同上，DiT 侧若拿到 [B,H,1,Skv] 的 padding mask 也要先展开（CUDA 上是恒等）
+    from utils.npu_compat import expand_attn_mask as _expand_attn_mask
+    attn_mask = _expand_attn_mask(attn_mask, q_B_H_S_D.shape[-2])
     result_B_S_HD = rearrange(
         torch.nn.functional.scaled_dot_product_attention(
             q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, attn_mask=attn_mask
@@ -2049,6 +2052,9 @@ class LLMAdapterAttention(nn.Module):
             cos, sin = position_embeddings_context
             key_states = apply_rotary_pos_emb_llm(key_states, cos, sin)
 
+        # 昇腾：FlashAttentionScore 不接受 Sq 维为 1 的广播 mask，先展开（CUDA 上是恒等）
+        from utils.npu_compat import expand_attn_mask as _expand_attn_mask
+        mask = _expand_attn_mask(mask, query_states.shape[-2])
         attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
 
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()

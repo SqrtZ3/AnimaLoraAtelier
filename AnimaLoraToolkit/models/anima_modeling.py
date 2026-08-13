@@ -82,6 +82,9 @@ class LLMAdapterAttention(nn.Module):
             cos, sin = position_embeddings_context
             key_states = apply_rotary_pos_emb(key_states, cos, sin)
 
+        # 昇腾：FlashAttentionScore 不接受 Sq 维为 1 的广播 mask，先展开（CUDA 上是恒等）
+        from utils.npu_compat import expand_attn_mask as _expand_attn_mask
+        mask = _expand_attn_mask(mask, query_states.shape[-2])
         attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
 
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()

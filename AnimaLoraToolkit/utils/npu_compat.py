@@ -61,6 +61,35 @@ def autocast_device_type() -> str:
     return "npu" if _NPU_ENABLED else "cuda"
 
 
+def expand_attn_mask(mask, q_len: int):
+    """把 ``[B, H, 1, Skv]`` 形状的广播 mask 展开成 ``[B, H, Sq, Skv]``（仅 NPU 上）。
+
+    **为什么**：PyTorch 的 SDPA 允许 attn_mask 在 query 维上广播（`Sq=1`），仓库里
+    key-padding mask 就是这么造的（`models/anima_modeling.py:181` 的
+    `unsqueeze(1).unsqueeze(1)`）。但昇腾把 SDPA 落到 `aclnnFlashAttentionScore`，
+    它**只接受** `[B,N,Sq,Skv]` / `[B,1,Sq,Skv]` / `[1,1,Sq,Skv]` / `[Sq,Skv]`
+    —— `Sq` 必须是真实的 query 长度。真机报错原文：
+
+        get unsupported atten_mask shape, the shape is [1, 1, 1, 251].
+        B=[1], N=[16], Sq=[251], Skv=[251]
+
+    展开后语义完全相同（广播本来就是把这一维复制 Sq 份）。`.contiguous()` 是因为
+    `expand` 出来的那一维 stride=0，融合算子对非连续输入的支持没有保证；bool mask
+    在文本长度这个量级上只有几十~几百 KB，代价可忽略。
+
+    CUDA/CPU 上直接原样返回 —— 未 `enable()` 时本函数是恒等映射，行为逐字节不变。
+    """
+    if not _NPU_ENABLED or mask is None:
+        return mask
+    import torch
+
+    if not torch.is_tensor(mask) or mask.dim() != 4:
+        return mask
+    if mask.shape[-2] != 1 or int(q_len) == 1:
+        return mask
+    return mask.expand(mask.shape[0], mask.shape[1], int(q_len), mask.shape[-1]).contiguous()
+
+
 def device_str() -> str:
     """训练主设备字符串。"""
     if _NPU_ENABLED:

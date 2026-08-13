@@ -2371,8 +2371,20 @@ class CachedLatentDataset(Dataset):
             self.encode_max_pixels,
             flip,
         )
-        use_cuda = str(getattr(device, "type", device)).startswith("cuda")
-        oom_error = getattr(torch.cuda, "OutOfMemoryError", RuntimeError)
+        # CUDA / NPU 通用：昇腾上 device.type 是 "npu"，原来的 startswith("cuda") 恒为 False，
+        # 会让下面 OOM 降级路径里的 empty_cache 被静默跳过；OOM 异常类型同理（torch_npu 抛的是
+        # torch.npu.OutOfMemoryError）。CUDA 上行为不变：torch.OutOfMemoryError 与
+        # torch.cuda.OutOfMemoryError 是同一个类（torch>=2.5），集合去重后仍是原来那一个。
+        _dev_type = str(getattr(device, "type", device))
+        use_accel = _dev_type.startswith("cuda") or _dev_type.startswith("npu")
+        _accel_mod = getattr(torch, "npu", None) if _dev_type.startswith("npu") else getattr(torch, "cuda", None)
+        oom_error = tuple({
+            e for e in (
+                getattr(torch, "OutOfMemoryError", None),
+                getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None),
+                getattr(getattr(torch, "npu", None), "OutOfMemoryError", None),
+            ) if isinstance(e, type)
+        }) or RuntimeError
 
         def _save_one(npz_path, lat, lat_flip, ph, pw):
             save_kwargs = {
@@ -2449,8 +2461,8 @@ class CachedLatentDataset(Dataset):
                         latent_all = vae.model.encode(enc_in, vae.scale)
                 except oom_error:
                     # 显存不够：清缓存并降级逐张编码（慢但不中断整个缓存任务）。
-                    if use_cuda:
-                        torch.cuda.empty_cache()
+                    if use_accel and _accel_mod is not None:
+                        _accel_mod.empty_cache()
                     logger.warning(
                         "[cache] encode OOM at batch=%d (%dx%d)，降级逐张。可调小 cache_encode_batch_size。",
                         enc_in.shape[0], pw, ph,

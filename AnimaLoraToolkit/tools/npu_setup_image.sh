@@ -217,7 +217,7 @@ EXTRA_OPT=( "prodigy-plus-schedule-free" )  # 仅当用 prodigyplus 优化器
 # 明确**不装**（并说明原因），避免下次有人「顺手补全 requirements.txt」
 say "4. 明确不安装的包（不是遗漏）"
 cat <<'EOF'
-   xformers        —— 昇腾无此包；NaViT 打包路径因此不可用（配置里必须关）
+   xformers        —— 昇腾无此包；改用 navit_attn_backend: npu_tnd / sdpa_seg，NaViT 打包仍可用
    bitsandbytes    —— 无昇腾后端；utils/optimizer_utils.py:76 是 try/except 可选导入
    triton          —— 昇腾无
    flash-attn      —— 昇腾无
@@ -296,7 +296,7 @@ cat <<'EOF'
 下一步（顺序不能反）：
   1. 确认上面第 6 步全是 ✓、第 7 步没有致命 FAIL
   2. **不要停止本调试任务**
-  3. 回到调试任务列表 →「更多」下拉 →「提交镜像」，填名称如 anima-npu-torch2.1-py39
+  3. 回到调试任务列表 →「更多」下拉 →「提交镜像」，填名称如 anima-npu-cann82-torch26-py311
   4. 提交期间任务转 WAITING，耐心等
   5. 之后每次新建任务直接选这个自定义镜像，不必重装
 EOF

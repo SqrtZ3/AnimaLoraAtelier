@@ -95,11 +95,7 @@ bf16/fp32 matmul 数值、`autocast("npu")`、SDPA（无 mask / bool mask / addi
 - `npu_tnd` 后端的真机可用性未验证（探针的 TND 项就是为它准备的）。
 - 分布式（多卡 HCCL）未接线；当前只考虑单卡。
 - `trainer/quant.py` 全部走 CUDA 专用路径，NPU 上由守卫拦掉，未做适配。
-- 文本编码器：平台的 Anima 仓库给的是 ComfyUI 单文件，需要用
-  `tools/convert_comfy_te_to_hf.py` 转成 HF 目录（转换工具本地已用合成模型验证过
-  键名/形状/逐 bit 一致，但**没有用真实的 `qwen_3_06b_base.safetensors` 跑过**——
-  真文件的键名前缀属于哪一种变换，要转的时候才知道；工具在配不上时会打出两边的键样本
-  并拒绝产出半成品）。
+- ~~文本编码器转换未用真实文件验证~~ → **已验证，见 §5.1。**
 
 ## 4.1 NPU 侧顺手修掉的一个真 bug
 
@@ -140,7 +136,16 @@ CUDA 上 `device_type == 'cuda'`，与原装饰器等价；CPU 上原来就无�
 `/tmp/dataset` 不入镜像；**NPU 环境下 `/home/ma-user/work` 不入镜像**；提交期间任务转
 WAITING 暂不可用。
 
-**调试任务时长**：文档写明**默认 4 小时**上限，可手动停止。
+**调试任务时长**：文档写明**默认 4 小时**上限，可手动停止。JupyterLab 工作区在 `/tmp/code`，
+任务不被回收时内容保留（用户实测：重启环境后仓库仍在）。⚠ 但**重启任务会回到基础镜像**——
+自定义镜像要在「新建调试任务」时选（用户实测）。
+
+**监控**：平台不暴露额外端口，仓库内置的 `train_monitor.py`（6006，纯内存）看不到。
+用 `wandb_enabled: true`（`trainer/wandb_logger.py`，opt-in）把指标外推；到 api.wandb.ai
+的连通性未验证，首跑建议 `wandb_mode: offline` 再 `wandb sync`。
+
+**解释器不在 PATH**：`cann8.2.rc2-ms2.7-py3.11-910b` 镜像里 `pip` / `python` 都不在 PATH，
+要用绝对路径 `/usr/local/python3.11.13/bin/python -m pip ...`（用户实测 `pip: command not found`）。
 
 **上传底模/数据集**：用官方 CLI，别用网页拖拽。
 ```bash
@@ -161,7 +166,44 @@ openi dataset upload <owner>/<数据集名> <本地路径> -w 100
 需要 HF 目录（`config.json` + tokenizer）；仓库内 `models/text_encoders/Qwen3-0.6B-Base/`
 的 tokenizer 齐但 `model.safetensors` 只有 135 字节（LFS 指针，非权重）。
 
-用 `tools/convert_comfy_te_to_hf.py` 转（**建议在本地转好再上传**，别在 4 小时的调试任务里现场折腾）：
+### 5.0 按单文件拉底模（不要挂载整个模型）
+
+挂载整个 `FoundationModel/Anima` 会拖慢调试任务启动（用户实测：新建工作区时卡住）。
+平台的模型文件可以**按单个文件**取，公开模型**无需登录**。以下均为实测（2026-08-13，匿名请求）：
+
+```
+GET https://openi.pcl.ac.cn/api/v1/aimodel/file/meta?aimodel_name=<owner/model>&file_name=<含子目录的路径>&parent_dir=
+GET https://openi.pcl.ac.cn/api/v1/aimodel/file?...（同参数）→ 301 到鹏城 OBS 签名直链，支持 Range
+```
+
+`FoundationModel/Anima` 三件套的精确 `file_name` 与字节数：
+
+| 文件 | file_name | 字节 |
+|---|---|---|
+| DiT | `split_files/diffusion_models/anima-base-v1.0.safetensors` | 4182218328 |
+| TE | `split_files/text_encoders/qwen_3_06b_base.safetensors` | 1192135096 |
+| VAE | `split_files/vae/qwen_image_vae.safetensors` | 253806246 |
+
+两种取法（`openi` CLI 的 `-f` 支持逗号分隔多文件；curl 直连支持 `-C -` 续传）：
+
+```bash
+openi model download FoundationModel/Anima -f "split_files/vae/qwen_image_vae.safetensors" -d ./anima_models
+curl -L -C - -o vae.safetensors "https://openi.pcl.ac.cn/api/v1/aimodel/file?aimodel_name=FoundationModel/Anima&file_name=split_files/vae/qwen_image_vae.safetensors&parent_dir="
+```
+
+数据集同理：`openi dataset upload/download`（上传支持文件夹，保留子目录）。**注意数据集
+归属项目仓库**——私有仓下的数据集不进公开列表（文档口径，未实建验证）。
+
+### 5.1 文本编码器转换：已用真实文件验证
+
+`tools/convert_comfy_te_to_hf.py` 对平台那份 `qwen_3_06b_base.safetensors`（与 ComfyUI 生态
+分发的是同一文件，字节数都是 1192135096）实测：**键名变换 = identity**（ComfyUI 单文件的
+键名已经就是 HF 口径，不需要加/去前缀）、期望键 310 / 源键 310、**形状 310/310 全部一致**；
+转出目录用 `AutoModelForCausalLM.from_pretrained` 加载成功，参数量 596,049,920。
+
+因此机上现场转即可（几十秒），**不需要在本地转好再上传**：
+
+用 `tools/convert_comfy_te_to_hf.py` 转：
 
 ```bash
 python tools/convert_comfy_te_to_hf.py \

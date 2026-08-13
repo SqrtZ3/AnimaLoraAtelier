@@ -509,20 +509,26 @@ def probe_packages() -> None:
     for mod, note in [
         ("safetensors", "权重读写，必需"),
         ("transformers", "文本编码器，必需"),
-        ("diffusers", "必需"),
         ("einops", "必需"),
-        ("omegaconf", "配置，必需"),
         ("PIL", "必需"),
-        ("pillow_jxl", "JXL 数据集才需要"),
-        ("lpips", "perceptual aux loss 才需要"),
-        ("scipy", "工具脚本"),
-        ("xformers", "昇腾上预期缺失 → NaViT 打包路径不可用"),
+        ("PyYAML/yaml", "配置解析，必需"),
+        ("rich", "进度显示，必需"),
+        # 以下都是**可选**。曾把 diffusers/omegaconf 标成"必需"是错的：AST 扫描
+        # anima_train.py + trainer/ + utils/ + models/ 的真实运行路径，两者都未被 import
+        # （tools/npu_setup_image.sh 的不装清单同源）。缺失不影响训练。
+        ("diffusers", "可选：运行路径未 import，不装"),
+        ("omegaconf", "可选：运行路径未 import，不装"),
+        ("pillow_jxl", "可选：JXL 数据集才需要"),
+        ("lpips", "可选：perceptual aux loss 才需要"),
+        ("scipy", "可选：工具脚本"),
+        ("xformers", "昇腾预期缺失 → 用 navit_attn_backend: npu_tnd / sdpa_seg 代替，"
+                     "NaViT 打包仍可用"),
         ("bitsandbytes", "昇腾上预期缺失 → 8-bit 优化器不可用"),
         ("triton", "昇腾上预期缺失"),
         ("flash_attn", "昇腾上预期缺失"),
     ]:
         try:
-            m = __import__(mod)
+            m = __import__(mod.split("/")[-1])
             record(f"pkg:{mod}", "OK", f"{getattr(m, '__version__', '?')} — {note}")
         except Exception as e:
             record(f"pkg:{mod}", "FAIL", f"{type(e).__name__} — {note}")

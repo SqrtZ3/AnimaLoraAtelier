@@ -42,6 +42,10 @@ import numpy as np
 RESULTS: list[dict] = []
 _T0 = time.time()
 _BOOTSTRAP_NOTE = ""
+# L3.2 实测的块对角注意力时间（ms）。L4.1 拿它当硬下限：一个**包含**这段注意力
+# 的完整层，步时不可能显著快过注意力本身。峰值 FLOPS 推的下限太松（4.19ms vs
+# 真值 108ms，差 25 倍），拦不住"没同步"这类假测量 —— 第三跑就是栽在这里。
+_T_ATTN_BD: float | None = None
 
 # 与 JAX 探针保持同一套形状，结果才可比。
 # Krea2 12B: features=6144, heads=48, kvheads=12(GQA 4:1), head_dim=128
@@ -77,19 +81,43 @@ JAX_CANDIDATES = [c for c in os.environ.get(
     "ANIMA_JAX_CANDIDATES", "0.7.0,0.6.2,0.6.1,0.6.0,0.5.3").split(",") if c.strip()]
 
 # 子进程里跑的最小 splash 编译测试：能打印 SPLASH_OK 就说明这个 jax 与当前 libtpu 配套。
+# **smoke 必须走 L3 真正用的那条路**（第二跑的教训之二）：原版只编一个 FullMask，
+# 但 L3 用的是自定义 sm.Mask 子类 + use_fused_bwd_kernel + vmap + 反向。
+# 候选 jax 跨 0.5.x~0.7.x，splash 的 Mask API 差异不小，FullMask 编得过不代表
+# 块对角编得过。所以这里直接用块对角 + 反向做 smoke，缩到 L=512 保证快。
+# 判据收紧成："扫描通过 ⇒ L3 必定能编"，避免假绿灯。
 _SPLASH_SMOKE = r"""
 import sys
+import numpy as np
 try:
     import jax, jax.numpy as jnp
     from jax.experimental.pallas.ops.tpu.splash_attention import (
         splash_attention_kernel as sk, splash_attention_mask as sm)
-    mask = sm.MultiHeadMask(masks=(sm.FullMask(_shape=(256, 256)),) * 2)
+
+    class BD(sm.Mask):
+        def __init__(self, lens):
+            self.lens = tuple(int(x) for x in lens)
+            self._ids = np.repeat(np.arange(len(self.lens), dtype=np.int32), self.lens)
+            n = int(self._ids.shape[0]); self._shape = (n, n)
+        @property
+        def shape(self): return self._shape
+        def __getitem__(self, idx):
+            a, b = self._ids[idx[0]], self._ids[idx[1]]
+            return (a[:, None] == b[None, :]).astype(np.bool_)
+        def __eq__(self, o): return isinstance(o, BD) and self.lens == o.lens
+        def __hash__(self): return hash((type(self), self.lens))
+
+    L, H, D = 512, 2, 128
+    mask = sm.MultiHeadMask(masks=(BD([256, 256]),) * H)
     bs = sk.BlockSizes(block_q=128, block_kv=128, block_kv_compute=128,
                        block_q_dkv=128, block_kv_dkv=128, block_kv_dkv_compute=128,
                        use_fused_bwd_kernel=True)
     f = sk.make_splash_mha(mask, head_shards=1, q_seq_shards=1, block_sizes=bs)
-    q = jnp.zeros((2, 256, 128), jnp.bfloat16)
-    jax.block_until_ready(f(q, q, q))
+    q = jnp.zeros((1, H, L, D), jnp.bfloat16)
+    vf = jax.vmap(f)                                   # L3 里就是这么调的
+    jax.block_until_ready(vf(q, q, q))                 # 前向
+    g = jax.grad(lambda a: jnp.sum(vf(a, a, a).astype(jnp.float32) ** 2))
+    jax.block_until_ready(g(q))                        # 反向（训练必需）
     print("SPLASH_OK", jax.__version__, jax.devices()[0].device_kind)
 except Exception as e:
     msg = str(e).replace(chr(10), " ")[:200]
@@ -348,31 +376,45 @@ def probe_version_scissors() -> str:
     """第一跑的杀手：torch_xla 绑老 libtpu，jax 的 Pallas 闸门要新 libtpu，两者
     差 12 个月。这一项在跑 L3 之前先把状态说清楚——它不过，L3 必然全挂。"""
     import datetime
+    import re
     import jax
     from jax._src import xla_bridge
     ver = xla_bridge.get_backend().platform_version
     one_line = " / ".join(x.strip() for x in ver.splitlines() if x.strip())
-    gated, build = None, "未知"
+
+    # **第二跑的教训之一**：原来用二分反推构建日，调的是
+    # `is_cloud_tpu_older_than(y, m, d, client)` —— 真机报
+    # `TypeError: takes 3 positional arguments but 4 were given`（各 jax 版本签名不同）。
+    # 而 platform_version 字符串里**本来就写着** "Built on Aug 15 2025"，直接解析即可，
+    # 既准确又不依赖 jax 私有 API 的签名。
+    m = re.search(r"Built on (\w{3})\s+(\d+)\s+(\d{4})", ver)
+    build = "未知"
+    if m:
+        try:
+            build = datetime.datetime.strptime(
+                f"{m.group(1)} {m.group(2)} {m.group(3)}", "%b %d %Y").date().isoformat()
+        except ValueError:
+            build = " ".join(m.groups())
+
+    # 闸门状态改成"直接问"：签名不确定就逐个 arity 试，试不出来就老实报未知。
+    gated = None
     try:
         from jax._src import cloud_tpu_init
         fn = getattr(cloud_tpu_init, "is_cloud_tpu_older_than", None)
         if fn is not None and jax.devices()[0].platform == "tpu":
-            client = jax.devices()[0].client
-            lo, hi = datetime.date(2023, 1, 1), datetime.date(2031, 1, 1)
-            while (hi - lo).days > 1:
-                mid = lo + (hi - lo) / 2
-                if fn(mid.year, mid.month, mid.day, client):
-                    hi = mid
-                else:
-                    lo = mid
-            build = lo.isoformat()
-            # 用一个远未来的日期问：libtpu 是否比"现在"旧到会被任何闸门拒
-            gated = fn(2026, 4, 1, client)
-    except Exception as e:
-        build = f"探测失败 {type(e).__name__}: {e}"
+            today = datetime.date.today()
+            for args in ((today.year, today.month, today.day),
+                         (today.year, today.month, today.day, jax.devices()[0].client)):
+                try:
+                    gated = bool(fn(*args))
+                    break
+                except TypeError:
+                    continue
+    except Exception:
+        pass
     state = ("**闸门会挡住 Pallas**" if gated else
-             "闸门通过" if gated is False else "闸门状态未知")
-    return (f"jax {jax.__version__} | libtpu 构建日约 {build} | {state} | "
+             "闸门通过" if gated is False else "闸门状态未知（不影响判断，看 S 扫描结果）")
+    return (f"jax {jax.__version__} | libtpu 构建日 {build} | {state} | "
             f"platform_version: {one_line}")
 
 
@@ -432,9 +474,18 @@ def _bd_jax_fn(q, k, v, seg_lens):
     mask = (sm.FullMask(_shape=(sum(lens), sum(lens))) if len(lens) == 1
             else BlockDiagonalMask(lens))
     multi = sm.MultiHeadMask(masks=(mask,) * n_heads)
+    # **反向块大小是显存与速度的关键旋钮**（arch_probe H1 在 L=16384/48head 实测）：
+    #   默认(q_dkv=128,kv_dkv=128,fused=False) 288ms
+    #   dkv=128/128 fused=True                 OOM  <- 第四跑 L4.1 撞的就是这个：
+    #       反向 dk/dv kernel 按 q 块物化 [128,48,16384,128] = 24GB > 16GB
+    #   dkv=512/512  fused=True                157ms
+    #   dkv=1024/1024 fused=True               142ms  <- 最快，比默认快 2.03x
+    #   dkv=2048/2048 fused=True               OOM
+    # 前向块仍取 128（段长对齐粒度，见 tpu-navit-splash 结论）；反向块取 1024。
+    BWD_BLOCK = 1024
     bs = sk.BlockSizes(
         block_q=BLOCK, block_kv=BLOCK, block_kv_compute=BLOCK,
-        block_q_dkv=BLOCK, block_kv_dkv=BLOCK, block_kv_dkv_compute=BLOCK,
+        block_q_dkv=BWD_BLOCK, block_kv_dkv=BWD_BLOCK, block_kv_dkv_compute=BWD_BLOCK,
         use_fused_bwd_kernel=True,
     )
     kernel = sk.make_splash_mha(multi, head_shards=1, q_seq_shards=1, block_sizes=bs)
@@ -478,6 +529,8 @@ def probe_call_jax_speed() -> str:
     if bad:
         raise RuntimeError(
             f"测量不可信，拒绝给结论：块对角 {t_bd:.2f}ms / 全通 {t_full:.2f}ms；{bad}")
+    global _T_ATTN_BD
+    _T_ATTN_BD = t_bd            # 给 L4.1 当"层时不可能快过自身注意力"的硬下限
     ratio = t_bd / t_full
     theory = sum(n * n for n in lens) / (TIME_L ** 2)
     verdict = "跳块生效" if ratio < (theory + 1.0) / 2 else "未跳块"
@@ -523,6 +576,134 @@ def _make_bd_splash():
             return dq, dk, dv, None
 
     return BDSplash
+
+
+@probe("L4.1 端到端训练步：attn+MLP+LoRA 前向反向+optimizer.step")
+def probe_train_step() -> str:
+    """**这才是"要不要动 29k 行"的裁决数据。** 前面测的都是孤立注意力；真训练里
+    还有 MLP、LoRA 旁路、optimizer.step，以及 torch_xla 的图捕获/执行开销。
+
+    用真实 Krea2 单层形状（features=6144, 48q/12kv x128, SwiGLU mlpdim=16384），
+    冻结底模 + LoRA rank32 只训 LoRA —— 与本仓库的训练范式一致。"""
+    import torch
+    import torch_xla.core.xla_model as xm
+    d, H, KV, hd, mlp, r = 6144, 48, 12, 128, 16384, 32
+    L = TIME_L
+    lens = _seg_lens(L, TIME_SEGMENTS, BLOCK)
+    dev = xm.xla_device()
+    BDSplash = _make_bd_splash()
+
+    def frozen(*shape):
+        return (torch.randn(*shape, dtype=torch.bfloat16, device=dev) * 0.02).requires_grad_(False)
+
+    W = {k: frozen(*s) for k, s in {
+        "wq": (d, H * hd), "wk": (d, KV * hd), "wv": (d, KV * hd),
+        "gate": (d, d), "wo": (d, d),
+        "w_gate": (d, mlp), "w_up": (d, mlp), "w_down": (mlp, d)}.items()}
+    # LoRA 只挂在 wq/wo/w_gate/w_down 上（与仓库 targets 同量级即可）
+    lora = {}
+    for name, (i, o) in {"wq": (d, H * hd), "wo": (d, d),
+                         "w_gate": (d, mlp), "w_down": (mlp, d)}.items():
+        lora[name] = (
+            (torch.randn(i, r, dtype=torch.bfloat16, device=dev) * 0.01).requires_grad_(True),
+            torch.zeros(r, o, dtype=torch.bfloat16, device=dev).requires_grad_(True))
+    params = [t for pair in lora.values() for t in pair]
+    opt = torch.optim.AdamW(params, lr=1e-4)
+
+    def lin(x, name):
+        y = x @ W[name]
+        if name in lora:
+            a, b = lora[name]
+            y = y + (x @ a) @ b
+        return y
+
+    x0 = torch.randn(L, d, dtype=torch.bfloat16, device=dev)
+
+    def step():
+        x = x0
+        q = lin(x, "wq").reshape(1, L, H, hd).permute(0, 2, 1, 3)
+        k = (x @ W["wk"]).reshape(1, L, KV, hd).permute(0, 2, 1, 3)
+        v = (x @ W["wv"]).reshape(1, L, KV, hd).permute(0, 2, 1, 3)
+        q = (q.to(torch.float32) * (hd ** -0.5)).to(torch.bfloat16)   # splash 不内置缩放
+        a = BDSplash.apply(q, k, v, tuple(lens))
+        a = a.permute(0, 2, 1, 3).reshape(L, H * hd)
+        a = a * torch.sigmoid(x @ W["gate"])
+        x = x + lin(a, "wo")
+        h = torch.nn.functional.silu(lin(x, "w_gate")) * (x @ W["w_up"])
+        x = x + lin(h, "w_down")
+        loss = x.to(torch.float32).pow(2).mean()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        # **必须消费输出**（第三跑的坑）：torch_xla 惰性执行，只调 step() +
+        # wait_device_ops() 根本没派发任何东西，wait 等了个空，测出 10.9ms ——
+        # 而同形状注意力单独就要 108ms。.cpu() 强制物化+同步才是真时间。
+        return float(loss.detach().cpu())
+
+    t0 = time.time()
+    first = step()
+    compile_s = time.time() - t0
+    if not np.isfinite(first):
+        raise RuntimeError(f"loss 非有限：{first}")
+    ts = []
+    for _ in range(5):
+        t = time.perf_counter()
+        step()
+        ts.append((time.perf_counter() - t) * 1e3)
+    med = float(np.median(ts))
+
+    # 双重量级自检。峰值 FLOPS 下限太松（4.19ms vs 真值 ~108ms），主判据用 L3.2
+    # 的实测注意力时间：这一层**包含**那段注意力，不可能显著更快。
+    bad = _implausible(med, L, H, hd, TIME_SEGMENTS)
+    if bad is None and _T_ATTN_BD is not None and med < _T_ATTN_BD * 0.8:
+        bad = (f"步时 {med:.2f}ms < L3.2 实测同形状注意力 {_T_ATTN_BD:.2f}ms 的 80% —— "
+               f"整层不可能快过它自己的注意力，说明没真算/没同步")
+    if bad:
+        raise RuntimeError(f"步时 {med:.2f}ms 不可信，拒绝给结论：{bad}")
+    return (f"真实 Krea2 单层形状 L={L} {TIME_SEGMENTS}段 LoRA r={r} | "
+            f"首步（含编译）{compile_s:.1f}s，稳态步时 {med:.1f}ms/层"
+            f"（其中注意力 {_T_ATTN_BD:.1f}ms，即 {_T_ATTN_BD / med:.0%}）-> "
+            f"外推 28 层约 {med * 28 / 1000:.1f}s/step（不含 TE/VAE/优化器全量）")
+
+
+@probe("L4.2 换段长布局的重编译代价（torch_xla 头号风险）")
+def probe_relayout_cost() -> str:
+    """JAX 侧已知：换布局要 ~250ms XLA 编译 + ~750ms MaskInfo（主机侧、无缓存）。
+    torch_xla 上要问的是**更糟的那个可能**：换 splash 的 mask 会不会连累整张
+    torch_xla 图重编译。若只有 splash 那一小块重编，代价与 JAX 侧同量级，
+    布局有限集（8 档量化 = 535 种）就能一次性预热掉。"""
+    import torch
+    import torch_xla.core.xla_model as xm
+    L, H, hd = TIME_L, 8, 128           # 头数缩小，只看编译代价不看绝对速度
+    BDSplash = _make_bd_splash()
+    q, k, v = _qkv(L, H, H, hd)
+    q.requires_grad_(True)
+
+    def run(lens):
+        out = BDSplash.apply(q, k, v, tuple(lens))
+        s = out.to(torch.float32).sum()
+        xm.mark_step()
+        return float(s.cpu())
+
+    layouts = [_seg_lens(L, 4, BLOCK),
+               [BLOCK * 2, BLOCK * 6, L - BLOCK * 8],
+               [BLOCK * 4] * 3 + [L - BLOCK * 12],
+               _seg_lens(L, 8, BLOCK)]
+    costs = []
+    for lens in layouts:
+        t = time.time()
+        run(lens)
+        xm.wait_device_ops()
+        costs.append(time.time() - t)
+    # 回到第一个布局：若有缓存，这次应该明显更快
+    t = time.time()
+    run(layouts[0])
+    xm.wait_device_ops()
+    again = time.time() - t
+    cached = again < costs[0] * 0.3
+    return (f"4 种布局首次 {[f'{c:.1f}s' for c in costs]}；回到第 1 种 {again:.2f}s -> "
+            f"{'有缓存，布局有限集可一次性预热' if cached else '**无缓存，每次换布局都要重付**'}"
+            f"（JAX 侧同项 ~0.25s 编译 + ~0.75s MaskInfo）")
 
 
 @probe("L3.3 反向能否穿过 call_jax（训练必需）")
@@ -581,12 +762,20 @@ def main() -> int:
     probe_builtin_splash()
     probe_builtin_mask_kind()
 
-    if ok_coexist:
+    # **短路**（第二跑的教训之三）：扫描全灭时父进程还带着最后一个候选（0.5.3）
+    # 继续跑 L3，产出一堆同因 FAIL 噪声、还白烧配额。全灭就直接 SKIP。
+    if not won:
+        record("L3.* / L4.*", "SKIP",
+               "jax 版本扫描全军覆没，call_jax + Pallas 在此组合下无解，后续探测无意义")
+    elif not ok_coexist:
+        record("L3.* / L4.*", "SKIP", "jax 与 torch_xla 无法共存，call_jax 路线不可测")
+    else:
         probe_call_jax()
         probe_call_jax_speed()
         probe_call_jax_backward()
-    else:
-        record("L3.*", "SKIP", "jax 与 torch_xla 无法共存，call_jax 路线不可测")
+        # L4 是"要不要动 29k 行"的裁决数据，但也最重最容易挂，排在最后
+        probe_train_step()
+        probe_relayout_cost()
 
     _ran = {r["name"] for r in RESULTS}
     _missed = [n for n in _DEFINED_PROBES if n not in _ran]
@@ -635,8 +824,11 @@ def main() -> int:
     elif _st("L3.2 ") == "OK" and "跳块生效" in _detail("L3.2 ") and _st("L3.3 ") == "OK":
         print("  [YES]  call_jax + 自建块对角 mask 跳块生效，且反向可穿过")
         print("         -> torch_xla 路线成立：29k 行 torch 代码不必重写成 JAX，")
-        print("            只需把 navit 注意力换成一个 call_jax 桥接。")
+        print("            只需把 navit 注意力换成一个 call_jax 桥接后端")
+        print("            （对齐 models/anima_modeling_core.py 的 npu_tnd 先例）。")
         print(f"         {_detail('L3.2 ')}")
+        print(f"         L4.1 端到端训练步: {_st('L4.1 ')} / {_detail('L4.1 ')}")
+        print(f"         L4.2 换布局代价:   {_st('L4.2 ')} / {_detail('L4.2 ')}")
     elif _st("L3.3 ") == "FAIL":
         print("  [NO]   反向穿不过 call_jax -> 只能推理用，训练不行。")
         print("         -> torch_xla 路线不成立，回到 JAX 重写的评估。")

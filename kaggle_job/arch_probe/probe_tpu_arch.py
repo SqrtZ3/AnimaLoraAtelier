@@ -510,6 +510,65 @@ def probe_sharded_weights() -> str:
             f"{'**8 卡分片放得下**' if used < limit * 0.9 else '**即使分片也吃紧**'}")
 
 
+# ── H. 反向 BlockSizes（torch_xla 第四跑撞的 24GB 墙）────────────────────────
+
+@probe("H1 反向 BlockSizes 扫描（真实形状下反向放不放得下）")
+def probe_bwd_blocksizes() -> str:
+    """torch_xla 探针在真实形状（L=16384, 48q/12kv x128）跑端到端训练步时报：
+
+        Allocation (size=24GB) would exceed memory (16GB)
+        shape = bf16[128, 48, 16384, 128]
+        tag = output of splash_mha_dkv_block_q_dkv_128...
+
+    头一维 128 = q 块数（16384/128）—— 反向的 dk/dv kernel **按 q 块物化**中间结果。
+    但纯 JAX 侧 T2 同形状前向+反向是跑通的（287.95ms），区别在那边用的是**默认**
+    BlockSizes，而 torch_xla 探针显式传了 block_q_dkv=128。
+
+    所以这里扫一遍：默认 / 各种 dkv 块大小 / fused 开关，看哪些组合放得下、多快。
+    这决定 `navit_token_budget` 能开到多大，是很实的工程参数。"""
+    from jax.experimental.pallas.ops.tpu.splash_attention import (
+        splash_attention_kernel as sk, splash_attention_mask as sm,
+    )
+    import jax
+    import jax.numpy as jnp
+    L, H, KV, D = TIME_L, KREA2_Q_HEADS, KREA2_KV_HEADS, KREA2_HEAD_DIM
+    lens = [L // 4] * 4
+    BD = _make_block_diag_mask_cls()
+    multi = sm.MultiHeadMask(masks=[BD(lens)] * H)
+    q, k, v = _rand_qkv(L, H, KV, D, jnp.bfloat16, seed=60)
+
+    dflt = sk.BlockSizes.get_default()
+    cands = [("默认", None)]
+    for bq, bkv, fused in ((128, 128, True), (128, 128, False),
+                           (512, 512, True), (1024, 1024, True), (2048, 2048, True)):
+        cands.append((f"dkv={bq}/{bkv} fused={fused}",
+                      dict(block_q_dkv=bq, block_kv_dkv=bkv, block_kv_dkv_compute=bkv,
+                           use_fused_bwd_kernel=fused)))
+    rows = []
+    for label, kw in cands:
+        try:
+            if kw is None:
+                fn = sk.make_splash_mha(multi, head_shards=1, q_seq_shards=1,
+                                        interpret=_INTERPRET)
+            else:
+                bs = sk.BlockSizes(block_q=BLOCK, block_kv=BLOCK, block_kv_compute=BLOCK, **kw)
+                fn = sk.make_splash_mha(multi, head_shards=1, q_seq_shards=1,
+                                        block_sizes=bs, interpret=_INTERPRET)
+            g = jax.jit(jax.grad(
+                lambda a, b, c: jnp.sum(fn(a, b, c).astype(jnp.float32) ** 2),
+                argnums=(0, 1, 2)))
+            t, _ = _bench(g, (q, k, v), reps=3, warmup=1)
+            rows.append(f"{label}: {t:.0f}ms")
+        except Exception as e:
+            msg = str(e)
+            hit = "OOM" if ("exceed memory" in msg or "RESOURCE_EXHAUSTED" in msg) else type(e).__name__
+            rows.append(f"{label}: {hit}")
+    return (f"L={L} {H}q/{KV}kv x{D} 前向+反向 | 默认 BlockSizes="
+            f"(q={dflt.block_q}, kv={dflt.block_kv}, q_dkv={dflt.block_q_dkv}, "
+            f"kv_dkv={dflt.block_kv_dkv}, fused={dflt.use_fused_bwd_kernel}) | "
+            + " ; ".join(rows))
+
+
 # ── G. 主机侧成本 ─────────────────────────────────────────────────────────────
 
 @probe("G1 MaskInfo 预处理成本（Kaggle 主机 CPU 实测）")
@@ -574,6 +633,9 @@ def main() -> int:
         probe_dynamic_mask_speed()
         probe_ragged_pack()
 
+    if not args.skip_slow:
+        probe_bwd_blocksizes()
+
     probe_mask_prep()
     probe_mask_prep_cache()
 
@@ -617,6 +679,7 @@ def main() -> int:
     print(f"  F1 权重账: {_d('F1 ')}")
     print(f"  F2 单层 HBM: {_d('F2 ')}")
     print(f"  F3 分片: {_d('F3 ')}")
+    print(f"  H1 反向 BlockSizes: {_d('H1 ')}")
     print("=" * 78)
     _flush()
     print(f"报告已写到 {OUT_DIR}/arch_probe_report.txt")

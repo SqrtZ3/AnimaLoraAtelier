@@ -41,6 +41,50 @@ import numpy as np
 
 RESULTS: list[dict] = []
 _T0 = time.time()
+_BOOTSTRAP_NOTE = ""
+
+# ── 自举：在 import jax 之前升级 jax + libtpu ──────────────────────────────────
+# 为什么需要：Kaggle 默认 TPU 镜像的 libtpu 构建于 2025-06-12，而 Pallas 有一道
+# **硬闸门** `is_cloud_tpu_older_than(...)`（jax/_src/pallas/mosaic/lowering.py），
+# libtpu 超过一个月就直接 raise，且**没有环境变量旁路**。实测 2026-08-14 在
+# v5e-8 上跑，所有 Pallas/splash 调用全部被这道闸门挡掉（jax 0.10.2 + libtpu
+# Jun 12 2025），与块对角本身无关。
+#
+# 开关默认 False（本仓库惯例：新行为 opt-in）。要用它必须同时满足：
+#   1) 这里改成 True，或设环境变量 ANIMA_TPU_UPGRADE=1
+#   2) kernel-metadata.json 里 "enable_internet": "true"（需账号已手机验证）
+# 失败不致命：记一条 FAIL 后继续跑，非 Pallas 的探测（A1/B1/C2/D1/M1）照样出数据。
+# 当前置 True：2026-08-14 实测 Kaggle 默认镜像必然被闸门挡住，不升级就没有 Pallas。
+# 等哪天 Kaggle 把镜像更新了（A1 会显示"闸门通过"），改回 False 可省掉一两分钟配额。
+BOOTSTRAP_UPGRADE_JAX = os.environ.get("ANIMA_TPU_UPGRADE", "1") == "1"
+
+
+def _bootstrap_upgrade_jax() -> None:
+    """必须在任何 `import jax` **之前**调用——jax 一旦初始化后端就换不掉 libtpu。"""
+    global _BOOTSTRAP_NOTE
+    if not BOOTSTRAP_UPGRADE_JAX:
+        _BOOTSTRAP_NOTE = "未开启（BOOTSTRAP_UPGRADE_JAX=False）"
+        return
+    if "jax" in sys.modules:
+        _BOOTSTRAP_NOTE = "跳过：jax 已被导入，此时换 libtpu 无效"
+        return
+    import subprocess
+    cmd = [sys.executable, "-m", "pip", "install", "-q", "-U", "jax[tpu]"]
+    t0 = time.time()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    except Exception as e:
+        _BOOTSTRAP_NOTE = f"失败：{type(e).__name__}: {e}"
+        return
+    dt = time.time() - t0
+    if r.returncode == 0:
+        _BOOTSTRAP_NOTE = f"成功，耗时 {dt:.0f}s"
+    else:
+        tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
+        _BOOTSTRAP_NOTE = f"pip 退出码 {r.returncode}（{dt:.0f}s）：{' | '.join(tail)}"
+
+
+_bootstrap_upgrade_jax()
 
 
 def record(name: str, status: str, detail: str = "") -> None:
@@ -137,6 +181,50 @@ def probe_hbm() -> str:
         raise _Skip(f"memory_stats 无容量字段，keys={sorted(stats)[:8]}")
     return (f"limit={lim / 2**30:.1f} GiB, in_use={used / 2**30:.2f} GiB"
             f"（v5e 官方规格 16 GB/chip，8 chip 共 128 GB）")
+
+
+@probe("A1 Pallas libtpu 版本闸门")
+def probe_libtpu_gate() -> str:
+    """Pallas TPU 有一道硬闸门：libtpu 超过约一个月就直接 raise，**无环境变量旁路**
+    （jax/_src/pallas/mosaic/lowering.py 的 `is_cloud_tpu_older_than`）。
+    Kaggle 默认镜像的 libtpu 很旧，这一条不过则后面**所有** Pallas/splash 探测
+    都会以同一个原因失败——那是镜像问题，不是块对角的问题。"""
+    import jax
+    from jax._src import xla_bridge
+    ver = xla_bridge.get_backend().platform_version
+    one_line = " / ".join(x.strip() for x in ver.splitlines() if x.strip())
+    gated, gate_desc = None, "未知"
+    if jax.devices()[0].platform != "tpu":
+        # 非 TPU 后端上 is_cloud_tpu_older_than 恒 False，二分出来的日期是假象，
+        # 打出来只会误导（本地 CPU 上实测会报成"2024-01-01"）。直接标 N/A。
+        gate_desc = "非 TPU 后端，闸门不适用"
+    else:
+        try:
+            import datetime
+            from jax._src import cloud_tpu_init
+            fn = getattr(cloud_tpu_init, "is_cloud_tpu_older_than", None)
+            if fn is None:
+                gate_desc = "该 jax 版本没有 is_cloud_tpu_older_than"
+            else:
+                client = jax.devices()[0].client
+                # fn(D) == (libtpu 构建日 B < D)。二分求 B：
+                #   fn(mid) 为真 => B < mid => 往前找（hi = mid）
+                #   为假        => B >= mid => 往后找（lo = mid）
+                d_lo, d_hi = datetime.date(2023, 1, 1), datetime.date(2031, 1, 1)
+                while (d_hi - d_lo).days > 1:
+                    mid = d_lo + (d_hi - d_lo) / 2
+                    if fn(mid.year, mid.month, mid.day, client):
+                        d_hi = mid
+                    else:
+                        d_lo = mid
+                gate_desc = f"libtpu 构建日约 {d_lo.isoformat()}"
+                gated = fn(2026, 4, 1, client)
+        except Exception as e:
+            gate_desc = f"探测闸门失败: {type(e).__name__}: {e}"
+    verdict = ("**Pallas 被闸门挡住**" if gated else
+               "Pallas 闸门通过" if gated is False else "闸门状态未知")
+    return (f"jax {jax.__version__} | platform_version: {one_line} | {gate_desc} | "
+            f"{verdict} | 自举升级: {_BOOTSTRAP_NOTE}")
 
 
 @probe("import splash_attention")
@@ -637,6 +725,7 @@ def main() -> int:
 
     probe_devices()
     probe_hbm()
+    probe_libtpu_gate()
     ok_splash = probe_import_splash()
     if ok_splash:
         probe_block_sizes()
@@ -699,7 +788,19 @@ def main() -> int:
     correct = all(_st(p) == "OK" for p in ("N2 ", "N3 ", "N4 "))
     t1 = _detail("T1 ")
     skipped_blocks = "跳块生效" in t1
-    if not correct:
+    # libtpu 闸门是"环境不具备"，不是"块对角不行"——绝不能把它读成技术结论
+    gate_blocked = "Pallas 被闸门挡住" in _detail("A1 ")
+    pallas_err = any(r["status"] == "FAIL" and "libtpu version" in r["detail"]
+                     for r in RESULTS)
+    if gate_blocked or pallas_err:
+        print("  [ENV]  **环境问题，非技术结论**：Kaggle 镜像的 libtpu 太旧，")
+        print("         Pallas 硬闸门把所有 splash 调用挡在门外（与块对角无关）。")
+        print(f"         {_detail('A1 ')}")
+        print("         修法：kernel-metadata.json 设 enable_internet=true，并把")
+        print("         BOOTSTRAP_UPGRADE_JAX 置 True（或环境变量 ANIMA_TPU_UPGRADE=1），")
+        print("         在 import jax 之前 pip install -U 'jax[tpu]'。")
+        print("         本次仍然有效的数据：A1/B1/C2/D1/M1 与设备/HBM 信息。")
+    elif not correct:
         print("  [NO]   块对角数值/梯度对拍未全过 -> 先修正确性，性能结论无意义")
     elif _INTERPRET:
         # 计时项没跑，这里绝不能把"没有 T1 结果"读成"跳块没生效"

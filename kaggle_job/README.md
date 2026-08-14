@@ -40,6 +40,39 @@ python -m kaggle auth login
 .\kaggle_run.ps1 -Username 你的用户名 -PullOnly
 ```
 
+## 真机第一跑的结论：libtpu 太旧，Pallas 整体被挡（非技术问题）
+
+2026-08-14 在 v5e-8 上跑（耗时 0.02h）。所有 splash/Pallas 探测以**同一个原因**失败：
+
+```
+RuntimeError: Pallas TPU requires a libtpu version that's at most a month old.
+Found version string: ... TFRT TPU v5 lite ... Built on Jun 12 2025 ...
+```
+
+Kaggle 默认镜像：**jax 0.10.2 + libtpu 构建于 2025-06-12**，比闸门要求老约 14 个月。
+闸门在 `jax/_src/pallas/mosaic/lowering.py` 的 `is_cloud_tpu_older_than(...)`，
+**硬 raise，没有环境变量旁路**。与块对角/NaViT 本身无关。
+
+**修法**（已写进本目录，下一跑生效）：`kernel-metadata.json` 设
+`"enable_internet": "true"`（账号需手机验证），探针顶部 `BOOTSTRAP_UPGRADE_JAX=True`
+会在 **`import jax` 之前** `pip install -U "jax[tpu]"`。必须在 import 之前——
+jax 一旦初始化后端就换不掉 libtpu。失败不致命，会记 FAIL 后继续。
+
+**这一跑仍然拿到的真实数据**：
+
+| 项 | 真机结果 |
+|---|---|
+| 设备 | 8 × `TPU v5 lite`，platform=tpu |
+| 单设备 HBM | **limit = 15.7 GiB**（印证官方 16 GB/chip） |
+| B1 块压缩率 | **与本地完全一致**：0.2500/0.2500、0.1582/0.1582、partial=0 |
+| C2 持久化编译缓存 | 可用，写入 `/kaggle/working/jax_cache` |
+| D1 API 面 | `make_splash_mha` 接受 `jax.Array` mask；`process_dynamic_mask` 存在 |
+| M1 8 卡分片 | 通过 |
+| 环境 | Python 3.12.13 / Linux 6.6.143 / `KAGGLE_KERNEL_RUN_TYPE=Batch` |
+
+新增探测 `A1` 专门诊断这道闸门（二分反推 libtpu 构建日），把十条一样的 stack trace
+压成一行；裁决段也加了 `[ENV]` 分支，不会再把环境问题误报成"块对角不行"。
+
 ## 首次真机运行踩到的三个坑（均已修）
 
 1. **Kaggle 把非零退出码判为 ERROR。** 探针原本在有 FAIL 项时 `return 1`，结果脚本明明

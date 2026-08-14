@@ -1,0 +1,14 @@
+{
+  "id": "ilovebg/anima-torchxla-navit-probe",
+  "title": "anima torchxla navit probe",
+  "code_file": "probe_torchxla_navit.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_internet": "true",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

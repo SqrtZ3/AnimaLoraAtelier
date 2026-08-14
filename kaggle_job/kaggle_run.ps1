@@ -41,7 +41,7 @@ param(
     [switch]$PullOnly,
     # 默认只拉报告和日志。探针会把 jax 编译缓存也写进 /kaggle/working，
     # 那是几十个文件、每次全下很慢。传 -FilePattern "" 可拉全部（含缓存）。
-    [string]$FilePattern = '(tpu_probe.*|.*\.log)$'
+    [string]$FilePattern = '(.*_probe.*|.*\.log)$'
 )
 
 $ErrorActionPreference = "Stop"
@@ -87,7 +87,7 @@ if ($PullOnly) {
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
     Write-Host "=== 仅重新拉取 $ref 的产物到 $outDir（不消耗配额）===" -ForegroundColor Cyan
     Get-KernelOutput $ref $outDir | Write-Host
-    $rep = Get-ChildItem $outDir -Filter "tpu_probe_report.txt" -Recurse -File -ErrorAction SilentlyContinue |
+    $rep = Get-ChildItem $outDir -Filter "*_probe_report.txt" -Recurse -File -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if ($rep) {
         Write-Host "`n=== 探针报告 ===" -ForegroundColor Cyan
@@ -149,7 +149,7 @@ if (-not $NoPull) {
         Select-Object Name, Length | Format-Table
 
     # 探针会把纯文本报告写到 /kaggle/working，优先读它——比内核日志更结构化
-    $report = Get-ChildItem $outDir -Filter "tpu_probe_report.txt" -Recurse -File -ErrorAction SilentlyContinue |
+    $report = Get-ChildItem $outDir -Filter "*_probe_report.txt" -Recurse -File -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if ($report) {
         Write-Host "`n=== 探针报告 ===" -ForegroundColor Cyan

@@ -281,16 +281,77 @@ def probe_sdpa_keypad_broadcast() -> str:
     真机曾报 ``get unsupported atten_mask shape ... [1,1,1,251]``，这是
     ``utils/npu_compat.expand_attn_mask`` 存在的唯一理由。如果某天这条变成 OK 且数值
     正确，那个展开（以及它 O(B·Sq·Skv) 的物化代价）就可以整体去掉。
+
+    ★ **必须在子进程里跑**：昇腾的错误状态是**粘滞**的。2026-08-14 真机实测，本用例在
+    主进程里触发 ``FlashAttentionScore`` tiling 失败后，同进程后续所有探测全部被污染——
+    TND self/cross 的 rel_err 从 2.2e-03 跳到 1.619e-01 且两条一模一样、三个梯度范数
+    全等、``checkpoint`` 的 grad_norm 变成 1.0000、AdamW 的 ``‖Δp‖`` 报出**负数**
+    （范数不可能为负）、吞吐虚高一倍、``Event`` 计时 FAIL 并在报错里回吐同一条
+    ``atten_mask`` inner error。也就是说：**一次故意的失败调用会让整份报告失去意义**。
+    所以这里 fork 一个自己的子进程跑（``--broadcast-mask-case``），子进程崩掉不影响主进程。
+    """
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "--broadcast-mask-case"],
+        capture_output=True, text=True, timeout=600,
+    )
+    tail = (proc.stdout or "").strip().splitlines()
+    verdict = tail[-1] if tail else ""
+    if verdict.startswith("BROADCAST_OK "):
+        return verdict[len("BROADCAST_OK "):] + \
+            "（→ 可考虑去掉 npu_compat.expand_attn_mask 的展开）"
+    if verdict.startswith("BROADCAST_SKIP "):
+        raise _Skip(verdict[len("BROADCAST_SKIP "):])
+    if verdict.startswith("BROADCAST_REJECTED "):
+        return "仍不支持（expand_attn_mask 有必要）：" + verdict[len("BROADCAST_REJECTED "):]
+    # 子进程直接被算子错误带崩（返回码非 0 且没来得及打裁决）也是"仍不支持"的一种
+    err = (proc.stderr or "").strip().splitlines()
+    hint = next((ln for ln in err if "atten_mask" in ln or "561103" in ln), err[-1] if err else "")
+    return (f"仍不支持（expand_attn_mask 有必要）：子进程 exit={proc.returncode}；"
+            f"{hint[:200]}")
+
+
+def _run_broadcast_mask_case_child() -> int:
+    """``--broadcast-mask-case`` 的子进程入口：只跑广播 mask 那一个用例。
+
+    输出的最后一行是给父进程解析的裁决行。这个进程跑完就退出，设备错误态随它一起消失。
     """
     try:
+        import torch          # noqa: F401
+        import torch_npu      # noqa: F401
         out, ref_ok, ref_inv = _keypad_mask_case(expand=False)
-    except Exception as e:  # 预期路径：昇腾拒收该形状
-        return f"仍不支持（expand_attn_mask 有必要）：{type(e).__name__}: {str(e)[:200]}"
-    err_ok = ((out - ref_ok).norm() / ref_ok.norm()).item()
-    err_inv = ((out - ref_inv).norm() / ref_inv.norm()).item()
-    ok = "数值正确" if err_ok < 5e-2 else f"但数值不对 rel_err={err_ok:.3e}"
-    return (f"本机接受广播 mask，{ok}（反转极性参考 {err_inv:.3e}）"
-            "→ 可考虑去掉 npu_compat.expand_attn_mask 的展开")
+        err_ok = ((out - ref_ok).norm() / ref_ok.norm()).item()
+        err_inv = ((out - ref_inv).norm() / ref_inv.norm()).item()
+        ok = "数值正确" if err_ok < 5e-2 else f"但数值不对 rel_err={err_ok:.3e}"
+        print(f"BROADCAST_OK 本机接受广播 mask，{ok}（反转极性参考 {err_inv:.3e}）", flush=True)
+    except _Skip as s:
+        print(f"BROADCAST_SKIP {s}", flush=True)
+    except Exception as e:
+        msg = " ".join(str(e).split())[:200]
+        print(f"BROADCAST_REJECTED {type(e).__name__}: {msg}", flush=True)
+    return 0
+
+
+@probe("设备健康复检（确认前面的失败调用没有污染后续探测）")
+def probe_device_health_recheck() -> str:
+    """重跑一遍最开头那个 bf16 matmul，确认设备没有进入粘滞错误态。
+
+    上一条探测**故意**触发了一个会失败的算子。昇腾上这类失败会污染同进程后续的所有
+    调用（详见 ``probe_sdpa_keypad_broadcast`` 的说明），所以这里立刻复检一次：数值对得上，
+    说明子进程隔离生效、后面的结果可信；对不上就当场喊停，别让人拿着一份垃圾报告下结论。
+    """
+    import torch
+    d = _dev()
+    torch.manual_seed(0)
+    a, b = torch.randn(512, 512), torch.randn(512, 512)
+    ref = a.double() @ b.double()
+    got = (a.to(d, torch.bfloat16) @ b.to(d, torch.bfloat16)).float().cpu().double()
+    rel = ((got - ref).norm() / ref.norm()).item()
+    if rel > 5e-2:
+        raise RuntimeError(
+            f"bf16 matmul 复检失真 rel={rel:.3e}（开头那次是 ~2.9e-03）——"
+            "设备很可能已进入粘滞错误态，本次报告后续各项都不可信，请重跑。"
+        )
+    return f"rel_err={rel:.3e}，与开头一致 → 设备状态干净，后续结果可信"
 
 
 @probe("torch_npu.npu_fusion_attention（昇腾融合注意力，BSH）")
@@ -626,7 +687,13 @@ def probe_packages() -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="昇腾 NPU 能力探针")
     ap.add_argument("--json", default="", help="把结果写成 JSON 便于回传")
+    ap.add_argument("--broadcast-mask-case", action="store_true",
+                    help="内部使用：只跑广播 mask 用例（由父进程 fork 调用，"
+                         "隔离昇腾的粘滞错误态）")
     args = ap.parse_args()
+
+    if args.broadcast_mask_case:
+        return _run_broadcast_mask_case_child()
 
     print("=" * 78)
     print("昇腾 Ascend NPU 能力探针 —— 全部为真机实测，未通过项即为该机器的真实限制")
@@ -646,7 +713,8 @@ def main() -> int:
     probe_sdpa_bool()
     probe_sdpa_add()
     probe_sdpa_keypad_semantics()
-    probe_sdpa_keypad_broadcast()
+    probe_sdpa_keypad_broadcast()   # ★ 内部走子进程，见该函数说明
+    probe_device_health_recheck()   # ★ 紧跟其后：确认上一条没污染设备
     probe_fusion_attn()
     probe_tnd_self()
     probe_tnd_cross()

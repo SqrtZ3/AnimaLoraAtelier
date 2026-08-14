@@ -567,8 +567,31 @@ def probe_recompile() -> str:
     for lens in layouts:
         _, c = _bench(_splash_fn(lens, ANIMA_Q_HEADS, ANIMA_Q_HEADS), (q, k, v), reps=2, warmup=1)
         costs.append(c)
-    return (f"3 种布局首调耗时 {[f'{c:.1f}s' for c in costs]}（含 mask 预处理+XLA 编译）"
-            f" → 每个布局一次；布局数可枚举时，这是一次性成本")
+    # 注意口径：_splash_fn(...) 在 _bench 之前就返回了，而 make_splash_mha 里的
+    # MaskInfo 预处理是在那时候（同步、numpy）做掉的 —— **不在这个计时区间里**。
+    # 所以这里量到的只是 XLA/Mosaic 编译，mask 预处理成本见 C3。
+    return (f"3 种布局首调耗时 {[f'{c:.1f}s' for c in costs]}（**仅** XLA/Mosaic 编译，"
+            f"不含 mask 预处理，后者见 C3）→ 每个布局一次")
+
+
+@probe("C3 mask 预处理成本（每布局，逐步都要付）")
+def probe_mask_prep_cost() -> str:
+    """`make_splash_mha` 里的 MaskInfo 预处理是同步 numpy，且随 L 与 head 数增长。
+    如果训练时每个 pack 都重建 mask，这个成本是**逐步**都要付的，会直接叠到步时上。
+    本地 CPU 实测 L=16384/48heads 约 500ms —— 与 T2 的 288ms 注意力步时同量级，
+    不能忽略。规避办法二选一：① 按布局缓存已构建的可调用对象；② 走 D2 的运行时
+    jax.Array mask 路径。"""
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel as sk
+    align = sk.BlockSizes.get_default().block_kv
+    rows = []
+    for label, lens, heads in (
+        ("L=16384 4段 48heads", _aligned_segments(TIME_L, 4, align), KREA2_Q_HEADS),
+        ("L=16384 16段 48heads", _aligned_segments(TIME_L, 16, align), KREA2_Q_HEADS),
+    ):
+        t0 = time.perf_counter()
+        _ = _splash_fn(lens, heads, heads)
+        rows.append(f"{label}: {(time.perf_counter() - t0) * 1e3:.0f}ms")
+    return " ; ".join(rows) + "（与 T2 步时同量级则必须按布局缓存或走 D2 路径）"
 
 
 @probe("C2 JAX 持久化编译缓存是否命中")
@@ -743,6 +766,7 @@ def main() -> int:
             if not args.skip_slow:
                 probe_speed_scaling()
                 probe_recompile()
+                probe_mask_prep_cost()
         probe_persistent_cache()
         probe_dynamic_mask_api()
         probe_dynamic_mask_call()

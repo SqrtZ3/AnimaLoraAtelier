@@ -38,8 +38,15 @@ def record(name: str, status: str, detail: str = "") -> None:
     print(f"[{mark}] {name}" + (f" — {detail}" if detail else ""), flush=True)
 
 
+# 所有被 @probe 声明过的探测名。``main()`` 末尾会核对它们是否都真的跑了——
+# 本文件的探测**不是**自动发现的，必须在 main() 里显式调用一次；漏调只会让那一项
+# 静默消失（加了新探测却在输出里找不到，实测踩过一次），所以这里做一道自检。
+_DEFINED_PROBES: list[str] = []
+
+
 def probe(name: str):
     """装饰器：把一个返回 detail 字符串的函数包成一项探测。"""
+    _DEFINED_PROBES.append(name)
 
     def deco(fn):
         def run(*a, **kw):
@@ -55,6 +62,7 @@ def probe(name: str):
                 record(name, "FAIL", f"{type(e).__name__}: {e} | {tb}")
                 return False
 
+        run.__probe_name__ = name    # 供上面那道"是否都被调用"的自检定位
         return run
 
     return deco
@@ -637,6 +645,8 @@ def main() -> int:
     probe_sdpa_none()
     probe_sdpa_bool()
     probe_sdpa_add()
+    probe_sdpa_keypad_semantics()
+    probe_sdpa_keypad_broadcast()
     probe_fusion_attn()
     probe_tnd_self()
     probe_tnd_cross()
@@ -650,6 +660,17 @@ def main() -> int:
     probe_mem()
     probe_throughput()
     probe_packages()
+
+    # 自检：@probe 声明了但 main() 忘了调用的探测（见 _DEFINED_PROBES 的说明）
+    if has_npu:
+        _ran = {r["name"] for r in RESULTS}
+        _missed = [n for n in _DEFINED_PROBES if n not in _ran]
+        if _missed:
+            print("=" * 78)
+            print("⚠ 以下探测已定义但 main() 没有调用，本次结果里缺这几项：")
+            for n in _missed:
+                print(f"  - {n}")
+            print("  （不是这台机器的限制，是探针脚本自己的疏漏，请补上调用后重跑）")
 
     ok = sum(1 for r in RESULTS if r["status"] == "OK")
     fail = sum(1 for r in RESULTS if r["status"] == "FAIL")

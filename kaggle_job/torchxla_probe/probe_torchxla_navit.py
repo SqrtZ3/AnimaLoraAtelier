@@ -55,8 +55,20 @@ OUT_DIR = "/kaggle/working" if os.path.isdir("/kaggle/working") else tempfile.ge
 
 # 安装 torch_xla。Kaggle 默认镜像没有它。默认开启——不装就什么都测不了。
 BOOTSTRAP_INSTALL = os.environ.get("ANIMA_XLA_INSTALL", "1") == "1"
-# 装哪一支。stable 对 v5e 应该够用（nightly 主要是为了更新的 Ironwood/v7）。
-INSTALL_SPEC = os.environ.get("ANIMA_XLA_SPEC", "torch~=2.9.0 torch_xla[tpu]~=2.9.0")
+
+# **版本剪刀**（第一跑实测踩到的核心矛盾）：
+#   * torch_xla 的 PJRT 层绑死一个较老的 libtpu —— v2.9.0 的 setup.py 钉
+#     libtpu 0.0.21 (20250813)，真机上报的正是 "Built on Aug 15 2025"。
+#   * jax 的 Pallas 闸门要求 libtpu 不超过一个月新。Kaggle 镜像自带 jax 0.10.2，
+#     它的闸门直接拒掉 2025-08 的 libtpu，于是 call_jax 里的 splash 全挂。
+# 所以**不能升 libtpu**（会破坏 torch_xla 的 PJRT），只能**把 jax 降到与之配套的
+# 版本**。v2.9.0 的 setup.py 同时钉了 jax/jaxlib 0.7.1（同为 20250813），就用它。
+# 注意装 jax 时**不要**带 [tpu] extra —— 那会拉进 jax 自己的 libtpu，把 torch_xla
+# 的覆盖掉，剪刀又合上了。
+INSTALL_STEPS = [
+    "torch~=2.9.0 torch_xla[tpu]~=2.9.0",
+    "jax==0.7.1 jaxlib==0.7.1",          # 不带 [tpu]：复用 torch_xla 装的 libtpu
+]
 
 
 def _flush() -> None:
@@ -119,19 +131,22 @@ def _bootstrap_install() -> None:
     if not BOOTSTRAP_INSTALL:
         _BOOTSTRAP_NOTE = "未开启"
         return
-    cmd = [sys.executable, "-m", "pip", "install", "-q"] + INSTALL_SPEC.split()
-    t0 = time.time()
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    except Exception as e:
-        _BOOTSTRAP_NOTE = f"失败：{type(e).__name__}: {e}"
-        return
-    dt = time.time() - t0
-    if r.returncode == 0:
-        _BOOTSTRAP_NOTE = f"成功（{INSTALL_SPEC}），耗时 {dt:.0f}s"
-    else:
-        tail = (r.stderr or r.stdout or "").strip().splitlines()[-4:]
-        _BOOTSTRAP_NOTE = f"pip 退出码 {r.returncode}（{dt:.0f}s）：{' | '.join(tail)}"
+    notes = []
+    for spec in INSTALL_STEPS:
+        cmd = [sys.executable, "-m", "pip", "install", "-q"] + spec.split()
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        except Exception as e:
+            notes.append(f"[{spec}] 异常 {type(e).__name__}: {e}")
+            continue
+        dt = time.time() - t0
+        if r.returncode == 0:
+            notes.append(f"[{spec}] OK {dt:.0f}s")
+        else:
+            tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
+            notes.append(f"[{spec}] 退出码 {r.returncode}（{dt:.0f}s）: {' | '.join(tail)}")
+    _BOOTSTRAP_NOTE = " ; ".join(notes)
 
 
 # ── L1 环境 ───────────────────────────────────────────────────────────────────
@@ -237,53 +252,57 @@ def probe_builtin_splash() -> str:
     return "torch_xla.experimental.splash_attention 可导入"
 
 
-@probe("L2.2 自带包装器：segment_ids 路径是否跳块（预期：否）")
-def probe_builtin_segment_ids_speed() -> str:
-    """torch_xla 的包装器给 make_splash_mha 传的编译期 mask 是 FullMask，
-    段信息只走运行时 SegmentIds。按 JAX 侧已验证的机理，块稀疏由**编译期** mask
-    驱动，所以这条预期**不跳块**（实测比 ~1.0）。这里把预期变成数字。
+@probe("L1.5 libtpu / jax 版本剪刀")
+def probe_version_scissors() -> str:
+    """第一跑的杀手：torch_xla 绑老 libtpu，jax 的 Pallas 闸门要新 libtpu，两者
+    差 12 个月。这一项在跑 L3 之前先把状态说清楚——它不过，L3 必然全挂。"""
+    import datetime
+    import jax
+    from jax._src import xla_bridge
+    ver = xla_bridge.get_backend().platform_version
+    one_line = " / ".join(x.strip() for x in ver.splitlines() if x.strip())
+    gated, build = None, "未知"
+    try:
+        from jax._src import cloud_tpu_init
+        fn = getattr(cloud_tpu_init, "is_cloud_tpu_older_than", None)
+        if fn is not None and jax.devices()[0].platform == "tpu":
+            client = jax.devices()[0].client
+            lo, hi = datetime.date(2023, 1, 1), datetime.date(2031, 1, 1)
+            while (hi - lo).days > 1:
+                mid = lo + (hi - lo) / 2
+                if fn(mid.year, mid.month, mid.day, client):
+                    hi = mid
+                else:
+                    lo = mid
+            build = lo.isoformat()
+            # 用一个远未来的日期问：libtpu 是否比"现在"旧到会被任何闸门拒
+            gated = fn(2026, 4, 1, client)
+    except Exception as e:
+        build = f"探测失败 {type(e).__name__}: {e}"
+    state = ("**闸门会挡住 Pallas**" if gated else
+             "闸门通过" if gated is False else "闸门状态未知")
+    return (f"jax {jax.__version__} | libtpu 构建日约 {build} | {state} | "
+            f"platform_version: {one_line}")
 
-    这一项 FAIL **不是决定性的**——它只说明自带包装器不好用，不影响 L3 的结论。
 
-    注意两个必须满足的前置（读 splash_attention.py 得知）：包装器内部会做
-    `Mesh.from_str(config.mesh)`，所以 mesh 不能是 None；它还断言
-    `batch / (data*fsdp)` 是整数，所以 batch 必须能被设备数整除。
-    """
-    import numpy as _np
-    import torch
-    import torch_xla.core.xla_model as xm
-    from torch_xla.distributed.spmd import Mesh
-    from torch_xla.experimental.splash_attention import (
-        splash_attention, SplashAttentionConfig,
-    )
-    n_dev = len(xm.get_xla_supported_devices() or [])
-    if n_dev < 1:
-        raise _Skip("没有可见 XLA 设备")
-    mesh = Mesh(_np.arange(n_dev), (n_dev, 1), ("data", "fsdp"))
-    lens = _seg_lens(TIME_L, TIME_SEGMENTS, BLOCK)
-    cfg = SplashAttentionConfig(
-        sa_block_q=BLOCK, sa_block_kv=BLOCK, sa_block_kv_compute=BLOCK,
-        sa_block_q_dkv=BLOCK, sa_block_kv_dkv=BLOCK, sa_block_kv_dkv_compute=BLOCK,
-        sa_block_q_dq=BLOCK, sa_block_kv_dq=BLOCK,
-        mesh=mesh.to_str(),
-    ).to_json()
-    # batch 取设备数，满足上面那条整除断言
-    d = xm.xla_device()
-    g = torch.Generator().manual_seed(0)
-    q = torch.randn(n_dev, KREA2_Q_HEADS, TIME_L, KREA2_HEAD_DIM,
-                    generator=g).to(torch.bfloat16).to(d)
-    k = torch.randn(n_dev, KREA2_KV_HEADS, TIME_L, KREA2_HEAD_DIM,
-                    generator=g).to(torch.bfloat16).to(d)
-    v = torch.randn(n_dev, KREA2_KV_HEADS, TIME_L, KREA2_HEAD_DIM,
-                    generator=g).to(torch.bfloat16).to(d)
-    sid = _seg_ids_t(lens).unsqueeze(0).repeat(n_dev, 1).to(d)
-    t_seg = _xla_bench(lambda: splash_attention(q, k, v, cfg, sid, causal=False))
-    t_full = _xla_bench(lambda: splash_attention(q, k, v, cfg, None, causal=False))
-    ratio = t_seg / t_full
-    theory = sum(n * n for n in lens) / (TIME_L ** 2)
-    verdict = "跳块生效(意外!)" if ratio < (theory + 1.0) / 2 else "未跳块（与预期一致）"
-    return (f"segment_ids {t_seg:.2f}ms vs 无段 {t_full:.2f}ms -> 实测比 {ratio:.3f}，"
-            f"块对角理论 {theory:.3f} -> {verdict}")
+@probe("L2.2 自带包装器用的是哪种 mask（读源码，零风险）")
+def probe_builtin_mask_kind() -> str:
+    """不去跑它，直接读它的源码 —— 结论一样确定，还不用趟 Mesh/mesh-string 的坑
+    （第一跑就是栽在 Mesh.to_str 上，而这一项本来就不是决定性的）。
+
+    要确认的是：它给 make_splash_mha 的**编译期** mask 只有 Causal/Full/Local，
+    段信息只走运行时 SegmentIds —— 而块稀疏是由编译期 mask 驱动的，所以自带
+    包装器拿不到块对角的跳块收益。"""
+    import inspect
+    from torch_xla.experimental import splash_attention as sa
+    src = inspect.getsource(sa)
+    kinds = [n for n in ("CausalMask", "FullMask", "LocalMask", "MultiHeadMask")
+             if f"splash_attention_mask.{n}" in src or f"sm.{n}" in src]
+    uses_segment_ids = "SegmentIds(" in src
+    takes_custom_mask = "mask=" in src and "def splash_attention(" in src
+    return (f"编译期 mask 种类={kinds}；用运行时 SegmentIds={uses_segment_ids}；"
+            f"对外暴露自定义 mask 入口={'是' if takes_custom_mask and 'BlockDiagonal' in src else '否'}"
+            f" -> 自带包装器**无法**表达块对角，必须走 L3 的 call_jax 自建 mask")
 
 
 # ── L3 call_jax 注入我们自己的块对角 mask（决定性）────────────────────────────
@@ -408,9 +427,11 @@ def main() -> int:
     probe_basic()
 
     ok_coexist = probe_jax_coexist()
+    if ok_coexist:
+        probe_version_scissors()
 
     probe_builtin_splash()
-    probe_builtin_segment_ids_speed()
+    probe_builtin_mask_kind()
 
     if ok_coexist:
         probe_call_jax()
@@ -444,7 +465,17 @@ def main() -> int:
 
     print("\n" + "=" * 78)
     print("torch_xla 路线裁决：")
-    if _st("L3.2 ") == "OK" and "跳块生效" in _detail("L3.2 ") and _st("L3.3 ") == "OK":
+    scissors = any(r["status"] == "FAIL" and "libtpu version" in r["detail"]
+                   for r in RESULTS)
+    if scissors:
+        print("  [ENV]  **版本剪刀，非技术结论**：torch_xla 的 PJRT 绑老 libtpu，")
+        print("         jax 的 Pallas 闸门要新 libtpu，两者对不上，splash 全挂。")
+        print(f"         {_detail('L1.5 ')}")
+        print("         下一步：把 jax 降到与 torch_xla 所带 libtpu 配套的版本")
+        print("         （v2.9.0 钉 jax 0.7.1 + libtpu 0.0.21/20250813），")
+        print("         且装 jax 时不要带 [tpu] extra，否则会覆盖 torch_xla 的 libtpu。")
+        print("         **注意这本身就是个结论**：torch_xla 路线要长期承受这把剪刀。")
+    elif _st("L3.2 ") == "OK" and "跳块生效" in _detail("L3.2 ") and _st("L3.3 ") == "OK":
         print("  [YES]  call_jax + 自建块对角 mask 跳块生效，且反向可穿过")
         print("         -> torch_xla 路线成立：29k 行 torch 代码不必重写成 JAX，")
         print("            只需把 navit 注意力换成一个 call_jax 桥接。")

@@ -65,10 +65,36 @@ BOOTSTRAP_INSTALL = os.environ.get("ANIMA_XLA_INSTALL", "1") == "1"
 # 版本**。v2.9.0 的 setup.py 同时钉了 jax/jaxlib 0.7.1（同为 20250813），就用它。
 # 注意装 jax 时**不要**带 [tpu] extra —— 那会拉进 jax 自己的 libtpu，把 torch_xla
 # 的覆盖掉，剪刀又合上了。
-INSTALL_STEPS = [
-    "torch~=2.9.0 torch_xla[tpu]~=2.9.0",
-    "jax==0.7.1 jaxlib==0.7.1",          # 不带 [tpu]：复用 torch_xla 装的 libtpu
-]
+# 第二跑实测：jax 0.7.1 过了日期闸门，但撞上更深一层 ——
+#   Failed to deserialize the Mosaic module: Unsupported version: expected <= 7 but got 8
+# 即 jax 0.7.1 的 Pallas 发出 Mosaic IR v8，而 torch_xla 2.9.0 带的 libtpu 只认 <= v7。
+# （torch_xla 的 setup.py 写着配 jax 0.7.1，但 PyPI 上的 0.7.1 补丁版已经吐 v8。）
+# 所以不能再一次 run 只试一个版本 —— 改成在**同一次 run 里扫一遍候选版本**：
+# 每个候选装上后，在**子进程**里编一个最小 splash kernel，看 Mosaic 版本能否被接受。
+# 子进程独占 TPU 后退出释放，所以这一步必须在父进程 import torch_xla **之前**做完。
+INSTALL_TORCH_XLA = "torch~=2.9.0 torch_xla[tpu]~=2.9.0"
+JAX_CANDIDATES = [c for c in os.environ.get(
+    "ANIMA_JAX_CANDIDATES", "0.7.0,0.6.2,0.6.1,0.6.0,0.5.3").split(",") if c.strip()]
+
+# 子进程里跑的最小 splash 编译测试：能打印 SPLASH_OK 就说明这个 jax 与当前 libtpu 配套。
+_SPLASH_SMOKE = r"""
+import sys
+try:
+    import jax, jax.numpy as jnp
+    from jax.experimental.pallas.ops.tpu.splash_attention import (
+        splash_attention_kernel as sk, splash_attention_mask as sm)
+    mask = sm.MultiHeadMask(masks=(sm.FullMask(_shape=(256, 256)),) * 2)
+    bs = sk.BlockSizes(block_q=128, block_kv=128, block_kv_compute=128,
+                       block_q_dkv=128, block_kv_dkv=128, block_kv_dkv_compute=128,
+                       use_fused_bwd_kernel=True)
+    f = sk.make_splash_mha(mask, head_shards=1, q_seq_shards=1, block_sizes=bs)
+    q = jnp.zeros((2, 256, 128), jnp.bfloat16)
+    jax.block_until_ready(f(q, q, q))
+    print("SPLASH_OK", jax.__version__, jax.devices()[0].device_kind)
+except Exception as e:
+    msg = str(e).replace(chr(10), " ")[:200]
+    print("SPLASH_FAIL", type(e).__name__, msg)
+"""
 
 
 def _flush() -> None:
@@ -131,22 +157,55 @@ def _bootstrap_install() -> None:
     if not BOOTSTRAP_INSTALL:
         _BOOTSTRAP_NOTE = "未开启"
         return
-    notes = []
-    for spec in INSTALL_STEPS:
-        cmd = [sys.executable, "-m", "pip", "install", "-q"] + spec.split()
-        t0 = time.time()
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-        except Exception as e:
-            notes.append(f"[{spec}] 异常 {type(e).__name__}: {e}")
+    cmd = [sys.executable, "-m", "pip", "install", "-q"] + INSTALL_TORCH_XLA.split()
+    t0 = time.time()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    except Exception as e:
+        _BOOTSTRAP_NOTE = f"torch_xla 安装异常 {type(e).__name__}: {e}"
+        return
+    dt = time.time() - t0
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
+        _BOOTSTRAP_NOTE = f"torch_xla 安装失败 退出码 {r.returncode}（{dt:.0f}s）: {' | '.join(tail)}"
+        return
+    _BOOTSTRAP_NOTE = f"torch_xla OK {dt:.0f}s（{INSTALL_TORCH_XLA}）"
+
+
+def _pip(spec: str, timeout=900) -> tuple[bool, str]:
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q"] + spec.split(),
+                       capture_output=True, text=True, timeout=timeout)
+    if r.returncode == 0:
+        return True, "ok"
+    tail = (r.stderr or r.stdout or "").strip().splitlines()[-2:]
+    return False, " | ".join(tail)
+
+
+def sweep_jax_versions() -> str | None:
+    """在**父进程 import torch_xla 之前**扫一遍 jax 候选版本，返回第一个能和当前
+    libtpu 一起把 splash kernel 编出来的版本（None = 全军覆没）。
+
+    为什么要子进程：TPU 是独占的，而 jax 一旦在某进程里初始化就换不掉 libtpu。
+    子进程跑完退出即释放 TPU，可以逐个试。
+    """
+    for ver in JAX_CANDIDATES:
+        ok, err = _pip(f"jax=={ver} jaxlib=={ver}")   # 不带 [tpu]：保住 torch_xla 的 libtpu
+        if not ok:
+            record(f"S jax {ver}", "SKIP", f"pip 装不上：{err}")
             continue
-        dt = time.time() - t0
-        if r.returncode == 0:
-            notes.append(f"[{spec}] OK {dt:.0f}s")
-        else:
-            tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
-            notes.append(f"[{spec}] 退出码 {r.returncode}（{dt:.0f}s）: {' | '.join(tail)}")
-    _BOOTSTRAP_NOTE = " ; ".join(notes)
+        try:
+            r = subprocess.run([sys.executable, "-c", _SPLASH_SMOKE],
+                               capture_output=True, text=True, timeout=600)
+        except Exception as e:
+            record(f"S jax {ver}", "FAIL", f"子进程异常 {type(e).__name__}: {e}")
+            continue
+        out = (r.stdout or "").strip().splitlines()
+        line = next((l for l in out if l.startswith("SPLASH_")), "(无输出)")
+        if line.startswith("SPLASH_OK"):
+            record(f"S jax {ver}", "OK", f"splash 编译通过 -> {line}")
+            return ver
+        record(f"S jax {ver}", "FAIL", line[:220])
+    return None
 
 
 # ── L1 环境 ───────────────────────────────────────────────────────────────────
@@ -202,20 +261,52 @@ def probe_jax_coexist() -> str:
 # ── 计时工具 ──────────────────────────────────────────────────────────────────
 
 def _xla_bench(fn, reps=10, warmup=3):
-    """torch_xla 是惰性执行的，必须 mark_step + 同步才能测到真时间。"""
+    """torch_xla 惰性执行，必须 mark_step + 同步才能测到真时间。
+
+    **必须消费输出**（第二跑踩的坑）：只调 fn() + mark_step() 而不用返回值，
+    XLA 会把整个注意力当死代码消掉，测出来是 0.17ms —— 同形状 JAX 侧实测
+    106.81ms，差 600 倍，物理上不可能。这里把结果 .sum() 搬回 CPU 强制物化。
+    调用方还应配合 _implausible() 做量级自检。
+    """
+    import torch
     import torch_xla.core.xla_model as xm
-    for _ in range(warmup):
-        fn()
+
+    def once():
+        out = fn()
+        s = out.to(torch.float32).sum() if hasattr(out, "to") else out.sum()
         xm.mark_step()
+        return float(s.cpu())          # .cpu() 强制同步 + 物化，杜绝 DCE
+
+    for _ in range(warmup):
+        once()
     xm.wait_device_ops()
     ts = []
     for _ in range(reps):
         t0 = time.perf_counter()
-        fn()
-        xm.mark_step()
-        xm.wait_device_ops()
+        once()
         ts.append((time.perf_counter() - t0) * 1e3)
     return float(np.median(ts))
+
+
+def _implausible(ms: float, L: int, qh: int, dim: int, segs: int) -> str | None:
+    """量级自检：时间低于**物理下限**就说明没真算（DCE 或没同步）。
+
+    块对角 fwd 的 FLOPs 约 2*2*qh*dim*Sigma n_i^2（QK^T 与 PV 各一次矩阵乘）。
+    下限用 v5e 单 chip bf16 **峰值** 197 TFLOPS —— 达成率不可能超过 100%，
+    所以 flops/peak 是时间的硬下界。再放宽 2 倍容错（我这个 FLOPs 估算可能偏大）。
+
+    口径校准（别再搞错方向）：L=16384/4段/48头/128维 时 flops≈1.65 TFLOP，
+    峰值下 8.4ms，阈值取 4.2ms。JAX 侧实测块对角 106.81ms（≈7.8% 达成率）
+    远在阈值之上 -> 放行；第二跑那个 0.17ms 远在阈值之下 -> 拦下。
+    最初我误用"5% 达成率"当下界得到 167ms，反而会把正确测量也拦掉。
+    """
+    n = L // segs
+    flops = 4.0 * qh * dim * (segs * n * n)
+    floor_ms = flops / 197e12 * 1e3 * 0.5      # 峰值时间的一半 = 绝无可能更快
+    if ms < floor_ms:
+        return (f"实测 {ms:.2f}ms 低于物理下限 {floor_ms:.2f}ms"
+                f"（v5e 峰值 197TFLOPS 的 2 倍宽容）-> 没真算（DCE/未同步），数字不可信")
+    return None
 
 
 def _seg_lens(L, n, align):
@@ -381,6 +472,12 @@ def probe_call_jax_speed() -> str:
     q, k, v = _qkv(TIME_L, KREA2_Q_HEADS, KREA2_KV_HEADS, KREA2_HEAD_DIM)
     t_bd = _xla_bench(lambda: call_jax(_bd_jax_fn, (q, k, v, tuple(lens)), {}, "bd"))
     t_full = _xla_bench(lambda: call_jax(_bd_jax_fn, (q, k, v, (TIME_L,)), {}, "full"))
+    # 先做量级自检 —— 数字不可信时**绝不**报"跳块/未跳块"的结论
+    bad = (_implausible(t_bd, TIME_L, KREA2_Q_HEADS, KREA2_HEAD_DIM, TIME_SEGMENTS)
+           or _implausible(t_full, TIME_L, KREA2_Q_HEADS, KREA2_HEAD_DIM, 1))
+    if bad:
+        raise RuntimeError(
+            f"测量不可信，拒绝给结论：块对角 {t_bd:.2f}ms / 全通 {t_full:.2f}ms；{bad}")
     ratio = t_bd / t_full
     theory = sum(n * n for n in lens) / (TIME_L ** 2)
     verdict = "跳块生效" if ratio < (theory + 1.0) / 2 else "未跳块"
@@ -390,23 +487,64 @@ def probe_call_jax_speed() -> str:
             f"（JAX 侧同形状实测 0.252 / 106.81ms，可直接对比）")
 
 
-@probe("L3.3 反向能否穿过 call_jax（训练必需）")
-def probe_call_jax_backward() -> str:
-    """call_jax 的可微性是 torch_xla 路线成立的硬条件——不可微就只能推理用。"""
+def _bd_jax_vjp(q, k, v, seg_lens, grad_out):
+    """块对角 splash 的反向，JAX 侧用 vjp 求。与 torch_xla 自带包装器的
+    _jax_grad_f 同构。"""
+    import functools
+    import jax
+    f = functools.partial(_bd_jax_fn, seg_lens=seg_lens)
+    _primals, f_vjp = jax.vjp(f, q, k, v)
+    return f_vjp(grad_out)
+
+
+def _make_bd_splash():
+    """建一个 autograd.Function 包住 call_jax。
+
+    **第二跑的教训**：call_jax **不透传 autograd**（报
+    "element 0 of tensors does not require grad and does not have a grad_fn"）。
+    torch_xla 自带的 SplashAttention 也是这么做的 —— 显式写 autograd.Function，
+    前向和反向各调一次 call_jax。这不是 torch_xla 路线的死穴，只是必须自己写。
+    """
     import torch
     from torch_xla.core.xla_builder import call_jax
+
+    class BDSplash(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, q, k, v, seg_lens):
+            ctx.save_for_backward(q, k, v)
+            ctx.seg_lens = seg_lens
+            return call_jax(_bd_jax_fn, (q, k, v, seg_lens), {}, "bd_fw")
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            q, k, v = ctx.saved_tensors
+            dq, dk, dv = call_jax(
+                _bd_jax_vjp, (q, k, v, ctx.seg_lens, grad_out.contiguous()), {}, "bd_bw")
+            return dq, dk, dv, None
+
+    return BDSplash
+
+
+@probe("L3.3 反向能否穿过 call_jax（训练必需）")
+def probe_call_jax_backward() -> str:
+    """可微性是 torch_xla 路线成立的硬条件——不可微就只能推理用。
+    注意：裸 call_jax 不可微（第二跑实测），必须自建 autograd.Function。"""
+    import torch
+    BDSplash = _make_bd_splash()
     L, qh, dim = 2048, 4, 128
     lens = _seg_lens(L, 3, BLOCK)
     q, k, v = _qkv(L, qh, qh, dim)
     q.requires_grad_(True)
-    out = call_jax(_bd_jax_fn, (q, k, v, tuple(lens)), {}, "bd_bw")
+    k.requires_grad_(True)
+    out = BDSplash.apply(q, k, v, tuple(lens))
     out.to(torch.float32).pow(2).sum().backward()
-    if q.grad is None:
-        raise RuntimeError("q.grad 为 None —— call_jax 这条路不可微，训练用不了")
-    g = float(q.grad.to(torch.float32).abs().mean().cpu())
-    if not np.isfinite(g) or g == 0.0:
-        raise RuntimeError(f"梯度异常：mean|grad|={g}")
-    return f"梯度穿过 call_jax，mean|dq|={g:.4e}"
+    if q.grad is None or k.grad is None:
+        raise RuntimeError("梯度为 None —— autograd.Function 包装后仍不可微")
+    gq = float(q.grad.to(torch.float32).abs().mean().cpu())
+    gk = float(k.grad.to(torch.float32).abs().mean().cpu())
+    if not (np.isfinite(gq) and np.isfinite(gk)) or gq == 0.0 or gk == 0.0:
+        raise RuntimeError(f"梯度异常：mean|dq|={gq}, mean|dk|={gk}")
+    return f"autograd.Function 包装后梯度可穿过，mean|dq|={gq:.4e} mean|dk|={gk:.4e}"
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -418,6 +556,16 @@ def main() -> int:
 
     _bootstrap_install()
     probe_env()
+
+    # ── jax 版本扫描：必须在**父进程 import torch_xla 之前**做完 ────────────────
+    # TPU 独占：父进程一旦 import torch_xla 就占住设备，子进程再也初始化不了。
+    won = sweep_jax_versions()
+    if won:
+        record("S 扫描结论", "OK", f"jax {won} 与 torch_xla 所带 libtpu 配套，用它继续")
+    else:
+        record("S 扫描结论", "FAIL",
+               f"候选 {JAX_CANDIDATES} 全部与 torch_xla 2.9.0 的 libtpu 不配套 "
+               f"-> Mosaic IR 版本对不上，torch_xla + Pallas 在此组合下无解")
 
     if not probe_import():
         record("裁决", "FAIL", "torch_xla 装不上/导不进 -> torch_xla 路线在 Kaggle 上不成立")
@@ -465,9 +613,18 @@ def main() -> int:
 
     print("\n" + "=" * 78)
     print("torch_xla 路线裁决：")
-    scissors = any(r["status"] == "FAIL" and "libtpu version" in r["detail"]
+    scissors = any(r["status"] == "FAIL"
+                   and ("libtpu version" in r["detail"]
+                        or "Unsupported version" in r["detail"]
+                        or "Mosaic" in r["detail"])
                    for r in RESULTS)
-    if scissors:
+    if _st("S 扫描结论") == "FAIL":
+        print("  [NO]   **版本剪刀无解**：候选 jax 版本没有一个能和 torch_xla 2.9.0")
+        print("         所带的 libtpu 把 splash kernel 编出来（Mosaic IR 版本对不上）。")
+        print(f"         {_detail('S 扫描结论')}")
+        print("         -> 想走 torch_xla 就得自己编 torch_xla（配新 libtpu），")
+        print("            那已经超出'省 29k 行重写'的性价比了。倾向选纯 JAX 路线。")
+    elif scissors:
         print("  [ENV]  **版本剪刀，非技术结论**：torch_xla 的 PJRT 绑老 libtpu，")
         print("         jax 的 Pallas 闸门要新 libtpu，两者对不上，splash 全挂。")
         print(f"         {_detail('L1.5 ')}")

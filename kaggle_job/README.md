@@ -40,6 +40,48 @@ python -m kaggle auth login
 .\kaggle_run.ps1 -Username 你的用户名 -PullOnly
 ```
 
+## 真训练 job（`anima_train/`）
+
+探针阶段结束后的正式入口。吃的是**与 GPU 侧同一份训练 yaml**，
+`jax_tpu/config.py` 负责翻译，并对没移植的开关 **fail-fast**（不静默忽略）。
+
+```powershell
+cd anima_train
+python build_job.py --config ..\..\AnimaLoraToolkit\config\train_anima.yaml
+cd ..
+.\kaggle_run.ps1 -Username 你的用户名 -Accelerator TpuV5E8 -TimeoutSec 40000 `
+    -JobDir anima_train -FilePattern '(.*\.safetensors|.*\.npz|.*\.json|.*\.log)$'
+```
+
+`-FilePattern` **必须改**：默认值只拉 `*_probe*` 与 `*.log`，训练产物
+（`.safetensors` / 优化器状态 `.npz`）会被过滤掉，跑完了却什么也拿不回来。
+
+`build_job.py` 把 `jax_tpu/` 的 13 个模块 base64 进单文件脚本，运行时写回磁盘再
+正常 import —— **不是**首尾拼接（10 个模块互相带命名空间引用，拼接会静默覆盖同名
+顶层函数）。脚本带源码 sha，本地跑过的代码与真机逐字节相同。
+
+权重与缓存走 Kaggle Models / Datasets，在 `kernel-metadata.json` 里挂，路径用环境
+变量覆盖 yaml（yaml 本身不动，两个后端共用同一份）：
+
+```
+ANIMA_TRANSFORMER=/kaggle/input/anima-base/anima-base-v1.0.safetensors
+ANIMA_DATA_DIR=/kaggle/input/<latent+textfeat 缓存>
+ANIMA_OUTPUT_DIR=/kaggle/working/out
+```
+
+**先跑 `--plan-only`**（本地即可，零配额）：它把配置摘要、数据集 token 分布、
+打包报告（布局数/填充率/成步率）、适配器结构与参数量全打出来。三个数决定 8 卡
+用得满不满 —— 填充率是线性层算力利用率的上界、成步率决定有没有卡空转、布局数
+决定编译次数。
+
+### 全局 token 预算怎么对账
+
+yaml 的 `navit_token_budget` 在 GPU 上是一步一个 pack 的预算；TPU 是 8 卡纯 DP、
+每卡一个 pack，所以它在这里被解释成**全局**预算，单卡拿 1/8。C12 配方的 131072
+正好落成 **8 x 16384**，而 16384 恰是 v5e 单 chip(15.7GiB) 在 scan+full 档装得下的
+量级（anima-mem-probe：32768 OOM）。于是"一步看多少 token"在两个后端上是同一个数，
+梯度噪声量级可比。不整除时直接报错，不四舍五入。
+
 ## 架构裁决（2026-08-14，`arch_probe` 第二跑，v5e-8 真机）
 
 块对角内核可行之后，这一轮问的是**整条路能不能走**：静态图（E）、显存（F）、

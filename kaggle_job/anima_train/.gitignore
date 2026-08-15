@@ -1,0 +1,5 @@
+# 生成物：`build_job.py --config <训练 yaml>` 把 yaml **内嵌**进这个脚本。
+# 训练 yaml 按仓库惯例不进仓库，所以它的载体也不进 —— 需要时本地重跑
+# build_job.py 即可（它带源码 sha 自检，产物可复现）。
+anima_train_job.py
+_unpacked/

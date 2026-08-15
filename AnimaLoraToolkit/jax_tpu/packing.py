@@ -1,0 +1,421 @@
+"""NaViT 打包：把任意分辨率的图片装进固定 token 预算的 pack，并控制布局种类。
+
+## 这个模块存在的理由
+
+TPU 上 splash 的块稀疏由**编译期 mask** 驱动（真机实测：编译期 mask 跳块比
+0.252/理论 0.250；运行时 mask 只有 0.569，且 8 头以上放不下 HBM）。于是段长布局
+进了编译身份 —— **每种布局要单独编译一次全模型**（真机实测首调约 60s）。
+
+任意分辨率会产生几十种段长，直接打包出 43~47 种布局。所以这里做两件事：
+
+  1. **段长量化**到 `quantum` 的倍数（默认 1024），把布局数压下来。
+     本地枚举实测（159 张真实 ARB 图 + multiscale 副本 = 477 条）：
+
+         budget  Q      布局数  有效填充率
+         16384   128    17     84.8%
+         16384   1024   4      84.8%
+         32768   128    25     94.8%
+         32768   1024   **4**  **94.8%**      <- 甜点
+         49152   512    10     97.0%
+         49152   4096   4      84.0%
+
+     Q=1024 是拐点：布局数从 25 塌到 4，填充率一分不掉。
+
+  2. **两级 mask 的索引构造**。量化会在图像段内留一截填充 token，它们会被同段的
+     真 token 看见（静默污染，本地实测 max_abs=5.4）。而"哪些是填充"逐 pack 变化，
+     编进编译期 mask 就前功尽弃。解法是 splash 的契约（SegmentIds 文档原文
+     "The static mask is and-ed with the segment id mask"）：粗粒度进编译期负责
+     跳块，精细边界走运行时 `segment_ids` 负责正确性，形状固定不触发重编译。
+
+## 8 卡 DP 的额外约束
+
+一个编译产物只有一种 mask，所以**一步的 8 个 pack 必须同布局**。`plan_steps`
+按布局分组后每 8 个成一步，凑不满 8 个的余量顺延到下一轮（用户的训练范式是
+"极大 epoch 一直训、随时挑 checkpoint"，顺延不会丢样本）。
+"""
+
+from __future__ import annotations
+
+import math
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+BLOCK = 128          # splash 块粒度；quantum 必须是它的倍数
+PAD_SEG = -1         # 自注意力里填充 token 的段号（它们彼此可见，行不空）
+
+
+def quantize_len(n: int, quantum: int) -> int:
+    """真实 token 数 -> 粗粒度段长（向上取整到 quantum 的倍数）。"""
+    return int(math.ceil(n / quantum) * quantum)
+
+
+@dataclass(frozen=True)
+class Layout:
+    """一个 pack 的**编译身份**。同 Layout 的 pack 共用一份编译产物。
+
+    seg_lens 含末尾的纯填充段（FFD 装箱余量），故恒有 sum(seg_lens) == budget。
+    """
+    budget: int
+    seg_lens: Tuple[int, ...]
+    txt_len: int
+
+    def __post_init__(self):
+        if sum(self.seg_lens) != self.budget:
+            raise ValueError(f"段长和 {sum(self.seg_lens)} != budget {self.budget}")
+        bad = [n for n in self.seg_lens if n % BLOCK]
+        if bad:
+            raise ValueError(f"段长必须是 {BLOCK} 的倍数（splash 块粒度），越界 {bad[:4]}")
+        if self.txt_len % BLOCK:
+            raise ValueError(f"txt_len 必须是 {BLOCK} 的倍数，得到 {self.txt_len}")
+
+    @property
+    def n_seg(self) -> int:
+        return len(self.seg_lens)
+
+    @property
+    def max_chunk(self) -> int:
+        """`anima_jax.forward_packed(chunk=...)` 能用的最大 chunk。
+
+        = 所有段长的最大公约数（这样每个 chunk 完整落在一张图内）。段长都是
+        quantum 的倍数时，它 >= quantum。chunk 越大，AdaLN 的 gather 目标越小。
+        **跨段的 chunk 会让调制静默用错图的 t**，所以这里取 gcd 而不是 quantum。
+        """
+        return math.gcd(*self.seg_lens) if len(self.seg_lens) > 1 else self.seg_lens[0]
+
+    @property
+    def kv_txt(self) -> int:
+        """cross-attn 的 kv 长度：每段一个定长文本槽（含填充段，否则它的行会全 0）。"""
+        return self.n_seg * self.txt_len
+
+
+@dataclass
+class Pack:
+    """一个 pack 的**运行时**内容。layout 相同、内容不同 -> 不重编译。"""
+    layout: Layout
+    items: List[object] = field(default_factory=list)      # 每段的样本引用
+    real_lens: List[int] = field(default_factory=list)     # 每段真实 token 数
+    grids: List[Tuple[int, int]] = field(default_factory=list)   # 每段 (h, w)
+
+    def index_arrays(self) -> Dict[str, np.ndarray]:
+        """造出喂给 attention.py / anima_jax.py 的全部索引数组。
+
+        seg_self   [B] 自注意力精细段号；段内填充统一 PAD_SEG（彼此可见，行不空）
+        seg_cross  [B] cross-attn 精细段号；填充**沿用宿主段号**——文本侧没有配对的
+                       填充段，给独立段号会让整行全 0 -> softmax 分母为 0
+                       （splash 的 SegmentIds 文档对此有明确警告）
+        seg_txt    [kv_txt] 文本侧段号
+        mod_index  [B] AdaLN 的 token->段（= 粗粒度段号）
+        rows/cols  [B] RoPE 网格坐标；填充位置填 0（输出被 loss_mask 丢弃）
+        loss_mask  [B] 1=真 token
+        """
+        L = self.layout
+        B = L.budget
+        seg_self = np.full(B, PAD_SEG, np.int32)
+        seg_cross = np.empty(B, np.int32)
+        mod_index = np.empty(B, np.int32)
+        rows = np.zeros(B, np.int32)
+        cols = np.zeros(B, np.int32)
+        loss_mask = np.zeros(B, np.float32)
+        off = 0
+        for i, seg in enumerate(L.seg_lens):
+            seg_cross[off:off + seg] = i
+            mod_index[off:off + seg] = i
+            r = self.real_lens[i] if i < len(self.real_lens) else 0
+            if r:
+                h, w = self.grids[i]
+                if h * w != r:
+                    raise ValueError(f"第 {i} 段网格 {h}x{w} != 真实 token 数 {r}")
+                seg_self[off:off + r] = i
+                loss_mask[off:off + r] = 1.0
+                rr, cc = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+                rows[off:off + r] = rr.reshape(-1)
+                cols[off:off + r] = cc.reshape(-1)
+            off += seg
+        return {"seg_self": seg_self, "seg_cross": seg_cross,
+                "seg_txt": np.repeat(np.arange(L.n_seg, dtype=np.int32), L.txt_len),
+                "mod_index": mod_index, "rows": rows, "cols": cols,
+                "loss_mask": loss_mask}
+
+    @property
+    def fill(self) -> float:
+        """有效填充率：真实 token / budget。它**直接等于**线性层的算力利用率
+        （填充 token 一样要过 MLP）。"""
+        return sum(self.real_lens) / self.layout.budget
+
+
+# ── 装箱 ──────────────────────────────────────────────────────────────────────
+def ffd(sizes: Sequence[int], budget: int) -> List[List[int]]:
+    """First-Fit-Decreasing 装箱，与仓库 `navit_pack_strategy: ffd` 同策略。
+    返回的是**下标**分组，不是尺寸，调用方据此取回样本。"""
+    order = sorted(range(len(sizes)), key=lambda i: -sizes[i])
+    bins: List[List[int]] = []
+    used: List[int] = []
+    for i in order:
+        s = sizes[i]
+        if s > budget:
+            raise ValueError(f"单段 {s} > budget {budget}，装不下（提高 budget "
+                             f"或降低该图分辨率）")
+        for b, u in enumerate(used):
+            if u + s <= budget:
+                bins[b].append(i)
+                used[b] += s
+                break
+        else:
+            bins.append([i])
+            used.append(s)
+    return bins
+
+
+class Packer:
+    """把 (样本, token 数) 列表打成 pack，并按布局分组成 8 卡一步的批。"""
+
+    def __init__(self, budget: int, quantum: int = 1024, txt_len: int = 512,
+                 devices: int = 8):
+        """txt_len 默认 512，且**填充的文本 token 照常参与 cross-attn**。
+
+        这不是疏忽：`navit_text_trim_padding` 在 trainer/config.py:540 默认 False，
+        因为训练去掉 512-pad 而 eval/采样/ARB 都带 pad，会让 cross-attn 的条件
+        不一致 —— memory `[[navit-text-trim-train-eval-mismatch]]` 记录了 A/B
+        实证：开 trim 时 eval_loss 冲高且拟合变差，关掉后单调下降并追平 ARB。
+        所以 TPU 侧也照此口径：定长 512、不 mask 掉 pad。
+        """
+        if quantum % BLOCK:
+            raise ValueError(f"quantum 必须是 {BLOCK} 的倍数（splash 块粒度），"
+                             f"得到 {quantum}")
+        if budget % quantum:
+            raise ValueError(f"budget {budget} 必须能被 quantum {quantum} 整除，"
+                             f"否则装箱余量凑不出合法的填充段")
+        self.budget, self.quantum, self.txt_len = budget, quantum, txt_len
+        self.devices = devices
+        self._carry: List[Pack] = []      # 上一轮凑不满 8 个的余量
+
+    def build_packs(self, items: Sequence[object],
+                    token_counts: Sequence[int],
+                    grids: Sequence[Tuple[int, int]]) -> List[Pack]:
+        """items/token_counts/grids 一一对应。grids[i] = (h, w) 且 h*w == token_counts[i]。"""
+        if not (len(items) == len(token_counts) == len(grids)):
+            raise ValueError("items / token_counts / grids 长度必须一致")
+        for i, (n, (h, w)) in enumerate(zip(token_counts, grids)):
+            if h * w != n:
+                raise ValueError(f"第 {i} 项网格 {h}x{w} != token 数 {n}")
+        q = [quantize_len(n, self.quantum) for n in token_counts]
+        packs = []
+        for group in ffd(q, self.budget):
+            seg = [q[i] for i in group]
+            rest = self.budget - sum(seg)
+            real = [token_counts[i] for i in group]
+            gr = [grids[i] for i in group]
+            it = [items[i] for i in group]
+            if rest:                       # 装箱余量 -> 一个纯填充段
+                seg.append(rest)
+                real.append(0)
+                gr.append((0, 0))
+                it.append(None)
+            # **段序规范化成降序**：段在 pack 里的先后是自由的（每段各算各的，
+            # AdaLN 走 mod_index、RoPE 走 rows/cols，都不依赖段序），但它进了
+            # Layout 的编译身份。FFD 在 bin 内本就是降序，唯独末尾追加的填充段
+            # 可能比它前面的段大（真实数据集实测出现过 (2944, 2944, 26880)），
+            # 于是同一段长 multiset 会拿到两种 Layout -> 白编译一次全模型。
+            # 排序是免费的去重；your-dataset 上当前尚未撞到同 multiset 的
+            # 两种序（白多 0），这里是防御性规范化，不改变任何已有布局的语义。
+            order = sorted(range(len(seg)), key=lambda i: (-seg[i], i))
+            seg = [seg[i] for i in order]
+            real = [real[i] for i in order]
+            gr = [gr[i] for i in order]
+            it = [it[i] for i in order]
+            packs.append(Pack(Layout(self.budget, tuple(seg), self.txt_len),
+                              it, real, gr))
+        return packs
+
+    def plan_steps(self, packs: Sequence[Pack]) -> Tuple[List[List[Pack]], List[Pack]]:
+        """按布局分组，每 `devices` 个 pack 凑成一步。
+
+        返回 (steps, carry)。carry 是凑不满一步的余量，应带到下一轮再凑
+        （用户范式是极大 epoch 连续训，顺延不丢样本）。
+        """
+        by_layout: Dict[Layout, List[Pack]] = defaultdict(list)
+        for p in list(self._carry) + list(packs):
+            by_layout[p.layout].append(p)
+        steps, carry = [], []
+        for layout, ps in by_layout.items():
+            n = len(ps) // self.devices * self.devices
+            for i in range(0, n, self.devices):
+                steps.append(ps[i:i + self.devices])
+            carry.extend(ps[n:])
+        self._carry = carry
+        return steps, carry
+
+
+# ── 分桶（ragged / 批维）调度 ─────────────────────────────────────────────────
+#
+# ## 与打包调度的关系
+#
+# 打包路线的**编译身份是段长元组**（如 `(10240, 9216, 4096, 4096, 3072, 2048)`），
+# 分桶路线的编译身份只是**一个整数 L**。这个差别的方向是确定的：
+#
+#   * 打包的等价类更细 -> 要凑齐 8 个**同元组**的 pack（≈ 8*每 pack 图数 张同构图），
+#     分桶 G=1 只要 8 张**同 L** 的图；
+#   * 反过来，打包能把不同大小的图混进同一个 pack，分桶不能（一步一个 L）。
+#
+# **哪一边划算完全取决于数据集的 token 数分布，不能一般化。** token 数越集中，
+# 分桶越占便宜（还能把 Q 降到 128 把填充率吃满）；越分散，打包的混装能力越值钱。
+# 用 `tests/enum_dataset_routes.py` 对**实际要训的**数据集算一遍再定 —— 零配额、
+# 秒级。不要拿别的数据集的数字外推：本仓库 memory `[[dont-infer-dataset-provenance]]`
+# 记着这条教训（数据来源与预处理链只有用户知道）。
+#
+# 分散度高时缓解手段（尚未实现，仅记录方向）：跨桶做梯度累积 —— 一个优化步由若干
+# 个不同 L 的微步组成，各自是独立的编译产物，LoRA 梯度累加后再更新。这样"凑不满
+# 8 张同 L"就不再卡住优化步，代价是每个 L 多一份编译（可被持久化编译缓存摊掉）。
+#
+# 顺延语义与 `Packer.plan_steps` 一致：凑不满一步的余量带到下一轮，不丢样本。
+@dataclass(frozen=True)
+class Bucket:
+    """一个分桶步的**编译身份**：桶长 L + 每卡图数 G + 文本槽长。"""
+    length: int
+    imgs: int
+    txt_len: int = 512
+
+    def __post_init__(self):
+        for name, v in (("length", self.length), ("txt_len", self.txt_len)):
+            if v % BLOCK:
+                raise ValueError(f"{name}={v} 必须是 {BLOCK} 的倍数（splash 块粒度）")
+        if self.imgs < 1:
+            raise ValueError(f"imgs 必须 >= 1，得到 {self.imgs}")
+
+
+@dataclass
+class BucketStep:
+    """一步的运行时内容：devices*imgs 张同 L 的图。"""
+    bucket: Bucket
+    items: List[object] = field(default_factory=list)
+    real_lens: List[int] = field(default_factory=list)
+    grids: List[Tuple[int, int]] = field(default_factory=list)
+
+    def index_arrays(self, devices: int) -> Dict[str, np.ndarray]:
+        """造出喂给 attention.make_bucket_attn / anima_jax.forward_ragged 的数组。
+
+        形状都是 [devices, imgs, L]（seg/rows/cols/loss_mask），第 0 维是设备维。
+
+        seg: 0=真 token、1=尾部量化填充。填充给**同一个**非零段号而不是逐 token
+        独立，保证填充行彼此可见、softmax 分母不为 0（splash 的 SegmentIds 文档
+        对全 0 行有明确警告）。
+        """
+        B, L = self.bucket, self.bucket.length
+        n = devices * B.imgs
+        if len(self.real_lens) != n:
+            raise ValueError(f"一步要 {n} 张图（{devices} 卡 x {B.imgs}），"
+                             f"得到 {len(self.real_lens)}")
+        seg = np.ones((n, L), np.int32)
+        rows = np.zeros((n, L), np.int32)
+        cols = np.zeros((n, L), np.int32)
+        loss_mask = np.zeros((n, L), np.float32)
+        for i, (r, (h, w)) in enumerate(zip(self.real_lens, self.grids)):
+            if h * w != r:
+                raise ValueError(f"第 {i} 张网格 {h}x{w} != 真实 token 数 {r}")
+            if r > L:
+                raise ValueError(f"第 {i} 张 {r} token > 桶长 {L}")
+            seg[i, :r] = 0
+            loss_mask[i, :r] = 1.0
+            rr, cc = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+            rows[i, :r] = rr.reshape(-1)
+            cols[i, :r] = cc.reshape(-1)
+        rs = lambda a: a.reshape(devices, B.imgs, L)
+        return {"seg": rs(seg), "rows": rs(rows), "cols": rs(cols),
+                "loss_mask": rs(loss_mask)}
+
+    @property
+    def fill(self) -> float:
+        """有效填充率 = 真实 token / 填充后 token。直接等于线性层的算力利用率。"""
+        return sum(self.real_lens) / (len(self.real_lens) * self.bucket.length)
+
+
+class BucketPlanner:
+    """把 (样本, token 数) 列表按量化长度分桶，凑成 devices*imgs 一步。"""
+
+    def __init__(self, quantum: int = 128, per_device: int = 1,
+                 txt_len: int = 512, devices: int = 8,
+                 max_length: Optional[int] = None):
+        """`quantum` 默认 128（= splash 块粒度，能取到的最细量化）。
+
+        打包路线要把它提到 1024 是为了压段长元组的组合数；分桶路线的编译身份只有
+        一个 L，多几个桶只是多几次编译（且各自独立、可被持久化编译缓存摊掉），
+        所以这里默认取最细的 128，把填充率吃满。
+        """
+        if quantum % BLOCK:
+            raise ValueError(f"quantum 必须是 {BLOCK} 的倍数（splash 块粒度），得到 {quantum}")
+        self.quantum, self.per_device, self.txt_len = quantum, per_device, txt_len
+        self.devices, self.max_length = devices, max_length
+        self._carry: Dict[int, List[Tuple]] = defaultdict(list)
+
+    def plan_steps(self, items: Sequence[object], token_counts: Sequence[int],
+                   grids: Sequence[Tuple[int, int]]
+                   ) -> Tuple[List[BucketStep], List[Tuple]]:
+        """返回 (steps, carry)。carry 是凑不满一步的余量，自动带到下一次调用。"""
+        if not (len(items) == len(token_counts) == len(grids)):
+            raise ValueError("items / token_counts / grids 长度必须一致")
+        by = defaultdict(list)
+        for k, v in self._carry.items():
+            by[k].extend(v)
+        for it, n, (h, w) in zip(items, token_counts, grids):
+            if h * w != n:
+                raise ValueError(f"网格 {h}x{w} != token 数 {n}")
+            L = quantize_len(n, self.quantum)
+            if self.max_length is not None and L > self.max_length:
+                raise ValueError(f"图 {n} token -> 桶长 {L} 超过上限 "
+                                 f"{self.max_length}（降分辨率或提高上限）")
+            by[L].append((it, n, (h, w)))
+
+        per_step = self.devices * self.per_device
+        steps: List[BucketStep] = []
+        self._carry = defaultdict(list)
+        for L, entries in by.items():
+            k = len(entries) // per_step
+            for i in range(k):
+                chunk = entries[i * per_step:(i + 1) * per_step]
+                steps.append(BucketStep(
+                    Bucket(L, self.per_device, self.txt_len),
+                    [c[0] for c in chunk], [c[1] for c in chunk],
+                    [c[2] for c in chunk]))
+            self._carry[L] = entries[k * per_step:]
+        carry = [e for v in self._carry.values() for e in v]
+        return steps, carry
+
+
+def report_buckets(steps: Sequence[BucketStep], carry_n: int = 0) -> str:
+    """分桶调度质量报告。桶数决定编译次数，填充率决定线性层算力利用率。"""
+    if not steps:
+        return f"（无可成步的样本；顺延 {carry_n} 张）"
+    by: Dict[Bucket, int] = defaultdict(int)
+    for s in steps:
+        by[s.bucket] += 1
+    real = sum(sum(s.real_lens) for s in steps)
+    pad = sum(len(s.real_lens) * s.bucket.length for s in steps)
+    lines = [f"步 {len(steps)} | 桶 {len(by)} 种 (≈{len(by)} 次全模型编译) | "
+             f"有效填充率 {real / pad:.1%} | 顺延 {carry_n} 张"]
+    for b, c in sorted(by.items(), key=lambda kv: -kv[1]):
+        lines.append(f"  L={b.length:<6} 每卡 {b.imgs} 图  x{c} 步")
+    return "\n".join(lines)
+
+
+# ── 诊断 ──────────────────────────────────────────────────────────────────────
+def report(packs: Sequence[Pack], devices: int = 8) -> str:
+    """打包质量报告。**上真机前先看这个**：布局数决定编译成本，填充率决定
+    线性层算力利用率，成步率决定有多少样本会被顺延。"""
+    if not packs:
+        return "（无 pack）"
+    layouts = {p.layout for p in packs}
+    by = defaultdict(int)
+    for p in packs:
+        by[p.layout] += 1
+    full = sum(c // devices * devices for c in by.values())
+    fill = sum(sum(p.real_lens) for p in packs) / sum(p.layout.budget for p in packs)
+    lines = [f"pack {len(packs)} 个 | 布局 {len(layouts)} 种 "
+             f"(≈{len(layouts)}次全模型编译) | 有效填充率 {fill:.1%} | "
+             f"可成步 {full}/{len(packs)} 个 pack = {full // devices} 步"]
+    for layout, c in sorted(by.items(), key=lambda kv: -kv[1]):
+        lines.append(f"  {str(layout.seg_lens):<44} x{c:<4} "
+                     f"步 {c // devices} 余 {c % devices}")
+    return "\n".join(lines)

@@ -1,0 +1,15 @@
+{
+  "id": "ilovebg/anima-navit-probe",
+  "title": "anima-navit-probe",
+  "code_file": "anima_navit_job.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

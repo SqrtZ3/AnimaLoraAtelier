@@ -247,9 +247,57 @@ def main() -> int:
     check("低 t 桶被抬高", float(f[:4].mean()) > float(f[4:].mean()),
           f"低 {f[:4].mean():.2f} vs 高 {f[4:].mean():.2f}")
 
+    print("\nT10 展开路径（吞吐旋钮）≡ scan 路径")
+    _check_unrolled(mcfg, tcfg, plans, lora, consts, params, batch, key, layout, mesh,
+                    float(loss), grads)
+
     print(f"\n{'*** 通过 ***' if FAIL == 0 else f'*** {FAIL} 项失败 ***'}"
           f"  ({OK} OK / {FAIL} FAIL)")
     return 0
+
+
+def _unstack_params(params):
+    """scan 布局 -> 展开布局（`blocks` 变回 list）。`stack_blocks` 的逆。"""
+    blk = params["blocks"]
+    n = jax.tree.leaves(blk)[0].shape[0]
+    return {**params, "blocks": [jax.tree.map(lambda z, i=i: z[i], blk)
+                                 for i in range(n)]}
+
+
+def _check_unrolled(mcfg, tcfg, plans, lora, consts, params, batch, key, layout,
+                    mesh, ref_loss, ref_grads):
+    """展开路径是 `--unrolled` 打开后训练真正走的那条，必须与 scan 同数学。
+
+    两条断言各防一件事：
+      * loss/梯度不一致 -> 展开路径的 LoRA 切片（`_slice_ctx`）或逐块键名错了；
+      * 非法组合不报错 -> `--unrolled` 单开会退回朴素展开（真机 budget 16384
+        的 full 档就要 20.60G），必须构造期就拦住。
+    """
+    import dataclasses
+    # **在 fp32 上对拍**：这条断言问的是"两条路径是不是同一个数学"，而默认的
+    # bf16 前向会把答案淹在舍入里（同一份代码 bf16 下梯度 rel 7e-3，fp32 下 1e-7；
+    # 见 tests/README「逐 bit 只在 fp32 下成立」）。ref_loss/ref_grads 是 bf16 的，
+    # 所以这里重新取一份 fp32 的 scan 参考。
+    up = _unstack_params(params)
+    f32 = dataclasses.replace(tcfg, dtype=jnp.float32)
+    ref = T.make_grad_fn(mcfg, f32, plans, layout, mesh, interpret=True)
+    l0, _, g0 = ref(lora, consts, params, batch, key)
+    for name, kw in (("barrier", dict(packed_barrier=True)),
+                     ("chunk", dict(packed_chunk=True))):
+        c = dataclasses.replace(f32, unrolled=True, **kw)
+        gf = T.make_grad_fn(mcfg, c, plans, layout, mesh, interpret=True)
+        l2, _, g2 = gf(lora, consts, up, batch, key)
+        rel = max(float(jnp.max(jnp.abs(a - b)) / (jnp.max(jnp.abs(b)) + 1e-30))
+                  for a, b in zip(jax.tree.leaves(g2), jax.tree.leaves(g0)))
+        check(f"展开+{name} loss ≡ scan",
+              abs(float(l2) - float(l0)) < 1e-5 * max(abs(float(l0)), 1.0),
+              f"{float(l0):.6f} vs {float(l2):.6f}")
+        check(f"展开+{name} LoRA 梯度 ≡ scan", rel < 1e-5, f"rel={rel:.2e}")
+    try:
+        dataclasses.replace(tcfg, unrolled=True)
+        check("单开 unrolled 被拒", False, "没有报错")
+    except ValueError:
+        check("单开 unrolled 被拒", True, "构造期 fail-fast")
 
 
 def replace_adapter_off(tcfg):

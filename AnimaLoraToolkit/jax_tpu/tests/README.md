@@ -24,6 +24,12 @@ immiscible、逐块 reg_dims）。⑪ 的每条断言都在防一种"不报错�
 会让梯度恒 0 而前向照跑；aux 开关接了但恒等于 0 也一样看不出来。所以它逐个关掉每个
 aux 去看 loss 变没变，而不是只看"能不能跑完"。
 
+⑪ 的 **T10 覆盖吞吐旋钮**（`run_train.py --unrolled --packed-chunk/--packed-barrier`）：
+展开路径与 scan 路径必须同数学（fp32 下 barrier 逐 bit、chunk 1.8e-07），且
+`--unrolled` 单开必须构造期报错 —— 朴素展开在真机 budget 16384 的 full 档就要 20.60G。
+**T10 必须在 fp32 上判**：默认 bf16 前向下同一份代码梯度 rel 就有 7e-3，
+那是舍入不是算法差异（同 README 下面"逐 bit 只在 fp32 下成立"那一节）。
+
 ⑫⑬ 的当前基线（fp32）：
 
 | 项 | rel |
@@ -80,7 +86,7 @@ python check_splash_blockdiag.py check_scan_equiv.py check_ragged_equiv.py
 
 （各脚本独立，逐个跑；两步式的在 docstring 里写了先 `--dump` / `--write`。）
 
-⑦⑩ 用 `XLA_FLAGS=--xla_force_host_platform_device_count=8` 在 CPU 上伪造 8 个设备，
+⑦⑩⑪ 用 `XLA_FLAGS=--xla_force_host_platform_device_count=8` 在 CPU 上伪造 8 个设备，
 于是 shard_map / 跨卡梯度 all-reduce / 每卡一份数据这些分支也验到了；
 splash 走 `interpret=True`（Pallas 解释执行）。
 
@@ -99,6 +105,10 @@ splash 走 `interpret=True`（Pallas 解释执行）。
 **②⑨ 的"填充隔离"判据是行为判据，不是数值接近**：动填充区的输入，真 token 输出
 必须**逐 bit 不变**（=0，不是"很小"）。两个脚本都带了**反证**（关掉隔离必须被污染），
 防止判据因为构造错误而失去分辨力 —— 一个恒过的断言比没有断言更糟。
+
+**⑪ 不带这个 flag 跑会假失败**：设备只有 1 个时 T6（逐图等权）的样本量掉到 1/8，
+两次扰动的差从 1% 涨到 4%，撞破 2% 的容差。判据本身没问题，但它对样本量敏感 ——
+看到 T6 单独红，先确认 flag 加了没有。
 
 **⑦⑩ 里 T1/T3/T4 不能删**：
 

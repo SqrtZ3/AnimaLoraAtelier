@@ -561,8 +561,10 @@ def _forward_core(params: PyTree, cfg: AnimaConfig,
     # 使步时假性变快 —— 属于必须靠断言拦住的一类。
     policy, wrap = resolve_remat(remat)
     if isinstance(params["blocks"], (list, tuple)):
-        # 展开路径：逐块单独编译。保留它是因为对拍脚本按块比对需要，
-        # **但训练不要用**——见 stack_blocks 的注释（显存 1.01 MB/token）。
+        # 展开路径：逐块单独编译。对拍脚本按块比对需要它，**训练也用得上** ——
+        # 但必须配 chunk 或 barrier（见下），否则就是 stack_blocks 注释里那个
+        # 1.01 MB/token 的朴素展开（budget 16384 即 OOM）。压住之后它是真机
+        # 最快的路径（budget 8192 + every2 = 30.2k 真tok/s，见 train.TrainConfig）。
         # `barrier`：在每块边界把 (x, emb, adaln_lora) 一起穿过 optimization_barrier，
         # **人为制造 emb -> x 的数据依赖**，于是第 i 块的 AdaLN 调制不可能早于第 i-1
         # 块的 x 算出来 —— 正是 anima-mem-probe 归因出的那个"28 组调制同时活着"。

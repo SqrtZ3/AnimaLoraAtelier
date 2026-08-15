@@ -101,8 +101,19 @@ class TrainConfig:
     #: 按仓库约定默认全关（行为中立）。
     packed_chunk: bool = False
     packed_barrier: bool = False
-    #: 展开路径（`unrolled=True`）+ every2 是真机最快的组合，但要配合 chunk 或
-    #: barrier 压住 AdaLN 的跨块提升，否则 budget 16384 就 OOM。默认走 scan。
+    #: 展开路径。**这是"把 8 卡吃满"的主旋钮**，但它与 budget 强耦合，真机
+    #: anima-layout-probe 的账（打包路线、8 卡、真tok/s / 有效MFU）：
+    #:
+    #:     budget 16384  scan+full          16.9k / 13.4%   <- 默认档
+    #:     budget 16384  展开+barrier+full   16.7k / 13.2%
+    #:     budget 16384  展开+chunk+every2   OOM (23.62G)
+    #:     budget  8192  展开+chunk+every2   **30.2k / 21.6%（全场最高）**
+    #:     budget  8192  展开+barrier+every2 28.9k / 20.6%
+    #:
+    #: 也就是说：**只在 budget 16384 上开展开是白开的**（16.7k vs 16.9k），
+    #: 收益全在"budget 减半 + 展开 + every2"这个组合上。budget 减半会让一步看到的
+    #: token 减半 = 改变有效 batch，要靠 grad_accum 2 补回来才是同一个实验。
+    #: 默认关（行为中立），由 run_train 的 `--unrolled` 显式打开。
     unrolled: bool = False
     dtype: Any = jnp.bfloat16
     seed: int = 0
@@ -112,12 +123,12 @@ class TrainConfig:
     adamw: O.AdamWConfig = field(default_factory=O.AdamWConfig)
 
     def __post_init__(self):
-        if self.unrolled and self.remat != "full" and not (self.packed_chunk
-                                                           or self.packed_barrier):
+        if self.unrolled and not (self.packed_chunk or self.packed_barrier):
             raise ValueError(
                 "展开路径（unrolled）下 AdaLN 调制会 28 组同时活着（真机归因 "
                 "1.01 MB/token，anima-mem-probe V4），必须开 packed_chunk 或 "
-                "packed_barrier 之一才压得住；否则 budget 16384 就 OOM。")
+                "packed_barrier 之一才压得住。**full 档也不例外** —— 朴素展开在 "
+                "budget 16384 的 full 档实测就要 20.60G（anima-layout-probe 第一棒）。")
 
 
 # ── 初始化 ────────────────────────────────────────────────────────────────────

@@ -19,6 +19,30 @@ r"""TPU 训练入口：`python run_train.py --config train_anima.yaml`。
   3. **布局数** = 全模型编译次数。首跑每种布局约 60s，跨 session 靠持久化编译
      缓存摊掉（`--jax-cache`）。布局数爆炸时先调大 `quantum`。
 
+## 两个可选的工作点（真机 anima-layout-probe，打包路线、8 卡、真tok/s）
+
+默认档不是最快档，这是有意的（新旋钮默认关、行为中立），但差距很大，**上生产前
+先决定用哪个**：
+
+  A. 默认：`navit_token_budget: 131072`（= 8 x 16384）+ scan + full
+       16.9k 真tok/s / 有效MFU 13.4%。一步 32 张图左右，与 GPU 侧同一份 yaml
+       的有效 batch 完全对齐，零额外决策。
+
+  B. 快档：yaml 改 `navit_token_budget: 65536`（= 8 x 8192）+ `grad_accum: 2`，
+     跑 `--unrolled --packed-chunk --remat every2`
+       30.2k 真tok/s / 有效MFU 21.6%（全场最高）。**约 1.8x**。
+       `grad_accum: 2` 把"一步看多少 token"补回 131072，所以它与 A 是同一个
+       有效 batch、同一个实验；变的只是 8 卡怎么把这些 token 走完。
+
+为什么不能只开 `--unrolled` 而不动 budget：budget 16384 下展开+every2 直接 OOM
+（23.62G），展开+full 是 16.7k —— 与 scan 的 16.9k 打平，白开。收益全在
+"budget 减半才装得下 every2"这一步上。
+
+代价（都已实测、可接受）：展开路径首调编译 56~83s vs scan 的 9~20s（靠
+`--jax-cache` 跨 session 摊掉）；`--packed-chunk` 数学等价但改 matmul lowering，
+bf16 梯度有 ULP 漂移，想要零数值风险就换 `--packed-barrier`（恒等算子，
+本地 fp32 对拍逐 bit，但 every2 档略慢：28.9k）。
+
 ## 断点接棒（Kaggle 12h / 20h 每周）
 
 `--save-state-every` 存完整优化器状态 + 自适应采样器的 EMA；`--resume-state`
@@ -47,6 +71,7 @@ import adapters as AD                                         # noqa: E402
 import anima_jax as A                                         # noqa: E402
 import config as C                                            # noqa: E402
 import data as D                                              # noqa: E402
+import flow as F                                              # noqa: E402
 import optim as O                                             # noqa: E402
 import sched as S                                             # noqa: E402
 import train as T                                             # noqa: E402
@@ -98,6 +123,19 @@ def main(argv=None) -> int:
                     help="只打印配置/打包/结构报告就退出，零设备开销")
     ap.add_argument("--interpret", action="store_true",
                     help="splash 走 Pallas 解释执行（CPU 冒烟用，真机上**不要**加）")
+    # ── 吞吐旋钮（默认全关 = 与改动前逐位等价）──────────────────────────────
+    ap.add_argument("--unrolled", action="store_true",
+                    help="走展开路径而不是 lax.scan。必须同时开 --packed-chunk 或 "
+                         "--packed-barrier。真机账见 train.TrainConfig.unrolled："
+                         "收益只在 budget 8192 + every2 上（30.2k vs 16.9k 真tok/s），"
+                         "而 budget 减半要用 grad_accum 补回有效 batch")
+    ap.add_argument("--packed-chunk", action="store_true",
+                    help="按段长 gcd 把调制切成广播（数学等价，bf16 有 ULP 漂移）")
+    ap.add_argument("--packed-barrier", action="store_true",
+                    help="块边界插 optimization_barrier（恒等算子，零数值风险）")
+    ap.add_argument("--remat", default="", choices=("", "full", "dots", "every2", "none"),
+                    help="覆盖 yaml 的 grad_checkpoint 推出来的档位。展开路径下 "
+                         "every2 才是快的那一档，但只在 budget<=8192 装得下")
     a = ap.parse_args(argv)
 
     raw = C.load_yaml(a.config)
@@ -114,6 +152,12 @@ def main(argv=None) -> int:
     rc = C.build(raw, a.devices, a.allow_unported, canvas_hw=ds.canvas_hw)
     rc = replace(rc, quantum=a.quantum,
                  max_steps=(a.max_steps or rc.max_steps))
+    # 吞吐旋钮走命令行而不是 yaml：它们**不改训练数学**（chunk 是数学等价、
+    # barrier 是恒等算子、remat 只改重算策略），所以不该混进"两个后端共用的
+    # 同一份实验描述"里。TrainConfig.__post_init__ 会拦住非法组合。
+    rc = replace(rc, tcfg=replace(
+        rc.tcfg, unrolled=a.unrolled, packed_chunk=a.packed_chunk,
+        packed_barrier=a.packed_barrier, remat=(a.remat or rc.tcfg.remat)))
 
     print(C.summary(rc))
     print(ds.report())
@@ -146,8 +190,12 @@ def main(argv=None) -> int:
     t0 = time.time()
     params, mcfg = A.load_safetensors_anima(str(rc.transformer_path),
                                             dtype=rc.tcfg.dtype)
-    params = A.stack_blocks(params)
-    print(f"底模载入 {time.time()-t0:.1f}s，{mcfg.num_blocks} 块")
+    # 展开路径要的就是 list-of-blocks 布局（`anima_jax._forward_core` 按它分派）。
+    # **不能两份都留着**：3.91GB x2 在 15.7GiB 的单 chip 上就没余量了。
+    if not rc.tcfg.unrolled:
+        params = A.stack_blocks(params)
+    print(f"底模载入 {time.time()-t0:.1f}s，{mcfg.num_blocks} 块"
+          f"（{'展开' if rc.tcfg.unrolled else 'scan'} 路径）")
     if mcfg.crossattn_dim != ds.crossattn_dim:
         # cross 是定长槽，维度对不上会在组装 batch 时才炸（而且报的是 numpy 广播
         # 错，看不出根因）。在这里点破：多半是文本特征缓存用的编码器与底模不配套。
@@ -191,6 +239,8 @@ def main(argv=None) -> int:
     out_dir = Path(rc.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     gstep, acc, acc_n = start_step, None, 0
+    fb: List[Tuple[np.ndarray, np.ndarray]] = []      # 本优化步累积的自适应反馈
+    evalset: Optional[Tuple] = None                   # 固定 eval 集，见 _pick_evalset
     t_epoch = time.time()
 
     for epoch in range(rc.epochs):
@@ -201,14 +251,26 @@ def main(argv=None) -> int:
             grad_fn, eval_fn = get_fns(layout)
             lats, ctxs = ds.materialize_packed(packs)
             n_img = len(packs) * layout.n_seg
-            t_vec = sampler.sample(rng, n_img, rc.tcfg.flow, gstep)
+            # 路由概率的线性退火只作用在 host 侧的 t 采样上，**不进编译产物**
+            # （device 侧的 FlowConfig 只被 huber/加权读，不读 mix 概率）。
+            # 退火关着时 at_step 返回原对象，逐位等价。
+            fcfg = F.at_step(rc.tcfg.flow, gstep)
+            t_vec = sampler.sample(rng, n_img, fcfg, gstep)
             batch = T.assemble_batch(packs, lats, ctxs, t_vec, mcfg, rc.tcfg.dtype,
                                      _ms_weights(packs, rc.ms_loss_weight))
             k_step, key = jax.random.split(key)
             loss, per, grads = grad_fn(state["master"], consts, params, batch, k_step)
+            if evalset is None and rc.eval_every and rc.eval_t_grid:
+                evalset = _pick_evalset(packs, lats, ctxs, layout, eval_fn, rc)
 
             acc = T.accumulate(acc, grads, acc_n)
             acc_n += 1
+            # 逐图 loss 回喂自适应采样器（**只喂真实图**：填充段的 loss 恒 0，
+            # 喂进去会把它所在的 t 桶的 EMA 直接拉到 0，采样权重整片失真）。
+            # **每个微步都要收**：grad_accum>1 时只收最后一个微步，等于把
+            # (accum-1)/accum 的反馈扔了，自适应会按一份偏小的样本更新 EMA。
+            v = _valid_mask(packs) > 0
+            fb.append((t_vec[v], np.asarray(per, np.float32).reshape(-1)[v]))
             if acc_n < rc.tcfg.grad_accum:
                 continue
             if rc.tcfg.grad_accum > 1:
@@ -216,12 +278,9 @@ def main(argv=None) -> int:
             state, diag = T.apply_update(state, acc, rc.tcfg.adamw)
             acc, acc_n = None, 0
             gstep += 1
-
-            # 逐图 loss 回喂自适应采样器（**只喂真实图**：填充段的 loss 恒 0，
-            # 喂进去会把它所在的 t 桶的 EMA 直接拉到 0，采样权重整片失真）
-            v = _valid_mask(packs) > 0
-            per_np = np.asarray(per, np.float32).reshape(-1)
-            sampler.update(t_vec[v], per_np[v])
+            sampler.update(np.concatenate([f[0] for f in fb]),
+                           np.concatenate([f[1] for f in fb]))
+            fb = []
 
             if gstep % rc.log_every == 0:
                 print(f"e{epoch} s{gstep} loss {float(loss):.5f} "
@@ -229,9 +288,8 @@ def main(argv=None) -> int:
                       f"| 图 {int(v.sum())} 填充率 "
                       f"{sum(sum(p.real_lens) for p in packs) / (len(packs)*layout.budget):.1%}"
                       f" | {time.time()-t_epoch:.1f}s")
-            if rc.eval_every and gstep % rc.eval_every == 0 and rc.eval_t_grid:
-                _run_eval(eval_fn, state, consts, params, packs, lats, ctxs,
-                          mcfg, rc, layout)
+            if rc.eval_every and gstep % rc.eval_every == 0 and evalset:
+                _run_eval(state, consts, params, mcfg, rc, evalset)
                 print("  " + sampler.summary())
             if rc.save_every_steps and gstep % rc.save_every_steps == 0:
                 _save(out_dir, rc, state, plans, mcfg, sampler, gstep)
@@ -242,7 +300,11 @@ def main(argv=None) -> int:
                 _save(out_dir, rc, state, plans, mcfg, sampler, gstep)
                 print("到达 max_steps，结束")
                 return 0
-        _save(out_dir, rc, state, plans, mcfg, sampler, gstep)
+        # yaml 的 save_every 是"每几个 epoch 存一次"。以前这里无条件每 epoch 存，
+        # save_every: 5 会被静默当成 1（多存不致命，但同一份 yaml 在两个后端上
+        # 产物节奏不同，事后对不上）。0 = 不按 epoch 存。
+        if rc.save_every and (epoch + 1) % rc.save_every == 0:
+            _save(out_dir, rc, state, plans, mcfg, sampler, gstep)
     return 0
 
 
@@ -273,12 +335,37 @@ def _advise_steps(steps, carry, rc) -> None:
           f"再考虑 repeats；调小 navit_token_budget 会改变有效 batch，算改实验。")
 
 
-def _run_eval(eval_fn, state, consts, params, packs, lats, ctxs, mcfg, rc, layout):
-    """在**固定 t 网格**上跑一次 eval：同一批图、同一个 t，只有权重在变。
+def _pick_evalset(packs, lats, ctxs, layout, eval_fn, rc):
+    """把**第一步**的那批图冻成 eval 集。
 
-    这样 eval 曲线的每个点都可比 —— 训练 loss 的波动大部分来自 t 的随机性，
-    盯着它看不出"学得怎么样"。t 网格来自 yaml 的 `eval_t_grid`。
+    以前 eval 用的是"当前训练步"的 packs —— 每次 eval 换一批图，于是 eval 曲线
+    上相邻两点的差里混着"换了图"和"权重变了"两件事，而它存在的全部理由就是
+    把后者单独看出来。冻住之后每个点只有权重在动。
+
+    图**故意取自训练集**（这条路线没有独立的 held-out 集，latent 缓存只有一份）：
+    它量的是"对这批图的拟合到了什么程度"，不是泛化。
+
+    yaml 的 `eval_count` 在这里只当上限提示打印出来：一步的图数由布局决定
+    （8 卡 x 每 pack 段数），不能自由取 16 张 —— 少一张就换一个布局、换一次编译。
+
+    **存的是 host 侧材料，不是组装好的 batch**：4 个 t 的 batch 常驻要几百 MB
+    设备内存，而单 chip 只有 15.7GiB、budget 已经贴顶。每 40 步重装一次的
+    host 开销可以忽略。
     """
+    n_real = sum(1 for p in packs for i in range(layout.n_seg)
+                 if i < len(p.real_lens) and p.real_lens[i] > 0)
+    note = (f"（yaml eval_count={rc.eval_count}；一步的图数由布局决定，取不到任意值）"
+            if rc.eval_count else "")
+    print(f"  eval 固定集：{n_real} 张图 x {len(rc.eval_t_grid)} 个 t{note}")
+    return (eval_fn, packs, lats, ctxs, layout)
+
+
+def _run_eval(state, consts, params, mcfg, rc, evalset):
+    """在**固定图 + 固定 t 网格**上跑一次 eval，只有权重在变。
+
+    训练 loss 的波动大部分来自 t 的随机性与换图，盯着它看不出"学得怎么样"。
+    """
+    eval_fn, packs, lats, ctxs, layout = evalset
     n_img = len(packs) * layout.n_seg
     key = jax.random.PRNGKey(rc.eval_seed)
     outs = []

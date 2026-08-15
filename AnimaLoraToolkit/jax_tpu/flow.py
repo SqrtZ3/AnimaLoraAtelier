@@ -79,6 +79,14 @@ class FlowConfig:
     t_max: float = 1.0
     stratified: bool = False
     stratified_oversample: int = 32
+    # ── 路由概率的线性退火（objective.py:314 `anneal_mix_prob`）──────────────
+    #: `*_end < 0` 或 `anneal_end <= anneal_start` = 禁用（yaml 默认就是这样）。
+    #: **只影响 host 侧的 t 采样**，不进任何编译产物 —— 所以每步换一份
+    #: FlowConfig 不会触发重编译（见 `at_step`）。
+    mix_anneal_start: int = 0
+    mix_anneal_end: int = 0
+    mix_low_prob_end: float = -1.0
+    mix_high_prob_end: float = -1.0
     # ── 主 loss ──────────────────────────────────────────────────────────────
     loss_type: str = "mse"
     huber_c: float = 0.1
@@ -201,6 +209,38 @@ def _draw_jax(key, n: int):
             "z_hi": jax.random.normal(k[2], (n,), jnp.float32),
             "u": jax.random.uniform(k[3], (n,), jnp.float32),
             "u_route": jax.random.uniform(k[4], (n,), jnp.float32)}
+
+
+def anneal_mix_prob(base: float, end: float, step: int,
+                    start: int, stop: int) -> float:
+    """objective.py:314 —— 路由概率的线性退火。`end<0` 或 `stop<=start` = 禁用。"""
+    if end < 0 or stop <= start:
+        return float(base)
+    prog = min(max((step - start) / float(stop - start), 0.0), 1.0)
+    return float(base) + (float(end) - float(base)) * prog
+
+
+def at_step(cfg: FlowConfig, step: int) -> FlowConfig:
+    """把第 `step` 步的退火后路由概率算进去，返回一份新的 FlowConfig。
+
+    **只该喂给 host 侧的 t 采样**（`sample_t_np` / `sched.AdaptiveTimestepSampler`）。
+    device 侧用到 FlowConfig 的只有 huber_delta / elem_loss / loss_weight，都不读
+    mix 概率，所以这份逐步变化的配置不会进编译身份 —— 但也别把它塞进
+    `TrainConfig` 再交给 `make_grad_fn`，那会让每步换一份 tcfg 从而每步重编译。
+
+    退火关着时（yaml 默认 `*_prob_end: -1`）返回**原对象**，零开销、零行为差异。
+    """
+    from dataclasses import replace as _replace
+    if cfg.mix_low_prob_end < 0 and cfg.mix_high_prob_end < 0:
+        return cfg
+    if cfg.mix_anneal_end <= cfg.mix_anneal_start:
+        return cfg
+    return _replace(
+        cfg,
+        mix_low_prob=anneal_mix_prob(cfg.mix_low_prob, cfg.mix_low_prob_end, step,
+                                     cfg.mix_anneal_start, cfg.mix_anneal_end),
+        mix_high_prob=anneal_mix_prob(cfg.mix_high_prob, cfg.mix_high_prob_end, step,
+                                      cfg.mix_anneal_start, cfg.mix_anneal_end))
 
 
 def sample_t(key, n: int, cfg: FlowConfig) -> jnp.ndarray:

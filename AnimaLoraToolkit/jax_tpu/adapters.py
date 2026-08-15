@@ -251,13 +251,24 @@ def init(key, model_cfg, cfg: AdapterConfig, targets: Sequence[str],
     return trainable, consts, plans
 
 
-def _base_weight(stacked_params: PyTree, target: str) -> jnp.ndarray:
-    """从 `stack_blocks` 之后的参数树里取某个 target 的 [L, out, in] 权重。"""
-    node: Any = stacked_params["blocks"]
-    for part in target.split("."):
-        node = node[part]
+def _base_weight(base_params: PyTree, target: str) -> jnp.ndarray:
+    """取某个 target 的 [L, out, in] 权重。**两种块布局都接受**。
+
+    scan 布局（`stack_blocks` 之后）直接取；展开布局（`blocks` 是 list）**只把这一个
+    target 堆起来**——不要为了取 DoRA 初值把整棵 3.91GB 的权重树 stack 一份，
+    那会让展开路径在 init 阶段就峰值翻倍（单 chip 只有 15.7GiB）。
+    """
+    def pick(node: Any) -> Any:
+        for part in target.split("."):
+            node = node[part]
+        return node
+
+    blocks = base_params["blocks"]
+    node = (jnp.stack([pick(b) for b in blocks])
+            if isinstance(blocks, (list, tuple)) else pick(blocks))
     if not hasattr(node, "ndim") or node.ndim != 3:
-        raise ValueError(f"target {target!r} 取到的不是 [L,out,in]（是不是没 stack_blocks？）")
+        raise ValueError(f"target {target!r} 取到的不是 [L,out,in]（拿到 "
+                         f"{getattr(node, 'shape', type(node))}）")
     return node
 
 

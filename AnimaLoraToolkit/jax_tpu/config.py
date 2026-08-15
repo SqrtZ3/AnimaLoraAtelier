@@ -87,8 +87,8 @@ _HANDLED = {
     "aux_spectral_wavelet_lambda", "aux_spectral_t_gate",
     "eval_every", "eval_count", "eval_t_grid", "eval_seed",
     "output_dir", "output_name", "save_every", "save_every_steps",
-    "save_state_every", "resume_lora", "resume_state",
-    "log_every", "grad_norm_log_every", "telemetry_enabled",
+    "save_state_every", "resume_state",
+    "log_every",
 }
 
 #: 由 **PyTorch 侧的离线缓存**负责，TPU 训练时不再需要（读的是缓存产物）。
@@ -114,6 +114,9 @@ _IGNORED = {
     "use_per_block_checkpoint", "telemetry_freq_bands", "telemetry_slope_window",
     "telemetry_optimizer_every", "telemetry_capacity_every",
     "bucket_drop_last", "effective_batch_size", "lora_one_init_scale",
+    # 纯展示/日志：TPU 侧每 log_every 步就打一次 gnorm，没有独立的遥测通道。
+    # 归在这里而不是 _HANDLED —— 它们不改训练数学，但也确实没被读。
+    "grad_norm_log_every", "telemetry_enabled",
 }
 
 #: 没移植。值 = (判定"是否被打开"的函数, 原因与替代路径)。
@@ -141,6 +144,11 @@ _UNPORTED: Dict[str, Tuple[Any, str]] = {
     "weight_cap_ratio": (lambda v: float(v or 0) > 0, "loss 权重上限比未移植。"),
     "fit_packed_training": (bool, "FiT 打包训练与 NaViT 打包是两条路，TPU 侧只走 NaViT。"),
     "token_bucket": (bool, "token_bucket 是 PyTorch DataLoader 侧的调度，TPU 侧走 packing.py。"),
+    "resume_lora": (lambda v: bool(str(v or "").strip()),
+                    "从 safetensors 里读回 LoRA 未实现（export.py 只有写，没有读；"
+                    "逐块 rank 还要按 rmax 重新补齐，键对不上会静默变成"
+                    "\"从零开始训\"）。续训请用 resume_state —— 它连优化器一二阶矩"
+                    "与自适应采样器的 EMA 一起存，才是真正的接棒。"),
 }
 
 
@@ -181,6 +189,8 @@ class RunConfig:
     caption_dropout: float = 0.0
     epochs: int = 200
     max_steps: int = 0
+    #: 每几个 epoch 存一次 LoRA（yaml 的 `save_every`）。0 = 只在 max_steps 收尾时存。
+    save_every: int = 1
     save_every_steps: int = 0
     save_state_every: int = 0
     eval_every: int = 0
@@ -188,7 +198,6 @@ class RunConfig:
     eval_t_grid: Tuple[float, ...] = ()
     eval_seed: int = 1234
     log_every: int = 1
-    resume_lora: str = ""
     resume_state: str = ""
     #: 未移植但被显式放行（--allow-unported）的键，训练开始时要再打印一次。
     waived: Tuple[str, ...] = ()
@@ -276,6 +285,10 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
         t_min=_f(d, "timestep_t_min", 0.0),
         t_max=_f(d, "timestep_t_max", 1.0),
         stratified=_b(d, "timestep_stratified"),
+        mix_anneal_start=_i(d, "timestep_mix_anneal_start", 0),
+        mix_anneal_end=_i(d, "timestep_mix_anneal_end", 0),
+        mix_low_prob_end=_f(d, "timestep_mix_low_prob_end", -1.0),
+        mix_high_prob_end=_f(d, "timestep_mix_high_prob_end", -1.0),
         loss_type=str(d.get("loss_type", "mse")).lower(),
         huber_c=_f(d, "huber_c", 0.1),
         huber_schedule=str(d.get("huber_schedule", "constant")).lower(),
@@ -345,13 +358,13 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
         flip_prob=(0.5 if _b(d, "flip_augment") else 0.0),
         caption_dropout=_f(d, "caption_dropout_rate"),
         epochs=_i(d, "epochs", 200), max_steps=_i(d, "max_steps", 0),
+        save_every=_i(d, "save_every", 1),
         save_every_steps=_i(d, "save_every_steps", 0),
         save_state_every=_i(d, "save_state_every", 0),
         eval_every=_i(d, "eval_every", 0), eval_count=_i(d, "eval_count", 0),
         eval_t_grid=_parse_grid(d.get("eval_t_grid", "")),
         eval_seed=_i(d, "eval_seed", 1234),
         log_every=max(_i(d, "log_every", 1), 1),
-        resume_lora=str(d.get("resume_lora", "") or ""),
         resume_state=str(d.get("resume_state", "") or ""),
         waived=tuple(waived),
     )

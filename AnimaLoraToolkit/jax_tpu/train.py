@@ -409,10 +409,19 @@ def apply_update(state, grads, cfg: O.AdamWConfig):
 
 
 def accumulate(acc, grads, n: int):
-    """梯度累加（host 侧驱动，跨布局也成立）。n=1 时直接返回 grads。"""
+    """梯度累加（host 侧驱动，跨布局也成立）。
+
+    **在 fp32 上累加**：`grad_fn` 里参数在进 `value_and_grad` 之前就被降到 bf16，
+    所以回来的余切也是 bf16（8 位尾数）。前向/反向用 bf16 是这条路线的既定口径，
+    但"把若干微步的梯度加起来"没有理由也在 bf16 上做 —— 那是纯粹白丢精度，
+    而且丢得不均匀（先加的微步被后加的舍入吃掉），不报错。
+    优化器本来就要把它转成 fp32（optim.update），这里只是把转换提前到累加之前。
+    第一个微步也转，否则 grad_accum=1 与 >1 的 dtype 路径不一致。
+    """
+    g32 = jax.tree.map(lambda x: x.astype(jnp.float32), grads)
     if acc is None:
-        return grads
-    return jax.tree.map(lambda a, b: a + b, acc, grads)
+        return g32
+    return jax.tree.map(lambda a, b: a + b, acc, g32)
 
 
 def _shard_map(f, mesh, in_specs, out_specs):

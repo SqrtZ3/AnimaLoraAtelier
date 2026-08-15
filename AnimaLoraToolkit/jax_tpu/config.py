@@ -109,7 +109,7 @@ _IGNORED = {
     "batch_size", "num_workers", "torch_compile", "attn_force_autocast_dtype",
     "keep_vae_on_gpu", "empty_cache_after_sample", "no_progress", "no_monitor",
     "monitor_host", "monitor_port", "no_browser", "loss_curve_steps",
-    "stage_timing_every", "stage_timing_warmup", "dora_export_mode",
+    "stage_timing_every", "stage_timing_warmup",
     "disable_tlora_hooks", "use_precommit_lora_forward",
     "use_per_block_checkpoint", "telemetry_freq_bands", "telemetry_slope_window",
     "telemetry_optimizer_every", "telemetry_capacity_every",
@@ -144,6 +144,11 @@ _UNPORTED: Dict[str, Tuple[Any, str]] = {
     "weight_cap_ratio": (lambda v: float(v or 0) > 0, "loss 权重上限比未移植。"),
     "fit_packed_training": (bool, "FiT 打包训练与 NaViT 打包是两条路，TPU 侧只走 NaViT。"),
     "token_bucket": (bool, "token_bucket 是 PyTorch DataLoader 侧的调度，TPU 侧走 packing.py。"),
+    "dora_export_mode": (lambda v: str(v or "native").lower() != "native",
+                         "TPU 侧的 export.py 只写 native（`dora_scale` 单独一个键）。"
+                         "trainer/lora.py:1485 的另外两档 diff / merged_model 要在导出时"
+                         "物化 ΔW 或整模合并，没移植。留 native，或用 tools/ 下的转换脚本"
+                         "在本地转。"),
     "resume_lora": (lambda v: bool(str(v or "").strip()),
                     "从 safetensors 里读回 LoRA 未实现（export.py 只有写，没有读；"
                     "逐块 rank 还要按 rmax 重新补齐，键对不上会静默变成"

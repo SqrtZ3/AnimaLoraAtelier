@@ -149,7 +149,7 @@ class CacheDataset:
             self._empty_ctx = self._read_ctx(q, "_empty")
 
     def _scan(self) -> None:
-        missing_lat, missing_txt, bad = [], [], []
+        missing_lat, missing_txt, bad, no_flip = [], [], [], []
         n_ms = 0
         stems = sorted({p.with_suffix("") for p in self.dir.iterdir()
                         if p.suffix.lower() in IMG_EXT})
@@ -166,6 +166,8 @@ class CacheDataset:
                     bad.append(f"{stem.name}: 无 latent 键")
                     continue
                 shape = z["latent"].shape
+                if self.flip_prob > 0 and "latent_flipped" not in z.files:
+                    no_flip.append(stem.name)
             if len(shape) != 4 or shape[0] != LATENT_CHANNELS:
                 bad.append(f"{stem.name}: latent 形状 {shape}（应为 [16, T, H, W]）")
                 continue
@@ -182,6 +184,19 @@ class CacheDataset:
                 f"multiscale=true 但 {self.dir} 下没有任何 `*.ms<档>.npz` 缓存。\n"
                 f"  那些副本由 PyTorch 侧的缓存流程产出（trainer/data.py:2216），"
                 f"这里不做图像处理。先带 --navit-multiscale 跑一遍缓存。")
+        if no_flip:
+            # `load_tokens` 里那句 `"latent_flipped" in z.files` 本身是安全的写法，
+            # 但配上 `flip_augment: true` 就成了静默降级：yaml 说要翻转、实际一次
+            # 都没翻，日志上完全看不出来。PyTorch 侧不会这样 —— trainer/data.py:2258
+            # 在缓存缺 latent_flipped 时直接判缓存失效并重新编码。这里没有编码器可以
+            # 重编，所以只能拦下来。
+            raise FileNotFoundError(
+                f"flip_augment 开着，但 {len(no_flip)} 个 latent 缓存里没有 "
+                f"`latent_flipped`（如 {no_flip[:3]}）。\n"
+                f"  翻转必须在**像素域**做完再 encode（VAE 卷积不是 flip-等变的），"
+                f"训练时没有 VAE 补不了。\n"
+                f"  要么带 flip 重跑一遍 PyTorch 侧的 latent 缓存，"
+                f"要么把 yaml 的 flip_augment 关掉 —— 别让它静默不生效。")
         if missing_lat or missing_txt or bad:
             parts = []
             if missing_lat:

@@ -147,6 +147,58 @@ AdamW 的 `‖Δp‖` 报出**负数**（范数不可能为负）、bf16 吞吐�
 CUDA 上 `device_type == 'cuda'`，与原装饰器等价；CPU 上原来就无效果（cuda autocast 不作用于 cpu
 张量），新实现显式跳过，保持无效果。
 
+**补一刀（真机日志实测）**：改成 `torch.autocast('npu', dtype=torch.float32)` 之后，昇腾真机
+训练日志里会出现
+
+```
+UserWarning: In npu autocast, but the target dtype is not supported. Disabling autocast.
+ npu Autocast only supports dtypes of torch.float16, torch.bfloat16 currently.
+```
+
+即 torch_npu 的 autocast **只支持 fp16/bf16**，传 fp32 会走 `torch/amp/autocast_mode.py` 的
+`if enabled and self.fast_dtype not in supported_dtype` 分支：打一条 warning，然后把 `enabled`
+直接置 False。所以昇腾上这个"fp32 区域"**从来没有真的按 fp32 autocast 跑过**，一直是
+enabled=False——又一处靠 warning 表达的静默降级（Python warning 默认每个位置只报一次，很容易被
+淹没在日志里）。
+
+已把 npu 分支显式改成 `torch.autocast('npu', enabled=False)`：
+
+- **与 torch_npu 当前实际行为逐位一致**，不是行为变更；
+- 不再依赖一条会被吞掉的警告，也不会在 torch_npu 将来支持 fp32 autocast 时行为突变；
+- CUDA 分支保持 `dtype=torch.float32` 原样，逐字节不动。
+
+为什么 `enabled=False` 在这个唯一用途上和 fp32 autocast 等价：`RMSNorm.forward` 的区域里只有
+`pow/mean/rsqrt/mul` 这些**非 autocast 算子**（autocast 只改 matmul/conv 等白名单算子的 dtype），
+`x` 已由 `.float()` 显式提到 fp32，`output * self.weight` 的 dtype 由 type promotion
+（bf16 × fp32 → fp32）决定。**若以后往这个区域里加 matmul 之类的白名单算子，两条路就不再等价，
+必须重新裁决。**
+
+顺带明确一句归因边界：这处降级**不足以解释**昇腾 run 训出的 LoRA 强度偏高（见 §4.2 的实验设计）——
+按上面的分析它在 RMSNorm 上是数值中性的。修它的理由是消除静默降级本身，不是把它当作那个现象的根因。
+
+## 4.2 待裁决：昇腾 run 训出的 LoRA 强度偏高（现象已确认，根因未定）
+
+**客观现象**（本地 checkpoint 取证，两份成品都是同一套 C12 配方）：
+
+| | ‖w1‖ 均值 ep1→末 | ‖w2‖ 均值 ep1→末 | ‖ΔW‖_F 轨迹 | cross_attn 能量占比 ep1→末 |
+|---|---|---|---|---|
+| 昇腾 / jima（206 张） | 0.376 → **0.428（升）** | 6.17 → 14.18 | 41.4 单调涨到 **113.2** | 25.8% → 31.5% |
+| CUDA / villainchin | 0.340 → **0.155（降）** | 5.85 → 11.91 | 峰值 41.9 后回落锁定 **35.7** | 23.5% → **51.0%** |
+
+`‖w2‖` 两边增长曲线几乎重合，差别全在 LoKr 的 w1（每模块 4×4 的总增益因子）走向相反：
+CUDA 上 w1 收缩抵消 w2 的增长（净强度稳定），昇腾上两者同向 → 乘积膨胀到 3.2 倍。
+方向动力学两边同构（相邻 epoch 的 ΔW 余弦 0.93~0.98）、无 NaN、grad_norm 0.002~0.005
+从未触发 clip —— **不是"训坏了"，是强度失控**。
+
+**混杂变量（三个，尚未拆开）**：① 数据集不同；② `navit_token_budget` 65536 vs 131072；
+③ 平台/注意力后端 npu+npu_tnd vs cuda+xformers。**现有证据不足以归罪昇腾平台**，
+本文档 §4.1 那处 autocast 降级按其语义分析是数值中性的，也不解释这个现象。
+
+**裁决实验**：`config/train_npu_c12_ab_dataset.yaml`（昇腾 + villainchin + budget 65536，
+与已跑完的 jima run **只差数据集**），跑 3 个 epoch 用
+`tools/lokr_strength_probe.py` 看 ‖w1‖ 走向即可分出"数据集"与"平台/预算"。
+判读方法、参照曲线与 fallback 都写在那个 yaml 的头部。
+
 ## 5. OpenI/启智 侧的事实（2026-08 查自平台帮助文档与镜像列表）
 
 **可用镜像**：在 `/explore/images` 用「昇腾NPU + PyTorch」筛选，**全站公开镜像只有 2 个**：

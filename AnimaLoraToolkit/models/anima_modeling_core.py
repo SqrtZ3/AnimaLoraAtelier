@@ -179,13 +179,35 @@ def _packed_attention_npu_tnd(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D, seg: _SegLens):
 
 @contextlib.contextmanager
 def _fp32_autocast(dev_type: str):
-    """在支持 autocast 的加速器上开一个 fp32 autocast 区域；其余设备是 no-op。
+    """在支持 autocast 的加速器上开一个"不要降精度"的区域；其余设备是 no-op。
 
     只对 ``cuda`` / ``npu`` 生效：CPU autocast 只支持 bf16/fp16，开 fp32 会报错，而
     原来的 ``@torch.autocast('cuda', ...)`` 装饰器在 CPU 上本来就无效果——保持一致。
+
+    **两条路的写法不同，原因见下（这不是笔误）：**
+
+    - ``cuda``：``autocast(dtype=fp32)``，与原装饰器逐字节等价，行为不动。
+    - ``npu``：``autocast(enabled=False)``。torch_npu 的 autocast **只支持
+      fp16/bf16**，传 fp32 会走 ``torch/amp/autocast_mode.py`` 的
+      ``if enabled and self.fast_dtype not in supported_dtype`` 分支——打一条
+      ``"In npu autocast, but the target dtype is not supported. Disabling
+      autocast."`` 然后把 ``enabled`` 直接置 False。也就是说昇腾上这段代码**一直**
+      落在 enabled=False，只是靠一条 Python warning（默认每个位置只报一次）表达，
+      属于静默降级。这里显式写出来：与 torch_npu 当前实际行为逐位一致，不再依赖
+      被吞掉的警告，也不会在 torch_npu 将来支持 fp32 autocast 时行为突变。
+
+    为什么 ``enabled=False`` 在本函数唯一的用途（:meth:`RMSNorm.forward`）上与 fp32
+    autocast 等价：区域内只有 ``pow/mean/rsqrt/mul`` 这些**非 autocast 算子**
+    （autocast 只改 matmul/conv 等白名单算子的 dtype），``x`` 已由调用方 ``.float()``
+    显式提到 fp32，``output * self.weight`` 的结果由 type promotion
+    （bf16 × fp32 → fp32）决定——两种写法给出同一个 dtype 链条。若以后往这个区域里
+    加 matmul 之类的白名单算子，两条路就**不再等价**，届时必须重新裁决。
     """
-    if dev_type in ("cuda", "npu"):
+    if dev_type == "cuda":
         with torch.autocast(dev_type, dtype=torch.float32):
+            yield
+    elif dev_type == "npu":
+        with torch.autocast(dev_type, enabled=False):
             yield
     else:
         yield

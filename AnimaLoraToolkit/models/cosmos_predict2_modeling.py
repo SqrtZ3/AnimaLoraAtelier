@@ -58,13 +58,19 @@ def _resize_nearest(x: torch.Tensor, size) -> torch.Tensor:
 
 @contextlib.contextmanager
 def _fp32_autocast(dev_type: str):
-    """在支持 autocast 的加速器上开 fp32 autocast 区域；其余设备 no-op。
+    """在支持 autocast 的加速器上开一个"不要降精度"的区域；其余设备 no-op。
 
     与 ``models/anima_modeling_core._fp32_autocast`` 同义（两个文件互不 import，
-    刻意各留一份而不是跨模块依赖）。
+    刻意各留一份而不是跨模块依赖）——**改这里记得同步改那边**，完整理由写在那份的
+    docstring 里。摘要：昇腾的 autocast 只支持 fp16/bf16，传 fp32 会被 torch_npu
+    静默降级成 enabled=False（只打一条 warning），这里显式写成 enabled=False；
+    CUDA 路径保持 fp32 autocast 不动。
     """
-    if dev_type in ("cuda", "npu"):
+    if dev_type == "cuda":
         with torch.autocast(dev_type, dtype=torch.float32):
+            yield
+    elif dev_type == "npu":
+        with torch.autocast(dev_type, enabled=False):
             yield
     else:
         yield

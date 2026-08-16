@@ -412,6 +412,13 @@ bash tools/npu_setup_image.sh             # 装必需依赖 + 跑探针
 （容器内改不了驱动），所以正确做法是**直接挑一个自带高版本 CANN 的镜像**，而不是在低版本镜像里
 折腾。`tools/npu_setup_image.sh` 已按这张表实现「读 CANN 实际版本 → 选配套 torch」。
 
+**想试 CANN 9？先跑 `tools/npu_check_cann9.sh`（只读，不装任何东西）**。它一次捞全
+driver / firmware / 芯片 / 当前 CANN / torch_npu 现状，对照官方兼容区间
+（CANN 9.0.0 Toolkit 最低兼容 8.5.0 的 ops 包）给出定性判定，并附硬试时的装前快照与
+装后验证清单。判据要点：驱动在宿主机、容器内改不了，8.2.RC2 镜像的配套驱动（24.1.x 线）
+配 CANN 9 大概率报 `driver version mismatch` / acl 初始化失败；具体配套版本以昇腾
+[兼容性查询助手](https://www.hiascend.com/hardware/compatibility) 为准。
+
 **架构决定 torch 的安装源**（最容易废掉环境的一步）：`x86_64` 走默认 PyPI 会拉到 **CUDA 构建**的
 torch（几个 GB 且 torch_npu 不认），必须 `--index-url https://download.pytorch.org/whl/cpu`；
 `aarch64` 的 PyPI wheel 本来就是 CPU 构建，直接装。脚本已按 `uname -m` 分支。

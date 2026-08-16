@@ -969,8 +969,28 @@ class LoKrLayer(torch.nn.Module):
         tmp = torch.matmul(x_flat, w2_b.transpose(0, 1))
         tmp, mask_BR = self._apply_tlora_mask_kron(tmp, orig_shape)
         tmp = torch.matmul(tmp, w2_a.transpose(0, 1))
-        # 用 (factor, factor) 在前广播：w1 @ (B*, factor, out_dim) -> (B*, factor, out_dim)
-        y = torch.matmul(w1, tmp)
+        # 用 (factor, factor) 在前：w1 @ (B*, factor, out_dim) -> (B*, factor, out_dim)
+        #
+        # ⚠ 这里**不能**写成 `torch.matmul(w1, tmp)`（2D × 3D，左操作数隐式广播）。
+        # 昇腾 torch_npu 2.6 上这条路径的 **backward 对左操作数算错**：前向逐位正确，
+        # 但 dL/dw1 需要沿被广播的 batch 维求和归约，torch_npu 归约错了。真机实测
+        # （tests/diag_npu_broadcast_matmul_grad.py，w1 (4,4) × tmp (2048,4,512) fp32）：
+        #
+        #     matmul(w1, tmp) 隐式广播   w1.grad cos=0.1656  相对误差 133.9%
+        #     einsum / expand+bmm / 纯 2D mm / w1 挪右操作数   cos=1.000000  ≤0.001%
+        #
+        # 后果不是数值噪声而是训练动力学变质：w1 是 LoKr 的**总增益因子**
+        # （ΔW = s·kron(w1, U)），它的梯度错 → 总强度失去负反馈 → ‖ΔW‖ 单调膨胀。
+        # 昇腾上实测 12 epoch 涨到 CUDA 同配方的 3.2 倍，成品推理时压过文本条件。
+        # 归因全过程见 docs/ascend-npu.md §4.2。
+        #
+        # 这里改用 expand + bmm：把"沿 batch 维的求和归约"从 matmul 内核里拿出来，
+        # 交给 autograd 的 ExpandBackward（与后端 GEMM 内核无关），因此不依赖任何
+        # 平台对广播 matmul 的实现是否正确。expand 是 stride-0 view，物化代价
+        # 是 (B*, factor, factor) 的小张量，可忽略。
+        # 注：3D × 2D（右操作数广播，如上面两行的 w2_b / w2_a）在昇腾上是**正确**的，
+        # 只有左操作数广播这一种形态中招，所以那两行不动。
+        y = torch.bmm(w1.unsqueeze(0).expand(tmp.shape[0], -1, -1), tmp)
 
         # Ortho init compensation for LoKr T-LoRA：减去用 init 权重 + 同一 mask 的贡献，
         # 让训练 step 0 时净 delta ≈ 0。实验性，论文未覆盖。
@@ -995,7 +1015,11 @@ class LoKrLayer(torch.nn.Module):
                 ).reshape(P, self.factor, self.rank)
                 tmp_i = tmp_i * mask_view
             tmp_i = torch.matmul(tmp_i, w2a_init.transpose(0, 1))
-            y_init = torch.matmul(w1_init, tmp_i)
+            # 同上：避开 2D×3D 左操作数广播（w1_init 当前不需要梯度，但形态一致
+            # 更安全，也免得将来放开它可训练时又踩一次）
+            y_init = torch.bmm(
+                w1_init.unsqueeze(0).expand(tmp_i.shape[0], -1, -1), tmp_i
+            )
             y = y - y_init
 
         # reshape 回 (..., out_features)

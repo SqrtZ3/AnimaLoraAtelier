@@ -176,7 +176,19 @@ enabled=False——又一处靠 warning 表达的静默降级（Python warning �
 顺带明确一句归因边界：这处降级**不足以解释**昇腾 run 训出的 LoRA 强度偏高（见 §4.2 的实验设计）——
 按上面的分析它在 RMSNorm 上是数值中性的。修它的理由是消除静默降级本身，不是把它当作那个现象的根因。
 
-## 4.2 待裁决：昇腾 run 训出的 LoRA 强度偏高（现象已确认，根因未定）
+## 4.2 【已结案】昇腾 run 训出的 LoRA 强度失控 —— torch_npu 广播 matmul 的 backward bug
+
+> **根因**：`torch_npu` 2.6 上 **2D × 3D matmul 在左操作数被广播时，backward 对左操作数
+> 的梯度算错**（前向逐位正确）。`LoKrLayer._compute` 用它把 (F,F) 的 w1 作用到
+> (B*,F,out_dim) 上，于是 LoKr 的**总增益因子** w1 拿到的是错的梯度。
+> **已修**：改用 `expand + bmm`，把沿 batch 维的求和归约从 matmul 内核里拿出来交给
+> autograd 的 `ExpandBackward`。回归测试见 `tests/test_lokr_w1_grad_no_broadcast.py`。
+> **影响**：此前所有昇腾上训出的 LoKr 成品都受影响，需重训。CUDA 成品不受影响
+> （该 bug 在 CUDA 上不复现）。
+
+下面保留完整的归因链条，供以后遇到同类现象时复用。
+
+### 现象
 
 **客观现象**（本地 checkpoint 取证，两份成品都是同一套 C12 配方）：
 
@@ -190,14 +202,76 @@ CUDA 上 w1 收缩抵消 w2 的增长（净强度稳定），昇腾上两者同�
 方向动力学两边同构（相邻 epoch 的 ΔW 余弦 0.93~0.98）、无 NaN、grad_norm 0.002~0.005
 从未触发 clip —— **不是"训坏了"，是强度失控**。
 
-**混杂变量（三个，尚未拆开）**：① 数据集不同；② `navit_token_budget` 65536 vs 131072；
-③ 平台/注意力后端 npu+npu_tnd vs cuda+xformers。**现有证据不足以归罪昇腾平台**，
-本文档 §4.1 那处 autocast 降级按其语义分析是数值中性的，也不解释这个现象。
+起初有三个混杂变量：① 数据集不同；② `navit_token_budget` 65536 vs 131072；
+③ 平台/注意力后端。（§4.1 那处 autocast 降级按其语义分析是数值中性的，不解释本现象——
+一开始就标注了这条边界，事后证明确实无关。）
 
-**裁决实验**：`config/train_npu_c12_ab_dataset.yaml`（昇腾 + villainchin + budget 65536，
-与已跑完的 jima run **只差数据集**），跑 3 个 epoch 用
-`tools/lokr_strength_probe.py` 看 ‖w1‖ 走向即可分出"数据集"与"平台/预算"。
-判读方法、参照曲线与 fallback 都写在那个 yaml 的头部。
+### 归因链条（四步，每步都是单变量）
+
+**第 1 步 · 排除数据集。** `config/train_npu_c12_ab_dataset.yaml`：昇腾 + **villainchin**
++ budget 65536，与已跑完的 jima run 只差数据集。3 个 epoch 即分晓：
+
+| | ep1 | ep2 | ep3 |
+|---|---|---|---|
+| 昇腾 + villainchin | 0.3744 | 0.3750 ↑ | **0.3815 ↑** |
+| CUDA + villainchin | 0.3399 | 0.2866 ↓ | **0.2428 ↓** |
+
+同一个训练集，w1 走向相反 → **数据集无罪**。
+
+**第 2 步 · 排除步长，锁定方向。** 从两边 `training_state` 读 optimizer 动量
+（昇腾 step205 vs CUDA step200）：
+
+| | \|m\| 中位 | sqrt(v) 中位 | 更新率 | cos(exp_avg, w1) | 收缩占比 |
+|---|---|---|---|---|---|
+| 昇腾 | 3.1e-7 | 4.6e-6 | 0.062 | **-0.134** | **34.3%** |
+| CUDA | 4.2e-7 | 6.5e-6 | 0.075 | **+0.479** | **87.1%** |
+
+`sqrt(v)` ≫ eps=1e-8 → eps 排除；|m| 与更新率同量级 → 步长排除。差别在**方向**。
+
+**第 3 步 · 缩到单个张量。** `tests/diag_dora_w1_grad.py --device npu`（单层，秒级）：
+
+    w1.grad          cos=-0.5268 / +0.5066     相对误差 640% / 1154%   ← 只有它错
+    w2_a.grad        cos= 0.999998             相对误差 0.153%
+    w2_b.grad        cos= 0.999997             相对误差 0.183%
+    dora_scale.grad  cos= 1.000000             相对误差 0.001%
+
+关掉 DoRA（`lora_variant=base`）w1 依然偏离 → 不在 DoRA 的 `merged_row_norms` 通路上，
+而在 LoKr 自身前向。
+
+**第 4 步 · 缩到单个算子。** `tests/diag_npu_broadcast_matmul_grad.py --device npu`
+（纯算子，不含任何 LoRA 代码，w1 (4,4) × tmp (2048,4,512) fp32）：
+
+| 写法 | 前向 cos | w1.grad cos | 相对误差 |
+|---|---|---|---|
+| `torch.matmul(w1, tmp)`（2D×3D 隐式广播） | 1.000000 | **0.1656** | **133.9%** |
+| `einsum ij,pjo->pio` | 1.000000 | 1.000000 | 0.001% |
+| `expand + bmm` | 1.000000 | 1.000000 | 0.000% |
+| 重排成纯 2D mm | 1.000000 | 1.000000 | 0.000% |
+| w1 挪到右操作数 | 1.000000 | 1.000000 | 0.000% |
+
+**前向对、backward 错**，且只有"左操作数被广播"这一种形态中招——
+3D × 2D（右操作数广播，如 LoKr 前两段 matmul 的 w2_a/w2_b）在昇腾上是正确的，
+这正好解释了"只有 w1.grad 错、其余三个梯度干净"。
+
+### 为什么后果这么严重
+
+w1 是 LoKr 的**总增益因子**（ΔW = s·kron(w1, U)）。它的梯度错不表现为数值噪声，
+而是让总强度失去负反馈：CUDA 上 w1 会主动收缩、抵消 w2 的增长，把 ‖ΔW‖ 锁在 ~35.7；
+昇腾上 w1 与 w2 同向膨胀，12 epoch 涨到 3.2 倍，成品推理时压过文本条件。
+
+### 排查过的其他位置
+
+只有"2D 参数（需要梯度）× 3D 张量"这一形态中招。`trainer/` 全量排查后命中两处：
+`LoKrLayer._compute` 的 `y = matmul(w1, tmp)` 与 ortho-init 补偿块的 `matmul(w1_init, tmp_i)`
+（后者当前不需要梯度，一并改以防将来放开）。其余 matmul 要么 3D×2D、要么 2D×2D。
+`models/` 下底模权重全部 `requires_grad=False`——广播归约只影响**被广播操作数**的梯度，
+激活梯度不受影响，故不涉及。
+
+### 防守
+
+`tests/test_lokr_w1_grad_no_broadcast.py`：① 按定义手工收缩出 dL/dw1 与实现对拍；
+② 一条源码断言禁止改回隐式广播写法。**注意这个 bug 在 CUDA 上不复现**，
+数值测试在 CUDA CI 上永远是绿的，所以那条源码断言是必要的第二道防线。
 
 ## 5. OpenI/启智 侧的事实（2026-08 查自平台帮助文档与镜像列表）
 

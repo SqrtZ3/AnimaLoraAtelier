@@ -57,32 +57,46 @@ for f in /usr/local/Ascend/driver/version.info /usr/local/Ascend/driver/version.
     esac
   fi
 done
-# 另一个取驱动版本的路子：npu-smi 输出头部自带驱动工具链版本
-# （如 "npu-smi 25.2.1"）。openI 容器实测看不到 /usr/local/Ascend/driver/version.info
-# （驱动目录不挂载），npu-smi 头部版本就是判断宿主驱动线的最直接证据。
-if [ -z "$DRIVER_VER" ] && command -v npu-smi >/dev/null 2>&1; then
-  DRIVER_VER="$(npu-smi info 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-  [ -n "$DRIVER_VER" ] && echo "   （npu-smi 头部版本 = 驱动工具链版本，作为 driver 参考）"
+# openI 容器实测：/usr/local/Ascend/driver/version.info 不挂载，但
+# `npu-smi info -t board` 输出里有 Software Version（驱动）与 Firmware Version（固件），
+# 这是容器内判定宿主驱动线的最直接证据。
+if command -v npu-smi >/dev/null 2>&1; then
+  # 容器里 -i 的编号未必是 0（openI 容器可见卡可能是宿主 NPU 7，-i 0 实测报
+  # Invalid card id），从 info 输出里解析第一个可见 NPU 编号
+  first_id="$(npu-smi info 2>/dev/null | sed -nE 's/^\| +([0-9]+) +[A-Za-z0-9]+.*/\1/p' | head -1)"
+  board_out=""
+  if [ -n "$first_id" ]; then
+    board_out="$(npu-smi info -t board -i "$first_id" 2>&1 | head -n 14)"
+    if echo "$board_out" | grep -qiE 'Invalid|Error|not support'; then
+      board_out=""   # -i 失败，下面再试不带 -i 的
+    fi
+  fi
+  if [ -z "$board_out" ] && [ -n "$first_id" ]; then
+    board_out="$(npu-smi info -t board 2>&1 | head -n 14)"
+  fi
+  if [ -n "$board_out" ]; then
+    if [ -z "$DRIVER_VER" ]; then
+      DRIVER_VER="$(echo "$board_out" | grep -m1 'Software Version' \
+                    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    fi
+    if [ -z "$FIRMWARE_VER" ]; then
+      FIRMWARE_VER="$(echo "$board_out" | grep -m1 'Firmware Version' \
+                      | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[.0-9]*' | head -1)"
+    fi
+    echo "   npu-smi board 详情（卡号 ${first_id:-?}）:"
+    echo "$board_out" | sed 's/^/     /'
+  else
+    echo "   （npu-smi 可用但拿不到 board 详情，常见于容器权限限制，不影响判定）"
+  fi
+  # 兜底：npu-smi 输出里带工具链版本行（如 "npu-smi 25.2.1"；真实输出里它在
+  # 表格边框内，不是第一行，所以要全文 grep 而不是 head -1）
+  if [ -z "$DRIVER_VER" ]; then
+    DRIVER_VER="$(npu-smi info 2>/dev/null | grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    [ -n "$DRIVER_VER" ] && echo "   （npu-smi 输出中的版本号 = 驱动工具链版本，作为 driver 参考）"
+  fi
 fi
 kv "driver 版本（解析）" "${DRIVER_VER:-<未解析到>}"
 kv "firmware 版本（解析）" "${FIRMWARE_VER:-<未解析到>}"
-if command -v npu-smi >/dev/null 2>&1; then
-  # 容器里 -i 的编号未必是 0（openI 容器可见卡可能是宿主 NPU 7，-i 0 实测报
-  # Invalid card id），从 info 输出里解析第一个可见 NPU 编号，解析不到就整体列
-  first_id="$(npu-smi info 2>/dev/null | sed -nE 's/^\| +([0-9]+) +[A-Za-z0-9]+.*/\1/p' | head -1)"
-  if [ -n "$first_id" ]; then
-    echo "   npu-smi board 详情（卡号 $first_id）:"
-    out="$(npu-smi info -t board -i "$first_id" 2>&1 | head -n 14)"
-    if echo "$out" | grep -qiE 'Invalid|Error|not support'; then
-      echo "     （容器内拿不到 board 详情，常见，不影响判定）"
-    else
-      echo "$out" | sed 's/^/     /'
-    fi
-  else
-    echo "   npu-smi board 详情:"
-    npu-smi info -t board 2>&1 | head -n 14 | sed 's/^/     /'
-  fi
-fi
 
 # ── 3. 当前 CANN ──────────────────────────────────────────────────────────────
 say "3. 当前 CANN（决定 torch/torch_npu 版本上限，也是与 CANN 9 的差距基准）"

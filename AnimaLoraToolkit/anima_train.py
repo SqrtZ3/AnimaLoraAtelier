@@ -1306,7 +1306,8 @@ def main():
             "dense/eval/采样的 SDPA 口径一致）")
 
     logger.info("加载 VAE...")
-    vae = load_vae(args.vae, device, dtype, repo_root)
+    vae = load_vae(args.vae, device, dtype, repo_root,
+                   attn_chunk_tokens=int(getattr(args, "vae_attn_chunk_tokens", 0) or 0))
 
     logger.info("加载文本编码器...")
     if is_krea2:

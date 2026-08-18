@@ -121,6 +121,7 @@ YAML_TO_ARGS = {
     "cache_encode_tile_px": "cache_encode_tile_px",
     "cache_encode_tile_overlap": "cache_encode_tile_overlap",
     "cache_encode_max_pixels": "cache_encode_max_pixels",
+    "vae_attn_chunk_tokens": "vae_attn_chunk_tokens",
     "alpha_handling": "alpha_handling",
     "alpha_background": "alpha_background",
     "alpha_threshold": "alpha_threshold",
@@ -627,6 +628,17 @@ DEFAULTS = {
     # *above* this budget are tiled, so raising it also means e.g. a 12.5M-px image
     # is encoded whole under a 16M budget (make sure VRAM allows).
     "cache_encode_max_pixels": 0,
+    # VAE 自注意力（wan/vae2_1.py AttentionBlock）的 query 分块大小，单位 token。
+    # 0 = 关闭，走原来的整块 SDPA（与本开关加入前逐字节同一条代码路径）。
+    # 该注意力是单头全局，token 数 N=(H/8)·(W/8)：1712×2432 → N=65056。在有
+    # flash / mem-efficient SDPA 后端的平台上显存 O(N)，无需分块；但当 SDPA 落到
+    # math backend（会物化 N×N 的 softmax 矩阵，如海光 DCU）时显存是 O(N²)——
+    # fp32 下 65056² = 15.77 GiB，单张图就能打爆 64GB 卡（且发生在 latent 缓存阶段，
+    # 训练还没开始）。分块后峰值 ≈ chunk·N：chunk=4096、N=65056 时约 1.0 GiB。
+    # 每个 query 的 softmax 归一化域仍是全部 key，故逐元素数学恒等，不是近似
+    # （tests/test_vae_attn_chunk.py 对拍）。代价是多次 kernel 启动，略慢。
+    # 建议：CUDA/昇腾保持 0；DCU 设 4096。
+    "vae_attn_chunk_tokens": 0,
     "alpha_handling": "none",
     "alpha_background": "neutral",
     "alpha_threshold": 0.01,

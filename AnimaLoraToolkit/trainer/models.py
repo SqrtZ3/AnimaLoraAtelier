@@ -18,6 +18,7 @@ import importlib.util
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -159,11 +160,21 @@ def load_anima_model(transformer_path, device, dtype, repo_root,
         rope_t_extrapolation_ratio=1.0,
     )
 
+    # 构造与权重加载都是纯 CPU 且都以分钟计（2.09B 参数）。分开计时：算力受限的节点上
+    # 这两段能占掉启动的绝大部分，不切开就只能看到一个几分钟的"卡住"。
+    _t0 = time.perf_counter()
     model = Anima(**config)
+    _t_build = time.perf_counter() - _t0
 
+    _t0 = time.perf_counter()
     _load_safetensors_into_model(
         model, Path(transformer_path), label="Transformer",
         skip_buffer_patterns=_RECOMPUTABLE_BUFFER_PATTERNS,
+    )
+    _t_load = time.perf_counter() - _t0
+    logger.info(
+        "Transformer 启动耗时: 构造(CPU 随机初始化) %.1fs + 权重加载 %.1fs "
+        "(torch 线程数=%d)", _t_build, _t_load, torch.get_num_threads(),
     )
 
     # 如果 checkpoint 中完全没有 llm_adapter 权重，随机初始化会把 cross-attn 条件搞乱，直接禁用更安全
@@ -182,10 +193,22 @@ def load_anima_model(transformer_path, device, dtype, repo_root,
     return model
 
 
-def load_vae(vae_path, device, dtype, repo_root):
-    """加载 VAE"""
+def load_vae(vae_path, device, dtype, repo_root, attn_chunk_tokens: int = 0):
+    """加载 VAE
+
+    `attn_chunk_tokens` > 0 时开启 VAE 自注意力的 query 分块（数学恒等，把 math-SDPA
+    后端下 O(N²) 的峰值显存降到 O(chunk·N)）。0 = 关闭，走原来的整块 SDPA。
+    """
     wan_vae = load_module_from_path("wan_vae", repo_root / "wan" / "vae2_1.py")
     WanVAE = wan_vae.WanVAE_
+
+    if int(attn_chunk_tokens or 0) > 0:
+        wan_vae.set_vae_attn_chunk_tokens(int(attn_chunk_tokens))
+        logger.info(
+            "[vae-attn] query 分块已启用：chunk=%d token。VAE 中间块是单头全局注意力，"
+            "SDPA 落到 math backend 时显存 O(N²)；分块后峰值 ≈ chunk·N，数学恒等（非近似）。",
+            int(attn_chunk_tokens),
+        )
 
     cfg = dict(
         dim=96, z_dim=16, dim_mult=[1, 2, 4, 4],

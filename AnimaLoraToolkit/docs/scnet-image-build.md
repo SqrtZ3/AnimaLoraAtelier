@@ -194,6 +194,7 @@ RUN python -c "..." | tee /opt/anima-build/base_torch.txt && 下一步
 | 3 | `pip install -c constraints -r requirements-dcu.txt` + wandb/accelerate | 改 requirements 时只有这层缓存失效 |
 | 3.5 | DAS 轮子：flash_attn / triton（+ pytest） | 从 download.sourcefind.cn 下载、约 750MB，与 requirements 解耦 |
 | 4 | `scnet_env.sh` → `/etc/profile.d/zz-scnet-env.sh` + 挂进 `.bashrc` | 见 §7 |
+| 4.5 | 前端 IDE：jupyterlab 升级 + code-server 解压到 `/usr/lib/code-server` | 平台 IDE 展示路径；tarball 走构建上下文（见 §10），与训练依赖解耦 |
 | 5 | 代码 → `/opt/anima-lora-train`（44MB） | 改代码只失效这层 |
 | 6 | 权重 → `/opt/anima_models`（**默认注释掉**） | 5.6GB，opt-in |
 | 7 | `dcu_image_selfcheck.py` 硬门槛 | 必须在所有安装**之后** |
@@ -294,13 +295,21 @@ jupyterlab=true
 | 镜像来源 | Dockerfile | |
 | Dockerfile文件路径 | `/public/home/${username}/dockerFileTemp/Dockerfile` | §4 |
 | SSH服务 | 已安装 | §2 已核对 |
-| 开发工具 | Jupyter → **默认路径** `/opt/conda/bin/jupyter` | §2 已核对 |
+| 开发工具 | Jupyter → **默认路径** `/opt/conda/bin/jupyter`；VSCode → **默认路径** `/usr/lib/code-server/bin/code-server` | 平台按启动路径展示 IDE；两个路径本镜像都提供（§6 层 4.5） |
 | 框架 / 版本 | PyTorch / `2.9.0` | `torch.__version__`（完整串 `2.9.0+das.opt1.dtk2604`） |
 | Python版本 | `3.11` | 实测 3.11.9 |
 | DTK版本 | `26.04` | `/opt/dtk -> /opt/dtk-26.04` |
 | 操作系统 | Ubuntu / `22.04` | 实测 22.04.5 LTS |
 | 推荐配置 | 开；型号 `BW`、最小显存 `64GB`、最小卡数 `1` | `get_device_name(0)`=`BW`，65520MB |
 | 部署服务 | 关 | 训练镜像不是推理服务 |
+
+**IDE 前置准备（2026-08-18）**：平台展示 VSCode 依赖 `/usr/lib/code-server/bin/code-server`
+存在，而基础镜像不带。code-server 官方分发（code-server.dev / github releases）在
+scnet 出网实测 SSL timeout，所以 tarball 走构建上下文：本地下载
+`code-server-<版本>-linux-amd64.tar.gz` → 上传到实例的
+`/root/private_data/dockerFileTemp/`（stage 后随上下文 COPY，Dockerfile 层 4.5 解压到
+`/usr/lib/code-server` 并软链）。jupyterlab 升级（pip `"jupyterlab>=4.2,<5"`，当前 4.6.3）
+走 tuna 直连，构建期无网络风险。
 
 ---
 

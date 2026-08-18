@@ -104,6 +104,24 @@ COPY anima-lora-train/AnimaLoraToolkit/tools/scnet_env.sh /etc/profile.d/zz-scne
 RUN chmod 0755 /etc/profile.d/zz-scnet-env.sh \
  && echo '[ -f /etc/profile.d/zz-scnet-env.sh ] && . /etc/profile.d/zz-scnet-env.sh' >> /root/.bashrc
 
+# --- 层 4.5：前端 IDE（jupyterlab 升级 + code-server）--------------------------
+# 平台构建镜像页可指定两个 IDE 的启动路径（路径存在才会展示）：
+#   jupyter: /opt/conda/bin/jupyter  —— 软链，pip 升级不动它
+#   VSCode : /usr/lib/code-server/bin/code-server  —— 基础镜像不带，需自装
+# jupyterlab 升级走 tuna 直连（构建期实测可达）；code-server 官方分发在
+# code-server.dev / github releases，scnet 出网实测 SSL timeout（2026-08-18），
+# 所以 tarball 由用户本地下载后放进 dockerFileTemp/（构建上下文）再 COPY，
+# 文件名形如 code-server-<版本>-linux-amd64.tar.gz（下面用通配符匹配）。
+# 升级/替换 code-server 时只需换 dockerFileTemp 里的 tarball，只有这层缓存失效。
+RUN python -m pip install --upgrade --root-user-action=ignore "jupyterlab>=4.2,<5"
+COPY code-server-*-linux-amd64.tar.gz /opt/anima-build/
+RUN set -eu; \
+    mkdir -p /usr/lib/code-server; \
+    tar -xzf /opt/anima-build/code-server-*-linux-amd64.tar.gz \
+        -C /usr/lib/code-server --strip-components=1; \
+    ln -sf /usr/lib/code-server/bin/code-server /usr/local/bin/code-server; \
+    /usr/lib/code-server/bin/code-server --version
+
 # --- 层 5：代码 ---------------------------------------------------------------
 # stage 脚本已经剔掉 .git / 权重 / 数据集 / 输出，这层约 45MB。
 COPY anima-lora-train/ /opt/anima-lora-train/

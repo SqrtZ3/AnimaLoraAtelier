@@ -106,6 +106,13 @@ def main() -> int:
     lost = [p for p in PLATFORM_BINS if not os.path.exists(p)]
     check("平台必需组件齐全", not lost, "缺 " + ", ".join(lost) if lost else "sshd/sudo/jupyter")
 
+    # --- 4.5) 平台 IDE 展示路径（软检查：缺了只是 IDE 列表里少一项，不影响训练）---
+    ide_bins = ["/usr/lib/code-server/bin/code-server"]
+    missing_ide = [p for p in ide_bins if not os.path.exists(p)]
+    if missing_ide:
+        print(f"  · IDE 路径缺 {', '.join(missing_ide)}"
+              "（平台构建页的 VSCode 展示需要它；code-server tarball 需放进 dockerFileTemp/ 随构建上下文 COPY）")
+
     # --- 5) 环境脚本进镜像了 ---
     check("/etc/profile.d/zz-scnet-env.sh 已安装",
           os.path.exists("/etc/profile.d/zz-scnet-env.sh"))

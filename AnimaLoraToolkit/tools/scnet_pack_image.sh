@@ -103,7 +103,7 @@ else
 fi
 
 # --- 5) 体积 ------------------------------------------------------------------
-echo "[5/5] 体积（平台上限 15G，口径未经验证，第一次存完对一下）"
+echo "[5/5] 体积（平台限的是 docker 单层 ≤15GB，不是总大小；下面每项都是独立的层）"
 du -sh /usr/local/lib/python3.11/site-packages 2>/dev/null | sed 's/^/  site-packages /'
 $WITH_CODE && du -sh "$IMAGE_CODE_DIR" 2>/dev/null | sed 's/^/  代码          /'
 echo "  ⚠ 权重（$([ -d /root/private_data/anima_models ] && du -sh /root/private_data/anima_models | cut -f1 || echo '未放置')）在持久盘，**不要**复制进 /"

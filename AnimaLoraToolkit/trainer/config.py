@@ -185,8 +185,13 @@ YAML_TO_ARGS = {
     "grad_clip_max_norm": "grad_clip_max_norm",
     "mixed_precision": "mixed_precision",
     # 计算后端：auto（默认，= 有 CUDA 走 CUDA、否则 CPU，与历史行为一致）/ npu（昇腾
-    # Ascend 910B，需要 torch_npu，见 docs/ascend-npu.md）。也可用环境变量 ANIMA_NPU=1。
+    # Ascend 910B，需要 torch_npu，见 docs/ascend-npu.md）/ dcu（海光 K100-AI 等，DTK
+    # 的 HIP 后端 torch，见 docs/hygon-dcu.md）。
+    # 也可用环境变量 ANIMA_NPU=1 / ANIMA_DCU=1。
     "device_backend": "device_backend",
+    # 多卡集合通信的超时（分钟）。主 rank 独占做采样出图 / eval 全量时其余 rank 阻塞在
+    # 下一次通信上，NCCL 默认超时在大数据集上会误杀，故默认放宽到 60。
+    "dist_timeout_minutes": "dist_timeout_minutes",
     "grad_checkpoint": "grad_checkpoint",
     "grad_checkpoint_skip_last": "grad_checkpoint_skip_last",
     "grad_checkpoint_policy": "grad_checkpoint_policy",
@@ -742,6 +747,7 @@ DEFAULTS = {
     "grad_clip_max_norm": 1.0,
     "mixed_precision": "bf16",
     "device_backend": "auto",
+    "dist_timeout_minutes": 60,
     "grad_checkpoint": False,
     # 分块 grad checkpoint：最后 N 个 transformer block 不做 checkpoint（存全部激活、
     # backward 不重算），其余照常。0 = 全部 checkpoint（默认，与改动前逐字节等价）。
@@ -1108,6 +1114,23 @@ DEPRECATED_V5_KEYS = {
 }
 
 
+#: 仍在历史 yaml 里、但 PyTorch 训练路径**完全不读**的键。
+#:
+#: 与 ``DEPRECATED_V5_KEYS`` 的区别：那批是"曾经生效、v5 之后停用"；这批是经 AST/grep
+#: 核对后确认**没有任何代码读取**（三个 `*_hooks`/`*_forward`/`*_checkpoint` 只出现在
+#: `jax_tpu/config.py` 的忽略名单里；`xformers` 是早年那个"钩子名不匹配、在 Anima 上
+#: 从未生效"的开关，已移除——注意力后端现在由 SDPA 自动选，或由 navit_attn_backend 指定）。
+#:
+#: 单独列出来而不是丢进"未知键"，是因为两者的**处置方式不同**：这批删掉即可，
+#: 而未知键多半是拼写错误、需要改对。
+INERT_KEYS = {
+    "disable_tlora_hooks",
+    "use_precommit_lora_forward",
+    "use_per_block_checkpoint",
+    "xformers",
+}
+
+
 def _is_active_deprecated_value(value):
     if value is None:
         return False
@@ -1120,6 +1143,58 @@ def _is_active_deprecated_value(value):
     if isinstance(value, (list, tuple, set, dict)):
         return len(value) > 0
     return True
+
+
+def unrecognized_keys(config):
+    """返回 ``(未知键, 已失效键)`` 两个有序列表。纯函数，不打日志，便于单测。
+
+    "未知"= 不在 ``YAML_TO_ARGS``、也不在 ``DEPRECATED_V5_KEYS`` / ``INERT_KEYS`` 里。
+    已失效键只在**值看起来是在开启它**时才计入（``disable_tlora_hooks: false`` 与
+    不写它完全等价，为这种情况刷警告纯属噪声）；未知键则一律计入 —— 拼错的键无论
+    值是什么都是问题。
+    """
+    if not config:
+        return [], []
+    known = set(YAML_TO_ARGS) | set(DEPRECATED_V5_KEYS) | set(INERT_KEYS)
+    unknown = sorted(k for k in config if k not in known)
+    inert = sorted(k for k in config
+                   if k in INERT_KEYS and _is_active_deprecated_value(config.get(k)))
+    return unknown, inert
+
+
+def _did_you_mean(key, limit=3):
+    """给未知键找最接近的合法键名。拼写错误是这条警告要抓的主要场景。"""
+    import difflib
+
+    return difflib.get_close_matches(key, YAML_TO_ARGS.keys(), n=limit, cutoff=0.72)
+
+
+def warn_unrecognized_keys(config):
+    """对 yaml 里无法识别的键发警告。
+
+    **为什么需要它**：``apply_yaml_config`` 只遍历 ``YAML_TO_ARGS``，任何不在表里的键
+    被**完全静默**地丢掉 —— 把 ``navit_token_budget`` 拼成 ``navit_token_budge``，
+    训练照常启动、按默认值跑，不打印任何东西。这类错误只有在事后对不上账时才会被发现。
+
+    jax_tpu 侧早就做对了（``jax_tpu/config.py`` 开头写着"表里完全没有的键 → 收集起来
+    报'未知键'，而不是默默忽略"，并直接 raise）。这里移植同一条原则，但**只警告不抛**：
+    抛会让历史 yaml 直接跑不起来，代价大于收益。
+    """
+    unknown, inert = unrecognized_keys(config)
+    for key in unknown:
+        hint = _did_you_mean(key)
+        logger.warning(
+            "YAML 键 %r 无法识别，已被忽略（该项不会生效）。%s",
+            key,
+            ("是不是想写：" + " / ".join(hint) + "？") if hint
+            else "请对照 config/train_all_args_annotated.yaml 核对拼写。",
+        )
+    if inert:
+        logger.warning(
+            "以下 YAML 键在当前 PyTorch 训练路径下**没有任何代码读取**，设了也不生效，"
+            "可以删掉：%s",
+            ", ".join(inert),
+        )
 
 
 def apply_yaml_config(args, config):
@@ -1137,6 +1212,8 @@ def apply_yaml_config(args, config):
             "Ignoring deprecated v5 training keys: %s. They no longer affect training.",
             ", ".join(ignored),
         )
+
+    warn_unrecognized_keys(config)
 
     for yaml_key, arg_attr in YAML_TO_ARGS.items():
         if yaml_key not in config:

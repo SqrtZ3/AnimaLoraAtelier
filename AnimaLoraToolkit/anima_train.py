@@ -394,7 +394,10 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=0.01, help="AdamW 权重衰减 (L2 正则, 0=禁用)")
     p.add_argument("--grad-clip-max-norm", type=float, default=1.0, help="梯度裁剪最大范数 (0=禁用；ProdigyPlus 推荐设 0)")
     p.add_argument("--resolution", type=int, default=1024,
-                   help="ARB 分桶的 base 边长（桶围着 base² 面积 ±10% 造）")
+                   # ★ %% 不是笔误：argparse 渲染 --help 时会对 help 文案做一次 %-格式化，
+                   # 裸的 % 会被当成占位符起头。这里 "% 造" 里的空格被当成 flag、'造' 被当成
+                   # 转换符 → ValueError: unsupported format character，整个 --help 直接崩。
+                   help="ARB 分桶的 base 边长（桶围着 base² 面积 ±10%% 造）")
     p.add_argument("--bucket-base-resos", default=None,
                    help="多级 ARB base 边长，逗号分隔，如 512,768,1024。显式设置时优先于自动 base 范围。")
     p.add_argument("--bucket-min-base-reso", type=int, default=0,
@@ -496,8 +499,8 @@ def parse_args():
     p.add_argument("--stage-profile-step", type=int, default=0,
                    help="在第 N 个 micro-step 用 torch.profiler 采样完整一步（含 optimizer），"
                         "下一步开始时把 kernel 汇总表 + GPU 忙碌占比打进日志。0=关（默认，"
-                        "非零仅多一次整型比较，行为中立）。用途：区分「kernel 本身慢」（忙碌≈100%）"
-                        "vs「kernel 之间有空隙 = CPU/分配器喂不上」（忙碌明显<100%）。"
+                        "非零仅多一次整型比较，行为中立）。用途：区分「kernel 本身慢」（忙碌≈100%%）"
+                        "vs「kernel 之间有空隙 = CPU/分配器喂不上」（忙碌明显<100%%）。"
                         "注意：N 别选训练的最后一步（汇总在下一步的开头触发）。")
     p.add_argument("--stage-profile-trace", action="store_true",
                    help="stage_profile_step 采样时额外导出 chrome trace json（可能数百 MB，"
@@ -506,7 +509,7 @@ def parse_args():
                    choices=["xformers", "sdpa_seg"],
                    help="krea2 navit packed attention 后端。xformers=历史行为（默认，逐 bit 不变）；"
                         "sdpa_seg=块对角 mask 换逐段 dense SDPA（cudnn），数学恒等（有对拍单测），"
-                        "H20 微基准 dense SDPA 比 xformers FA2 varlen 快 1.56×，预计省 ~10% 步时。")
+                        "H20 微基准 dense SDPA 比 xformers FA2 varlen 快 1.56×，预计省 ~10%% 步时。")
     p.add_argument("--fit-max-tokens", type=int, default=65536,
                    help="Maximum FiT tokens per image before applying the over-budget policy.")
     p.add_argument("--fit-warn-tokens", type=int, default=16384,
@@ -742,7 +745,7 @@ def parse_args():
     p.add_argument("--eval-seed", type=int, default=1234, help="eval 固定噪声种子（CPU RNG，跨机器一致）。")
     p.add_argument("--tread-enabled", action="store_true",
                    help="TREAD token 路由（arXiv 2501.04765）：训练期让随机 ratio 的 token 绕过中段 blocks，"
-                        "省 20-40% 算力，推理完全不变。dense 路径限定。")
+                        "省 20-40%% 算力，推理完全不变。dense 路径限定。")
     p.add_argument("--tread-ratio", type=float, default=0.3,
                    help="路由段内被绕过的 token 比例。LoRA 微调 >0.35 可能伤收敛（SimpleTuner 经验），"
                         "保守 0.3 起步。")
@@ -1073,7 +1076,15 @@ def main():
     import numpy as np
     from PIL import Image
 
-    # 设置随机种子
+    # ── 分布式（单机多卡）：必须在**任何**会建设备上下文的调用之前绑卡 ────────────
+    # 未用 torchrun 启动时 WORLD_SIZE 不存在 → 下面每一步都是 no-op，单卡路径逐字节不变。
+    from utils import dist_utils
+    dist_utils.bind_device()
+
+    # 设置随机种子。⚠ 这里**所有 rank 必须完全一致**：LoRA/LoKr 的初始化走全局 RNG，
+    # 各 rank 起点不同的话，"同一份平均梯度"作用在不同权重上，权重差永远不会收敛回来
+    # （梯度同步只同步增量，不同步绝对值）。让抽样跨 rank 独立的种子偏移放在模型建好
+    # 之后（搜 `_reseed_per_rank`），那时再偏移只影响训练期的噪声/timestep/dropout。
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1085,11 +1096,30 @@ def main():
     # ★ 后端选择：默认 auto = 有 CUDA 走 CUDA（与本段加入前逐字节等价）；
     # device_backend: npu / ANIMA_NPU=1 时切昇腾 Ascend（见 docs/ascend-npu.md）。
     # 必须在下面第一次碰设备之前完成。
+    # device_backend: dcu / ANIMA_DCU=1 时切海光 DCU（见 docs/hygon-dcu.md）。DCU 的 torch
+    # 是 HIP 后端，torch.cuda.* 本身就是 DCU，所以下面 CUDA 那一支照常执行、无需分叉。
     from utils import npu_compat
+    from utils import dcu_compat
     if npu_compat.npu_requested(getattr(args, "device_backend", "auto")):
         npu_compat.enable()
         npu_compat.guard_unsupported(args)
         npu_compat.set_allocator_env()
+    elif dcu_compat.dcu_requested(getattr(args, "device_backend", "auto")):
+        dcu_compat.enable()
+        dcu_compat.guard_unsupported(args)
+        dcu_compat.set_allocator_env()
+        logger.info("[dcu] %s", dcu_compat.miopen_cache_hint())
+
+    # 进程组初始化：放在后端确认之后（这样"torch 被 pip 覆盖成 CUDA 构建"这类环境问题
+    # 会先由 dcu_compat.enable() 报出可读的错，而不是变成一句 NCCL 初始化失败）。
+    if npu_compat.is_npu() and dist_utils.env_world_size() > 1:
+        raise RuntimeError(
+            "多卡分布式首版只支持 CUDA / DCU（集合通信走 nccl/RCCL）。昇腾要走 hccl，"
+            "本仓库尚未接线 —— 请用单卡跑 NPU。"
+        )
+    dist_ctx = dist_utils.init_from_env(
+        timeout_minutes=int(getattr(args, "dist_timeout_minutes", 60) or 60))
+    dist_utils.guard_incompatible(args, dist_ctx)
 
     if not npu_compat.is_npu() and torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
@@ -1128,9 +1158,10 @@ def main():
     sample_dir = output_dir / "samples"
     sample_dir.mkdir(exist_ok=True)
 
-    # 启动训练监控面板
+    # 启动训练监控面板。多卡下只有主 rank 起：8 个进程抢同一个端口会有 7 个失败，
+    # 而且面板数据本来就该是全局视角而不是某个 rank 的局部视角。
     monitor_server = None
-    if not getattr(args, "no_monitor", False):
+    if not getattr(args, "no_monitor", False) and dist_ctx.is_main:
         try:
             from train_monitor import start_monitor_server, update_monitor
             monitor_server = start_monitor_server(
@@ -1164,10 +1195,12 @@ def main():
 
     # wandb 接线（opt-in，默认关）。与 monitor_server 相互独立：不给暴露端口的云平台上
     # 6006 面板看不到，wandb 是训练进程主动外推。未开启时下面每个调用点都是 no-op。
-    wandb_logger.init(args, extra_config={
-        k: v for k, v in vars(args).items()
-        if isinstance(v, (int, float, str, bool, type(None)))
-    })
+    # 多卡下只有主 rank 推：否则同一个 run 会被 8 个进程各写一份、曲线互相打架。
+    if dist_ctx.is_main:
+        wandb_logger.init(args, extra_config={
+            k: v for k, v in vars(args).items()
+            if isinstance(v, (int, float, str, bool, type(None)))
+        })
 
     # 查找模型代码
     repo_root = find_diffusion_pipe_root()
@@ -2072,6 +2105,32 @@ def main():
             **_loader_kwargs,
         )
 
+    # ── 多卡：把已经组好的 batch 列表按 rank 切成互斥子集 ────────────────────────
+    # 放在四条分支之后统一处理，四种 sampler（ARB 分桶 / token 预算 / NaViT 打包）
+    # 的分批逻辑一行都不用改 —— 切的是"batch 的序列"，不是数据集本身。
+    # collate_fn 从刚建好的 loader 上取，保证与所属分支一致。
+    if dist_ctx.enabled:
+        _global_batches = len(batch_sampler)
+        batch_sampler = dist_utils.ShardedBatchSampler(
+            batch_sampler, dist_ctx.rank, dist_ctx.world_size)
+        dataloader = DataLoader(
+            dataset, batch_sampler=batch_sampler,
+            collate_fn=dataloader.collate_fn,
+            num_workers=args.num_workers,
+            **_loader_kwargs,
+        )
+        logger.info(
+            "[dist] 数据分片：全局 %d 个 batch → 每 rank %d 个"
+            "（尾部 %d 个不整除的 batch 本 epoch 丢弃，每 epoch 重洗牌所以丢的不是固定样本）",
+            _global_batches, len(batch_sampler), _global_batches % dist_ctx.world_size,
+        )
+        logger.warning(
+            "[dist] 有效 batch 变成 %d×：单步现在看到 %d 个 rank 的数据。"
+            "**学习率没有被自动缩放**（那属于未经请求的行为改变）—— "
+            "沿用单卡 lr 还是按 √W / W 放大，请自行决定并记录在 config 里。",
+            dist_ctx.world_size, dist_ctx.world_size,
+        )
+
     # 训练前自检：VAE encode->decode 循环（快速排除 VAE/scale/shape 问题）
     try:
         if len(base_dataset) > 0:
@@ -2272,6 +2331,27 @@ def main():
         trainable_params.extend(group["params"])
     trainable_named_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
 
+    # ── 多卡起点对齐 + 训练期 RNG 分流 ────────────────────────────────────────
+    if dist_ctx.enabled:
+        # (1) 把主 rank 的可训练权重广播给所有 rank。种子相同**通常**就够了，但这里不赌：
+        #     PiSSA / OLoRA / LoRA-One 这类初始化会对底模权重做 SVD，不同卡上 SVD 的
+        #     符号与简并子空间选择可以不同（数值库层面的非确定性），种子一样也可能分叉。
+        #     起点不一致是**静默**的：loss 照降，只是 8 张卡在训 8 个不同的 LoRA，
+        #     最后存下来的是其中一个。一次广播就杜绝了整类问题。
+        import torch.distributed as _dist
+        for _p in trainable_params:
+            _dist.broadcast(_p.data, src=0)
+        logger.info("[dist] 已从 rank0 广播 %d 个可训练张量，各 rank 起点一致", len(trainable_params))
+
+        # (2) _reseed_per_rank：模型建好后再给全局 RNG 加 rank 偏移，让训练期的噪声 /
+        #     timestep / caption-dropout 跨 rank 独立（否则 8 张卡在不同数据上抽同一串
+        #     随机数，多样性白白损失一截）。
+        #     ⚠ 三个 batch sampler 的洗牌用它们自己的 `random.Random(seed + epoch)`，
+        #     不读全局 RNG → 不受影响，各 rank 的全局 batch 序列仍相同，分片才有意义。
+        torch.manual_seed(args.seed + dist_ctx.rank)
+        random.seed(args.seed + dist_ctx.rank)
+        np.random.seed(args.seed + dist_ctx.rank)
+
     # 计算总步数
     sample_accum_enabled = int(getattr(args, "effective_batch_size", 0) or 0) > 0
     effective_batch_size = int(getattr(args, "effective_batch_size", 0) or 0)
@@ -2347,7 +2427,10 @@ def main():
         logger.info(f"学习率调度: cosine_with_restart (T_0={t0}, T_mult={t_mult}, eta_min={eta_min})")
 
     # 初始化进度显示
-    progress, task_id, progress_kind = init_progress(not args.no_progress, total_steps)
+    # 多卡：只有主 rank 渲染进度条 / rich Live。8 个进程同时往同一个 TTY 画 Live
+    # 会互相擦除、输出变成乱码，且非主 rank 的进度本来也不代表全局。
+    progress, task_id, progress_kind = init_progress(
+        (not args.no_progress) and dist_ctx.is_main, total_steps)
     use_rich = progress_kind == "rich"
     use_plain = progress == "plain"
     live = None
@@ -2369,6 +2452,10 @@ def main():
             progress.start()
 
     def emit(msg):
+        # 多卡下给非主 rank 的输出打上 [rankN/W] 前缀（单卡时 tag 是空串，逐字节不变），
+        # 否则 8 份交错的日志无法判断某条警告来自哪张卡。
+        if dist_ctx.tag:
+            msg = f"{dist_ctx.tag}{msg}"
         if use_plain:
             print()
         if live:
@@ -2499,6 +2586,12 @@ def main():
             emit("强制退出...")
             sys.exit(1)
         interrupted = True
+        # 多卡：torchrun 会把 SIGINT 发给每个进程。只让主 rank 写状态，其余直接退出 ——
+        # 8 个进程同时写同一个 .pt 会写出损坏文件，而且不会有任何报错。
+        if not dist_ctx.is_main:
+            emit(f"{dist_ctx.tag}收到 Ctrl+C，退出（状态由 rank0 保存）")
+            dist_ctx.shutdown()
+            sys.exit(0)
         emit("\n检测到 Ctrl+C，正在保存训练状态...")
         state_path = output_dir / f"training_state_step{global_step}.pt"
         if hasattr(optimizer, "eval") and global_step > 0: optimizer.eval()
@@ -2704,6 +2797,11 @@ def main():
         return prompt, False
 
     def run_sample_checkpoint(label, filename_stem):
+        # 多卡：只有主 rank 出图。其余 rank 直接返回 —— 它们会在下一个累积边界的集合
+        # 通信处自然等主 rank 采样完，不需要显式 barrier（也不能加：barrier 与
+        # all_reduce 的调用次数必须跨 rank 完全对齐）。
+        if not dist_ctx.is_main:
+            return None
         prompt, prompt_from_dataset = get_next_sample_prompt()
         prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
         emit(f"采样中 ({label}): {prompt_short}")
@@ -2749,6 +2847,11 @@ def main():
         return sample_path
 
     def save_lora_checkpoint(filename_stem):
+        # 多卡：只有主 rank 落盘。8 个进程写同一个 safetensors 路径会写出**损坏文件**，
+        # 而且不会报错（后写的截断前写的）。各 rank 的 LoRA 权重在每个边界步都被
+        # all-reduce 后的同一份梯度更新过，所以主 rank 的那份就是全局权重。
+        if not dist_ctx.is_main:
+            return None
         if hasattr(optimizer, "eval"):
             optimizer.eval()
         lora_path = output_dir / f"{args.output_name}_{filename_stem}.safetensors"
@@ -2768,6 +2871,10 @@ def main():
         batch 位置成对，都是"最后一次完成 optimizer step"时的锚点 —— 两者必须同源，
         否则 resume 的 epoch 内快进会错位（同 signal_handler 里的注释）。
         """
+        # 多卡：同 save_lora_checkpoint，只有主 rank 落盘。优化器状态各 rank 本就相同
+        # （同一份平均梯度 + 同一起点 → 同一条更新轨迹），存主 rank 的即可。
+        if not dist_ctx.is_main:
+            return None
         if hasattr(optimizer, "eval"):
             optimizer.eval()
         state_path = output_dir / f"training_state_{tag}.pt"
@@ -2876,8 +2983,25 @@ def main():
     sample_accum_pending = 0
     sample_accum_loss_sum = None
     legacy_accum_samples = 0
+    # 累积周期内各 micro-batch 主 loss 的和 + 计数，用来算"本周期的平均 loss"。
+    # 与 sample_accum_loss_sum 同款手法：在设备上累加成张量，只在边界处 .item() 一次，
+    # 不给每个 micro-batch 增加一次 GPU→CPU 同步。
+    legacy_accum_loss_sum = None
+    legacy_accum_loss_n = 0
     pending_reference_batches = 0
     step_start_time = time.perf_counter()
+
+    def _legacy_cycle_loss() -> float:
+        """本累积周期的平均主 loss（legacy grad_accum 路径）。
+
+        与 sample_accum 分支的 ``sum / pending`` 同语义。周期内因非有限 loss 被跳过的
+        micro-batch 不进 sum/n，所以这里是"有效 micro-batch 的均值"。
+        n=0 只可能出现在整周期全被跳过的情形，而那条路径 ``continue`` 掉了、走不到调用点；
+        保险起见返回 0.0 而不是抛。
+        """
+        if legacy_accum_loss_sum is None or legacy_accum_loss_n <= 0:
+            return 0.0
+        return float(legacy_accum_loss_sum.detach().cpu()) / float(legacy_accum_loss_n)
 
     # pad_mask 复用缓存：key=(B, 1, H_lat, W_lat) → tensor
     # ARB 多 bucket 时大概会有 5-20 个 unique shape，cache 几 KB 内存换掉每步的 cudaMalloc。
@@ -2923,6 +3047,13 @@ def main():
         _gaf_log = str(getattr(args, "gaf_log_path", "") or "").strip()
         if not _gaf_log:
             _gaf_log = os.path.join(args.output_dir, f"{args.output_name}_gaf_trust.csv")
+        if dist_ctx.rank_suffix:
+            # 多卡：逐图信任是**进程本地**状态，每个 rank 只见过自己那份数据分片。
+            # 写同一个文件会互相写坏；合到一起也不对（同一张图在不同 epoch 落到不同 rank，
+            # 信任历史本就是碎的，见 dist_utils.guard_incompatible 的警告）。
+            # 所以每个 rank 出自己的提名表，读的时候心里有数：每份只覆盖 1/world_size 的样本。
+            _root, _ext = os.path.splitext(_gaf_log)
+            _gaf_log = f"{_root}{dist_ctx.rank_suffix}{_ext}"
         gaf_ctrl = GafController(
             backend=str(getattr(args, "gaf_backend", "autograd") or "autograd"),
             params=[p for _, p in trainable_named_params],
@@ -3280,12 +3411,18 @@ def main():
     _stage_timer = _stage_noop_ref  # 非 navit/arb 主路径前的占位；循环内每 micro-batch 重选
     if _stage_timing_every > 0:
         from trainer.telemetry import _append_csv as _stage_append_csv
-        _stage_timing_csv = output_dir / "stage_timing.csv"
+        # 多卡：每个 rank 写自己的文件（rank_suffix 单卡时为空串，文件名不变）。
+        # 分文件不只是为了避免交错写坏行 —— 各 rank 的耗时差本身就是信息：集合通信要等
+        # 最慢的那个，持续掉队的 rank 就是整个 job 的瓶颈。
+        _stage_timing_csv = output_dir / f"stage_timing{dist_ctx.rank_suffix}.csv"
         _stage_timing_header = [
             "step", "mode", "grad_checkpoint", "G",
             "data_fetch_ms", "text_encode_ms", "timestep_ms", "forward_ms",
             "navit_noise_patchify_ms", "navit_model_forward_ms", "navit_loss_loop_ms",
             "loss_assembly_ms", "aux_ms", "adaptive_ms", "backward_ms",
+            # grad_sync：多卡梯度 all-reduce 的耗时（单卡恒为空）。它除以 whole_step
+            # 就是并行效率的直接损耗项——判断"8 卡值不值"看这一列。
+            "grad_sync_ms",
             "optimizer_ms", "whole_step_ms", "tokens",
         ]
         emit(f"[stage_timing] enabled: every={_stage_timing_every} warmup={_stage_timing_warmup} "
@@ -3363,7 +3500,8 @@ def main():
                 table = ka.table(sort_by="self_cuda_time_total", row_limit=25)
             emit("[stage_profile] top ops:\n" + table)
             if bool(getattr(args, "stage_profile_trace", False)):
-                _trace_path = output_dir / "profile_step.json"
+                # 多卡：每个 rank 一份 trace（后缀单卡时为空，文件名不变）。
+                _trace_path = output_dir / f"profile_step{dist_ctx.rank_suffix}.json"
                 prof.export_chrome_trace(str(_trace_path))
                 emit(f"[stage_profile] chrome trace -> {_trace_path}")
         except Exception as _pe:
@@ -3375,7 +3513,14 @@ def main():
         loss 统一用 MSE（与训练 loss_type 无关），保证跨配置可比；
         schedule-free 必须切 optimizer.eval() 测平均序列权重。
         结果 emit 一行 + 追加 output_dir/eval_loss.csv。
+
+        多卡：只有主 rank 跑。8 个进程追加同一个 csv 会写出交错的坏行；而且 eval 用的是
+        固定样本×固定噪声×固定 t 网格，各 rank 的权重在每个边界步后本就相同 ——
+        跑 8 遍只是把同一个数算 8 次。其余 rank 会在下一个累积边界的集合通信处自然等待
+        （这也是 dist_timeout_minutes 默认放到 60 分钟的原因）。
         """
+        if not dist_ctx.is_main:
+            return
         if not _eval_set:
             return
         model.eval()
@@ -3424,7 +3569,12 @@ def main():
 
     def run_step_telemetry(step):
         """O1/O2/O3 + C1：挂在 optimizer.step() 之后、zero_grad 之前（grad 仍在）。
-        图盲：只读优化器 state / 权重 / param.grad 标量。各探针独立 cadence，失败不致命。"""
+        图盲：只读优化器 state / 权重 / param.grad 标量。各探针独立 cadence，失败不致命。
+
+        多卡：只有主 rank 写。梯度已在上一行 all-reduce 过、优化器 state 各 rank 同轨，
+        所以主 rank 的读数就是全局读数；8 个进程写同一批 csv 只会互相写坏。"""
+        if not dist_ctx.is_main:
+            return
         if not _telemetry_on:
             return
         if _telem_opt_every > 0 and step % _telem_opt_every == 0:
@@ -3604,6 +3754,8 @@ def main():
                 step_start_time = time.perf_counter()
                 pending_reference_batches = 0
                 accum_clean = True
+                legacy_accum_loss_sum = None
+                legacy_accum_loss_n = 0
             batch_reference_batches = 0
             if hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "reference_batches_for_batch_index"):
                 batch_reference_batches = dataloader.batch_sampler.reference_batches_for_batch_index(batch_idx)
@@ -4401,6 +4553,22 @@ def main():
                     del x0_target
                 if aux_total is not None:
                     del aux_total
+                # ── 多卡死锁面 ①：本 micro-batch 因 NaN 跳过 backward 直接 continue，
+                # 但它**可能正是累积边界** —— 此刻其余 rank 已经停在边界的集合通信上等我。
+                # 不参与 = 全体挂死（且没有任何报错，只是永远不再前进）。
+                # 这里补一次与正常边界路径严格一一对应的 all_ranks_clean(False)：
+                # 所有 rank 都会因此得到 False，一致地判定"本周期作废"，然后同样跳过
+                # 梯度 all-reduce —— 两条路径的集合通信次数于是完全对齐。
+                if dist_ctx.enabled:
+                    _ddp_boundary = ((batch_idx + 1) % args.grad_accum == 0
+                                     or (batch_idx + 1) == len(dataloader))
+                    if _ddp_boundary:
+                        dist_ctx.all_ranks_clean(False)
+                        optimizer.zero_grad(set_to_none=True)
+                        legacy_accum_samples = 0
+                        legacy_accum_loss_sum = None
+                        legacy_accum_loss_n = 0
+                        pending_reference_batches = 0
                 continue
 
             _stage_timer.stop("aux")
@@ -4441,6 +4609,10 @@ def main():
             else:
                 loss_to_backward = loss / args.grad_accum
                 legacy_accum_samples += int(bs)
+                # 记录本 micro-batch 的主 loss（未除 grad_accum 的那个），供边界处求周期均值。
+                _lg = loss.detach().float()
+                legacy_accum_loss_sum = _lg if legacy_accum_loss_sum is None else legacy_accum_loss_sum + _lg
+                legacy_accum_loss_n += 1
                 step_boundary = (batch_idx + 1) % args.grad_accum == 0 or (batch_idx + 1) == len(dataloader)
             _stage_timer.stop("loss_assembly")
             # Fail-fast on a severed graph: a non-grad loss means no trainable param fed it
@@ -4473,6 +4645,12 @@ def main():
                         f"effective_batch_size={effective_batch_size}. "
                         "BucketBatchSampler should split micro-batches before crossing the window."
                     )
+                # ── 多卡死锁面 ②：把"本周期干不干净"变成全体一致的决定。
+                # accum_clean 是**数据相关**的 per-rank 布尔量：某个 rank 撞上 NaN 就会走
+                # 下面的 continue，从而跳过梯度 all-reduce。不先取跨 rank 逻辑与的话，
+                # 一张卡的一次 NaN 就能让整个 8 卡 job 静默卡死。
+                accum_clean = dist_ctx.all_ranks_clean(accum_clean)
+
                 # ★ 守护 1：周期内有 micro-batch NaN/Inf loss → 整周期作废，不做 step
                 if not accum_clean:
                     logger.warning(
@@ -4485,8 +4663,22 @@ def main():
                         sample_accum_loss_sum = None
                     else:
                         legacy_accum_samples = 0
+                        legacy_accum_loss_sum = None
+                        legacy_accum_loss_n = 0
                     pending_reference_batches = 0
                     continue
+
+                # ── 多卡数据并行的唯一一次梯度交换：跨 rank 平均可训练参数的梯度。
+                # 位置选在这里有两个理由：
+                #   1. 必须在 clip_grad_norm_ **之前** —— 裁剪要对全局梯度做，各 rank
+                #      先裁自己的再平均，等于裁了个不存在的量（范数不可加）。
+                #   2. 放在下面 NaN 检查**之前** —— all-reduce 会把任一 rank 的 NaN 传播到
+                #      所有 rank，那道逐参数 isfinite 于是自动成为全体一致的判定，
+                #      不必再加一次集合通信（少一次通信 = 少一个可能错位的点）。
+                if dist_ctx.enabled:
+                    _stage_timer.start("grad_sync")
+                    dist_ctx.all_reduce_grads_(trainable_params)
+                    _stage_timer.stop("grad_sync")
 
                 # ★ 守护 2：梯度 NaN/Inf 检查（即使 loss 全 finite，反向也可能出 NaN）
                 # 逐参数 `if not isfinite(g).all()` 会每个参数触发一次 GPU→CPU 同步——LoKr
@@ -4509,6 +4701,8 @@ def main():
                         sample_accum_loss_sum = None
                     else:
                         legacy_accum_samples = 0
+                        legacy_accum_loss_sum = None
+                        legacy_accum_loss_n = 0
                     pending_reference_batches = 0
                     continue
 
@@ -4549,7 +4743,13 @@ def main():
                             if sample_accum_loss_sum is not None else 0.0
                         )
                     else:
-                        optimizer_loss_val = float(loss.item() * args.grad_accum)
+                        # ★ 本周期各 micro-batch 主 loss 的**平均**，与上面 sample_accum 分支
+                        # 同语义。旧写法是 `loss.item() * args.grad_accum` —— loss 是本周期
+                        # **最后一个** micro-batch 的 loss 且从没被除过（除的是 loss_to_backward），
+                        # 再乘 grad_accum 等于把它放大 grad_accum 倍。grad_accum=1 时两者恒等，
+                        # 所以一直没暴露；>1 时喂给 set_loss 的值是虚高的，而 EmoSens 正是
+                        # 按 loss 序列动态写 lr（utils/emosens_optimizer.py），ProdigyPlus 也读它。
+                        optimizer_loss_val = _legacy_cycle_loss()
                     optimizer.set_loss(optimizer_loss_val)
                 _stage_timer.start("optimizer")
                 optimizer.step()
@@ -4591,8 +4791,10 @@ def main():
                     sample_accum_pending = 0
                     sample_accum_loss_sum = None
                 else:
-                    loss_val = float(loss.item() * args.grad_accum)
+                    loss_val = _legacy_cycle_loss()      # 同上：周期均值，不是 last×grad_accum
                     legacy_accum_samples = 0
+                    legacy_accum_loss_sum = None
+                    legacy_accum_loss_n = 0
                 samples_seen += max(0, committed_samples)
 
                 # ── 断点续训锚点：记下"最后一次完成 optimizer step"时的 epoch 内位置。
@@ -4733,7 +4935,8 @@ def main():
                         _st.get("forward"), _st.get("navit_noise_patchify"),
                         _st.get("navit_model_forward"), _st.get("navit_loss_loop"),
                         _st.get("loss_assembly"), _st.get("aux"), _st.get("adaptive"),
-                        _st.get("backward"), _st.get("optimizer"), _st.get("whole_step"),
+                        _st.get("backward"), _st.get("grad_sync"),
+                        _st.get("optimizer"), _st.get("whole_step"),
                         _stage_tokens,
                     ]
                     _stage_append_csv(_stage_timing_csv, _stage_timing_header, row)
@@ -4852,10 +5055,11 @@ def main():
         sample_accum_pending = 0
         sample_accum_loss_sum = None
 
-    # 最终保存
+    # 最终保存（多卡只由主 rank 写；各 rank 权重同源，见 save_lora_checkpoint 的说明）
     if hasattr(optimizer, "eval"): optimizer.eval()
     final_path = output_dir / f"{args.output_name}.safetensors"
-    injector.save(final_path, model=model)
+    if dist_ctx.is_main:
+        injector.save(final_path, model=model)
 
     # 清理进度显示
     if live:
@@ -4891,6 +5095,12 @@ def main():
             pass
 
     wandb_logger.finish()
+
+    # 多卡：所有 rank 到齐再拆进程组。少了这道 barrier，跑得快的 rank 会先
+    # destroy_process_group()，慢的那个在收尾集合通信上撞到 "socket closed"。
+    if dist_ctx.enabled:
+        dist_ctx.barrier()
+    dist_ctx.shutdown()
 
 
 if __name__ == "__main__":

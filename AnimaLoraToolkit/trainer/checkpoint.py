@@ -409,9 +409,13 @@ def dataloader_fingerprint(dataloader, grad_accum=1):
         "dataset_len": dataset_len,
         "grad_accum": int(grad_accum or 1),
     }
+    # world_size 只在多卡的 ShardedBatchSampler 上存在（单卡 sampler 没这个属性 →
+    # 不进指纹，历史 run 的指纹逐字节不变）。加它是因为：8 卡跑出来的 state 拿到 4 卡
+    # 上 resume，每 rank 的 batch 序列完全不同，"跳过前 N 个 batch" 会跳到别的数据上，
+    # 而 sampler 类名和 dataset_len 都一样、指纹察觉不到。
     for key in ("batch_size", "seed", "shuffle", "drop_last",
                 "effective_batch_size", "reference_batch_size",
-                "max_tokens_per_batch", "token_budget"):
+                "max_tokens_per_batch", "token_budget", "world_size"):
         if sampler is not None and hasattr(sampler, key):
             value = getattr(sampler, key)
             if isinstance(value, bool):

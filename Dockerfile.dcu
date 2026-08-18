@@ -1,85 +1,115 @@
-# syntax=docker/dockerfile:1
 # ==============================================================================
-#  Anima LoRA 训练 · 海光 DCU（K100-AI）镜像
+#  Anima LoRA 训练 · 海光 DCU 镜像（国家超算互联网 scnet · Dockerfile 构建方式）
 #
-#  设计要点（都是为了避开 docs/hygon-dcu.md §2「两条红线」）：
-#    1. FROM 光源 DTK 基础镜像 —— torch 由它提供，本 Dockerfile **一次都不装 torch**。
-#    2. 装依赖前先把镜像里 torch/torchvision/numpy 的实际版本冻成 constraints，
-#       pip 于是没有任何路径能替换它们；真有冲突会在 build 阶段红着脸失败。
-#    3. build 末尾有一道**硬门槛**：torch.version.hip 为空则 build 失败。
-#       这保证「能 build 出来的镜像」一定不是被 CUDA 版污染过的。
+#  按平台《构建镜像规则》写成：
+#    https://www.scnet.cn/help/docs/mainsite/container-service/image-management/build-rules/
 #
-#  构建：
-#    docker build -f Dockerfile.dcu \
-#      --build-arg BASE_IMAGE=<从平台复制的基础镜像完整 tag> \
-#      -t anima-dcu:k100ai .
+#  ★ 平台的 COPY 约定：所有 COPY/ADD 的源路径**相对于家目录下的 dockerFileTemp**
+#    （/public/home/${username}/dockerFileTemp，即 Notebook 里的 /root/private_data/dockerFileTemp）。
+#    用 AnimaLoraToolkit/tools/scnet_stage_dockerfile.sh 一键把上下文准备好。
 #
-#  运行（卡的挂载方式以平台文档为准，下面是 DTK 的常见写法）：
-#    docker run -it --rm \
-#      --device=/dev/kfd --device=/dev/mkfd --device=/dev/dri \
-#      --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
-#      --ipc=host --shm-size=32g \
-#      -v /path/to/models:/workspace/models \
-#      -v /path/to/dataset:/workspace/AnimaLoraToolkit/Dataset \
-#      -v /path/to/output:/workspace/output \
-#      anima-dcu:k100ai bash
+#  ★ 平台的硬性要求（缺了实例起不来）：openssh-server、sudo、/opt/conda/bin/jupyter。
+#    基础镜像三样都有，本文件**不动它们**，也不覆盖 CMD/ENTRYPOINT ——
+#    平台按启动路径扫描 IDE，覆盖掉会导致创建实例失败。末尾有一道自检守着这三样。
 #
-#  ⚠ 权重与数据集**不进镜像**（几十 GB，且随实验变）。除非评审要求自包含产物，
-#    否则一律走 -v 挂载。
+#  ★ 体积规则：限制的是 **docker 单层 ≤ 15GB**，不是镜像总大小。所以下面刻意把
+#    「依赖」「代码」「（可选）权重」拆成不同的 RUN/COPY 层，任一层都远小于 15GB。
 # ==============================================================================
 
-# 平台给的基础镜像 tag，形如：
-#   image.sourcefind.com:5000/dcu/admin/base/pytorch:2.9.0-dtk26.04-py3.11-ubuntu22.04
-# 以平台控制台/`docker images` 里的实际字符串为准，不要照抄这里的默认值。
-ARG BASE_IMAGE=image.sourcefind.com:5000/dcu/admin/base/pytorch:2.9.0-dtk26.04-py3.11-ubuntu22.04
+# 平台 DCU 基础镜像的完整拉取地址。**必须**换成控制台「镜像管理」里看到的真实字符串，
+# 下面这个是按平台文档里 GPU 版的命名规律推的，未经验证。
+ARG BASE_IMAGE=image.sourcefind.cn:5000/dcu/admin/base/jupyterlab-pytorch:2.9.0-py3.11-dtk26.04-ubuntu22.04
 FROM ${BASE_IMAGE}
 
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
+LABEL module="jupyter" \
+      description="Anima LoRA training on Hygon DCU (DTK 26.04 / torch 2.9.0+das)"
+
+USER root
+SHELL ["/bin/bash", "-c"]
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
-    TZ=Asia/Shanghai
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
-WORKDIR /workspace
+# 构建机的出网方式。scnet 的容器是走内网 HTTP 代理的，构建服务是否同样需要代理未知：
+#   - 不需要：保持 BUILD_PROXY 为空即可
+#   - 需要：--build-arg BUILD_PROXY=http://preset:xxxx@10.16.1.51:3128
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG BUILD_PROXY=
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    http_proxy=${BUILD_PROXY} https_proxy=${BUILD_PROXY} \
+    HTTP_PROXY=${BUILD_PROXY} HTTPS_PROXY=${BUILD_PROXY} \
+    no_proxy=localhost,127.0.0.1
 
-# --- 1) 记录基线：这是判断「后面有没有被污染」的唯一依据 ----------------------
-RUN python -c "import torch,sys;print('BASE torch=',torch.__version__,'hip=',torch.version.hip,'cuda=',torch.version.cuda)" \
- && python -m pip list > /opt/anima_base_pip_freeze.txt
+# --- 层 1：记录基线 -----------------------------------------------------------
+# 这是判断「后面有没有被污染」的唯一依据。das 版 torch 一旦被 PyPI 的 CUDA 版覆盖，
+# 报错会全部指向奇怪的地方，所以先把原始状态钉在镜像里。
+RUN mkdir -p /opt/anima-build \
+ && python -c "import torch;print('BASE torch=',torch.__version__,'hip=',torch.version.hip,'cuda=',torch.version.cuda)" \
+      | tee /opt/anima-build/base_torch.txt \
+ && python -m pip list > /opt/anima-build/base_pip_freeze.txt
 
-# --- 2) 冻结不可动的包 --------------------------------------------------------
-COPY AnimaLoraToolkit/tools/dcu_gen_constraints.py /opt/anima/dcu_gen_constraints.py
-RUN python /opt/anima/dcu_gen_constraints.py > /opt/anima/constraints-dcu.txt \
- && cat /opt/anima/constraints-dcu.txt
+# --- 层 2：冻结不可动的包 -----------------------------------------------------
+# 镜像里**没有 torchvision**，而仓库原 requirements.txt 写着 torchvision>=0.15.0 ——
+# pip 会从 PyPI 装它，连带把 das 版 torch 换成 CUDA 构建。constraints 把 torch/numpy
+# 钉死之后，任何想换它们的包会**报错**而不是静默替换。
+COPY anima-lora-train/AnimaLoraToolkit/tools/dcu_gen_constraints.py /opt/anima-build/
+RUN python /opt/anima-build/dcu_gen_constraints.py > /opt/anima-build/constraints-dcu.txt \
+ && cat /opt/anima-build/constraints-dcu.txt
 
-# --- 3) 装依赖（只有这一层会变，改 requirements 时缓存只失效这里）-------------
-COPY AnimaLoraToolkit/requirements-dcu.txt /opt/anima/requirements-dcu.txt
-RUN python -m pip install --prefer-binary \
-        -c /opt/anima/constraints-dcu.txt \
-        -r /opt/anima/requirements-dcu.txt
+# --- 层 3：依赖（改 requirements 时只有这层失效）------------------------------
+COPY anima-lora-train/AnimaLoraToolkit/requirements-dcu.txt /opt/anima-build/
+RUN python -m pip install --prefer-binary --root-user-action=ignore \
+        -c /opt/anima-build/constraints-dcu.txt \
+        -r /opt/anima-build/requirements-dcu.txt \
+ && python -m pip install --prefer-binary --root-user-action=ignore \
+        -c /opt/anima-build/constraints-dcu.txt \
+        wandb accelerate
 
-# --- 4) ★ 硬门槛：装完之后 torch 必须还是 HIP 构建 ----------------------------
-RUN python - <<'PY'
-import sys, torch
+# --- 层 4：环境脚本 -----------------------------------------------------------
+# DTK 的 env.sh 不在 /etc/profile.d 里（不 source 就 import torch 报
+# libgalaxyhip.so.5 找不到）；出网代理只存在于 jupyter 进程的环境里，ssh 会话拿不到。
+COPY anima-lora-train/AnimaLoraToolkit/tools/scnet_env.sh /etc/profile.d/zz-scnet-env.sh
+RUN chmod 0755 /etc/profile.d/zz-scnet-env.sh \
+ && echo '[ -f /etc/profile.d/zz-scnet-env.sh ] && . /etc/profile.d/zz-scnet-env.sh' >> /root/.bashrc
+
+# --- 层 5：代码 ---------------------------------------------------------------
+# stage 脚本已经剔掉 .git / 权重 / 数据集 / 输出，这层约 45MB。
+COPY anima-lora-train/ /opt/anima-lora-train/
+
+# --- 层 6（可选，默认关闭）：把权重也固化进镜像 --------------------------------
+# 默认**不带**：权重在平台共享目录里本来就有（每个节点都能读），塞进镜像只会让每次
+# 拉取多传 5.6GB。要做成完全自包含的参赛产物时，把权重放进 dockerFileTemp/anima_models/
+# 再解开下面两行。5.6GB 单层，远低于 15GB 上限。
+# COPY anima_models/ /opt/anima_models/
+# ENV ANIMA_MODELS_DIR=/opt/anima_models
+
+# --- 层 7：★ 双重硬门槛 -------------------------------------------------------
+# (a) torch 必须仍是 HIP 构建；(b) 平台要求的三样组件必须还在。
+# 任一不过则 build 失败 —— 能 build 出来的镜像必然可用。
+RUN set -e; \
+    python - <<'PY'
+import shutil, sys, os, torch
 hip, cuda = torch.version.hip, torch.version.cuda
 print(f"AFTER-INSTALL torch={torch.__version__} hip={hip} cuda={cuda}")
-if not hip:
-    sys.exit(
-        "✗ torch 已不是 HIP 构建 —— 依赖安装过程把 das 版换成了 PyPI CUDA 版。\n"
-        "  用 `pip install --dry-run -v` 定位是哪个包拉的 torch，然后把它加进\n"
-        "  requirements-dcu.txt 的排除名单或改用 --no-deps 装。"
-    )
-if cuda:
-    sys.exit(f"✗ torch.version.cuda={cuda} 非空，同上。")
-import numpy, transformers, safetensors, einops, yaml, PIL, sentencepiece
-print("import 自检通过 numpy=", numpy.__version__, "transformers=", transformers.__version__)
+if not hip or cuda:
+    sys.exit("✗ torch 已不是 HIP 构建 —— 依赖安装把 das 版换成了 PyPI CUDA 版。\n"
+             "  用 `pip install --dry-run -v` 定位是哪个包拉的 torch。")
+for m in ("numpy", "transformers", "safetensors", "einops", "sentencepiece", "yaml", "PIL", "rich", "omegaconf"):
+    __import__(m)
+print("✓ 训练依赖 import 自检通过")
+missing = [x for x in ("/usr/sbin/sshd", "/usr/bin/sudo", "/opt/conda/bin/jupyter") if not os.path.exists(x)]
+if missing:
+    sys.exit(f"✗ 平台必需组件缺失 {missing} —— 实例会起不来（见平台《构建镜像规则》一、1/2）")
+print("✓ 平台必需组件齐全 (sshd / sudo / /opt/conda/bin/jupyter)")
 PY
 
-# --- 5) 代码 -----------------------------------------------------------------
-COPY . /workspace/anima-lora-train
-WORKDIR /workspace/anima-lora-train
+# 构建期代理不该留在运行期环境里（凭据会随实例变，由 zz-scnet-env.sh 动态读取）
+ENV http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY=
 
-# 运行期默认值。8 卡时 run_dcu.sh --nproc 8 会用 torchrun 起。
 ENV ANIMA_DCU=1
+WORKDIR /opt/anima-lora-train
 
-CMD ["bash"]
+# ★ 不设 CMD/ENTRYPOINT：沿用基础镜像的 IDE 启动方式。平台按启动路径扫描 IDE，
+#   覆盖掉会导致创建实例失败。

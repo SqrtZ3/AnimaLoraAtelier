@@ -123,6 +123,7 @@ YAML_TO_ARGS = {
     "cache_encode_max_pixels": "cache_encode_max_pixels",
     "vae_attn_chunk_tokens": "vae_attn_chunk_tokens",
     "fast_model_init": "fast_model_init",
+    "navit_attn_chunk_tokens": "navit_attn_chunk_tokens",
     "alpha_handling": "alpha_handling",
     "alpha_background": "alpha_background",
     "alpha_threshold": "alpha_threshold",
@@ -648,6 +649,16 @@ DEFAULTS = {
     # buffer 必须全部落在显式重算集合里），对不上直接 raise 而不是让训练悄悄跑歪。
     # 默认关：这是启动速度优化，不影响任何训练数值。
     "fast_model_init": False,
+    # sdpa_seg 后端的段内 query 分块（token 数）。0 = 关，走原来的整段 SDPA。
+    # 只在没有 flash / mem-efficient SDPA 后端的平台上才需要（海光 DCU 实测只剩 math
+    # backend）：math 会物化 S×S 的 softmax，一张 2048×2048 原生图 = 16384 token，
+    # 16 头 fp32 就是 16.00 GiB，训练第一步 backward 直接爆。
+    # 注意：光分块不管用 —— math SDPA 把 S×S 存进 backward 图，切块只是拆成小块、
+    # 总量不变（本地强制 MATH 实测 S=4096：整块持有 1.12GiB，分块 1.30GiB）。所以
+    # 每个 query 块再套一层 gradient checkpoint，持有量降到 0.02GiB（56×）。
+    # 代价是注意力多跑一遍前向。数学上与不分块逐元素恒等。
+    # 建议：CUDA/昇腾保持 0；DCU 且装不上 flash-attn 时设 2048。
+    "navit_attn_chunk_tokens": 0,
     "alpha_handling": "none",
     "alpha_background": "neutral",
     "alpha_threshold": 0.01,

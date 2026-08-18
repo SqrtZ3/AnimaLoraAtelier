@@ -3454,8 +3454,25 @@ def main():
             emit(f"[navit-attn] krea2 packed attention backend = {_navit_attn_backend}"
                  f"（与块对角 mask 数学恒等；xformers 路径不再使用）")
         else:
-            from models.anima_modeling_core import set_packed_attention_backend
+            from models.anima_modeling_core import (
+                set_packed_attention_backend, set_seg_attn_chunk_tokens,
+            )
             set_packed_attention_backend(_navit_attn_backend)
+            _seg_chunk = int(getattr(args, "navit_attn_chunk_tokens", 0) or 0)
+            if _seg_chunk > 0:
+                if _navit_attn_backend != "sdpa_seg":
+                    raise ValueError(
+                        f"navit_attn_chunk_tokens={_seg_chunk} 只对 navit_attn_backend=sdpa_seg "
+                        f"有意义（当前是 {_navit_attn_backend!r}）。xformers / npu_tnd 是变长融合核，"
+                        f"本来就不物化 S×S，无需分块。"
+                    )
+                set_seg_attn_chunk_tokens(_seg_chunk)
+                logger.info(
+                    "[navit-attn] sdpa_seg 段内 query 分块已启用：chunk=%d token，每块套 "
+                    "gradient checkpoint。math SDPA 会把 S×S 物化进 backward 图，只分块不管用；"
+                    "套 checkpoint 后持有显存 ~56×↓，代价是注意力多跑一遍前向。数学恒等。",
+                    _seg_chunk,
+                )
             _note = ("昇腾原生 TND 变长融合注意力" if _navit_attn_backend == "npu_tnd"
                      else "逐段 dense SDPA")
             emit(f"[navit-attn] anima packed attention backend = {_navit_attn_backend}"

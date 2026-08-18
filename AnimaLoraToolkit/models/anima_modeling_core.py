@@ -99,6 +99,67 @@ def get_packed_attention_backend() -> str:
     return _PACKED_ATTN_BACKEND
 
 
+# ── sdpa_seg 的段内 query 分块（opt-in，默认 0 = 关）─────────────────────────────
+#
+# 只在**没有 flash / mem-efficient SDPA 后端**的平台上才需要（如海光 DCU：真机探针
+# 显示 torch 编译时就没带 mem-efficient / cuDNN attention，flash 的 .so 也缺失，
+# head_dim=128 / S=4096 只有 MATH 可用）。math backend 会逐元素物化 softmax(q@kᵀ)，
+# 显存 O(S²)：一张 2048×2048 原生分辨率图是 16384 token，16 头 fp32 的 S×S 就是
+# 16.00 GiB —— 真机上训练第一步的 backward 就是这样爆的。
+#
+# 关键的一点（本地 GPU 强制 MATH 后端实测，S=4096/H=16/bf16）：**光按 query 分块没用**，
+# 因为 math SDPA 会把 S×S 的 softmax 结果存进 backward 图，切块只是把一个大张量拆成
+# 若干小的，加起来还是 S×S：
+#     整块 SDPA                    forward 后持有 1.12 GiB   峰值 2.41 GiB
+#     query 分块 (c=1024)          forward 后持有 1.30 GiB   峰值 1.64 GiB   ← 没省
+#     query 分块 + 每块 checkpoint  forward 后持有 0.02 GiB   峰值 0.65 GiB   ← 56×↓
+# 所以这里每个 query 块**再套一层 gradient checkpoint**，backward 时逐块重算。
+# 代价是注意力多跑一遍前向。
+#
+# 数学上：每个 query 的 softmax 归一化域仍是本段全部 key，与不分块逐元素恒等
+# （tests/test_seg_attn_chunk.py 对拍前向与梯度）。0 = 关，走原来的整段 SDPA。
+_SEG_ATTN_CHUNK_TOKENS = 0
+
+
+def set_seg_attn_chunk_tokens(n: int) -> int:
+    """设置 sdpa_seg 段内 query 分块大小（token 数）。0 = 关。返回生效值。"""
+    global _SEG_ATTN_CHUNK_TOKENS
+    n = int(n or 0)
+    if n < 0:
+        raise ValueError(f"navit_attn_chunk_tokens 必须 ≥0，收到 {n}")
+    _SEG_ATTN_CHUNK_TOKENS = n
+    return _SEG_ATTN_CHUNK_TOKENS
+
+
+def get_seg_attn_chunk_tokens() -> int:
+    return _SEG_ATTN_CHUNK_TOKENS
+
+
+def _sdpa_plain(q, k, v):
+    return F.scaled_dot_product_attention(q, k, v)
+
+
+def _seg_sdpa_chunked(qs, ks, vs, chunk: int):
+    """段内按 query 分块的 SDPA，每块套 gradient checkpoint。
+
+    qs/ks/vs: [B, H, s, D]。与 ``F.scaled_dot_product_attention(qs, ks, vs)`` 数学恒等。
+    无梯度时（eval / 采样）不套 checkpoint —— 那种场景没有 backward 图，分块本身就够。
+    """
+    sq = qs.shape[-2]
+    if chunk <= 0 or sq <= chunk:
+        return F.scaled_dot_product_attention(qs, ks, vs)
+    use_ckpt = torch.is_grad_enabled() and (
+        qs.requires_grad or ks.requires_grad or vs.requires_grad)
+    outs = []
+    for st in range(0, sq, chunk):
+        qc = qs[:, :, st:st + chunk, :]
+        if use_ckpt:
+            outs.append(checkpoint(_sdpa_plain, qc, ks, vs, use_reentrant=False))
+        else:
+            outs.append(F.scaled_dot_product_attention(qc, ks, vs))
+    return torch.cat(outs, dim=-2)
+
+
 class _SegLens:
     """打包注意力的轻量段长标记（替代 xformers ``BlockDiagonalMask``）。
 
@@ -135,7 +196,7 @@ def _packed_attention_seg(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D, seg: _SegLens):
         qs = q_B_S_H_D[:, qo:qo + sq].transpose(1, 2)
         ks = k_B_S_H_D[:, ko:ko + sk].transpose(1, 2)
         vs = v_B_S_H_D[:, ko:ko + sk].transpose(1, 2)
-        o = F.scaled_dot_product_attention(qs, ks, vs)
+        o = _seg_sdpa_chunked(qs, ks, vs, _SEG_ATTN_CHUNK_TOKENS)
         outs.append(o.transpose(1, 2))                       # 回 [B, s, H, D]
         qo += sq
         ko += sk

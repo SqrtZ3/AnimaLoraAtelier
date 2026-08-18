@@ -235,7 +235,7 @@ Dockerfile 把它装到 `/etc/profile.d/zz-scnet-env.sh`（登录 shell 自动�
 |---|---|:--:|:--:|
 | 1 | torch 仍是 HIP 构建（`version.hip` 非空且 `version.cuda` 为空） | ✅ | ✅ |
 | 2 | numpy 仍是 1.x | ✅ | ✅ |
-| 3 | 训练必需依赖可 import（含 flash_attn / triton，2026-08-18 起） | ✅ | ✅ |
+| 3 | 训练必需依赖可 import（含 flash_attn / triton；**构建期无 DCU，对这两个只查包存在性**，import 验证在运行期） | ✅ | ✅ |
 | 4 | 平台必需组件 `sshd`/`sudo`/`/opt/conda/bin/jupyter` 齐全 | ✅ | ✅ |
 | 5 | `/etc/profile.d/zz-scnet-env.sh` 已安装 | ✅ | ✅ |
 | 6 | **DCU 真的可见** | ❌ | ✅ |

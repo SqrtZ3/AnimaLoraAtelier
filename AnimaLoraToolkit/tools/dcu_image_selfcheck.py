@@ -84,10 +84,20 @@ def main() -> int:
         check("import numpy", False, f"{type(exc).__name__}: {exc}")
 
     # --- 3) 训练依赖 ---
+    # flash_attn 的 .so 在 dlopen 时就会查询 HIP 设备（getCurrentDeviceProperties），
+    # 构建节点没有 DCU → C++ terminate（exit 139），try/except 接不住。所以构建期对
+    # 这类"碰设备"的模块只查包存在性（find_spec 不执行模块代码），真 import 验证
+    # 交给运行期 —— 运行期的「SDPA flash 后端激活」项已覆盖 flash_attn 可用性
+    # （dlopen 不成功 configure_sdpa_backends 就会关 flash）。
+    DEVICE_TOUCHING = {"flash_attn", "triton"}
     missing = []
     for mod in REQUIRED:
         try:
-            importlib.import_module(mod)
+            if mod in DEVICE_TOUCHING and not torch.cuda.is_available():
+                if importlib.util.find_spec(mod) is None:
+                    raise ModuleNotFoundError(mod)
+            else:
+                importlib.import_module(mod)
         except Exception:
             missing.append(mod)
     check("训练必需依赖齐全", not missing, "缺 " + ", ".join(missing) if missing

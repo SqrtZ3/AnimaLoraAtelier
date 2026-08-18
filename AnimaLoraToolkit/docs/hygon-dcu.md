@@ -125,6 +125,14 @@ DTK 的 torch 把无 mask 的 SDPA 派发给一个**外部的 flash-attn 动态�
 * 用 `requirements-dcu.txt` + `tools/dcu_gen_constraints.py` 生成的 constraints 装，
   constraints 会把 `torch`/`numpy` 钉死，任何试图换 torch 的包会**报错**而不是静默替换。
 * **`numpy` 必须留在 1.25.0**：das 版 torch 是按它编的（未做 numpy2 对拍，保守不动）。
+* **clone 时跳过 LFS 权重**：仓库有 13 个文件被 Git LFS 跟踪（旧模型权重），直接 clone
+  会多下约 16GB，而在 scnet 上权重是从平台共享目录取的，不需要它们：
+
+  ```bash
+  GIT_LFS_SKIP_SMUDGE=1 git clone -b feat/tpu-probe https://cnb.cool/hanpi222333/anima-lora-train.git
+  ```
+
+  `AnimaLoraToolkit/models/t5_tokenizer/` 是 git 直接管理的小文件，不走 LFS，clone 后即可用。
 * ★ 【实测】**容器没有直连出网，全部走内网 HTTP 代理**，而这套 proxy 变量**只存在于
   Jupyter 进程的环境里**（`/proc/<jupyter-pid>/environ`）。sshd 由 pid 1 拉起、不继承它，
   所以 **SSH 会话里 pip / git / wandb 全部超时**，看起来像"整个容器断网"——

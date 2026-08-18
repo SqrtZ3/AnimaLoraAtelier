@@ -5,12 +5,18 @@
 ——mem-efficient 与 cuDNN attention 在**编译期**就没进 torch，flash 的 .so 缺失。
 math 会物化 S×S 的 softmax，NaViT 打包路径单段 16384 token 时 backward 直接 OOM。
 
-本脚本按"编译可行性由低到高的风险"依次探测四条路，每条独立、互不阻塞，
+本脚本按"编译可行性由低到高的风险"依次探测各条路，每条独立、互不阻塞，
 任何一条崩了都继续往下跑，最后给汇总表。**只读探测，不改环境。**
 
     python tools/dcu_attn_backend_probe.py
 
 关注三列：可用 / 数值是否与 math 一致 / 峰值显存与耗时。
+
+2026-08-18 新增两项检测，配合 DAS wheel 的安装验证（详见 docs/dcu-attn-backend-research.md）：
+- [0b] libamdhip64 的 HIP 符号：triton≥3.6 需要 hipDrvLaunchKernelEx（HIP 6.4 才有），
+  DTK 26.04 的 hip 6.3.26093 没有 → 上游新 triton 死在第 1 道门；DAS 自编 triton 不受限。
+- [5] torch SDPA 的 FLASH 后端：DAS torch 的 flash 是运行时 dlopen 外部
+  flash_attn_2_cuda*.so，装上光源 DAS 的 flash_attn wheel 后这一项应从 FAIL 变 OK。
 """
 
 from __future__ import annotations
@@ -53,6 +59,12 @@ def probe_env():
     if not torch.cuda.is_available():
         raise SystemExit("  没有可用加速卡，退出")
     print(f"  device: {torch.cuda.get_device_properties(0).gcnArchName}")
+    for pkg in ("flash_attn", "triton", "xformers", "aotriton"):
+        try:
+            m = __import__(pkg)
+            print(f"  {pkg} {getattr(m, '__version__', '?')} 已安装（{m.__file__}）")
+        except Exception:
+            pass
     try:
         import triton
         print(f"  triton {triton.__version__}  ({triton.__file__})")
@@ -60,6 +72,64 @@ def probe_env():
     except Exception as e:
         print(f"  triton 不可用: {type(e).__name__}: {e}")
         return False
+
+
+def probe_hip_library():
+    """libamdhip64.so 上 Triton 关心的 HIP 符号是否存在。
+
+    背景【实测 · scnet BW(gfx936)】：上游 triton 3.7.1 在 HIPUtils() 初始化时报
+    `cannot get address for 'hipDrvLaunchKernelEx' from libamdhip64.so` ——
+    DTK 26.04 的 libamdhip64（hip 6.3.26093）没有该符号（HIP 6.4 才引入）。
+    核对 triton v3.2.0 源码：其 AMD 后端只用 hipModuleLaunchKernel /
+    hipModuleLoadDataEx / hipModuleGetFunction / hipFuncGetAttribute 等老符号，
+    因此 ≤3.2 的版本能过这一关；DAS 自编 triton（光源 DAS1.8 有 3.3.0/3.5.1 轮子）
+    也应满足。这一项给出"哪个版本的 triton 能过 ABI 门"的直接证据。
+    """
+    print("=" * 78)
+    print("[0b] libamdhip64 符号（决定 triton 的 ABI 门）")
+    try:
+        import ctypes
+        lib = ctypes.CDLL("libamdhip64.so")
+    except Exception as e:
+        _record("libamdhip64 加载", "FAIL", f"{type(e).__name__}: {e}")
+        return
+    for sym in ("hipModuleLaunchKernel", "hipModuleLoadDataEx",
+                "hipGetDeviceProperties", "hipDrvLaunchKernelEx"):
+        try:
+            getattr(lib, sym)
+            _record(f"libamdhip64.{sym}", "有")
+        except AttributeError:
+            _record(
+                f"libamdhip64.{sym}", "缺失",
+                "（triton>=3.6 需要它；缺失时只能用 <=3.5 的 triton 或 DAS 自编版）")
+
+
+def probe_aotriton():
+    """aotriton（torch ROCm 侧 flash 的编译期依赖）是否存在。
+
+    上游 aotriton 的 arch 列表没有 gfx936，因此即使 DTK 带了 aotriton，
+    对 SDPA flash 后端也没有帮助——此项只是取证，结论写在 docs/dcu-attn-backend-research.md。
+    """
+    print("=" * 78)
+    print("[0c] aotriton（torch ROCm flash 的编译期依赖，gfx936 预期无实例）")
+    found = []
+    try:
+        import aotriton
+        found.append(f"python 包 aotriton {getattr(aotriton, '__version__', '?')}")
+    except Exception:
+        pass
+    try:
+        import glob
+        import os
+        hits = glob.glob(os.path.join(os.path.dirname(torch.__file__), "lib", "*aotriton*"))
+        found.extend(os.path.basename(h) for h in hits)
+    except Exception:
+        pass
+    if found:
+        _record("aotriton", "OK", ", ".join(found))
+    else:
+        _record("aotriton", "未找到",
+                "（DTK 26.04 不带；即便带，上游 arch 列表也无 gfx936）")
 
 
 def probe_triton_hello():
@@ -102,6 +172,11 @@ def probe_flash_attn_triton(q, k, v, ref):
     Dao-AILab 官方仓库自带，用 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE 安装时**不编**
     CK 的 C++ kernel，纯 Triton JIT —— 因此不受 CK 那套按 gfx90a/gfx942 生成 instance
     的架构门槛限制，是 gfx936 上最有希望编出来的一条。
+
+    注意：**优先装光源 DAS 的 flash_attn 轮子**（预编译、与 das torch 的 dlopen
+    约定配套），源码编译只在轮子不可用时才是备胎：
+      https://download.sourcefind.cn:65024/directlink/4/flash_attn/DAS1.8/
+    详情见 docs/dcu-attn-backend-research.md。
     """
     print("=" * 78)
     print("[2] flash-attn Triton AMD 后端（需先安装；本脚本只检测是否已可用）")
@@ -109,9 +184,12 @@ def probe_flash_attn_triton(q, k, v, ref):
         from flash_attn import flash_attn_func
     except Exception as e:
         _record("flash_attn 包", "未安装", f"{type(e).__name__}")
-        print("      安装方式（源码，纯 Triton、不编 CK）：")
-        print("        git clone https://github.com/Dao-AILab/flash-attention")
-        print("        cd flash-attention && FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE pip install -v -e . --no-build-isolation")
+        print("      安装方式（优先 DAS 轮子，其次源码）：")
+        print("        1) 光源 DAS1.8: https://download.sourcefind.cn:65024/directlink/4/flash_attn/DAS1.8/")
+        print("           选 flash_attn-2.8.3+das.opt1.dtk2604.torch290-cp311-*.whl 后 pip install")
+        print("        2) 源码（纯 Triton、不编 CK）：")
+        print("           git clone https://github.com/Dao-AILab/flash-attention")
+        print("           cd flash-attention && FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE pip install -v -e . --no-build-isolation")
         return
     try:
         # flash_attn_func 吃 [B, S, H, D]
@@ -161,6 +239,28 @@ def probe_math_baseline(q, k, v):
     return out
 
 
+def probe_sdpa_flash(q, k, v, ref):
+    """torch SDPA 的 FLASH 后端能否跑通（装 DAS flash_attn 轮子后的激活验证）。
+
+    背景【实测】：DAS torch 把无 mask 的 SDPA 派发给外部动态库 flash_attn_2_cuda*.so，
+    缺失时报 `RuntimeError: No matching libraries found for flash_attn_2_cuda*.so`
+    （此时 dcu_compat.configure_sdpa_backends() 会把 flash 后端关掉）。
+    装上光源 DAS1.8 的 flash_attn 轮子后，这一项应从 FAIL 变 OK，
+    sdpa_seg 的训练路径即可摆脱"math + 分块 + checkpoint"的兜底。
+    """
+    print("=" * 78)
+    print("[5] torch SDPA 的 FLASH 后端（装 flash_attn das 轮子后验证激活）")
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    try:
+        with sdpa_kernel(SDPBackend.FLASH):
+            out = F.scaled_dot_product_attention(q, k, v)
+        torch.cuda.synchronize()
+        err = (out.float() - ref.float()).abs().max().item()
+        _record("SDPA FLASH 后端", "OK", f"max|Δ| vs math = {err:.2e}")
+    except Exception as e:
+        _record("SDPA FLASH 后端", "FAIL", f"{type(e).__name__}: {str(e)[:200]}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seq", type=int, default=4096, help="序列长度（真实痛点是 16384）")
@@ -170,6 +270,8 @@ def main():
     args = ap.parse_args()
 
     probe_env()
+    probe_hip_library()
+    probe_aotriton()
     triton_ok = probe_triton_hello()
 
     dt = getattr(torch, args.dtype)
@@ -179,6 +281,7 @@ def main():
     print(f"（math 后端会物化的 S×S: {args.heads * args.seq ** 2 * q.element_size() / 2**30:.2f} GiB）")
 
     ref = probe_math_baseline(q, k, v)
+    probe_sdpa_flash(q, k, v, ref)
     probe_flash_attn_triton(q, k, v, ref)
     if triton_ok:
         probe_flex_attention(q, k, v, ref)

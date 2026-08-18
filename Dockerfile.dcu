@@ -80,6 +80,23 @@ RUN python -m pip install --prefer-binary --root-user-action=ignore \
         -c /opt/anima-build/constraints-dcu.txt \
         wandb accelerate
 
+# --- 层 3.5：DAS 生态轮子（flash_attn / triton，2026-08-18 真机验证通过）------------
+# 这两个包 PyPI 上只有 NVIDIA CUDA 版（`pip index versions flash-attn` 全是 cu 段），
+# 必须装海光光源 DAS1.8 的预编译轮子（torch290 / cp311 段 = torch 2.9.0+das.opt1.dtk2604
+# / py3.11，与本镜像配套）。装上后 DAS torch 的 SDPA flash 后端被激活（运行时 dlopen
+# flash_attn_2_cuda*.so）：无 mask SDPA 峰值显存 32.57 → 0.34 GiB（S=16384），
+# 数值 max|Δ|=4.88e-4。版本核实与获取方式见
+# AnimaLoraToolkit/docs/dcu-attn-backend-research.md。
+# pytest 是 flash_attn import 链的硬依赖（flash_attn_triton.py 模块级 import）。
+# ★ 构建期到 download.sourcefind.cn:65024 的公网可达性：tuna 直连可达（§9 实测），
+#   该站公网证书正常（本地 curl 200 验证）；若构建机访问不通，把两个 wheel 下载到
+#   dockerFileTemp 再 COPY（参照层 6 的权重做法）。
+ARG DAS_FLASH_ATTN_URL=https://download.sourcefind.cn:65024/directlink/4/flash_attn/DAS1.8/flash_attn-2.8.3+das.opt1.dtk2604.torch290-cp311-cp311-manylinux_2_28_x86_64.whl
+ARG DAS_TRITON_URL=https://download.sourcefind.cn:65024/directlink/4/triton/DAS1.8/triton-3.5.1+das.opt1.dtk2604.torch290-cp311-cp311-manylinux_2_28_x86_64.whl
+RUN set -eu; \
+    python -m pip install --root-user-action=ignore "${DAS_FLASH_ATTN_URL}" "${DAS_TRITON_URL}"; \
+    python -m pip install --root-user-action=ignore pytest
+
 # --- 层 4：环境脚本 -----------------------------------------------------------
 # DTK 的 env.sh 不在 /etc/profile.d 里（不 source 就 import torch 报
 # libgalaxyhip.so.5 找不到）；出网代理只存在于 jupyter 进程的环境里，ssh 会话拿不到。

@@ -141,6 +141,15 @@ image.sourcefind.cn:5000/dcu/admin/base/jupyterlab-pytorch:2.9.0-ubuntu22.04-dtk
 生成的 constraints 把 `torch`/`numpy` 钉死。钉死后任何想换它们的包会**报错**而不是
 静默替换。`numpy` 必须留在 1.25.0：das torch 是按 1.x ABI 编的，未做 numpy2 对拍。
 
+**另一个同族坑（2026-08-18 修复）**：flash_attn / triton 在 PyPI 上只有 NVIDIA CUDA 版，
+但 DCU 的 SDPA flash 后端与 torch.compile 都需要它们（flash_attn 缺了，DTK 上无 mask
+SDPA 直接抛异常，仓库只能关掉 flash 退回 O(S²) 的 math；triton 还是 flash_attn 的 import
+硬依赖）。→ 装海光光源 DAS1.8 的预编译轮子（`Dockerfile.dcu` 层 3.5 直接从
+`download.sourcefind.cn:65024/directlink/4/{flash_attn,triton}/DAS1.8/` 下载，
+`torch290`/`cp311` 段与本镜像的 torch 2.9.0+das.opt1.dtk2604 / py3.11 配套），
+另需 `pytest`（flash_attn import 链硬依赖）。装后 SDPA 自动走 flash：无 mask 峰值
+32.57 → 0.34 GiB（S=16384），真机验证通过（详见 `dcu-attn-backend-research.md`）。
+
 ### 5.2 legacy builder：heredoc 直接失效
 
 平台用 **docker legacy builder**（日志里会打 `DEPRECATED: The legacy builder is deprecated`）。
@@ -183,6 +192,7 @@ RUN python -c "..." | tee /opt/anima-build/base_torch.txt && 下一步
 | 1 | 记录 base 的 torch/pip 基线到 `/opt/anima-build/` | "有没有被污染"的判据，必须在装任何东西**之前** |
 | 2 | 生成 constraints | 只读包元数据，不 import torch |
 | 3 | `pip install -c constraints -r requirements-dcu.txt` + wandb/accelerate | 改 requirements 时只有这层缓存失效 |
+| 3.5 | DAS 轮子：flash_attn / triton（+ pytest） | 从 download.sourcefind.cn 下载、约 750MB，与 requirements 解耦 |
 | 4 | `scnet_env.sh` → `/etc/profile.d/zz-scnet-env.sh` + 挂进 `.bashrc` | 见 §7 |
 | 5 | 代码 → `/opt/anima-lora-train`（44MB） | 改代码只失效这层 |
 | 6 | 权重 → `/opt/anima_models`（**默认注释掉**） | 5.6GB，opt-in |
@@ -224,23 +234,22 @@ Dockerfile 把它装到 `/etc/profile.d/zz-scnet-env.sh`（登录 shell 自动�
 |---|---|:--:|:--:|
 | 1 | torch 仍是 HIP 构建（`version.hip` 非空且 `version.cuda` 为空） | ✅ | ✅ |
 | 2 | numpy 仍是 1.x | ✅ | ✅ |
-| 3 | 7 个训练必需依赖可 import | ✅ | ✅ |
+| 3 | 训练必需依赖可 import（含 flash_attn / triton，2026-08-18 起） | ✅ | ✅ |
 | 4 | 平台必需组件 `sshd`/`sudo`/`/opt/conda/bin/jupyter` 齐全 | ✅ | ✅ |
 | 5 | `/etc/profile.d/zz-scnet-env.sh` 已安装 | ✅ | ✅ |
 | 6 | **DCU 真的可见** | ❌ | ✅ |
-| 7 | **无 mask SDPA 真的能跑**（`dcu_compat` 的 flash 关闭生效） | ❌ | ✅ |
+| 7 | **SDPA flash 后端激活**（`configure_sdpa_backends` 什么都不关；不再校验"关闭 flash 生效"） | ❌ | ✅ |
 
 **6/7 构建期验不了** —— 构建节点上没有 DCU（日志里 `get hyhal driver version error!`）。
-而第 7 项正是这个镜像存在的主要理由（DTK 上无 mask 的 SDPA 会直接抛
-`No matching libraries found for flash_attn_2_cuda*.so`，见 `hygon-dcu.md` §2.5）。
-**所以"构建成功"不等于"验收通过"，必须用新镜像建实例跑一次 `--runtime`。**
+第 7 项语义（2026-08-18 更新）：v0.1.1 时期它是"无 mask SDPA 能跑 + flash 被关闭"
+（flash_attn 轮子缺失时的修复证据）；镜像带上 DAS flash_attn 轮子后，它升级为
+"flash 后端激活"（`sdpa.flash=True` 且 `disabled_by_anima` 为空）—— 这才是这个镜像
+存在的主要理由：无 mask SDPA 显存 O(S) 级（S=16384 峰值 0.34 GiB），NaViT 大 token
+预算可用。**所以"构建成功"不等于"验收通过"，必须用新镜像建实例跑一次 `--runtime`。**
 
-正常输出里这几条**不是错误**：
+正常输出里这条**不是错误**：
 
-* `[dcu] 无 mask SDPA 失败（… flash_attn_2_cuda*.so），已关闭 flash 后端后重试`
-  ← 修复正在工作的证据
-* `WARNING: /opt/hyhal/lib/cmake/rocm_smi doesn't exist`、
-  `Torch was not compiled with memory efficient attention` ← 基础镜像固有
+* `Torch was not compiled with memory efficient attention`、`WARNING: /opt/hyhal/lib/cmake/rocm_smi doesn't exist` ← 基础镜像固有
 
 ---
 

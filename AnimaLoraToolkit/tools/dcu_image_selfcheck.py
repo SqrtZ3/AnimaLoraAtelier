@@ -31,7 +31,12 @@ import sys
 
 # 训练必需（anima_train.py:ensure_dependencies 的硬门槛）
 REQUIRED = ["numpy", "PIL", "safetensors", "transformers", "einops", "sentencepiece", "yaml"]
-# 强烈建议 / 本镜像额外装的
+# 本镜像额外装的两类：
+#  - 强烈建议：EXPECTED
+#  - DCU 注意力后端（DAS 预编译轮子，PyPI 无 DCU 版）：flash_attn / triton ——
+#    flash_attn 激活 DAS torch 的 SDPA flash 后端；triton 是 flash_attn 的 import 硬依赖
+#    （flash_attn/utils/sparse_utils.py 模块级 import），也是 torch.compile / FlexAttention 的前提
+REQUIRED += ["flash_attn", "triton"]
 EXPECTED = ["rich", "omegaconf", "wandb", "accelerate"]
 # 平台要求，缺了实例起不来（见《构建镜像规则》一、1/2）
 PLATFORM_BINS = ["/usr/sbin/sshd", "/usr/bin/sudo", "/opt/conda/bin/jupyter"]
@@ -85,7 +90,8 @@ def main() -> int:
             importlib.import_module(mod)
         except Exception:
             missing.append(mod)
-    check("训练必需依赖齐全", not missing, "缺 " + ", ".join(missing) if missing else "7/7")
+    check("训练必需依赖齐全", not missing, "缺 " + ", ".join(missing) if missing
+          else f"{len(REQUIRED)}/{len(REQUIRED)}")
 
     soft = []
     for mod in EXPECTED:
@@ -110,8 +116,6 @@ def main() -> int:
         check("DCU 可见", avail,
               f"{torch.cuda.device_count()} 卡 {torch.cuda.get_device_name(0)}" if avail else "无")
         if avail:
-            # ★ 这条是本镜像存在的主要理由之一：DTK 上无 mask 的 SDPA 会直接抛
-            #   RuntimeError（缺 flash_attn_2_cuda*.so），dcu_compat 会实测后关掉 flash。
             sys.path.insert(0, "/opt/anima-lora-train/AnimaLoraToolkit")
             try:
                 from utils import dcu_compat
@@ -119,11 +123,18 @@ def main() -> int:
                 import torch.nn.functional as F
                 q = torch.randn(1, 2, 64, 32, device="cuda", dtype=torch.bfloat16)
                 F.scaled_dot_product_attention(q, q, q)
-                check("无 mask SDPA 可用（dcu_compat 修复生效）", True,
-                      f"关掉了 {info.get('sdpa', {}).get('disabled_by_anima')}")
+                check("无 mask SDPA 可用", True)
             except Exception as exc:
-                check("无 mask SDPA 可用（dcu_compat 修复生效）", False,
-                      f"{type(exc).__name__}: {exc}")
+                check("无 mask SDPA 可用", False, f"{type(exc).__name__}: {exc}")
+            # ★ flash 后端必须激活：DAS 版 torch 把无 mask SDPA 派发给外部 flash-attn
+            #   动态库（缺失时报 `No matching libraries found for flash_attn_2_cuda*.so`，
+            #   dcu_compat 会实测后关掉 flash 退回 math —— 那是"能用但 O(S²)"）。
+            #   镜像里带 DAS flash_attn 轮子后，configure_sdpa_backends 应什么都不关
+            #   （flash 保持开），SDPA 峰值显存 O(S) 级（详见 docs/dcu-attn-backend-research.md）。
+            sdpa_state = info.get("sdpa", {})
+            flash_on = bool(sdpa_state.get("flash")) and not sdpa_state.get("disabled_by_anima")
+            check("SDPA flash 后端激活（DAS flash_attn 轮子生效）", flash_on,
+                  f"flash={sdpa_state.get('flash')} 关掉了 {sdpa_state.get('disabled_by_anima')}")
 
     print("-" * 70)
     if fails:

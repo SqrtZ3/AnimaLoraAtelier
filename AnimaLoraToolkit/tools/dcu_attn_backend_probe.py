@@ -210,6 +210,8 @@ def probe_flex_attention(q, k, v, ref):
     """
     print("=" * 78)
     print("[3] torch FlexAttention（自带，走 Inductor→Triton）")
+    print("      注：若此处 segfault（triton 的 LLVM 在编译时崩），换 triton 3.3.0 轮子再试：")
+    print("        pip install triton-3.3.0+das.opt1.dtk2604.torch290-cp311-cp311-manylinux_2_28_x86_64.whl")
     try:
         from torch.nn.attention.flex_attention import flex_attention
     except Exception as e:
@@ -240,13 +242,18 @@ def probe_math_baseline(q, k, v):
 
 
 def probe_sdpa_flash(q, k, v, ref):
-    """torch SDPA 的 FLASH 后端能否跑通（装 DAS flash_attn 轮子后的激活验证）。
+    """torch SDPA 的 flash 后端能否跑通（装 DAS flash_attn 轮子后的激活验证）。
 
     背景【实测】：DAS torch 把无 mask 的 SDPA 派发给外部动态库 flash_attn_2_cuda*.so，
     缺失时报 `RuntimeError: No matching libraries found for flash_attn_2_cuda*.so`
     （此时 dcu_compat.configure_sdpa_backends() 会把 flash 后端关掉）。
     装上光源 DAS1.8 的 flash_attn 轮子后，这一项应从 FAIL 变 OK，
     sdpa_seg 的训练路径即可摆脱"math + 分块 + checkpoint"的兜底。
+
+    注【实测】：DAS torch 的 SDPBackend 枚举里**没有 FLASH 常量**（后端枚举被重写，
+    上游 torch 2.9 才有）。所以先试上游写法，AttributeError 时退化为
+    "开 flash 全局开关 + 无 mask SDPA"，用峰值显存判定：
+    flash 特征 ~0.1 GiB，math 特征 ~32 GiB（S=16384），区分度极大。
     """
     print("=" * 78)
     print("[5] torch SDPA 的 FLASH 后端（装 flash_attn das 轮子后验证激活）")
@@ -257,6 +264,21 @@ def probe_sdpa_flash(q, k, v, ref):
         torch.cuda.synchronize()
         err = (out.float() - ref.float()).abs().max().item()
         _record("SDPA FLASH 后端", "OK", f"max|Δ| vs math = {err:.2e}")
+    except AttributeError:
+        # DAS torch：枚举里没有 FLASH（flash 是运行时 dlopen 外部 flash_attn 库）
+        try:
+            backends = getattr(torch.backends, "cuda", None)
+            if backends is not None and hasattr(backends, "enable_flash_sdp"):
+                backends.enable_flash_sdp(True)
+            torch.cuda.reset_peak_memory_stats()
+            out = F.scaled_dot_product_attention(q, k, v)  # 无 mask，走默认派发
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated() / 2 ** 30
+            err = (out.float() - ref.float()).abs().max().item()
+            _record("SDPA 无 mask（默认派发）", "OK",
+                    f"峰值 {peak:.2f} GiB（flash 特征 ~0.1，math 特征 ~32）, max|Δ|={err:.2e}")
+        except Exception as e:
+            _record("SDPA 无 mask（默认派发）", "FAIL", f"{type(e).__name__}: {str(e)[:200]}")
     except Exception as e:
         _record("SDPA FLASH 后端", "FAIL", f"{type(e).__name__}: {str(e)[:200]}")
 

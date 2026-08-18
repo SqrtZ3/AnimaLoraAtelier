@@ -135,3 +135,15 @@ python /opt/anima-lora-train/AnimaLoraToolkit/tools/dcu_attn_backend_probe.py --
 - `navit_attn_chunk_tokens` 兜底是否应默认关（flash 可用时它是纯开销）。
 - DAS triton 与 torch 2.9 的 inductor 配套；FlexAttention 在 gfx936 上的数值对拍。
 - VAE head_dim=384 永远走 chunk 兜底（flash 上限 256），与后端无关。
+
+## 7. 真机验证进度（2026-08-18，scnet BW / gfx936）
+
+| 项 | 结果 | 说明 |
+|---|---|---|
+| DAS triton 3.5.1 安装 + 最简 kernel | ✅ OK | `libamdhip64.hipDrvLaunchKernelEx` 缺失（[0b] 确认），但海光自编版不依赖它；gfx936 codegen 通 —— 问题 6 两道门全过 |
+| flash_attn_func 直调（S=16384, H=16, D=128, bf16） | ✅ OK | 峰值 **0.13 GiB / 10.9 ms**，`max|Δ|=4.88e-4`（bf16 正常误差）；对比 math 32.57 GiB / 216 ms —— 显存 250 倍、速度 20 倍 |
+| [5] SDPA FLASH 后端 | ⚠️ 测法修正 | DAS torch 的 `SDPBackend` 枚举**没有 FLASH 常量**（后端枚举被重写，佐证 flash=dlopen 外部库机制）。探针已改为退化测法（开全局 flash + 无 mask SDPA + 峰值判定），待重跑 |
+| flash_attn 版本号 | ⚠️ 待核实 | 探针显示 `flash_attn.__version__ = 2.6.1`，而 pip metadata 是 `2.8.3+das...` —— 疑似轮子内部版本号未同步（不影响功能），待 `pip show` 对账 |
+| FlexAttention（triton 3.5.1） | ❌ segfault | triton 的 LLVM 编译 flex kernel 时 `addSource: error: expected type` 后 core dump —— 待换 triton 3.3.0（torch 2.9 官方配套更接近 3.3/3.4）重试 |
+
+注意：`flash_attn.__version__` 与 pip metadata 不一致的待核实项不影响主结论（[2] 已实测可用）；SDPA 无 mask 默认派发是否走 flash 以修正后的 [5] 为准。

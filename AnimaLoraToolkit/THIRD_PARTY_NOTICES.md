@@ -131,5 +131,34 @@
 
 ---
 
+## DCU 镜像内分发的第三方组件（2026-08-18）
+
+以下组件随 `Dockerfile.dcu` 构建的公开镜像（`anima-lora-dcu:*`）分发，发布镜像时请保留
+各自许可并附版权声明（许可文本随 pip 包或官方仓库提供）：
+
+| 组件 | 版本（镜像内实测） | 许可 | 来源 |
+|---|---|---|---|
+| flash_attn（海光 DAS 预编译轮子） | 2.8.3+das.opt1.dtk2604.torch290 | BSD-3-Clause | `Dao-AILab/flash-attention`，由光源 DAS1.8 编译分发（download.sourcefind.cn:65024） |
+| triton（海光 DAS 预编译轮子） | 3.5.1+das.opt1.dtk2604.torch290 | MIT | `triton-lang/triton`，由光源 DAS1.8 编译分发 |
+| code-server | 4.133.0（tarball 手动打包进镜像） | MIT | `coder/code-server`（github releases 下载） |
+| jupyterlab | 4.6.3 | BSD-3-Clause | PyPI（清华镜像） |
+| transformers / accelerate | 4.57.6 / 随 pip freeze | Apache-2.0 | PyPI |
+| torch / torchvision（基础镜像自带 das 构建） | 2.9.0+das.opt1.dtk2604 | BSD-3-Clause（PyTorch） | 光源基础镜像 `jupyterlab-pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.11-devel` |
+| wandb / einops / safetensors / Pillow 等 | 随 pip freeze | 各包许可（MIT/Apache-2.0/BSD 为主） | PyPI |
+
+注意事项：
+
+1. **海光 DAS 预编译轮子（flash_attn/triton）的再分发**：上游开源许可允许再分发，但
+   轮子本身由海光光源平台编译提供，公开发布镜像前建议确认光源平台的使用条款是否允许
+   再分发其编译产物（如需，可改在发布说明中注明"包含海光 DAS 编译的
+   flash_attn/triton，来源 download.sourcefind.cn:65024"）。
+2. **镜像内依赖全量清单**：构建期已把 pip 基线冻结在镜像内
+   `/opt/anima-build/base_pip_freeze.txt`；实例内可随时 `python -m pip list --format=freeze`
+   生成完整清单（见 `docs/scnet-image-build.md` §11 的发布指令）。
+3. 本仓库代码许可（GPL-3.0）适用于镜像内 `/opt/anima-lora-train` 的代码副本，
+   与上述第三方组件许可相互独立。
+
+---
+
 如你希望把项目改为更宽松的许可（例如 MIT），需要先移除/替换所有 GPL-3.0 派生部分，并重新梳理第三方依赖的许可兼容性。
 

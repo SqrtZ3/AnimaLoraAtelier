@@ -20,14 +20,14 @@ Anima LoKr 训练跑通过程中出现的全部问题、各自的证据与当前
 | # | 问题 | 状态 |
 |---|---|---|
 | 1 | VAE latent 缓存阶段 OOM | 已定位，已修，真机已通过缓存阶段 |
-| 2 | 启动阶段静默停顿 375 秒 | 已定位，已修，真机未验证 |
-| 3 | 训练第一步 backward OOM | 已解决（flash 后端可用，兜底可关；真机训练未复跑） |
+| 2 | 启动阶段静默停顿 375 秒 | 已解决（fast_model_init 启用，训练实跑通过） |
+| 3 | 训练第一步 backward OOM | 已解决（DAS flash_attn 轮子激活 flash 后端，训练实跑通过） |
 | 4 | SDPA 只剩 math 后端 | 已解决（DAS flash_attn 轮子激活 flash 后端，真机验证） |
 | 5 | flash_attn DAS 包获取受阻 | 已解决（download.sourcefind.cn 轮子装完即激活，真机验证） |
 | 6 | 上游 Triton 不可用 | 已解决（DAS triton 3.5.1 双门全过，真机验证） |
 | 7 | NaViT 原生分辨率无 per-image token 上限 | 已确认，未处理 |
-| 8 | torch 线程数 128 与初始化耗时的关系 | 未裁决 |
-| 9 | FlexAttention 在 triton 3.5.1 下编译 segfault | 未决（待换 triton 3.3.0） |
+| 8 | torch 线程数 128 与初始化耗时的关系 | 未裁决（fast_model_init 已绕开该路径） |
+| 9 | FlexAttention 在 triton 3.5.1 下编译 segfault | 未决（不影响主路径，未再追） |
 
 ---
 
@@ -136,7 +136,9 @@ non-persistent）与正常构造逐位一致；漏掉任一 key 时必 raise。
 
 ### 现状
 
-真机未验证。
+已解决（2026-08-18）：`fast_model_init: true` 加入 `config/train_dcu_k100ai.yaml`，
+训练实跑通过。具体提速数字未单独计时记录（日志行会打
+`Transformer 启动耗时: 构造(meta, 跳过随机初始化) ...`，下次启动可抄录）。
 
 ---
 
@@ -203,6 +205,11 @@ flash 后端可用后（见问题 4），16384 单段不再需要 math+分块+ch
 （`models/anima_modeling_core.py` `_seg_sdpa_chunked`），训练主循环自动吃 flash。
 `navit_attn_chunk_tokens` 兜底在 flash 下数学恒等但属纯开销（分块 + 每块 checkpoint 的
 额外前向），**是否关掉由真机训练对比 it/s 决定**，本文不改默认值。
+
+### 训练实跑（2026-08-18 收尾）【实测】
+
+`navit_token_budget: 76800` 开训，单卡稳态：**~0.02–0.03 it/s**（33–50 s/step），
+显存 **40–60 GB 浮动**（68.7 GB 卡）。训练跑通，无 OOM——问题 3 关闭。
 
 ---
 
@@ -417,11 +424,12 @@ das torch 2.9 的 inductor 版本配套不严（torch 2.9 官方配套更接近 
 
 ## 尚无数据的空白
 
-- 真机训练的 it/s 与稳态显存占用（三个开关全开后）。
-- `navit_attn_chunk_tokens` 的额外前向带来的速度代价。
-- `fast_model_init` 在 DCU 上的实际提速。
+- 真机训练 it/s 与稳态显存：**已有数据**（76800 budget / 0.02–0.03 it/s / 40–60 GB，见问题 3）。
+- `navit_attn_chunk_tokens` 的额外前向带来的速度代价（flash 可用后未对比）。
+- `fast_model_init` 在 DCU 上的实际提速（未单独计时；日志行可抄录）。
 - 问题 3 中注意力 dtype 为何是 fp32，而非 `attn_force_autocast_dtype=true` 所期望的 bf16。
 - 8 卡的 all-reduce 带宽与拓扑（该实例只有 1 张卡）。
+- FlexAttention 换 triton 3.3.0 是否可行（问题 9，未再追）。
 
 ---
 
@@ -435,6 +443,10 @@ das torch 2.9 的 inductor 版本配套不严（torch 2.9 官方配套更接近 
 | `5b55798` | 注意力后端探针 `tools/dcu_attn_backend_probe.py`（问题 4、6） |
 | `5b0a3e7` | 探针新增 [0b] HIP 符号 / [0c] aotriton / [5] SDPA FLASH 后端检测；调研文档 `docs/dcu-attn-backend-research.md`（问题 5、6） |
 | `f0e4f11` | 探针 [5] 适配 DAS torch（SDPBackend 枚举无 FLASH 常量 → 无 mask 派发 + 峰值判定）；调研文档 §7 真机进度（问题 4、9） |
+| `8e20f60` | Dockerfile 层 3.5 DAS 轮子（flash_attn/triton/pytest）+ 自检升级 flash 激活验证 + `fast_model_init: true`（问题 2、4、5、6） |
+| `2b6d8ea` | Dockerfile 层 4.5 前端 IDE（jupyterlab 升级 + code-server 到平台约定路径） |
+| `01f23f2` | 构建期自检对 flash_attn/triton 只查包存在性（构建节点无 DCU 的 C++ terminate 修复） |
+| `fe70b0c` | 记录 IDE 层真机验收（code-server 4.133.0 平台前端可连；VSCode 入口属平台 UI 配置） |
 
 新增的三个 config 键（`vae_attn_chunk_tokens` / `fast_model_init` /
 `navit_attn_chunk_tokens`）全部 opt-in、默认关，关闭时与改动前是同一条代码路径。

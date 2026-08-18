@@ -329,3 +329,34 @@ scnet 出网实测 SSL timeout，所以 tarball 走构建上下文：本地下�
 * 备用路线：控制台「关机 → 保存开发环境」直接把当前容器存成镜像，不需要拉基础镜像。
   存之前跑 `tools/scnet_pack_image.sh --code` 做同样的检查。
   代价是不可复现（评审看不到构建过程），只在 Dockerfile 路线走不通时用。
+
+## 12. 发布公开镜像：内容清单指令
+
+发布前在新镜像的实例上跑一遍，把输出收进发布说明（或镜像文档）：
+第三方许可与再分发注意事项见 `THIRD_PARTY_NOTICES.md`。
+
+```bash
+# ① Python 依赖全量清单（发布说明的"环境依赖"一栏直接贴这个）
+python -m pip list --format=freeze | sort > /root/private_data/image_pip_freeze.txt
+wc -l /root/private_data/image_pip_freeze.txt
+
+# ② 关键组件版本一栏（torch 系 + 注意力后端 + IDE）
+python -c "import torch,flash_attn,triton,transformers,safetensors,einops; \
+print('torch',torch.__version__); print('flash_attn',flash_attn.__version__); \
+print('triton',triton.__version__); print('transformers',transformers.__version__); \
+print('safetensors',safetensors.__version__); print('einops',einops.__version__)"
+jupyter lab --version && /usr/lib/code-server/bin/code-server --version
+hy-smi 2>/dev/null | head -4 || rocm-smi 2>/dev/null | head -4
+
+# ③ 构建期留痕（基线 torch / constraints / 代码 commit）
+cat /opt/anima-build/base_torch.txt
+cat /opt/anima-lora-train/AnimaLoraToolkit/.image_commit 2>/dev/null || true
+ls /opt/anima-build/
+
+# ④ 镜像内装了什么（磁盘布局）
+du -sh /opt/anima-lora-train /usr/lib/code-server \
+       /usr/local/lib/python3.11/site-packages 2>/dev/null
+
+# ⑤ 平台要求组件与 IDE 路径（证明"能创建实例"）
+ls -la /usr/sbin/sshd /usr/bin/sudo /opt/conda/bin/jupyter /usr/lib/code-server/bin/code-server
+```

@@ -142,8 +142,9 @@ python /opt/anima-lora-train/AnimaLoraToolkit/tools/dcu_attn_backend_probe.py --
 |---|---|---|
 | DAS triton 3.5.1 安装 + 最简 kernel | ✅ OK | `libamdhip64.hipDrvLaunchKernelEx` 缺失（[0b] 确认），但海光自编版不依赖它；gfx936 codegen 通 —— 问题 6 两道门全过 |
 | flash_attn_func 直调（S=16384, H=16, D=128, bf16） | ✅ OK | 峰值 **0.13 GiB / 10.9 ms**，`max|Δ|=4.88e-4`（bf16 正常误差）；对比 math 32.57 GiB / 216 ms —— 显存 250 倍、速度 20 倍 |
-| [5] SDPA FLASH 后端 | ⚠️ 测法修正 | DAS torch 的 `SDPBackend` 枚举**没有 FLASH 常量**（后端枚举被重写，佐证 flash=dlopen 外部库机制）。探针已改为退化测法（开全局 flash + 无 mask SDPA + 峰值判定），待重跑 |
-| flash_attn 版本号 | ⚠️ 待核实 | 探针显示 `flash_attn.__version__ = 2.6.1`，而 pip metadata 是 `2.8.3+das...` —— 疑似轮子内部版本号未同步（不影响功能），待 `pip show` 对账 |
-| FlexAttention（triton 3.5.1） | ❌ segfault | triton 的 LLVM 编译 flex kernel 时 `addSource: error: expected type` 后 core dump —— 待换 triton 3.3.0（torch 2.9 官方配套更接近 3.3/3.4）重试 |
+| [5] SDPA 无 mask 默认派发 | ✅ OK | 峰值 **0.34 GiB**（math 特征 ~32 GiB），`max|Δ|=4.88e-4`；torch 日志打出 `sdpa adopt the new interface of flash-attn`（cutlassfa_adapter.h:145）—— **flash 后端激活，核心假设成立**。S=16384 训练主循环（sdpa_seg 段内无 mask）自动吃 flash |
+| flash_attn 版本号 | ✅ 确认无害 | pip metadata `2.8.3+das.opt1.dtk2604.torch290`，包内 `__version__=2.6.1` —— 海光打包时包内版本号未同步，功能/ABI 正常 |
+| FlexAttention（triton 3.5.1） | ❌ segfault | triton 的 LLVM 编译 flex kernel 时 `addSource: error: expected type`（`@global_smem` 的 getelementptr）后 core dump —— 待换 triton 3.3.0（torch 2.9 官方配套更接近 3.3/3.4）重试；不影响主路径 |
 
-注意：`flash_attn.__version__` 与 pip metadata 不一致的待核实项不影响主结论（[2] 已实测可用）；SDPA 无 mask 默认派发是否走 flash 以修正后的 [5] 为准。
+注意：SDPA 无 mask 默认派发与直调 flash_attn_func 的峰值差（0.34 vs 0.13 GiB）来自
+torch 的 dlopen 派发层（cutlass 适配器）与直调路径的中间缓冲差异，均远低于 math 的 32 GiB。

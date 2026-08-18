@@ -21,12 +21,13 @@ Anima LoKr 训练跑通过程中出现的全部问题、各自的证据与当前
 |---|---|---|
 | 1 | VAE latent 缓存阶段 OOM | 已定位，已修，真机已通过缓存阶段 |
 | 2 | 启动阶段静默停顿 375 秒 | 已定位，已修，真机未验证 |
-| 3 | 训练第一步 backward OOM | 已定位，已修，真机未验证 |
-| 4 | SDPA 只剩 math 后端 | 已取证，无解（DAS flash_attn 轮子或可解，见 5） |
-| 5 | flash_attn DAS 包获取受阻 | 已定位获取路径，真机未验证 |
-| 6 | 上游 Triton 不可用 | 上游路线已判死，DAS 适配版待真机验证 |
+| 3 | 训练第一步 backward OOM | 已解决（flash 后端可用，兜底可关；真机训练未复跑） |
+| 4 | SDPA 只剩 math 后端 | 已解决（DAS flash_attn 轮子激活 flash 后端，真机验证） |
+| 5 | flash_attn DAS 包获取受阻 | 已解决（download.sourcefind.cn 轮子装完即激活，真机验证） |
+| 6 | 上游 Triton 不可用 | 已解决（DAS triton 3.5.1 双门全过，真机验证） |
 | 7 | NaViT 原生分辨率无 per-image token 上限 | 已确认，未处理 |
 | 8 | torch 线程数 128 与初始化耗时的关系 | 未裁决 |
+| 9 | FlexAttention 在 triton 3.5.1 下编译 segfault | 未决（待换 triton 3.3.0） |
 
 ---
 
@@ -194,6 +195,15 @@ checkpoint。既有 packed 注意力回归 51 条通过。
 
 真机未验证。额外前向带来的速度代价**未测**。
 
+### 更新（2026-08-18，真机验证）
+
+flash 后端可用后（见问题 4），16384 单段不再需要 math+分块+checkpoint 兜底。
+探针【实测】：S=16384 / H=16 / D=128 / bf16 无 mask 默认派发峰值 **0.34 GiB**（math 基线
+32.57 GiB），`max|Δ|=4.88e-4`。`_packed_attention_seg` 的段内 SDPA 无 mask
+（`models/anima_modeling_core.py` `_seg_sdpa_chunked`），训练主循环自动吃 flash。
+`navit_attn_chunk_tokens` 兜底在 flash 下数学恒等但属纯开销（分块 + 每块 checkpoint 的
+额外前向），**是否关掉由真机训练对比 it/s 决定**，本文不改默认值。
+
 ---
 
 ## 4. SDPA 只剩 math 后端
@@ -226,7 +236,12 @@ S=4096 / H=16 / D=128 / bf16：**11.0 ms、峰值 2.14 GiB**。
 
 ### 现状
 
-无解。仓库侧以问题 1、3 的两个开关兜底。
+已解决（2026-08-18 真机验证）：装上 DAS flash_attn 轮子（问题 5）后，无 mask SDPA
+默认派发峰值 32.57 → **0.34 GiB**（S=16384），`max|Δ| vs math = 4.88e-4`；torch 日志
+【实测】打出 `UserWarning: sdpa adopt the new interface of flash-attn`
+（`aten/src/ATen/native/transformers/hip/cutlassfa_adapter.h:145`），直接证实 flash
+路径激活。`dcu_compat.configure_sdpa_backends()` 按实测决定开关，现在不会再关 flash。
+限制不变：flash 系列 head_dim ≤ 256 → VAE（384）继续走 `vae_attn_chunk_tokens` 兜底。
 
 ---
 
@@ -258,7 +273,13 @@ S=4096 / H=16 / D=128 / bf16：**11.0 ms、峰值 2.14 GiB**。
 
 ### 现状
 
-已定位获取路径，真机未安装未验证。验证步骤见 `docs/dcu-attn-backend-research.md` §5。
+已解决（2026-08-18 真机验证）：wheel 装完即可用，SDPA flash 后端被激活（见问题 4）。
+两个遗留细节：
+- 轮子内部 `flash_attn.__version__ = 2.6.1`，与 pip metadata `2.8.3+das.opt1.dtk2604.torch290`
+  不一致 —— 疑似海光打包时包内版本号未同步，功能/ABI 均正常【实测】，不影响使用。
+- import 链硬依赖 triton 与 pytest（`flash_attn/utils/sparse_utils.py` 与
+  `flash_attn_triton.py` 的模块级 import），DAS 轮子未把它们列为依赖，需先装
+  DAS triton 轮子（问题 6）与 `pip install pytest`。
 
 ---
 
@@ -315,8 +336,9 @@ RuntimeError: cannot get address for 'hipDrvLaunchKernelEx' from libamdhip64.so
 
 ### 现状
 
-上游 triton 路线判死（无版本能同时过两道门）。DAS 适配版（3.3.0 / 3.5.1）待真机验证。
-验证步骤见 `docs/dcu-attn-backend-research.md` §5。
+已解决（2026-08-18 真机验证）：DAS triton 3.5.1 装后，最简 kernel 在 gfx936 上编译并
+跑对【实测】—— ABI 门与 codegen 门全过（`libamdhip64.hipDrvLaunchKernelEx` 实测缺失，
+海光自编版不依赖它）。FlexAttention 编译 segfault 另记问题 9。
 
 ---
 
@@ -351,6 +373,35 @@ DCU 节点 `torch.get_num_threads() = 128`，2.09B 参数初始化 301.5s；
 
 ---
 
+## 9. FlexAttention 在 triton 3.5.1 下编译 segfault
+
+### 现象【实测】
+
+探针 [3]（`torch.compile(flex_attention)`，走 Inductor→Triton）在编译阶段崩：
+
+```
+addSource: error: expected type
+  %72 = getelementptr inbounds nuw i8, ptr addrspace(3) @global_smem, i64 %71, !dbg !29
+                               ^
+Segmentation fault (core dumped)
+```
+
+triton 3.5.1（DAS 自编）能编译最简 kernel（问题 6 的 [1] 项 OK），但编译 flex_attention
+的 kernel 时其 LLVM 解析 `@global_smem` 的 getelementptr 失败并段错误。
+
+### 判定【推断】
+
+海光 triton fork 的 LLVM 对某类 IR（smem 地址计算）的处理有缺陷，或 triton 3.5.1 与
+das torch 2.9 的 inductor 版本配套不严（torch 2.9 官方配套更接近 triton 3.3/3.4）。
+未验证，置信度低——先试 triton 3.3.0（DAS 同目录有 torch290 轮子）。
+
+### 现状
+
+未决。不影响主路径：FlexAttention 是 sdpa_seg 之外的备选实现，flash 后端已激活（问题 4），
+训练不需要它。
+
+---
+
 ## 已被证伪的假设（留档，避免重走）
 
 | 假设 | 证伪依据 |
@@ -382,7 +433,8 @@ DCU 节点 `torch.get_num_threads() = 128`，2.09B 参数初始化 301.5s；
 | `44784fa` | meta device 构造 transformer（问题 2） |
 | `1c062f9` | sdpa_seg 段内 query 分块 + 每块 checkpoint（问题 3） |
 | `5b55798` | 注意力后端探针 `tools/dcu_attn_backend_probe.py`（问题 4、6） |
-| （本次） | 探针新增 [0b] HIP 符号 / [0c] aotriton / [5] SDPA FLASH 后端三项检测；调研文档 `docs/dcu-attn-backend-research.md`（问题 5、6） |
+| `5b0a3e7` | 探针新增 [0b] HIP 符号 / [0c] aotriton / [5] SDPA FLASH 后端检测；调研文档 `docs/dcu-attn-backend-research.md`（问题 5、6） |
+| `f0e4f11` | 探针 [5] 适配 DAS torch（SDPBackend 枚举无 FLASH 常量 → 无 mask 派发 + 峰值判定）；调研文档 §7 真机进度（问题 4、9） |
 
 新增的三个 config 键（`vae_attn_chunk_tokens` / `fast_model_init` /
 `navit_attn_chunk_tokens`）全部 opt-in、默认关，关闭时与改动前是同一条代码路径。

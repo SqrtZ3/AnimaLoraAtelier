@@ -1,0 +1,104 @@
+==============================================================================
+海光 DCU 能力探针 —— 全部为真机实测，未通过项即为这台机器的真实限制
+==============================================================================
+[ INFO ] python — 3.11.9 @ /usr/local/bin/python
+[ INFO ] platform — Linux-5.15.0-25-generic-x86_64-with-glibc2.39
+[ INFO ] env:ROCM_PATH — /opt/dtk
+[ INFO ] env:HIP_PATH — /opt/dtk/hip
+[ INFO ] env:LD_LIBRARY_PATH — /opt/dtk/dcc/gcvm/lib:/opt/dtk/hip/lib:/opt/dtk/llvm/lib:/opt/dtk/lib:/opt/dtk/lib64:/opt/hyhal/lib:/opt/hyhal/lib64:/opt/dtk/dushmem/lib:/opt/dtk/opencl/lib:/opt/dtk/.hyhal/rocm_smi/lib:
+[ INFO ] dtk 根目录 — /opt/dtk 存在
+[ INFO ] rocm-smi — 
+================================= System Management Interface ==================================
+================================================================================================
+HCU     Temp     AvgPwr     Perf     PwrCap     VRAM%      HCU%      Dec%      Enc%      Mode     
+0       50.0C    65.0W      auto     1000.0W    0%         0.0%      0.0%      0.0%      Normal   
+================================================================================================
+======================================== End of SMI Log ========================================
+[ INFO ] hy-smi — 
+================================= System Management Interface ==================================
+================================================================================================
+HCU     Temp     AvgPwr     Perf     PwrCap     VRAM%      HCU%      Dec%      Enc%      Mode     
+0       50.0C    65.0W      auto     1000.0W    0%         0.0%      0.0%      0.0%      Normal   
+================================================================================================
+======================================== End of SMI Log ========================================
+[ INFO ] rocminfo — 
+Name:                    gfx936
+Name:                    amdgcn-amd-amdhsa--gfx936:sramecc+:xnack-
+[  OK  ] import torch（必须是 DTK 的 das 版，不能是 PyPI 的 CUDA/CPU 版） — torch 2.9.0, hip=6.3.26093（版本串里没有 das/dtk 标记，确认一下来源）
+[  OK  ] DCU 可见性与规格 — 1 卡
+        #0 BW arch=gfx936:sramecc+:xnack- mem=68.7GB CU=80
+[  OK  ] bf16 matmul 数值 — rel_err=2.874e-03
+[  OK  ] fp16 matmul 数值 — rel_err=3.596e-04
+[  OK  ] fp32 matmul 数值 — rel_err=4.065e-07（>1e-4 说明默认走了降精度模式；训练里 loss/reduce 的 fp32 残留路径需留意）
+[  OK  ] autocast('cuda', bf16) — 输出 dtype=torch.bfloat16
+[  OK  ] ★ 2D×3D 广播 matmul 的**反向**（昇腾在这里静默算错过） — fwd=1.289e-07 dA=1.819e-07 dB=1.113e-07 → 前向与反向都正确
+/root/private_data/anima-lora-train/AnimaLoraToolkit/tools/dcu_probe.py:281: UserWarning: 1Torch was not compiled with memory efficient attention. (Triggered internally at /home/pytorch/aten/src/ATen/native/transformers/hip/sdp_utils.cpp:790.)
+  o = F.scaled_dot_product_attention(q, k, v)
+/root/private_data/anima-lora-train/AnimaLoraToolkit/tools/dcu_probe.py:281: UserWarning: Memory efficient kernel not used because: (Triggered internally at /home/pytorch/aten/src/ATen/native/transformers/hip/sdp_utils.cpp:941.)
+  o = F.scaled_dot_product_attention(q, k, v)
+/root/private_data/anima-lora-train/AnimaLoraToolkit/tools/dcu_probe.py:281: UserWarning: Flash attention kernel not used because: (Triggered internally at /home/pytorch/aten/src/ATen/native/transformers/hip/sdp_utils.cpp:943.)
+  o = F.scaled_dot_product_attention(q, k, v)
+/root/private_data/anima-lora-train/AnimaLoraToolkit/tools/dcu_probe.py:281: UserWarning: Flash attention has been runtime disabled. (Triggered internally at /home/pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:540.)
+  o = F.scaled_dot_product_attention(q, k, v)
+/root/private_data/anima-lora-train/AnimaLoraToolkit/tools/dcu_probe.py:281: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /home/pytorch/aten/src/ATen/native/transformers/hip/sdp_utils.cpp:945.)
+  o = F.scaled_dot_product_attention(q, k, v)
+/root/private_data/anima-lora-train/AnimaLoraToolkit/tools/dcu_probe.py:281: UserWarning: Torch was not compiled with cuDNN attention. (Triggered internally at /home/pytorch/aten/src/ATen/native/transformers/hip/sdp_utils.cpp:673.)
+  o = F.scaled_dot_product_attention(q, k, v)
+[  OK  ] ★ SDPA 可用后端（决定 NaViT 能不能上大 token 预算） — flash=NO(RuntimeError) mem_efficient=NO(RuntimeError) math=OK → ⚠ 只剩 math 后端 —— 注意力会物化 O(S²)，大 token 预算必炸显存
+[dcu] 无 mask SDPA 失败（RuntimeError: No matching libraries found for flash_attn_2_cuda*.so），已关闭 flash 后端后重试
+[  OK  ] ★ 应用 SDPA 后端修复（之后所有 SDPA 项都在修复后的状态下测） — 关闭了 flash → flash=False mem_efficient=True math=True
+[  OK  ] SDPA 无 mask (B1 H16 S2048 D128 bf16, fwd+bwd) — fwd+bwd 15.6 ms, peak 1.22 GB, grad_ok=True
+[  OK  ] SDPA bool mask（稠密 SxS） — fwd+bwd 18.2 ms, peak 1.23 GB, grad_ok=True
+[  OK  ] SDPA additive mask（稠密 SxS） — fwd+bwd 8.3 ms, peak 1.23 GB, grad_ok=True
+[  OK  ] SDPA 广播 mask [B,1,1,Skv]（昇腾拒收过，DCU 是否接受） — fwd+bwd 8.3 ms, peak 1.22 GB, grad_ok=True
+[  OK  ] ★ SDPA key-padding mask 的语义/极性（真实 padding 对拍） — rel_err=1.664e-03（反转极性参考 1.297e+00，差 780×）→ 极性与 torch 语义一致
+[  OK  ] ★ sdpa_seg 逐段注意力（DCU 上 NaViT 的主路径，含反向） — rel_err=1.659e-03 | fwd+bwd 102.2 ms, peak 0.33 GB | q=[1024, 2048, 1024] kv=[128, 256, 96]
+[  OK  ] ★ sdpa_seg 显存线性性（ΣN 8k vs 32k —— 判断是否落到 math 后端） — ΣN=8192(4段 每段2048) peak=2.35GB 37ms | ΣN=32768(8段 每段4096) peak=13.49GB 249ms | 比值=5.7× 近似线性 → 走的是快核
+[ SKIP ] flash_attn varlen（若 DTK 带了海光移植版） — 无 flash_attn（ModuleNotFoundError）—— NaViT 走 sdpa_seg 即可
+[  OK  ] torch.fft（spectral aux loss 依赖） — rfft2 -> (2, 16, 64, 33) rel_err=1.697e-07
+[  OK  ] Conv2d/GroupNorm/SiLU bf16（VAE 路径，走 MIOpen） — 输出 (1, 32, 128, 128) dtype=torch.float32（conv 走 MIOpen，首次会现编内核、偏慢属正常）
+[  OK  ] torch.utils.checkpoint 梯度检查点 — grad_norm=30.1868
+[  OK  ] AdamW 单步 — ‖Δp‖=1.0323e-01
+[  OK  ] torch.cuda.Event 计时（stage_timer 依赖） — elapsed=0.751 ms
+[  OK  ] 显存 API + expandable_segments — alloc=0.201GB peak=13.489GB after_free=0.067GB | alloc_conf=(未设)
+[ FAIL ] FP8 张量核（base_quant 的前提；K100-AI 预期没有） — RuntimeError: torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm MI300+ | RuntimeError: torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm MI300+
+[  OK  ] bf16 线性层 fwd+bwd 吞吐（算力标定） — 3.14 ms/iter ≈ 263.0 TFLOPS(bf16, 含 bwd 粗估)；K100-AI 标称峰值 ~192 TFLOPS(BF16)，实测/标称 ≈ 137%
+[  OK  ] pkg:safetensors — 0.7.0 — 权重读写，必需
+[  OK  ] pkg:transformers — 4.57.6 — 文本编码器，必需
+[  OK  ] pkg:einops — 0.8.2 — 必需
+[  OK  ] pkg:PIL — 12.2.0 — 必需
+[  OK  ] pkg:yaml — 6.0.3 — 配置解析，必需
+[  OK  ] pkg:rich — ? — 进度显示，必需
+[ FAIL ] pkg:torchvision — ModuleNotFoundError — 可选：只有 aux_perceptual 才要。⚠ 只能装光源的 +das 版，PyPI 版会连带把 torch 换成 CUDA 构建、废掉整个环境
+[ FAIL ] pkg:pillow_jxl — ModuleNotFoundError — 可选：JXL 数据集才需要
+[ FAIL ] pkg:lpips — ModuleNotFoundError — 可选：perceptual aux loss 才需要
+[ FAIL ] pkg:scipy — ModuleNotFoundError — 可选：工具脚本
+[ FAIL ] pkg:xformers — ModuleNotFoundError — DCU 预期缺失 → NaViT 用 navit_attn_backend: sdpa_seg 代替
+[ FAIL ] pkg:bitsandbytes — ModuleNotFoundError — DCU 预期缺失 → 8-bit 优化器不可用
+[ FAIL ] pkg:triton — ModuleNotFoundError — DCU 上随 DTK 版本变化 → 有才能开 torch_compile
+[ FAIL ] pkg:flash_attn — ModuleNotFoundError — 有的话是 sdpa_seg 之外的第二条路（仓库尚未接线）
+[ FAIL ] pkg:wandb — ModuleNotFoundError — 可选：外推训练曲线
+[ SKIP ] 多卡集合通信 — 未用 torchrun 启动。跑法：torchrun --nproc_per_node=8 tools/dcu_probe.py --dist
+==============================================================================
+汇总：OK=29  FAIL=10  SKIP=2
+
+失败项（这些是这台机器的真实限制，配置里必须绕开）：
+  - FP8 张量核（base_quant 的前提；K100-AI 预期没有）: RuntimeError: torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm MI300+ | RuntimeError: torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm MI300+
+  - pkg:torchvision: ModuleNotFoundError — 可选：只有 aux_perceptual 才要。⚠ 只能装光源的 +das 版，PyPI 版会连带把 torch 换成 CUDA 构建、废掉整个环境
+  - pkg:pillow_jxl: ModuleNotFoundError — 可选：JXL 数据集才需要
+  - pkg:lpips: ModuleNotFoundError — 可选：perceptual aux loss 才需要
+  - pkg:scipy: ModuleNotFoundError — 可选：工具脚本
+  - pkg:xformers: ModuleNotFoundError — DCU 预期缺失 → NaViT 用 navit_attn_backend: sdpa_seg 代替
+  - pkg:bitsandbytes: ModuleNotFoundError — DCU 预期缺失 → 8-bit 优化器不可用
+  - pkg:triton: ModuleNotFoundError — DCU 上随 DTK 版本变化 → 有才能开 torch_compile
+  - pkg:flash_attn: ModuleNotFoundError — 有的话是 sdpa_seg 之外的第二条路（仓库尚未接线）
+  - pkg:wandb: ModuleNotFoundError — 可选：外推训练曲线
+
+配置裁决：
+  ✓ 广播 matmul 前向+反向都正确 → LoKr/DoRA 路径无需昇腾那种绕行
+  ✓ NaViT 打包可用 → navit_packing: true + navit_attn_backend: sdpa_seg
+  ✓ FP8 不可用（符合预期）→ base_quant: none
+  ✓ 无 xformers（符合预期）→ 别用 navit_attn_backend: xformers
+  ✓ 无 triton → torch_compile: false
+==============================================================================
+已写出 /root/private_data/dcu_probe3.json

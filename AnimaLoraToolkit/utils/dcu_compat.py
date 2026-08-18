@@ -150,7 +150,80 @@ def enable() -> dict:
             "是在 K100-AI 上取的，换型号需重跑 tools/dcu_probe.py。",
             arch, _K100AI_ARCH,
         )
+    _DCU_INFO["sdpa"] = configure_sdpa_backends()
     return _DCU_INFO
+
+
+def configure_sdpa_backends() -> dict:
+    """把**实际不可用**的 SDPA 后端关掉，让 dispatcher 落到能跑的那个。
+
+    ★ 这不是性能调优，是可用性修复。【实测 · scnet BW(gfx936) / torch 2.9.0+das.dtk2604】：
+
+        F.scaled_dot_product_attention(q, k, v)        # 不给 mask
+        RuntimeError: No matching libraries found for flash_attn_2_cuda*.so
+
+    DTK 的 torch 把 **无 mask 的 SDPA** 派发给一个外部的 flash-attn 动态库，而基础镜像里
+    根本没有那个 .so（``find / -name '*flash_attn*'`` 为空）。它不会优雅回退到 math，
+    而是直接抛 RuntimeError —— 于是「给了 mask 就能跑、不给 mask 就崩」，
+    ``sdpa_seg``（NaViT 主路径）整条挂掉。
+
+    ``torch.backends.cuda.enable_flash_sdp(False)`` 一行即可绕开：实测关掉之后
+    同一个调用立刻通过（fwd+bwd 都对）。
+
+    做法上**不写死"DCU 没有 flash"** —— 光源在持续补 flash-attn 的 das 版轮子，装上以后
+    这条路是通的。所以这里实测一次：能跑就什么都不动，跑不通才逐个关。
+
+    返回一份 dict 记录最终各后端的开关状态，供日志/telemetry 用。
+    """
+    import torch
+    import torch.nn.functional as F
+
+    backends = getattr(torch.backends, "cuda", None)
+    if backends is None or not hasattr(backends, "enable_flash_sdp"):
+        return {}
+
+    def _probe() -> str:
+        """跑一次无 mask 的小 SDPA，返回 "" 表示通过，否则返回错误摘要。"""
+        try:
+            q = torch.randn(1, 2, 64, 32, device="cuda", dtype=torch.bfloat16)
+            F.scaled_dot_product_attention(q, q, q)
+            return ""
+        except Exception as exc:  # noqa: BLE001 —— 任何异常都算"这条路不通"
+            return f"{type(exc).__name__}: {exc}"
+
+    disabled = []
+    err = _probe()
+    if err and backends.flash_sdp_enabled():
+        backends.enable_flash_sdp(False)
+        disabled.append("flash")
+        logger.warning("[dcu] 无 mask SDPA 失败（%s），已关闭 flash 后端后重试", err[:120])
+        err = _probe()
+    if err and backends.mem_efficient_sdp_enabled():
+        backends.enable_mem_efficient_sdp(False)
+        disabled.append("mem_efficient")
+        logger.warning("[dcu] 仍失败（%s），已关闭 mem_efficient 后端后重试", err[:120])
+        err = _probe()
+
+    state = {
+        "flash": bool(backends.flash_sdp_enabled()),
+        "mem_efficient": bool(backends.mem_efficient_sdp_enabled()),
+        "math": bool(backends.math_sdp_enabled()),
+        "disabled_by_anima": disabled,
+        "still_failing": err,
+    }
+    if err:
+        # 到这一步还不通就别静默继续 —— 注意力是每一层都要走的路。
+        raise RuntimeError(
+            "DCU 上所有 SDPA 后端都跑不通，最后一次错误：" + err + "\n"
+            "这台机器的注意力路径不可用，先跑 tools/dcu_probe.py 看「SDPA 可用后端」项。"
+        )
+    if disabled:
+        logger.info(
+            "[dcu] SDPA 后端最终状态：flash=%s mem_efficient=%s math=%s（本次关掉了 %s）"
+            " → 只剩 math 时注意力会物化 O(S^2) 分数矩阵，NaViT 的 token 预算要按实测压。",
+            state["flash"], state["mem_efficient"], state["math"], "/".join(disabled),
+        )
+    return state
 
 
 def _safe_device_name() -> str:

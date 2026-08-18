@@ -1,0 +1,18 @@
+# 这些进镜像会让体积从 ~10GB 涨到几十 GB，而且全是运行期该挂载的东西
+.git
+venv/
+.venv/
+venv.zip
+AnimaLoraToolkit/venv/
+AnimaLoraToolkit/.venv/
+AnimaLoraToolkit/Dataset/
+AnimaLoraToolkit/monitor_data/
+output/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.log
+**/__pycache__/
+*.pyc
+.ide/

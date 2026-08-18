@@ -289,6 +289,33 @@ def probe_sdpa_backends() -> str:
     return " ".join(got) + f" → {verdict}"
 
 
+@probe("★ 应用 SDPA 后端修复（之后所有 SDPA 项都在修复后的状态下测）")
+def probe_sdpa_backend_fix() -> str:
+    """把上一项测出来不可用的后端关掉，再往下测。
+
+    【实测 · scnet BW(gfx936) / torch 2.9.0+das.dtk2604】DTK 的 torch 把**无 mask 的
+    SDPA** 派发给外部的 flash-attn 动态库，镜像里没有那个 .so 就直接抛
+    ``RuntimeError: No matching libraries found for flash_attn_2_cuda*.so``，
+    而不是回退到 math。于是「给 mask 能跑、不给 mask 崩」。
+
+    训练时 ``utils/dcu_compat.enable()`` 会自动做同样的事，所以探针也要在**修复后**的
+    状态下量后面几项 —— 否则 sdpa_seg 三项会全 FAIL，看起来像 NaViT 不可用，
+    实际只是少关了一个开关。
+    """
+    import sys, pathlib as _pl
+    sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent))
+    from utils import dcu_compat
+
+    state = dcu_compat.configure_sdpa_backends()
+    if not state:
+        raise _Skip("该 torch 没有 torch.backends.cuda.enable_flash_sdp，无需/无法修复")
+    off = state.get("disabled_by_anima") or []
+    if not off:
+        return "无需修复：默认后端就能跑无 mask SDPA"
+    return (f"关闭了 {'/'.join(off)} → flash={state['flash']} "
+            f"mem_efficient={state['mem_efficient']} math={state['math']}")
+
+
 def _sdpa_case(mask_kind: str) -> str:
     import torch
     import torch.nn.functional as F
@@ -787,6 +814,7 @@ def main() -> int:
     probe_autocast()
     probe_broadcast_matmul_backward()
     probe_sdpa_backends()
+    probe_sdpa_backend_fix()
     probe_sdpa_none()
     probe_sdpa_bool()
     probe_sdpa_add()

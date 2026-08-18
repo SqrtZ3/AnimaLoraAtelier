@@ -1,0 +1,252 @@
+[
+  {
+    "name": "python",
+    "status": "INFO",
+    "detail": "3.11.9 @ /usr/local/bin/python"
+  },
+  {
+    "name": "platform",
+    "status": "INFO",
+    "detail": "Linux-5.15.0-25-generic-x86_64-with-glibc2.39"
+  },
+  {
+    "name": "env:ROCM_PATH",
+    "status": "INFO",
+    "detail": "/opt/dtk"
+  },
+  {
+    "name": "env:HIP_PATH",
+    "status": "INFO",
+    "detail": "/opt/dtk/hip"
+  },
+  {
+    "name": "env:LD_LIBRARY_PATH",
+    "status": "INFO",
+    "detail": "/opt/dtk/dcc/gcvm/lib:/opt/dtk/hip/lib:/opt/dtk/llvm/lib:/opt/dtk/lib:/opt/dtk/lib64:/opt/hyhal/lib:/opt/hyhal/lib64:/opt/dtk/dushmem/lib:/opt/dtk/opencl/lib:/opt/dtk/.hyhal/rocm_smi/lib:"
+  },
+  {
+    "name": "dtk 根目录",
+    "status": "INFO",
+    "detail": "/opt/dtk 存在"
+  },
+  {
+    "name": "rocm-smi",
+    "status": "INFO",
+    "detail": "\n================================= System Management Interface ==================================\n================================================================================================\nHCU     Temp     AvgPwr     Perf     PwrCap     VRAM%      HCU%      Dec%      Enc%      Mode     \n0       50.0C    65.0W      auto     1000.0W    0%         0.0%      0.0%      0.0%      Normal   \n================================================================================================\n======================================== End of SMI Log ========================================"
+  },
+  {
+    "name": "hy-smi",
+    "status": "INFO",
+    "detail": "\n================================= System Management Interface ==================================\n================================================================================================\nHCU     Temp     AvgPwr     Perf     PwrCap     VRAM%      HCU%      Dec%      Enc%      Mode     \n0       50.0C    65.0W      auto     1000.0W    0%         0.0%      0.0%      0.0%      Normal   \n================================================================================================\n======================================== End of SMI Log ========================================"
+  },
+  {
+    "name": "rocminfo",
+    "status": "INFO",
+    "detail": "\nName:                    gfx936\nName:                    amdgcn-amd-amdhsa--gfx936:sramecc+:xnack-"
+  },
+  {
+    "name": "import torch（必须是 DTK 的 das 版，不能是 PyPI 的 CUDA/CPU 版）",
+    "status": "OK",
+    "detail": "torch 2.9.0, hip=6.3.26093（版本串里没有 das/dtk 标记，确认一下来源）"
+  },
+  {
+    "name": "DCU 可见性与规格",
+    "status": "OK",
+    "detail": "1 卡\n        #0 BW arch=gfx936:sramecc+:xnack- mem=68.7GB CU=80"
+  },
+  {
+    "name": "bf16 matmul 数值",
+    "status": "OK",
+    "detail": "rel_err=2.874e-03"
+  },
+  {
+    "name": "fp16 matmul 数值",
+    "status": "OK",
+    "detail": "rel_err=3.596e-04"
+  },
+  {
+    "name": "fp32 matmul 数值",
+    "status": "OK",
+    "detail": "rel_err=4.065e-07（>1e-4 说明默认走了降精度模式；训练里 loss/reduce 的 fp32 残留路径需留意）"
+  },
+  {
+    "name": "autocast('cuda', bf16)",
+    "status": "OK",
+    "detail": "输出 dtype=torch.bfloat16"
+  },
+  {
+    "name": "★ 2D×3D 广播 matmul 的**反向**（昇腾在这里静默算错过）",
+    "status": "OK",
+    "detail": "fwd=1.289e-07 dA=1.819e-07 dB=1.113e-07 → 前向与反向都正确"
+  },
+  {
+    "name": "★ SDPA 可用后端（决定 NaViT 能不能上大 token 预算）",
+    "status": "OK",
+    "detail": "flash=NO(RuntimeError) mem_efficient=NO(RuntimeError) math=OK → ⚠ 只剩 math 后端 —— 注意力会物化 O(S²)，大 token 预算必炸显存"
+  },
+  {
+    "name": "★ 应用 SDPA 后端修复（之后所有 SDPA 项都在修复后的状态下测）",
+    "status": "OK",
+    "detail": "关闭了 flash → flash=False mem_efficient=True math=True"
+  },
+  {
+    "name": "SDPA 无 mask (B1 H16 S2048 D128 bf16, fwd+bwd)",
+    "status": "OK",
+    "detail": "fwd+bwd 15.6 ms, peak 1.22 GB, grad_ok=True"
+  },
+  {
+    "name": "SDPA bool mask（稠密 SxS）",
+    "status": "OK",
+    "detail": "fwd+bwd 18.2 ms, peak 1.23 GB, grad_ok=True"
+  },
+  {
+    "name": "SDPA additive mask（稠密 SxS）",
+    "status": "OK",
+    "detail": "fwd+bwd 8.3 ms, peak 1.23 GB, grad_ok=True"
+  },
+  {
+    "name": "SDPA 广播 mask [B,1,1,Skv]（昇腾拒收过，DCU 是否接受）",
+    "status": "OK",
+    "detail": "fwd+bwd 8.3 ms, peak 1.22 GB, grad_ok=True"
+  },
+  {
+    "name": "★ SDPA key-padding mask 的语义/极性（真实 padding 对拍）",
+    "status": "OK",
+    "detail": "rel_err=1.664e-03（反转极性参考 1.297e+00，差 780×）→ 极性与 torch 语义一致"
+  },
+  {
+    "name": "★ sdpa_seg 逐段注意力（DCU 上 NaViT 的主路径，含反向）",
+    "status": "OK",
+    "detail": "rel_err=1.659e-03 | fwd+bwd 102.2 ms, peak 0.33 GB | q=[1024, 2048, 1024] kv=[128, 256, 96]"
+  },
+  {
+    "name": "★ sdpa_seg 显存线性性（ΣN 8k vs 32k —— 判断是否落到 math 后端）",
+    "status": "OK",
+    "detail": "ΣN=8192(4段 每段2048) peak=2.35GB 37ms | ΣN=32768(8段 每段4096) peak=13.49GB 249ms | 比值=5.7× 近似线性 → 走的是快核"
+  },
+  {
+    "name": "flash_attn varlen（若 DTK 带了海光移植版）",
+    "status": "SKIP",
+    "detail": "无 flash_attn（ModuleNotFoundError）—— NaViT 走 sdpa_seg 即可"
+  },
+  {
+    "name": "torch.fft（spectral aux loss 依赖）",
+    "status": "OK",
+    "detail": "rfft2 -> (2, 16, 64, 33) rel_err=1.697e-07"
+  },
+  {
+    "name": "Conv2d/GroupNorm/SiLU bf16（VAE 路径，走 MIOpen）",
+    "status": "OK",
+    "detail": "输出 (1, 32, 128, 128) dtype=torch.float32（conv 走 MIOpen，首次会现编内核、偏慢属正常）"
+  },
+  {
+    "name": "torch.utils.checkpoint 梯度检查点",
+    "status": "OK",
+    "detail": "grad_norm=30.1868"
+  },
+  {
+    "name": "AdamW 单步",
+    "status": "OK",
+    "detail": "‖Δp‖=1.0323e-01"
+  },
+  {
+    "name": "torch.cuda.Event 计时（stage_timer 依赖）",
+    "status": "OK",
+    "detail": "elapsed=0.751 ms"
+  },
+  {
+    "name": "显存 API + expandable_segments",
+    "status": "OK",
+    "detail": "alloc=0.201GB peak=13.489GB after_free=0.067GB | alloc_conf=(未设)"
+  },
+  {
+    "name": "FP8 张量核（base_quant 的前提；K100-AI 预期没有）",
+    "status": "FAIL",
+    "detail": "RuntimeError: torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm MI300+ | RuntimeError: torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm MI300+"
+  },
+  {
+    "name": "bf16 线性层 fwd+bwd 吞吐（算力标定）",
+    "status": "OK",
+    "detail": "3.14 ms/iter ≈ 263.0 TFLOPS(bf16, 含 bwd 粗估)；K100-AI 标称峰值 ~192 TFLOPS(BF16)，实测/标称 ≈ 137%"
+  },
+  {
+    "name": "pkg:safetensors",
+    "status": "OK",
+    "detail": "0.7.0 — 权重读写，必需"
+  },
+  {
+    "name": "pkg:transformers",
+    "status": "OK",
+    "detail": "4.57.6 — 文本编码器，必需"
+  },
+  {
+    "name": "pkg:einops",
+    "status": "OK",
+    "detail": "0.8.2 — 必需"
+  },
+  {
+    "name": "pkg:PIL",
+    "status": "OK",
+    "detail": "12.2.0 — 必需"
+  },
+  {
+    "name": "pkg:yaml",
+    "status": "OK",
+    "detail": "6.0.3 — 配置解析，必需"
+  },
+  {
+    "name": "pkg:rich",
+    "status": "OK",
+    "detail": "? — 进度显示，必需"
+  },
+  {
+    "name": "pkg:torchvision",
+    "status": "FAIL",
+    "detail": "ModuleNotFoundError — 可选：只有 aux_perceptual 才要。⚠ 只能装光源的 +das 版，PyPI 版会连带把 torch 换成 CUDA 构建、废掉整个环境"
+  },
+  {
+    "name": "pkg:pillow_jxl",
+    "status": "FAIL",
+    "detail": "ModuleNotFoundError — 可选：JXL 数据集才需要"
+  },
+  {
+    "name": "pkg:lpips",
+    "status": "FAIL",
+    "detail": "ModuleNotFoundError — 可选：perceptual aux loss 才需要"
+  },
+  {
+    "name": "pkg:scipy",
+    "status": "FAIL",
+    "detail": "ModuleNotFoundError — 可选：工具脚本"
+  },
+  {
+    "name": "pkg:xformers",
+    "status": "FAIL",
+    "detail": "ModuleNotFoundError — DCU 预期缺失 → NaViT 用 navit_attn_backend: sdpa_seg 代替"
+  },
+  {
+    "name": "pkg:bitsandbytes",
+    "status": "FAIL",
+    "detail": "ModuleNotFoundError — DCU 预期缺失 → 8-bit 优化器不可用"
+  },
+  {
+    "name": "pkg:triton",
+    "status": "FAIL",
+    "detail": "ModuleNotFoundError — DCU 上随 DTK 版本变化 → 有才能开 torch_compile"
+  },
+  {
+    "name": "pkg:flash_attn",
+    "status": "FAIL",
+    "detail": "ModuleNotFoundError — 有的话是 sdpa_seg 之外的第二条路（仓库尚未接线）"
+  },
+  {
+    "name": "pkg:wandb",
+    "status": "FAIL",
+    "detail": "ModuleNotFoundError — 可选：外推训练曲线"
+  },
+  {
+    "name": "多卡集合通信",
+    "status": "SKIP",
+    "detail": "未用 torchrun 启动。跑法：torchrun --nproc_per_node=8 tools/dcu_probe.py --dist"
+  }
+]

@@ -5,9 +5,10 @@
 > **【资料】** = 来自公开资料/厂商口径，未验证。
 > **【推断】** = 从架构代际或其它平台的经验外推，**最容易错**，都留了实测推翻的口子。
 >
-> 截至撰写时，**DCU 侧没有任何【实测】** —— 本适配是"照着已知约束写好、把不确定的
-> 全部收敛到一个探针里"的状态。上机第一件事是跑探针，然后回来把本文档的【资料】/
-> 【推断】替换成【实测】。
+> **2026-08-18 更新：单卡侧已有真机实测**，机器是国家超算互联网 scnet Notebook
+> （`ssh.zzai.scnet.cn`），DTK 26.04 / torch 2.9.0+das.opt1.dtk2604 / py3.11。
+> 完整探针输出见 `docs/probe_results/dcu_probe_bw_gfx936_dtk2604.{json,log}`，
+> 关键结论汇总在 §2.5。**8 卡侧仍是零实测**（该实例只有 1 张卡）。
 
 ---
 
@@ -65,6 +66,56 @@ K100-AI：gfx928、64GB 显存、~896 GB/s 带宽、BF16/FP16 峰值 ~192 TFLOPS
 * 看卡：`rocm-smi`（DTK 侧）、`hy-smi`（驱动侧）、`rocminfo | grep gfx`。
 * DTK 根目录 `/opt/dtk`；`LD_LIBRARY_PATH` 缺 `/opt/dtk/lib` 会表现为找不到 `libhip*.so`。
 * `HSA_OVERRIDE_GFX_VERSION=9.2.8` 对应 K100-AI（仅当 torch 不是为 gfx928 编的时才需要）。
+
+## 2.5 真机实测（scnet / 卡名 "BW" / gfx936 / DTK 26.04）【实测】
+
+| 项 | 实测值 | 与本文档原有【资料】/【推断】的出入 |
+|---|---|---|
+| 卡 | name=`BW`、arch=`gfx936:sramecc+:xnack-`、68.7 GB、80 CU | **不是 gfx928** —— §2 写的 K100-AI=gfx928 对这台机器不成立 |
+| torch | `2.9.0+das.opt1.dtk2604`，`hip=6.3.26093`，`cuda=None` | — |
+| bf16 吞吐 | **263 TFLOPS**（线性层 fwd+bwd 粗估） | 标称 192 的 137%，进一步说明这不是 K100-AI |
+| bf16/fp16/fp32 matmul | rel_err 2.9e-3 / 3.6e-4 / 4.1e-7 | 正常 |
+| ★ 2D×3D 广播 matmul **反向** | fwd 1.3e-7 / dA 1.8e-7 / dB 1.1e-7 | **通过** → LoKr 不需要昇腾那种 expand+bmm 绕行 |
+| ★ key-padding mask 极性 | 与 torch 语义一致（反转极性差 780×） | 通过 |
+| ★ SDPA 后端 | flash=NO、mem_efficient=NO、math=OK | 见下面的坑 |
+| sdpa_seg 正确性 | rel_err 1.66e-3，fwd+bwd 均正确 | 通过（**修复之后**） |
+| sdpa_seg 显存 | ΣN=8k → 2.35 GB；ΣN=32k → **13.49 GB** | 比值 5.7×。探针把 <7× 判成"走的是快核"，**这个判定在这里不可信**：逐后端强制测下来 flash/mem_efficient 都不可用，只剩 math，5.7× 更接近 math 的理论 8× 而不是快核的 4×。**以 13.49 GB 这个绝对值定 `navit_token_budget`** |
+| FP8 (`torch._scaled_mm`) | 不支持（要求 ROCm MI300+） | 与【推断】一致 → `base_quant: none` |
+| torchvision / xformers / bitsandbytes / triton / flash_attn | 全部缺失 | 与【资料】一致 |
+| grad checkpoint / fft / Conv2d+GroupNorm bf16 / AdamW / cuda.Event / 显存 API | 全部通过 | — |
+
+### ★ 坑 1：DTK 的环境变量不会自动 source
+`/etc/profile.d/` 里**没有** DTK 的 env。交互 shell 和 ssh 非登录 shell 里 `LD_LIBRARY_PATH`
+都是空的，直接 `import torch` 报
+`ImportError: libgalaxyhip.so.5: cannot open shared object file`。
+每个 shell 都要先 `source /opt/dtk/env.sh`。`run_dcu.sh` 已在体检 0 里无条件补了这一步。
+
+### ★ 坑 2：无 mask 的 SDPA 直接抛异常，不回退
+```
+F.scaled_dot_product_attention(q, k, v)      # 不给 attn_mask
+RuntimeError: No matching libraries found for flash_attn_2_cuda*.so
+```
+DTK 的 torch 把无 mask 的 SDPA 派发给一个**外部的 flash-attn 动态库**，而基础镜像里
+根本没有那个 `.so`（`find / -name '*flash_attn*'` 为空）。它不会优雅回退到 math，
+而是直接 RuntimeError —— 症状是**"给 mask 就能跑、不给 mask 就崩"**，
+`sdpa_seg`（NaViT 主路径）整条挂掉，看起来像 NaViT 在 DCU 上不可用。
+
+一行修复：`torch.backends.cuda.enable_flash_sdp(False)`。
+`utils/dcu_compat.configure_sdpa_backends()` 会在 `enable()` 里**实测一次再决定**关谁
+（不写死"DCU 没有 flash"，因为光源在补 flash-attn 的 das 版轮子，装上以后这条路是通的），
+`tools/dcu_probe.py` 也在同一位置应用同样的修复，否则后面三项 SDPA 会全 FAIL。
+
+### 部署（scnet Notebook 实例）
+* **依赖装进系统 python `/usr/local/lib/python3.11/site-packages`**，不要建 venv：
+  `/`（系统盘）随镜像保存，`/root/private_data` 不随镜像保存。
+* 基础镜像已自带 `torch 2.9.0+das`、`transformers 4.57.6`、`numpy 1.25.0`、
+  `pyyaml`、`Pillow`、`protobuf`、`tqdm`、`psutil`、`safetensors 0.7.0`。
+  训练必需项只差 **`einops`、`sentencepiece`**（外加建议装的 `rich`、`omegaconf`）。
+* 用 `requirements-dcu.txt` + `tools/dcu_gen_constraints.py` 生成的 constraints 装，
+  constraints 会把 `torch`/`numpy` 钉死，任何试图换 torch 的包会**报错**而不是静默替换。
+* **`numpy` 必须留在 1.25.0**：das 版 torch 是按它编的（未做 numpy2 对拍，保守不动）。
+* 【实测】该实例的 **出站 HTTPS 全部不通**（DNS 通、TCP 443 全 FAIL，含 tuna/aliyun/pypi.org）。
+  网络断的时候 pip 装不了任何东西，只能从别处拷 wheel 或直接拷已装好的包目录。
 
 ### 两条红线【资料】
 1. **绝不 `pip install torch` / `pip install torchvision`**。PyPI 版会把镜像里适配好的

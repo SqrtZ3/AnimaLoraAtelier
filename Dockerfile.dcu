@@ -1,0 +1,85 @@
+# syntax=docker/dockerfile:1
+# ==============================================================================
+#  Anima LoRA 训练 · 海光 DCU（K100-AI）镜像
+#
+#  设计要点（都是为了避开 docs/hygon-dcu.md §2「两条红线」）：
+#    1. FROM 光源 DTK 基础镜像 —— torch 由它提供，本 Dockerfile **一次都不装 torch**。
+#    2. 装依赖前先把镜像里 torch/torchvision/numpy 的实际版本冻成 constraints，
+#       pip 于是没有任何路径能替换它们；真有冲突会在 build 阶段红着脸失败。
+#    3. build 末尾有一道**硬门槛**：torch.version.hip 为空则 build 失败。
+#       这保证「能 build 出来的镜像」一定不是被 CUDA 版污染过的。
+#
+#  构建：
+#    docker build -f Dockerfile.dcu \
+#      --build-arg BASE_IMAGE=<从平台复制的基础镜像完整 tag> \
+#      -t anima-dcu:k100ai .
+#
+#  运行（卡的挂载方式以平台文档为准，下面是 DTK 的常见写法）：
+#    docker run -it --rm \
+#      --device=/dev/kfd --device=/dev/mkfd --device=/dev/dri \
+#      --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+#      --ipc=host --shm-size=32g \
+#      -v /path/to/models:/workspace/models \
+#      -v /path/to/dataset:/workspace/AnimaLoraToolkit/Dataset \
+#      -v /path/to/output:/workspace/output \
+#      anima-dcu:k100ai bash
+#
+#  ⚠ 权重与数据集**不进镜像**（几十 GB，且随实验变）。除非评审要求自包含产物，
+#    否则一律走 -v 挂载。
+# ==============================================================================
+
+# 平台给的基础镜像 tag，形如：
+#   image.sourcefind.com:5000/dcu/admin/base/pytorch:2.9.0-dtk26.04-py3.11-ubuntu22.04
+# 以平台控制台/`docker images` 里的实际字符串为准，不要照抄这里的默认值。
+ARG BASE_IMAGE=image.sourcefind.com:5000/dcu/admin/base/pytorch:2.9.0-dtk26.04-py3.11-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai
+
+WORKDIR /workspace
+
+# --- 1) 记录基线：这是判断「后面有没有被污染」的唯一依据 ----------------------
+RUN python -c "import torch,sys;print('BASE torch=',torch.__version__,'hip=',torch.version.hip,'cuda=',torch.version.cuda)" \
+ && python -m pip list > /opt/anima_base_pip_freeze.txt
+
+# --- 2) 冻结不可动的包 --------------------------------------------------------
+COPY AnimaLoraToolkit/tools/dcu_gen_constraints.py /opt/anima/dcu_gen_constraints.py
+RUN python /opt/anima/dcu_gen_constraints.py > /opt/anima/constraints-dcu.txt \
+ && cat /opt/anima/constraints-dcu.txt
+
+# --- 3) 装依赖（只有这一层会变，改 requirements 时缓存只失效这里）-------------
+COPY AnimaLoraToolkit/requirements-dcu.txt /opt/anima/requirements-dcu.txt
+RUN python -m pip install --prefer-binary \
+        -c /opt/anima/constraints-dcu.txt \
+        -r /opt/anima/requirements-dcu.txt
+
+# --- 4) ★ 硬门槛：装完之后 torch 必须还是 HIP 构建 ----------------------------
+RUN python - <<'PY'
+import sys, torch
+hip, cuda = torch.version.hip, torch.version.cuda
+print(f"AFTER-INSTALL torch={torch.__version__} hip={hip} cuda={cuda}")
+if not hip:
+    sys.exit(
+        "✗ torch 已不是 HIP 构建 —— 依赖安装过程把 das 版换成了 PyPI CUDA 版。\n"
+        "  用 `pip install --dry-run -v` 定位是哪个包拉的 torch，然后把它加进\n"
+        "  requirements-dcu.txt 的排除名单或改用 --no-deps 装。"
+    )
+if cuda:
+    sys.exit(f"✗ torch.version.cuda={cuda} 非空，同上。")
+import numpy, transformers, safetensors, einops, yaml, PIL, sentencepiece
+print("import 自检通过 numpy=", numpy.__version__, "transformers=", transformers.__version__)
+PY
+
+# --- 5) 代码 -----------------------------------------------------------------
+COPY . /workspace/anima-lora-train
+WORKDIR /workspace/anima-lora-train
+
+# 运行期默认值。8 卡时 run_dcu.sh --nproc 8 会用 torchrun 起。
+ENV ANIMA_DCU=1
+
+CMD ["bash"]

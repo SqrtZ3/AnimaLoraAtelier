@@ -81,6 +81,22 @@ echo " 配置     : $CONFIG_FILE"
 echo " 卡数     : $NPROC"
 echo "=============================================================="
 
+# --- 体检 0：DTK 环境 ---------------------------------------------------------
+# 【实测 · scnet BW 64GB 容器】DTK 的 env.sh **不会**被 /etc/profile.d 自动 source，
+# 交互 shell 和 ssh 非登录 shell 里 LD_LIBRARY_PATH 都是空的，直接 `import torch`
+# 报 `libgalaxyhip.so.5: cannot open shared object file`。所以这里无条件补一次。
+# 已经 source 过是幂等的；DTK_ROOT 可用环境变量覆盖（多版本共存时指到具体版本目录）。
+DTK_ROOT="${DTK_ROOT:-/opt/dtk}"
+if [ -z "${ROCM_PATH:-}" ] && [ -f "$DTK_ROOT/env.sh" ]; then
+    # env.sh 里大量 `export X=...:$X` 的写法，X 未定义时在 `set -u` 下是致命错误，
+    # 会让整个脚本在这里静默退出（RC=1，连体检都没打完）。所以这一段临时关掉 -u。
+    set +u
+    # shellcheck disable=SC1091
+    . "$DTK_ROOT/env.sh" >/dev/null 2>&1
+    set -u
+    echo "  · 已 source $DTK_ROOT/env.sh（ROCM_PATH=${ROCM_PATH:-未设置}）"
+fi
+
 FAIL=0
 warn() { echo "  ⚠ $*"; }
 bad()  { echo "  ✗ $*"; FAIL=1; }

@@ -81,5 +81,8 @@ for d in "$STAGE"/*; do
     if [ "$sz" -gt 15000 ]; then echo "  ✗ $(basename "$d") = ${sz}MB 超过单层上限"; else echo "  ✓ $(basename "$d") = ${sz}MB"; fi
 done
 echo
-echo "下一步：控制台 → 镜像管理 → 构建镜像 → Dockerfile，贴入 $STAGE/Dockerfile 的内容，"
-echo "        并把 ARG BASE_IMAGE 换成控制台里看到的**真实**基础镜像地址。"
+echo "下一步：控制台 → 镜像管理 → 构建镜像 → Dockerfile，"
+echo "        「Dockerfile文件路径」填：$(dirname "$STAGE")/dockerFileTemp/Dockerfile"
+echo
+echo "当前 FROM： $(grep -m1 '^ARG BASE_IMAGE=' "$STAGE/Dockerfile" | cut -d= -f2-)"
+echo "（该地址已用 config blob 的 Env 与运行中的实例对拍确认，见 docs/hygon-dcu.md §2.7）"

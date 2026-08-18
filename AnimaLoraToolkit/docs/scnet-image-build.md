@@ -311,6 +311,13 @@ scnet 出网实测 SSL timeout，所以 tarball 走构建上下文：本地下�
 `/usr/lib/code-server` 并软链）。jupyterlab 升级（pip `"jupyterlab>=4.2,<5"`，当前 4.6.3）
 走 tuna 直连，构建期无网络风险。
 
+**IDE 验收（2026-08-18，v0.1.2 实测）**：镜像内 `code-server 4.133.0` 启动正常、
+平台前端可连（握手后打出 `Extension host agent started`）。注意：
+* 密码文件在 `/root/.config/code-server/config.yaml`（系统盘，重启回退会丢，新实例
+  首次启动会重新生成/提示设置——平台自带连接机制时一般不依赖它）。
+* "VSCode 入口是否展示"是**平台 UI 配置**：构建表单「开发工具」是否填了 VSCode 路径、
+  创建实例时的 IDE 选项、平台文档的 IDE 说明，三处任一没到位就不显示，与镜像侧无关。
+
 ---
 
 ## 11. 迭代与版本

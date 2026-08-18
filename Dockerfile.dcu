@@ -16,9 +16,13 @@
 #    「依赖」「代码」「（可选）权重」拆成不同的 RUN/COPY 层，任一层都远小于 15GB。
 # ==============================================================================
 
-# 平台 DCU 基础镜像的完整拉取地址。**必须**换成控制台「镜像管理」里看到的真实字符串，
-# 下面这个是按平台文档里 GPU 版的命名规律推的，未经验证。
-ARG BASE_IMAGE=image.sourcefind.cn:5000/dcu/admin/base/jupyterlab-pytorch:2.9.0-py3.11-dtk26.04-ubuntu22.04
+# 平台 DCU 基础镜像。控制台不展示这个地址，是直接查光源 harbor 的 registry API 拿到的：
+#   GET https://image.sourcefind.cn:5000/v2/dcu/admin/base/jupyterlab-pytorch/tags/list
+# 并用 config blob 的环境变量跟运行中的实例逐项对拍确认（AMDGPU_TARGETS /
+# MOFED_VERSION / MIOPEN_FIND_MODE / DTKROOT / HF_ENDPOINT 五项全同），
+# 所以这不是猜的。同名还有一个 `-shca` 变体，用途不明，别乱换。
+# 该镜像 Entrypoint=docker-entrypoint.sh、Cmd=/bin/bash —— 本文件不覆盖，原样继承。
+ARG BASE_IMAGE=image.sourcefind.cn:5000/dcu/admin/base/jupyterlab-pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.11-devel
 FROM ${BASE_IMAGE}
 
 LABEL module="jupyter" \

@@ -122,6 +122,7 @@ YAML_TO_ARGS = {
     "cache_encode_tile_overlap": "cache_encode_tile_overlap",
     "cache_encode_max_pixels": "cache_encode_max_pixels",
     "vae_attn_chunk_tokens": "vae_attn_chunk_tokens",
+    "fast_model_init": "fast_model_init",
     "alpha_handling": "alpha_handling",
     "alpha_background": "alpha_background",
     "alpha_threshold": "alpha_threshold",
@@ -639,6 +640,14 @@ DEFAULTS = {
     # （tests/test_vae_attn_chunk.py 对拍）。代价是多次 kernel 启动，略慢。
     # 建议：CUDA/昇腾保持 0；DCU 设 4096。
     "vae_attn_chunk_tokens": 0,
+    # 在 meta device 上构造 transformer，跳过 2.09B 参数的默认随机初始化（这些随机值
+    # 随即被 checkpoint 权重整个覆盖，一个字节都用不上）。纯 CPU 开销：本地 16 线程
+    # 实测 26.5s，算力受限的节点上实测 301.5s。
+    # 风险与防线：to_empty() 分配的是未初始化内存，没被 checkpoint 填过的张量会是垃圾值。
+    # 加载后有一道 fail-fast 对账（missing ∪ shape 不匹配被丢弃的 buffer ∪ non-persistent
+    # buffer 必须全部落在显式重算集合里），对不上直接 raise 而不是让训练悄悄跑歪。
+    # 默认关：这是启动速度优化，不影响任何训练数值。
+    "fast_model_init": False,
     "alpha_handling": "none",
     "alpha_background": "neutral",
     "alpha_threshold": 0.01,

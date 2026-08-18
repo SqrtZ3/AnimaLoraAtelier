@@ -81,8 +81,74 @@ _RECOMPUTABLE_BUFFER_PATTERNS = (
 )
 
 
+# RoPE 派生 buffer 所属模块的属性名。fast_init 路径下这些模块的 buffer 是从 arange
+# 重算的（不是训练学到的），必须在 to_empty() 之后显式 reset_parameters()。
+_POS_EMBEDDER_MODULE_SUFFIXES = ("pos_embedder", "extra_pos_embedder")
+
+
+def _build_anima_on_meta(Anima, config):
+    """在 meta device 上构造 Anima，再 to_empty 到 CPU。
+
+    为什么：2.09B 参数的默认随机初始化（kaiming_uniform_ 等）是纯 CPU 串行开销，
+    本地 16 线程实测 26.5s，算力受限的节点上实测 301.5s —— 而这些随机值随即会被
+    checkpoint 权重整个覆盖，一个字节都用不上。meta 构造把这段降到接近 0。
+
+    代价与防线：``to_empty()`` 分配的是**未初始化内存**，任何没被 checkpoint 填过的
+    参数/buffer 都会是垃圾值（且不会报错，只会让训练悄悄跑歪）。所以本函数返回它显式
+    重算过的 key 集合，由 ``_assert_no_uninitialized`` 与加载结果对账，对不上就 raise。
+
+    返回 ``(model, recomputed_keys)``。
+    """
+    with torch.device("meta"):
+        model = Anima(**config)
+    model.to_empty(device="cpu")
+
+    # 需要显式重算的两类模块：
+    #   1) RoPE 位置嵌入 —— 它的 buffer 在 ckpt 里有，但 shape 跟着 max_img_* 变，
+    #      加载时按 recomputable 丢弃（见 _RECOMPUTABLE_BUFFER_PATTERNS）。
+    #   2) 任何持有 **non-persistent buffer** 的模块 —— 这类 buffer 不进 state_dict，
+    #      checkpoint 永远填不到（如 llm_adapter.rotary_emb.inv_freq）。
+    persistent = set(model.state_dict().keys())
+    recomputed: set[str] = set()
+    for mname, m in model.named_modules():
+        own_buffers = [f"{mname}.{b}" if mname else b for b, _ in m.named_buffers(recurse=False)]
+        needs = (mname.split(".")[-1].endswith(_POS_EMBEDDER_MODULE_SUFFIXES)
+                 or any(k not in persistent for k in own_buffers))
+        if not needs or not hasattr(m, "reset_parameters"):
+            continue
+        m.reset_parameters()
+        recomputed.update(own_buffers)
+    return model, recomputed
+
+
+def _assert_no_uninitialized(model, load_info: dict, recomputed: set) -> None:
+    """fail-fast：确认 fast_init 之后模型里没有残留的未初始化内存。
+
+    未被 checkpoint 填过的 key = ``missing``（ckpt 里根本没有）∪ ``skipped``（ckpt 里有
+    但 shape 不匹配、被当作 recomputable 丢掉）。这些必须全部落在 ``recomputed`` 里。
+    另外 state_dict 不含 non-persistent buffer，单独再查一遍。
+    """
+    unfilled = set(load_info.get("missing", ())) | set(load_info.get("skipped", ()))
+    persistent = set(model.state_dict().keys())
+    non_persistent = {n for n, _ in model.named_buffers()} - persistent
+    leftover = sorted((unfilled | non_persistent) - set(recomputed))
+    if leftover:
+        raise RuntimeError(
+            f"fast_init（meta 构造）后有 {len(leftover)} 个参数/buffer 既没被 checkpoint "
+            f"填充、也没被显式重算，内容是未初始化内存：{leftover[:10]}"
+            f"{' ...' if len(leftover) > 10 else ''}。"
+            f"请设 fast_init=false（回到 CPU 随机初始化路径）并反馈这个列表 —— "
+            f"这说明模型结构里新增了 fast_init 不认识的、需要真初始化的张量。"
+        )
+    logger.info(
+        "[fast_init] 校验通过：%d 个 key 由 checkpoint 填充，%d 个 RoPE 派生 buffer 已重算，"
+        "无未初始化残留。", len(model.state_dict()) - len(unfilled), len(recomputed),
+    )
+
+
 def load_anima_model(transformer_path, device, dtype, repo_root,
-                     max_img_h: int = 240, max_img_w: int = 240, max_frames: int = 128):
+                     max_img_h: int = 240, max_img_w: int = 240, max_frames: int = 128,
+                     fast_init: bool = False):
     """加载 Anima transformer 模型。
 
     `max_img_h` / `max_img_w` 控制 RoPE position embedding 的 `seq` buffer 长度上限
@@ -163,19 +229,25 @@ def load_anima_model(transformer_path, device, dtype, repo_root,
     # 构造与权重加载都是纯 CPU 且都以分钟计（2.09B 参数）。分开计时：算力受限的节点上
     # 这两段能占掉启动的绝大部分，不切开就只能看到一个几分钟的"卡住"。
     _t0 = time.perf_counter()
-    model = Anima(**config)
+    if fast_init:
+        model, _recomputed = _build_anima_on_meta(Anima, config)
+    else:
+        model, _recomputed = Anima(**config), None
     _t_build = time.perf_counter() - _t0
 
     _t0 = time.perf_counter()
-    _load_safetensors_into_model(
+    _info = _load_safetensors_into_model(
         model, Path(transformer_path), label="Transformer",
         skip_buffer_patterns=_RECOMPUTABLE_BUFFER_PATTERNS,
     )
     _t_load = time.perf_counter() - _t0
     logger.info(
-        "Transformer 启动耗时: 构造(CPU 随机初始化) %.1fs + 权重加载 %.1fs "
-        "(torch 线程数=%d)", _t_build, _t_load, torch.get_num_threads(),
+        "Transformer 启动耗时: 构造%s %.1fs + 权重加载 %.1fs (torch 线程数=%d)",
+        "(meta, 跳过随机初始化)" if fast_init else "(CPU 随机初始化)",
+        _t_build, _t_load, torch.get_num_threads(),
     )
+    if fast_init:
+        _assert_no_uninitialized(model, _info, _recomputed)
 
     # 如果 checkpoint 中完全没有 llm_adapter 权重，随机初始化会把 cross-attn 条件搞乱，直接禁用更安全
     with safe_open(transformer_path, framework="pt", device="cpu") as f:

@@ -247,6 +247,10 @@ def _load_safetensors_into_model(
         "coverage": coverage,
         "missing": missing,
         "unexpected": unexpected,
+        # 在 ckpt 里有对应 key、但因 shape 不匹配被当作 recomputable 丢掉的 buffer。
+        # 与 `missing` 合起来才是"模型里没被 checkpoint 填过的 key"的全集 —— fast_init
+        # （meta 构造）路径必须拿到这个全集，才能验证没有未初始化的内存漏出去。
+        "skipped": [name for name, _, _ in skipped_buffers],
     }
 
 

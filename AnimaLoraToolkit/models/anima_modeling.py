@@ -26,8 +26,20 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim):
         super().__init__()
         self.rope_theta = 10000
-        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.int64).to(dtype=torch.float) / head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._head_dim = head_dim
+        self.register_buffer("inv_freq", self._make_inv_freq(), persistent=False)
+
+    def _make_inv_freq(self) -> torch.Tensor:
+        return 1.0 / (self.rope_theta ** (torch.arange(0, self._head_dim, 2, dtype=torch.int64).to(dtype=torch.float) / self._head_dim))
+
+    def reset_parameters(self) -> None:
+        """重算 ``inv_freq``（non-persistent buffer，checkpoint 永远填不到它）。
+
+        正常构造路径下 ``__init__`` 已经算好、本方法不会被调用；只有 meta device 构造
+        （trainer/models.py 的 fast_init）在 ``to_empty()`` 之后需要它——那时 buffer
+        里是未初始化内存。与 anima_modeling_core.RotaryEmbedding 保持一致。
+        """
+        self.inv_freq = self._make_inv_freq().to(self.inv_freq.device)
 
     @torch.no_grad()
     def forward(self, x, position_ids):

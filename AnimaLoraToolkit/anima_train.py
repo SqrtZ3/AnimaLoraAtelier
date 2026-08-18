@@ -1289,6 +1289,7 @@ def main():
         model = load_anima_model(
             args.transformer, device, dtype, repo_root,
             max_img_h=max_img_h, max_img_w=max_img_w,
+            fast_init=bool(getattr(args, "fast_model_init", False)),
         )
 
     # 注意力精度口径（opt-in, default-off；见 models/anima_modeling_core._unify_attn_dtype）。

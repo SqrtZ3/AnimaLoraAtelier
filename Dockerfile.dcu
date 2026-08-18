@@ -49,10 +49,19 @@ ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
 # --- 层 1：记录基线 -----------------------------------------------------------
 # 这是判断「后面有没有被污染」的唯一依据。das 版 torch 一旦被 PyPI 的 CUDA 版覆盖，
 # 报错会全部指向奇怪的地方，所以先把原始状态钉在镜像里。
-RUN mkdir -p /opt/anima-build \
- && python -c "import torch;print('BASE torch=',torch.__version__,'hip=',torch.version.hip,'cuda=',torch.version.cuda)" \
-      | tee /opt/anima-build/base_torch.txt \
- && python -m pip list > /opt/anima-build/base_pip_freeze.txt
+#
+# ★ 两个踩过的坑，改法都在这一条里：
+#   (a) 构建期必须先 `. /opt/dtk/env.sh` —— DTK 环境是基础镜像的 docker-entrypoint.sh
+#       在**容器启动时**设的，RUN 不走 entrypoint，裸 import torch 会报
+#       `librocm_smi64.so.2: cannot open shared object file`。
+#   (b) 不能写成 `python -c ... | tee f`：管道的退出码取的是 tee 的，永远成功，
+#       后面的 `&&` 照走 —— 上一次构建里这一步**报错了但没拦住**。改成先写文件再 cat。
+RUN set -eu; \
+    . /opt/dtk/env.sh; \
+    mkdir -p /opt/anima-build; \
+    python -c "import torch;print('BASE torch=',torch.__version__,'hip=',torch.version.hip,'cuda=',torch.version.cuda)" > /opt/anima-build/base_torch.txt; \
+    cat /opt/anima-build/base_torch.txt; \
+    python -m pip list > /opt/anima-build/base_pip_freeze.txt
 
 # --- 层 2：冻结不可动的包 -----------------------------------------------------
 # 镜像里**没有 torchvision**，而仓库原 requirements.txt 写着 torchvision>=0.15.0 ——
@@ -89,25 +98,19 @@ COPY anima-lora-train/ /opt/anima-lora-train/
 # COPY anima_models/ /opt/anima_models/
 # ENV ANIMA_MODELS_DIR=/opt/anima_models
 
-# --- 层 7：★ 双重硬门槛 -------------------------------------------------------
-# (a) torch 必须仍是 HIP 构建；(b) 平台要求的三样组件必须还在。
-# 任一不过则 build 失败 —— 能 build 出来的镜像必然可用。
-RUN set -e; \
-    python - <<'PY'
-import shutil, sys, os, torch
-hip, cuda = torch.version.hip, torch.version.cuda
-print(f"AFTER-INSTALL torch={torch.__version__} hip={hip} cuda={cuda}")
-if not hip or cuda:
-    sys.exit("✗ torch 已不是 HIP 构建 —— 依赖安装把 das 版换成了 PyPI CUDA 版。\n"
-             "  用 `pip install --dry-run -v` 定位是哪个包拉的 torch。")
-for m in ("numpy", "transformers", "safetensors", "einops", "sentencepiece", "yaml", "PIL", "rich", "omegaconf"):
-    __import__(m)
-print("✓ 训练依赖 import 自检通过")
-missing = [x for x in ("/usr/sbin/sshd", "/usr/bin/sudo", "/opt/conda/bin/jupyter") if not os.path.exists(x)]
-if missing:
-    sys.exit(f"✗ 平台必需组件缺失 {missing} —— 实例会起不来（见平台《构建镜像规则》一、1/2）")
-print("✓ 平台必需组件齐全 (sshd / sudo / /opt/conda/bin/jupyter)")
-PY
+# --- 层 7：★ 硬门槛 -----------------------------------------------------------
+# ★ 这里**不能用 heredoc**。scnet 用的是 docker legacy builder，它把 RUN 的多行命令
+#   压成一行，`python - <<'PY' ... PY` 会退化成
+#       warning: here-document at line 1 delimited by end-of-file (wanted `PY')
+#   校验一行都不跑，这一步却「成功」—— 上一次构建就是这样，门槛完全没生效。
+#   所以校验写成仓库里的真实脚本 tools/dcu_image_selfcheck.py，这里只调用它。
+#
+# 检查项：torch 仍是 HIP 构建、numpy 仍是 1.x、训练必需依赖齐全、平台必需组件
+#        （sshd / sudo / /opt/conda/bin/jupyter）齐全、环境脚本已安装。
+# 任一不过则 build 失败。
+RUN set -eu; \
+    . /opt/dtk/env.sh; \
+    python /opt/anima-lora-train/AnimaLoraToolkit/tools/dcu_image_selfcheck.py
 
 # 构建期代理不该留在运行期环境里（凭据会随实例变，由 zz-scnet-env.sh 动态读取）
 ENV http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY=

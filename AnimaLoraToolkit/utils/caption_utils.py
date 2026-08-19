@@ -4,10 +4,12 @@ Caption 处理工具
 - 标准化格式
 - 分类 shuffle
 """
+# PEP 563：注解延迟求值。本文件签名用了 ``dict | None``，Python 3.9 求值注解会 TypeError。
+from __future__ import annotations
+
 import json
 import random
 from pathlib import Path
-from typing import Optional
 
 
 def load_caption_json(json_path: Path) -> dict | None:

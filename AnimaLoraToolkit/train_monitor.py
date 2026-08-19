@@ -19,6 +19,7 @@
 但实际是 no-op。
 """
 import json
+import sys
 import threading
 import time
 from collections import deque
@@ -39,6 +40,8 @@ MONITOR_STATE = {
     "lr_history": deque(maxlen=_MAX_LR_POINTS),
     "epoch": 0,
     "step": 0,
+    "ref_step": 0.0,
+    "samples_seen": 0,
     "total_steps": 0,
     "speed": 0.0,
     "samples": [],
@@ -59,6 +62,8 @@ def _state_snapshot_for_serialization():
             "lr_history": list(MONITOR_STATE["lr_history"]),
             "epoch": MONITOR_STATE["epoch"],
             "step": MONITOR_STATE["step"],
+            "ref_step": MONITOR_STATE.get("ref_step", 0.0),
+            "samples_seen": MONITOR_STATE.get("samples_seen", 0),
             "total_steps": MONITOR_STATE["total_steps"],
             "speed": MONITOR_STATE["speed"],
             "samples": list(MONITOR_STATE["samples"]),
@@ -67,7 +72,10 @@ def _state_snapshot_for_serialization():
         }
 
 
-def update_monitor(loss=None, lr=None, epoch=None, step=None, total_steps=None, speed=None, sample_path=None, config=None):
+def update_monitor(
+    loss=None, lr=None, epoch=None, step=None, total_steps=None, speed=None,
+    sample_path=None, config=None, ref_step=None, samples_seen=None,
+):
     """更新监控状态（线程安全；纯内存，无 disk IO）。"""
     with _STATE_LOCK:
         # 先更新 step/epoch 等，使本次写入的 loss/lr 点位正确
@@ -75,6 +83,10 @@ def update_monitor(loss=None, lr=None, epoch=None, step=None, total_steps=None, 
             MONITOR_STATE["epoch"] = epoch
         if step is not None:
             MONITOR_STATE["step"] = step
+        if ref_step is not None:
+            MONITOR_STATE["ref_step"] = ref_step
+        if samples_seen is not None:
+            MONITOR_STATE["samples_seen"] = samples_seen
         if total_steps is not None:
             MONITOR_STATE["total_steps"] = total_steps
         if speed is not None:
@@ -111,13 +123,17 @@ def get_state():
     return _state_snapshot_for_serialization()
 
 
-def restore_monitor_state(losses=None, lr_history=None, epoch=None, step=None, total_steps=None, start_time=None, config=None):
+def restore_monitor_state(
+    losses=None, lr_history=None, epoch=None, step=None, total_steps=None,
+    start_time=None, config=None, ref_step=None, samples_seen=None,
+):
     """恢复监控状态（用于断点续训）。
 
     Args:
         losses: 历史 loss 列表，格式 [{"step": int, "loss": float, "time": float}, ...]
         lr_history: 历史 lr 列表，格式 [{"step": int, "lr": float}, ...]
         epoch, step, total_steps: 训练进度
+        ref_step, samples_seen: reference step 与已提交样本数（可选）
         start_time: 训练开始时间
         config: 配置字典
     """
@@ -130,6 +146,10 @@ def restore_monitor_state(losses=None, lr_history=None, epoch=None, step=None, t
             MONITOR_STATE["epoch"] = epoch
         if step is not None:
             MONITOR_STATE["step"] = step
+        if ref_step is not None:
+            MONITOR_STATE["ref_step"] = ref_step
+        if samples_seen is not None:
+            MONITOR_STATE["samples_seen"] = samples_seen
         if total_steps is not None:
             MONITOR_STATE["total_steps"] = total_steps
         if start_time is not None:
@@ -197,7 +217,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             align-items: center;
             gap: 8px;
         }
-        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 15px; }
         .stat-item {
             background: rgba(0,212,255,0.1);
             border-radius: 12px;
@@ -286,6 +306,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="stat-item">
                 <div class="stat-value" id="step">-</div>
                 <div class="stat-label">Step</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="ref-step">-</div>
+                <div class="stat-label">Ref Step</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="samples-seen">-</div>
+                <div class="stat-label">Samples</div>
             </div>
             <div class="stat-item">
                 <div class="stat-value" id="loss">-</div>
@@ -427,6 +455,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 // 更新统计
                 document.getElementById('epoch').textContent = data.epoch || 0;
                 document.getElementById('step').textContent = data.step || 0;
+                document.getElementById('ref-step').textContent = data.ref_step ? Number(data.ref_step).toFixed(1) : '-';
+                document.getElementById('samples-seen').textContent = data.samples_seen || 0;
                 document.getElementById('speed').textContent = (data.speed || 0).toFixed(2);
                 
                 // Loss
@@ -580,7 +610,31 @@ class MonitorHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, output_dir=None, **kwargs):
         self.output_dir = output_dir or Path("./output")
         super().__init__(*args, **kwargs)
-    
+
+    def handle_one_request(self):
+        """吞掉客户端中途断开导致的连接异常，避免污染训练日志。
+
+        长采样（step N 出图：denoise + VAE decode + 存 PNG/LoRA 可达数分钟）期间，
+        训练与采样都跑在**主线程**，HTTP worker 线程被饿死；浏览器每秒轮询的 fetch
+        等不到响应而主动断连。采样结束 worker 恢复、再 wfile.write 时对端已关闭，
+        抛 BrokenPipeError/ConnectionResetError（均为 ConnectionError 子类）。
+
+        这类异常对训练**完全无害**——训练在主线程，handler 是 daemon worker 线程，
+        互不影响；但 socketserver 默认会把整条 traceback 打到 stderr，看着像崩溃。
+        这里按异常类型精确拦截：标记关闭连接、安静返回，不冒泡到 handle_error。
+        """
+        try:
+            super().handle_one_request()
+        except ConnectionError:
+            self.close_connection = True
+
+    def finish(self):
+        """兜底：finally 阶段 flush/close 若再撞断连，同样静默（不掩盖其它异常）。"""
+        try:
+            super().finish()
+        except ConnectionError:
+            pass
+
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":
             self.send_response(200)
@@ -654,6 +708,22 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         pass  # 静默日志
 
 
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """监控服务器：把客户端断连（ConnectionError 系）的 traceback 静音。
+
+    ``MonitorHandler.handle_one_request`` / ``finish`` 已拦掉请求生命周期里常见的断连
+    路径；这里在 socketserver 的统一错误出口 ``handle_error`` 再兜一层 —— setup /
+    shutdown_request 等边角阶段漏出的断连异常也会经此打印整条 traceback，独立兜底后
+    无论哪条路径断连都不会污染训练日志。非连接类异常仍照常上报（不掩盖真实 bug）。
+    """
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, ConnectionError):
+            return
+        super().handle_error(request, client_address)
+
+
 def start_monitor_server(port=8765, host="0.0.0.0", output_dir=None, open_browser=True, max_port_retries=5):
     """启动监控服务器。
 
@@ -674,7 +744,7 @@ def start_monitor_server(port=8765, host="0.0.0.0", output_dir=None, open_browse
     for attempt in range(max(int(max_port_retries), 1)):
         try_port = port + attempt
         try:
-            server = ThreadingHTTPServer((host, try_port), handler)
+            server = _QuietThreadingHTTPServer((host, try_port), handler)
             actual_port = try_port
             break
         except OSError as e:

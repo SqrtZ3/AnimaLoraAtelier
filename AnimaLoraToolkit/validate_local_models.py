@@ -44,7 +44,7 @@ def test_qwen_tokenizer():
     
     from transformers import AutoTokenizer
     
-    qwen_path = Path(__file__).parent / "models" / "text_encoders"
+    qwen_path = Path(__file__).parent / "models" / "text_encoders" / "Qwen3-0.6B-Base"
     print(f"   Path: {qwen_path}")
     
     try:
@@ -74,7 +74,7 @@ def test_qwen_model():
     import torch
     from transformers import AutoModelForCausalLM
     
-    qwen_path = Path(__file__).parent / "models" / "text_encoders"
+    qwen_path = Path(__file__).parent / "models" / "text_encoders" / "Qwen3-0.6B-Base"
     print(f"   Path: {qwen_path}")
     
     try:
@@ -107,7 +107,7 @@ def test_encode_workflow():
     from transformers import AutoModelForCausalLM, AutoTokenizer, T5Tokenizer
     
     base_path = Path(__file__).parent / "models"
-    qwen_path = base_path / "text_encoders"
+    qwen_path = base_path / "text_encoders" / "Qwen3-0.6B-Base"
     t5_path = base_path / "t5_tokenizer"
     
     try:

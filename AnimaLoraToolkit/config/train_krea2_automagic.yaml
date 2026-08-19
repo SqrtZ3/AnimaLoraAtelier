@@ -1,0 +1,378 @@
+# ══════════════════════════════════════════════════════════════════
+# Krea 2 · Automagic 单变量 A/B（2026-07-18）
+#
+# ── 本实验的唯一变量 ───────────────────────────────────────────────
+#   optimizer_type: adamw → automagic（其余字段与 train_krea2_c12port.yaml
+#   逐字段一致，仅 output_dir/output_name 改名）。
+#
+# ── 为什么试它（假设，可证伪）──────────────────────────────────────
+#   Automagic 的核心是**逐元素 lr mask**：某权重的更新符号与上步一致就
+#   +lr_bump，翻转就 -lr_bump。梯度方向被数据稳定支持的权重自动加速；
+#   被噪声驱动、符号来回翻转的权重 lr 衰减到 min_lr = 自动饿死噪声方向。
+#   → 正对病灶 A（goutong 集是 AI 生成、自带线条噪声，已由用户裁决实验实证）。
+#   这比 huber 的"钝化大残差"更有针对性：huber 按残差大小无差别钝化，
+#   Automagic 按方向的时间一致性区分信号与噪声。
+#   ⚠ 以上是机理推断，**未经实证**。本 run 就是去证伪它。
+#
+# ── 为什么不是 muon_sf（已结案的前车之鉴）──────────────────────────
+#   muon_sf 在本配方下不拟合，根因已由 epoch9 checkpoint 取证锁定：
+#   Newton-Schulz 把更新矩阵所有奇异值拉到 1，抹平谱形。实测对比 ——
+#     adamw : top1 能量 57.7%，谱条件数 22.1，有效秩  8.3（最强层 top1 98%）
+#     muon  : top1 能量  8.9%，谱条件数  1.7，有效秩 25.0（最强层 top1 3.5%）
+#   主方向幅度差 15×。调 lr 治不了（lr 只等比缩放全部奇异值 = 尺度问题，
+#   而这是形状问题）—— 这解释了 5e-5/1e-4/5e-4 全部无效。
+#   Automagic 全链路逐元素运算，无任何谱平坦化算子，Adafactor 的 rank-1
+#   缩放严格保持 rank-1 结构（tests/test_automagic_optimizer.py 已断言）。
+#
+# ── 判读方法（★别再烧到 10 epoch，200~400 步就能定生死）─────────────
+#   ⓪ ★v2 首要判读：总 ||dW||^2 是否追平基线量级。v1 的教训是谱形对但幅度
+#      差 43 倍 = 无效对照。用 tools/lora_delta_forensics.py 与 c12port adamw
+#      **同 epoch** 对比：总能量落在基线 0.5~2 倍区间才算有效对照，
+#      < 1/5 说明仍是步长不足 → 先修强度，别去比画面。
+#   ① 谱形取证：看 top1 能量 / 谱条件数 / 有效秩。
+#      · 落在 adamw 那一侧（top1 > 40%、cond > 10）→ 谱形健康，继续训；
+#      · 落在 muon 那一侧（top1 < 15%、cond < 3）  → 同款谱形病，立刻停。
+#      · v1 实测已确认 Automagic 在这条上健康（57.0% / 15.0 / 6.8），
+#        v2 若谱形仍健康则本判读可跳过，重心放在 ⓪ 和 ③。
+#   ② 平均 lr 曲线：日志里 Automagic 会报 avg_lr。若绝大多数权重都顶到
+#      max_lr=1e-4 → 退化成 adamw@1e-4，机制没起作用（说明梯度符号普遍稳定，
+#      假设被证伪）；若 avg_lr 明显低于 max_lr 且分布分化 → 机制在工作。
+#   ③ 拟合进度：与 adamw c12port 同步数对比 —— adamw 第 6 epoch 已有不错
+#      拟合，这是及格线。
+#   ④ 画面：仍按 c12port 的发丝应力 / 元素探针 prompt 电池判读。
+#
+# ── fallback ──────────────────────────────────────────────────────
+#   · 判读①落在 muon 侧 → 停，记进 memory 实验矩阵，回 adamw。
+#   · 若 400 步内 loss 明显比 adamw 同期高且 avg_lr 已顶满 → max_lr 降到 5e-5
+#     （与 c12port adamw 完全同口径）重跑，排除"无动量导致的噪声放大"。
+#   · ★爬升过慢：本地 smoke test（纯噪声梯度、真实 Krea2 形状）300 步 avg_lr
+#     仅爬到 1.35e-5。噪声方向不被加速正是机制的设计意图，但真实梯度下若
+#     **300 步时 avg_lr 仍 < 3e-5**，说明整体爬升太慢、有效强度远低于 adamw
+#     基线 → 把 lr_bump 提到 3.0e-6 重跑（爬到 max_lr 从 ~99 步缩到 ~33 步）。
+#     这条要在判读③之前查，否则会把"还没起步"误判成"不拟合"。
+#   · 任何 NaN/尖峰 → 先关 base_quant 回 bf16 再判断。
+#
+# ── 实现说明 ──────────────────────────────────────────────────────
+#   utils/automagic_optimizer.py，移植自 ostris/ai-toolkit（Apache-2.0）。
+#   本仓库改动：加 fp32 master（本仓库 LoRA 参数是 bf16，起始 lr=1e-6 时
+#   每步更新 ~1e-6 远低于 bf16 在 6e-3 处的 ulp ~3e-5，会被四舍五入吞掉
+#   —— muon_sf 踩过的同款坑）。上游用随机舍入规避，本仓库统一用 fp32 master。
+#   显存：master 4B + lr_mask 4B + polarity 1B ≈ 9B/param，与 AdamW 的
+#   8B/param 持平（约 1.0GB）。**不是省显存方案**，别指望它解决 OOM。
+# ══════════════════════════════════════════════════════════════════
+#
+# ── 以下为继承自 c12port 的原始说明（各旋钮依据，均未改动）──────────
+# Krea 2 训练配置 · C12 经验移植版（2026-07-16）
+#
+# 定位：把 Anima C12 配方（train_my 43）里"抗记忆/护细节"的经验移植到
+# Krea2，针对两个已观测病灶：
+#   病灶 A：AI 生成训练集的线条噪声被忠实记忆 → 发丝/线条混乱随 epoch 加重
+#           （goutong 集实证：epoch12 干净 / epoch20 崩；换量化/底模不消失）
+#   病灶 B：干净训练集出现元素级记忆（个别小物件吸进触发词）
+#
+# 锚点 = 已在 Krea2 上验证成功的基线（fp8_ab / goutong minimal_diag）：
+#   adamw 1e-4 + 标准 LoRA + family 默认 targets + krea2_res_shift 官方口径。
+# 每个偏离锚点的旋钮都标注证据等级：
+#   [K] = Krea2 已验证   [A] = Anima 验证、Krea2 未验证   [D] = 本次推导、未实证
+#
+# ── 相对 goutong diag 基线的全部差异（逐条依据）─────────────────────
+#  1. timestep_sampling: logit_normal → mixed_uniform_logit(p=0.7) [D]
+#     30% uniform 分量补低 t 监督。res-shift@1024²(α≈2.48) 复合后
+#     P(t'<0.15) 从 ~0.4% → ~2.3%（≈6×）。依据：发丝在低噪步决定，
+#     纯官方调度下该波段无监督，delta 在那里是随 epoch 放大的外推。
+#     注意 mix_low_prob 在此模式语义 = "走 logit_normal 的概率"（代码
+#     objective.py mixed_uniform_logit 分支），不是低噪比例，勿按名字理解。
+#  2. loss: l2 → huber(c=0.2, snr 调度) [A]
+#     C12 同款。大残差影响被钝化 → 少追训练集的线条噪声离群残差。
+#  3. rank_dropout 0.05 + module_dropout 0.03 [A]
+#     C12 同款容量噪声正则，抗逐样本记忆。
+#  4. 逐模块 rank 布局 lora_reg_dims [D，物证支撑]
+#     Krea2 成功 LoRA 逐层取证：77% 能量在 mlp.gate/up，attn 仅 12.7%
+#     （memory krea2-lora-delta-geometry）。把预算从 attn 挪给 mlp：
+#     mlp.gate/up=48，attn=16，其余=32。总参数量 ≈ 全 32 基线持平。
+#     注意：范数占比≠因果重要性，attn 仍留 16 非归零；以画面 A/B 为准。
+#  5. weight_decay 0.01 → 1e-5 [K]
+#     你在 Krea2 Klein 50 图 run 实测：风格最优 1e-5，0.001 已过火
+#     （fp8_ab 头注释原话）。0.01 只是"贴官方"，非实测最优。
+#  6. tag_dropout 0.2(C12) → 0.1（保持 Krea2 基线值）[D]
+#     病灶 B 方向性推理：tag 被 drop 时元素归因给触发词/无条件 → 更漏。
+#     元素记忆的第一治理在打标（独特元素显式打 tag），不在这里加。
+#  7. navit_pack_ffd_window: 256(默认) → 32 [D，代码事实支撑]
+#     数据集条目数 < 默认窗口 → 全局 FFD → 每 epoch 包序完全相同
+#     （已诊断的 loss epoch 周期形态根因）。32 < 条目数恢复逐 epoch 变包。
+#  8. bucket 基准 1536 → 1024 [K]
+#     RAW 只训到 1k（官方）；1536 分布外且 res-shift 线性外推 α≈4.3，
+#     低 t 被进一步压死（minimal_diag 头注释结论）。multiscale 阶梯保留。
+#  9. base_quant: fp8 [K]  —— fp8_ab A/B 已验证拟合等价，省显存提速。
+# 10. learning_rate 1e-4 → 5e-5 [用户决策，2026-07-17]
+#     动机：goutong 集 epoch12 干净/epoch20 崩，选点窗口过窄；降 LR 拉长
+#     "画风已学到 → 伪影记忆崩坏"之间的窗口、提高选点分辨率。
+#     注意：官方/社区在 Krea2 上没有 sub-1e-4 的公开实测（1e-4 是唯一
+#     公认锚点，官方自家画风 LoRA 结构=r32 全 264，超参未公开）。
+#     fallback：若 ~3000 步画风信号仍明显弱于基线同期 → 回 1e-4。
+#
+# ── C12 里【没有】移植的组件（防误解，都是有意关掉）─────────────────
+#   · LoKr f4 + DoRA：LoKr 在 Krea2 结构性不可用（实验矩阵已结案）；
+#     DoRA 在 Krea2 无干净格子，不携带进配方。→ 标准 LoRA。
+#   · soap_sf：Krea2 上 OOM（已挂起）。muon_sf 可用但校准仅标准 LoRA
+#     lr 2e-3 口径 → 首版仍用 adamw（最稳锚点）。
+#   · adaptive_timestep(slope)：slope 指标实测系统性饿低 t
+#     （memory dataset-tloss-shape），与本配方目标相反 → 关。
+#   · aux_spectral / dfm / immiscible：Anima 验证、Krea2 未验证；
+#     且 aux_spectral 会把高频推向训练集的高频——对含线条噪声的
+#     AI 生成集（病灶 A）方向相反。干净画师集可单变量再开。
+#   · 三峰 mixed_logsnr_three：低噪峰(基 t≈0.25)经 res-shift 复合后
+#     落到 t'≈0.45（中噪），够不到细节区 → 改用 uniform 掺混。
+#
+# ── 判读方法（跑之前记住）────────────────────────────────────────
+#   A. step 0 采样必须正常（LoRA init 净增量=0）。坏 → 停，回来报告。
+#   B. eval_t_grid 的 t=0.1 曲线【应当开始下降】——这是低 t 补监督
+#      生效的直接信号（官方调度下它纹丝不动是常态，现在不该了）。
+#   C. loss 曲线的 epoch 周期形态应消失（ffd_window 生效的信号）。
+#   D. 核心验收（vs goutong diag 基线，同拟合度对比而非同步数）：
+#      Turbo 工作流下发丝崩坏的 epoch 阈值是否后移、同等干净度下
+#      画风保留是否更多。部署侧"最后 2 步裸底模"技巧可叠加使用。
+#   E. 若 1500 步内画风信号明显弱于基线同期 → 先单变量回退 timestep
+#      （mixed_uniform_logit → logit_normal），它是本配方最大的分布改动。
+# fallback：任何 NaN/尖峰 → 先关 base_quant 回 bf16 再判断；
+#   rank/module_dropout 疑似拖慢收敛 → 归零回退（其余不动）。
+# ══════════════════════════════════════════════════════════════════
+
+# ── 模型路径 ────────────────────────────────────────────────
+model_family: "krea2"
+transformer_path: "AnimaLoratoolkit/models/transformers/raw.safetensors"
+vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
+krea2_text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-VL-4B-Instruct"
+krea2_text_max_length: 512
+krea2_text_cache_entries: 128
+
+# ── 数据集 ──────────────────────────────────────────────────
+data_dir: "./Dataset/your-dataset"       # ★必改
+resolution: 1024
+repeats: 1
+
+# ── ARB 分桶（1024 基准 = RAW 分布内，差异 #8）───────────────
+bucket_base_resos: [1024]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 2048
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.7
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+max_img_h: 0
+max_img_w: 0
+
+# ── NaViT 块对角打包（差异 #7：ffd_window 修静态包序）────────
+navit_packing: true
+navit_native_resolution: true
+navit_token_budget: 16384
+fit_max_tokens: 32768000
+fit_warn_tokens: 32768000
+navit_max_images_per_pack: 0
+navit_multiscale: true
+navit_multiscale_token_ladder: "2304,4096"
+navit_pack_strategy: ffd
+navit_pack_ffd_window: 32       # ★差异 #7：默认 256 > 数据集条目数 = 全局 FFD 静态包序
+navit_text_trim_padding: false
+cache_latents: true
+cache_encode_tiled: true
+cache_encode_max_pixels: 16777216
+fit_packed_training: false
+token_bucket: false
+bucket_drop_last: false
+torch_compile: false
+
+# ── 底模量化（差异 #9，[K] fp8_ab 已验证）────────────────────
+base_quant: fp8
+base_quant_gemm: auto
+base_quant_fp8_scale: auto
+base_quant_fp8_grad: false
+
+# ── 数据增强 / 打标（差异 #6：tag_dropout 保持 0.1）──────────
+shuffle_caption: true
+keep_tokens: 1
+flip_augment: true
+tag_dropout: 0.1
+tag_dropout_overrides:
+  close-up: 0.5
+caption_dropout_rate: 0.01
+freq_balanced_dropout_strength: 0.0
+prefer_json: false
+
+# ── LoRA 结构：标准 LoRA + 逐模块容量布局（差异 #3/#4）───────
+# 不写 lora_targets → family 默认全部 Linear（与成功基线一致）
+lora_type: "lora"
+lora_rank: 32                   # 未被 reg_dims 命中的模块用它
+lora_alpha: 32.0
+lora_dropout: 0.0
+lora_variant: "base"            # 无 DoRA（Krea2 无干净验证格子）
+
+# 差异 #4：预算从 attn 挪向 mlp gate/up（实测能量 77% vs 12.7%）
+# alpha=rank 逐档同步（保持 scaling=1，与基线口径一致）
+lora_reg_dims:
+  '.*mlp\.(gate|up)$': 48
+  '.*attn\.(wq|wk|wv|wo|gate)$': 16
+lora_reg_alphas:
+  '.*mlp\.(gate|up)$': 48
+  '.*attn\.(wq|wk|wv|wo|gate)$': 16
+
+rank_dropout: 0.05              # ★差异 #3 [A] C12 同款
+module_dropout: 0.03            # ★差异 #3 [A] C12 同款
+loraplus_lr_ratio: 1.0
+
+# ── 优化器（★本实验唯一变量：adamw → automagic）──────────────
+# learning_rate 在 Automagic 里是**起始值**，不是训练强度旋钮。
+# 真正决定强度的是 max_lr —— 梯度方向稳定的权重最终都会顶到它。
+# max_lr=1e-4 的依据：Automagic 有 clip_threshold=1.0 的更新 RMS 裁剪，
+# 量级语义与 AdamW 的 m/sqrt(v)(RMS≈1) 对齐，所以可直接沿用 AdamW 已验证
+# 的锚点（1e-4 是 Krea2 社区/官方唯一公认值，c12port 用的 5e-5 是其一半）。
+# 取 1e-4 而非 5e-5：Automagic **无一阶动量**，逐步更新比 AdamW 噪声大，
+# 且 max_lr 只是上界（噪声驱动的权重会自动降到 min_lr），故取已验证上界。
+# lr_bump=1e-6：从 1e-6 爬到 max_lr 需 ~99 步 ≈ 2.5 epoch，天然充当 warmup。
+optimizer_type: "automagic"
+# ★ v2 修订（2026-07-19，依据 v1 epoch9 取证）：v1 用上游默认 lr=1e-6 起步，
+#   结果 9 epoch 下来总 ||dW||^2 仅 2.615（基线 112.4，小 43 倍 = ||dW|| 小 6.6 倍），
+#   反推有效 lr 仅 ~1e-5 量级 —— lr mask 整个 run 都没爬到 max_lr。
+#   谱形完全健康（top1 57.0% vs 基线 57.7%），是纯粹的步长不足，不是机制失败。
+#   修法：起点直接放到 adamw 已验证值 5e-5，让 mask 只负责"分化"而不负责"起步"。
+learning_rate: 5.0e-5           # ★起点 = c12port adamw 同口径（不再从 1e-6 慢爬）
+lr_scheduler: "none"            # Automagic 自管逐权重 lr，外部调度器会被强制关掉
+optimizer_args:
+  min_lr: 1.0e-7                # 保持上游值：噪声方向要能被真正饿死（机制核心）
+  max_lr: 1.0e-4                # ★上界仍是已验证锚点，稳定方向最多加速到 2 倍起点
+  lr_bump: 2.0e-6               # 起点→max_lr 仅需 25 步；起点→min_lr 约 25 步（双向都够快）
+  beta2: 0.999
+  clip_threshold: 1.0
+  weight_decay: 0.00001         # 与 c12port 对齐（实际影响 ~1e-9/step，近似 no-op）
+
+# ── 训练循环 ────────────────────────────────────────────────
+epochs: 200
+max_steps: 0
+batch_size: 4
+effective_batch_size: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0
+grad_norm_log_every: 20
+mixed_precision: "bf16"
+grad_checkpoint: true
+num_workers: 4
+
+# ── Timestep 采样（差异 #1：uniform 掺混补低 t）───────────────
+# mixed_uniform_logit：mix_low_prob = 走 logit_normal 的概率（≠低噪比例！）
+# 0.7 → 70% 官方形状 + 30% uniform；uniform 分量同样过 res-shift，
+# 复合后 P(t'<0.15) ≈ 2.3%（基线 ~0.4%）。
+flow_shift: 1.0
+timestep_sampling: mixed_uniform_logit
+timestep_mix_low_prob: 0.7
+timestep_stratified: true
+timestep_t_min: 0.0
+timestep_t_max: 1.0
+schedule_shift: 1
+
+# ── krea2 分辨率感知 shift（官方调度不动，与 #1 复合）─────────
+krea2_res_shift: true
+krea2_shift_min_res: 256
+krea2_shift_max_res: 1280
+krea2_shift_y1: 0.5
+krea2_shift_y2: 1.15
+
+adaptive_timestep: false        # slope 指标饿低 t，与本配方目标相反，明确关
+
+# ── 主 loss（差异 #2：huber + snr 调度，C12 同款）─────────────
+loss_type: "huber"
+huber_c: 0.2
+huber_schedule: "snr"
+huber_snr_clamp_max: 2.0
+loss_weighting_scheme: "none"
+weight_cap_ratio: 0
+min_snr_gamma: 0
+
+# ── 噪声 ────────────────────────────────────────────────────
+noise_offset: 0
+noise_offset_min: 0
+noise_offset_random_strength: false
+pyramid_noise_iterations: 0
+pyramid_noise_discount: 0.3
+
+# ── 辅助 loss（eisbach 保留 [K]；其余首版全关，见头注释）──────
+eisbach_lambda: 0.15
+
+dfm_lambda: 0.0
+dfm_mode: "vecor"
+aux_spectral_enabled: false     # 对含线条噪声的 AI 生成集方向相反，勿开
+aux_spectral_lambda: 0.065
+aux_spectral_use_wavelet: true
+aux_spectral_wavelet_lambda: 0.20
+aux_spectral_t_gate: 0.55
+lwd_mask_enabled: false
+lwd_mask_floor: 0.3
+aux_perceptual_enabled: false
+immiscible_enabled: false       # Krea2+navit 未验证，首版收窄变量面
+
+# ── eval ────────────────────────────────────────────────────
+# ★ 判读 B：本配方下 t=0.1 曲线应开始下降（低 t 有监督了）。
+eval_every: 40
+eval_count: 16
+eval_t_grid: "0.1,0.5,0.9,0.97"
+eval_seed: 1234
+
+# ── 遥测 ────────────────────────────────────────────────────
+telemetry_enabled: true
+telemetry_freq_bands: 3
+telemetry_slope_window: 6
+telemetry_optimizer_every: 0
+telemetry_capacity_every: 0
+
+# ── 输出 / 保存 ─────────────────────────────────────────────
+output_dir: "./output/krea2-automagic"   # ★必改
+output_name: "krea2-automagic"           # ★必改
+save_every: 1
+save_every_steps: 0
+save_state_every: 100
+keep_vae_on_gpu: true
+empty_cache_after_sample: false
+seed: 42
+resume_lora: ""
+resume_state: ""
+stage_timing_every: 20
+stage_timing_warmup: 0
+
+# ── 采样出图（进度条用；checkpoint 选点在 Turbo 工作流做）─────
+# 提示词电池（2026-07-17，仿官方 darkbrush 预览法：分布外场景 × 病灶探针）。
+# 轮换语义（anima_train.py get_next_sample_prompt）：每次采样事件轮换 1 条，
+# sample_every=1 → 同一条提示词每 4 个 epoch 重现一次（固定 seed 可比）。
+# step-0 基线会把前 N 条都各采一张作对照。嫌密度不够可删到 2 条（保 #1/#2）。
+# 判读：
+#  #1 发丝应力：线条崩坏在这条上最先显形 → 定位崩坏 epoch 阈值
+#  #2 元素记忆探针：白背景+简单裙，画面里凭空多出的道具/背景=病灶 B 信号
+#  #3 分布外迁移：训练集不会有的场景，画风应带过去；只出"训练集式构图"=记忆
+#  #4 服从性：多主体绑定，LoRA 不应损伤底模的 prompt 追从（官方关注点）
+sample_every: 1
+sample_steps: 0
+sample_infer_steps: 30
+sample_cfg_scale: 4.5
+sample_sampler_name: "er_sde"
+sample_scheduler: "beta"
+sample_width: 0
+sample_height: 0
+sample_seed: 1234
+sample_negative_prompt: ""
+sample_prompt: "@g0ut0ng style, 1girl"         # ★必改 trigger（sample_prompts 为空时的后备）
+sample_prompts:                                 # ★必改 trigger 前缀，与训练 caption 同款
+  - "@g0ut0ng style, 1girl, close-up portrait, long flowing hair, wind, detailed hair strands, looking at viewer, dark simple background"
+  - "@g0ut0ng style, 1girl, standing, full body, plain white background, simple white dress, arms at sides"
+  - "@g0ut0ng style, 1girl, riding a bicycle through a rainy neon-lit street at night, holding a transparent umbrella, reflection in puddle"
+  - "@g0ut0ng style, 2girls, one sitting on a park bench eating ice cream, the other standing behind her pointing at the sky, autumn leaves falling"
+
+# ── 日志 / 监控 ─────────────────────────────────────────────
+loss_curve_steps: 1
+no_progress: false
+log_every: 1
+no_monitor: false
+monitor_port: 8765
+monitor_host: "0.0.0.0"
+no_browser: true

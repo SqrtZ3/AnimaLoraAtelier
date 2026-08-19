@@ -1,0 +1,14 @@
+{
+  "id": "ilovebg/anima-tpu-spmd-probe",
+  "title": "anima tpu spmd probe",
+  "code_file": "probe_tpu_spmd.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_internet": "true",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

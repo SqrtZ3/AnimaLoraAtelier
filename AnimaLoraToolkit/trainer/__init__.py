@@ -4,7 +4,7 @@
 做中等粒度拆分，每个子模块只导出本职任务所需的公开接口：
 
 - `text_encode`  — Qwen / T5 文本编码与 prompt-tag 权重解析
-- `sampling`     — 训练时推理（flow sigmas、ER-SDE 采样、sample_image）
+- `sampling`     — 训练时推理（flow sigmas、ER-SDE 采样、sample_latent / sample_image）
 - `objective`    — 噪声 / timestep / loss / 自适应采样 / grad helpers
 - `lora`         — LoRA / LoKr / DoRA 适配器、注入器、保存/加载
 - `data`         — ARB 分桶、ImageDataset、CachedLatentDataset、collate

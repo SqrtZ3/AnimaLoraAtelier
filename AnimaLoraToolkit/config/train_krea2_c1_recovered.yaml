@@ -1,0 +1,255 @@
+# ══════════════════════════════════════════════════════════════════
+# Krea 2 训练配置 · krea2-C1 复原版（2026-07-23）
+#
+# 来源：从成品 safetensors 内嵌配置快照复原（非人工回忆）——
+#   <本地路径>/krea2-C1_step200.safetensors
+#   metadata key = anima_training_config（schema v1），与 training_state_step200.pt
+#   同一次 run 产出（.pt 本身不存配置，只存权重/优化器/RNG 状态）。
+#   下列所有值 = 该 run 实际生效值，不是模板默认值。
+#
+# ── 与 train_krea2 (7).yaml（c12port 配方）的实质差异（复原时逐条核对）──
+#   1. timestep_sampling: mixed_logsnr_three（三峰,high=0.48/low=0.12,
+#      logsnr μ=-6.0 σ=2.4），非 mixed_uniform_logit
+#   2. adaptive_timestep: true（slope 指标,完整参数见下），非关闭
+#   3. krea2_res_shift: false + flow_shift: 3.0（c12port 是 res_shift true + shift 1.0）
+#   4. timestep_t_min: 0.05（c12port 是 0.0）
+#   5. lora_reg_dims 方向相反：attn=48 / mlp=32（c12port 是 mlp=48 / attn=16）
+#   6. learning_rate: 2.5e-4（c12port 是 5e-5）
+#   7. aux_spectral_enabled: true + dfm_lambda: 0.05（c12port 全关）
+#   8. base_quant_fp8_grad: true（c12port 是 false）
+#   9. sample_every: 1（c12port 是 2）；trigger 为 rv0g4nzha0
+#  10. 文本编码器为 heretic 版 Qwen3-VL-4B-Instruct
+#   run 时 config 源文件名为 ./AnimaLoraToolkit/config/train_krea2.yaml（已丢失）。
+# ══════════════════════════════════════════════════════════════════
+
+# ── 模型路径 ────────────────────────────────────────────────
+# （快照里是云端绝对路径 /workspace/AnimaLoraToolkit/...，此处还原为仓库相对写法）
+model_family: "krea2"
+transformer_path: "AnimaLoratoolkit/models/transformers/raw.safetensors"
+vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
+krea2_text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-VL-4B-Instruct-heretic"   # ★heretic 版
+krea2_text_max_length: 512
+krea2_text_cache_entries: 128
+
+# ── 数据集 ──────────────────────────────────────────────────
+data_dir: "./Dataset/your-dataset"        # ★必改
+resolution: 1024
+repeats: 1
+
+# ── ARB 分桶 ────────────────────────────────────────────────
+bucket_base_resos: [1024]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 2048
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.7
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+max_img_h: 0
+max_img_w: 0
+
+# ── NaViT 块对角打包 ─────────────────────────────────────────
+navit_packing: true
+navit_native_resolution: true
+navit_token_budget: 65536
+fit_max_tokens: 32768000
+fit_warn_tokens: 32768000
+navit_max_images_per_pack: 0
+navit_multiscale: true
+navit_multiscale_token_ladder: "4096"
+navit_pack_strategy: next_fit
+navit_pack_ffd_window: 32
+navit_text_trim_padding: false
+cache_latents: true
+cache_encode_tiled: true
+cache_encode_max_pixels: 16777216
+fit_packed_training: false
+token_bucket: false
+bucket_drop_last: false
+torch_compile: false
+navit_attn_backend: sdpa_seg
+base_quant_fuse_act_quant: true
+
+# ── 底模量化 ────────────────────────────────────────────────
+base_quant: fp8
+base_quant_gemm: auto
+base_quant_fp8_scale: auto
+base_quant_fp8_grad: true              # ★差异 #8：此 run 开了 fp8 grad
+
+lora_compress_budget_mb: 35.0
+lora_compress_replace_main: true
+
+# ── 数据增强 / 打标 ──────────────────────────────────────────
+shuffle_caption: true
+keep_tokens: 1
+flip_augment: true
+tag_dropout: 0.1
+tag_dropout_overrides:
+  close-up: 0.5
+caption_dropout_rate: 0.01
+freq_balanced_dropout_strength: 0.0
+prefer_json: false
+
+# ── LoRA 结构 ───────────────────────────────────────────────
+# 不写 lora_targets → family 默认全部 Linear
+lora_type: "lora"
+lora_rank: 32
+lora_alpha: 32.0
+lora_dropout: 0.0
+lora_variant: "base"
+
+# ★差异 #5：此 run 的容量布局是 attn=48 / mlp=32（与 c12port 相反）
+lora_reg_dims:
+  '.*attn\.(wq|wk|wv|wo|gate)$': 48
+  '.*mlp\.(gate|up)$': 32
+lora_reg_alphas:
+  '.*attn\.(wq|wk|wv|wo|gate)$': 48
+  '.*mlp\.(gate|up)$': 32
+
+rank_dropout: 0.05
+module_dropout: 0.03
+loraplus_lr_ratio: 1.0
+
+# ── 优化器 ──────────────────────────────────────────────────
+optimizer_type: "adamw_snr"
+learning_rate: 2.5e-4                  # ★差异 #6
+optimizer_args:
+  betas: [0.98, 0.999]
+  snr_power: 1.5
+  cautious: false
+  weight_decay: 0.00001
+
+# ── 训练循环 ────────────────────────────────────────────────
+epochs: 200
+max_steps: 0
+batch_size: 4
+effective_batch_size: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0
+grad_norm_log_every: 20
+mixed_precision: "bf16"
+grad_checkpoint: true
+num_workers: 4
+
+# ── Timestep 采样（★差异 #1/#3/#4：三峰 + flow_shift 3.0 + t_min 0.05）──
+flow_shift: 3.0
+timestep_sampling: mixed_logsnr_three
+timestep_mix_high_prob: 0.48
+timestep_mix_low_prob: 0.12
+timestep_logsnr_mu: -6.0
+timestep_logsnr_sigma: 2.4
+timestep_stratified: true
+timestep_t_min: 0.05
+timestep_t_max: 1.0
+schedule_shift: 1
+
+# ── krea2 分辨率感知 shift（此 run 关闭，靠 flow_shift=3.0 固定移位）────
+krea2_res_shift: false                 # ★差异 #3
+krea2_shift_min_res: 256
+krea2_shift_max_res: 1280
+krea2_shift_y1: 0.5
+krea2_shift_y2: 1.15
+
+# ── adaptive timestep（★差异 #2：此 run 开启，slope 指标）─────
+adaptive_timestep: true
+adaptive_timestep_metric: "slope"
+adaptive_timestep_base_mix: 0.5
+adaptive_timestep_bins: 8
+adaptive_timestep_burn_in: 200
+adaptive_timestep_candidate_mult: 4
+adaptive_timestep_ema_decay: 0.97
+adaptive_timestep_gate_c: 0.04
+adaptive_timestep_gate_n: 3.0
+adaptive_timestep_highfreq_weight: 0.14
+adaptive_timestep_low_noise_gate: true
+adaptive_timestep_max_factor: 2.2
+adaptive_timestep_min_factor: 0.5
+adaptive_timestep_slope_slow_decay: 0.995
+
+# ── 主 loss ─────────────────────────────────────────────────
+loss_type: "huber"
+huber_c: 0.2
+huber_schedule: "snr"
+huber_snr_clamp_max: 2.0
+loss_weighting_scheme: "none"
+weight_cap_ratio: 0
+min_snr_gamma: 0
+
+# ── 噪声 ────────────────────────────────────────────────────
+noise_offset: 0
+noise_offset_min: 0
+noise_offset_random_strength: false
+pyramid_noise_iterations: 0
+pyramid_noise_discount: 0.3
+
+# ── 辅助 loss（★差异 #7：aux_spectral + dfm 此 run 均开启）────
+eisbach_lambda: 0.15
+
+dfm_lambda: 0.05
+dfm_mode: "vecor"
+aux_spectral_enabled: true
+aux_spectral_lambda: 0.065
+aux_spectral_use_wavelet: true
+aux_spectral_wavelet_lambda: 0.20
+aux_spectral_t_gate: 0.55
+lwd_mask_enabled: false
+lwd_mask_floor: 0.3
+aux_perceptual_enabled: false
+immiscible_enabled: false
+
+# ── eval ────────────────────────────────────────────────────
+eval_every: 0
+eval_count: 16
+eval_t_grid: "0.1,0.5,0.9,0.97"
+eval_seed: 1234
+
+# ── 遥测 ────────────────────────────────────────────────────
+telemetry_enabled: true
+telemetry_freq_bands: 3
+telemetry_slope_window: 6
+telemetry_optimizer_every: 0
+telemetry_capacity_every: 0
+
+# ── 输出 / 保存 ─────────────────────────────────────────────
+output_dir: "./output/krea2-C1"
+output_name: "krea2-C1"
+save_every: 1
+save_every_steps: 0
+save_state_every: 100
+keep_vae_on_gpu: true
+empty_cache_after_sample: false
+seed: 42
+# resume_lora: ""                      # 此 run 未使用 resume
+# resume_state: ""
+stage_timing_every: 20
+stage_timing_warmup: 0
+
+# ── 采样出图 ────────────────────────────────────────────────
+sample_every: 1                        # ★差异 #9
+sample_steps: 0
+sample_infer_steps: 30
+sample_cfg_scale: 4.5
+sample_sampler_name: "er_sde"
+sample_scheduler: "beta"
+sample_width: 0
+sample_height: 0
+sample_seed: 1234
+sample_negative_prompt: ""
+sample_prompt: "rv0g4nzha0 style,1girl,a"
+sample_prompts:
+  - "rv0g4nzha0 style,1girl, close-up portrait, long flowing hair, wind, detailed hair strands, looking at viewer, dark simple background,a"
+  - "rv0g4nzha0 style,1girl, standing, full body, plain white background, simple white dress, arms at sides,a"
+  - "rv0g4nzha0 style,1girl, riding a bicycle through a rainy neon-lit street at night, holding a transparent umbrella, reflection in puddle,a"
+  - "rv0g4nzha0 style,2girls, one sitting on a park bench eating ice cream, the other standing behind her pointing at the sky, autumn leaves falling,a"
+
+# ── 日志 / 监控 ─────────────────────────────────────────────
+loss_curve_steps: 1
+no_progress: false
+log_every: 1
+no_monitor: false
+monitor_port: 8765
+monitor_host: "0.0.0.0"
+no_browser: true

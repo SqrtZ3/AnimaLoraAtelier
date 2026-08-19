@@ -1,0 +1,278 @@
+# ════════════════════════════════════════════════════════════════════════════
+# 角色训练配置 —— 基于 train_my-Ushaped.yaml 派生（2026-06）
+# 与画风版的差异全部标注 [CHAR]；未标注的行 = 与画风模板一致。
+#
+# 角色 vs 画风的训练物理（依据：T-LoRA arXiv:2507.05964、Style-Friendly 2411.14793、
+# goutong10 block 扫描实证）：
+#   - 画风在高噪段(t≈0.95)写入 → 画风用 U形/logsnr 高噪偏置
+#   - 角色身份 = 结构(中高t) + 识别细节(低t)；高噪段是"记死构图/背景"的过拟合主源
+#     → 角色用温和 logit_normal，不要高噪偏置
+#   - adaln/final 实证白训 → 已从 targets 移除（画风角色通用）
+#   - 几何全网分布 → 保留全 block 覆盖，只做 rank 倾斜不做砍块
+#
+# 2026-06-12 对齐 universal_v1（任务无关骨干补齐 + 一个实验位）：
+#   + eval 常开（与画风线同网格，跨任务可比；之前此文件整段缺失）
+#   + TREAD 0.25（v4 实测永久件，机制任务无关）
+#   + close-up 解绑 0.5（工作流级：特写子集技法在角色线同样会用，门控同理）
+#   + [实验位] dfm_mode=vecor：待证队列②的指定场景——单角色同质集上 batch
+#     负样本退化，合成负样本不依赖 batch 多样性（详见 dfm 处注释）
+#   - LoRA-One init 建议已移除（in-house 判否决，commit 08e7797）
+#   退火对本文件天然不适用（只作用于三峰路由，logit_normal 下惰性）。
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── 模型路径 ──────────────────────────────────────────────────────────────
+transformer_path: "AnimaLoratoolkit/models/transformers/anima-base-v1.0.safetensors"
+vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
+text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-0.6B-Base"
+t5_tokenizer_path: "AnimaLoratoolkit/models/t5_tokenizer"
+
+# ── 数据集 ────────────────────────────────────────────────────────────────
+data_dir: "./Dataset/char-xxx"      # ★必改：角色集（20-50 张，多角度/多构图；避免同姿势重复）
+resolution: 1024
+repeats: 1
+
+bucket_base_resos: [1024]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 3072
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.7
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+
+max_img_h: 0
+max_img_w: 0
+
+shuffle_caption: true
+keep_tokens: 1                # trigger 永远第一位
+flip_augment: false           # [CHAR] 必关：角色的不对称设计（发饰/挑染/瞳色差/服装纹章）会被翻转毁掉
+tag_dropout: 0.1
+# 工作流级解绑（universal_v1 同款）：特写子集若打 close-up tag，虹膜/发丝等
+# 识别细节会被门控在 tag 后面（v4 实证机制）。无该 tag 的数据集上是无操作。
+tag_dropout_overrides:
+  close-up: 0.5
+prefer_json: false
+cache_latents: true
+
+# [CHAR] caption 纪律（不是配置项，是打标规则）：
+#   固有特征（发色/瞳色/发型/体型）不写 tag → 绑进 trigger；
+#   可变项（服装/姿势/表情/背景）全部写 tag → 保留控制力。换装能力要强就多服装数据。
+
+# ── LoRA / LoKr / DoRA ────────────────────────────────────────────────────
+lora_type: "lokr"
+lora_rank: 32
+lora_alpha: 32.0
+lora_dropout: 0.0
+lokr_factor: 4
+lora_variant: "dora"          # [CHAR] 默认仍用 dora（已验证管线）。
+dora_export_mode: "native"
+# [CHAR-实验] 角色过拟合的对症武器是 T-LoRA（高噪段降有效rank，单图/小集主体定制
+# AAAI 2026 实证）。健康用法是 LoKr 实验路径：训练期动态 mask，导出即标准 LoKr
+# key（lokr_w1/w2_a/w2_b，bf16，ss_network_module=lycoris.kohya）→ ComfyUI 标准
+# loader 直载，体积与普通 LoKr 同级（~20MB）。120MB 旧账是 plain-LoRA 主路径
+# （结构 ~8× LoKr + ortho init 副本 ×2），别再走。与 dora 代码级互斥
+# （lora.py raise），二选一。启用方式：
+#   lora_variant: "tlora"
+#   tlora_lokr_experimental: true
+#   tlora_lokr_ortho_init: false   # 推荐 false：w2_b=0 起步天然 ΔW=0，native 导出
+#                                  # 严格自洽（ComfyUI 标准 loader 直载）。
+#                                  # true 的一致性 bug 已修（2026-06-12）：delta/diff/
+#                                  # merged 导出统一减 init 项，init buffers 随
+#                                  # checkpoint 保存供续训；但净 ΔW 是两个 kron 之差，
+#                                  # 无法表达为标准 LoKr key → 与 dora_export_mode:
+#                                  # "native" 组合会在启动时 raise（需 diff/merged_model）。
+#   tlora_rmin_ratio: 0.5
+# 附带收益：画风写在高噪段（t≈0.95），T-LoRA 高噪降 rank 在 t 轴上同样压制
+# "吸画风"——与下方 14-20 block 倾斜（block 轴）正交互补。若本次 rank 倾斜后
+# 画风渗漏仍在，tlora 就是下一个单开关。
+
+lora_targets:                 # [CHAR] adaln_modulation 与 final_layer 已移除（扫描实证白训）
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "output_proj"
+  - "mlp.layer1"
+  - "mlp.layer2"
+
+lora_exclude_patterns:
+  - ".*llm_adapter.*"
+
+# [CHAR] 基线统一 32（kohya 实证高 rank 反伤细节捕捉）+ 画风隔离倾斜：
+# 14-20 是画风主带（goutong 扫描），降 16 减少"把数据集画风吸进角色 LoRA"。
+# 2026-06-12 启用——首个角色 LoKr 实测有画风渗漏，从假设转为对症。
+# 归因轴：与画风 LoRA 叠用兼容性 / 无画风 prompt 时底模画风保持；同时盯
+# 身份是否变弱（几何全网分布，14-20 也可能载识别特征——练成后用
+# tools/lokr_block_scan.py 实测身份分布再固化或回调）。
+# 块段模式必须在通用模式之前（首个 fullmatch 生效；启动日志出现
+# [lora_reg_dims] 遮蔽告警务必停下检查）。
+lora_reg_dims:
+  '.*blocks\.(1[4-9]|20)\..*': 16
+  ".*self_attn.*": 32
+  ".*cross_attn.*": 32
+  ".*mlp.*": 32
+lora_reg_alphas:
+  '.*blocks\.(1[4-9]|20)\..*': 16
+  ".*self_attn.*": 32
+  ".*cross_attn.*": 32
+  ".*mlp.*": 32
+
+rank_dropout: 0.05
+module_dropout: 0.03
+loraplus_lr_ratio: 1.0
+
+# ── 优化器：soap_sf（与画风一致）─────────────────────────────────────────
+optimizer_type: "soap_sf"
+learning_rate: 4e-4
+lr_scheduler: "none"
+
+optimizer_args:
+  betas: [0.9, 0.95]
+  shampoo_beta: -1.0
+  eps: 1.0e-8
+  weight_decay: 0.01
+  precondition_frequency: 5
+  max_precond_dim: 10000
+  precond_in_state: false
+  merge_dims: false
+  precondition_1d: false
+  normalize_grads: false
+  data_format: "channels_first"
+  correct_bias: true
+  weight_lr_power: 2.0
+  r: 0.0
+  warmup_steps: 0
+
+epochs: 200
+max_steps: 0
+batch_size: 4
+effective_batch_size: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0
+grad_norm_log_every: 40
+mixed_precision: "bf16"
+grad_checkpoint: true
+num_workers: 4
+
+# ── Timestep / loss ───────────────────────────────────────────────────────
+flow_shift: 2.5               # [CHAR] 温和中高噪偏置；不要画风的高噪激进档
+timestep_sampling: logit_normal   # [CHAR] 角色不用 U 形：高噪端是构图过拟合主源（T-LoRA 实证）
+timestep_stratified: true     # [CHAR/通用] batch=4 分层采样，零开销降梯度噪声（新功能）
+timestep_t_min: 0.05          # [CHAR/通用] 截掉病态低噪端（arXiv 2509.20952），识别细节 0.05-0.25 区间足够
+timestep_t_max: 1.0
+schedule_shift: 1
+
+adaptive_timestep: true       # 沿用（Exp-03 证 ON 更好；loss-aware 与任务无关）
+adaptive_timestep_metric: "entropy_rate"
+disable_tlora_hooks: false
+use_precommit_lora_forward: false
+use_per_block_checkpoint: true
+adaptive_timestep_low_noise_gate: true
+adaptive_timestep_gate_n: 3.0
+adaptive_timestep_gate_c: 0.04
+adaptive_timestep_highfreq_weight: 0.14
+adaptive_timestep_bins: 8
+adaptive_timestep_ema_decay: 0.97
+adaptive_timestep_burn_in: 200
+adaptive_timestep_min_factor: 0.5
+adaptive_timestep_max_factor: 2.5
+adaptive_timestep_base_mix: 0.70
+adaptive_timestep_candidate_mult: 4
+
+# TREAD：v4 实测永久件（单步 -25%，画质无投诉；token 路由机制任务无关）。
+tread_enabled: true
+tread_ratio: 0.25
+tread_start_layer: 3
+tread_end_layer: -4
+
+# LoRA-One init 不要用：in-house 已判否决（commit 08e7797，修复归一化 bug 后
+# 实测仍无收益）。保持禁用。
+lora_one_init_steps: 0
+lora_one_init_scale: 0.01
+
+loss_weighting_scheme: "none"
+weight_cap_ratio: 0
+min_snr_gamma: 0
+detail_inv_t_min: 1.0
+detail_inv_t_max: 8.0
+
+noise_offset: 0
+noise_offset_min: 0
+noise_offset_random_strength: false
+pyramid_noise_iterations: 0
+pyramid_noise_discount: 0.3
+
+# [CHAR-实验位·唯一] ΔFM 反发灰项在单角色集的正确形态是 vecor：原 batch 模式
+# 在同质集上负样本≈自身 target、排斥项退化（此前因此直接关 0）；vecor 用合成
+# 负样本（通道乱序/裁剪拉伸），不依赖 batch 多样性（packed 路径自动跳过，
+# 标准分桶 dense 路径生效）。这是待证队列②的指定 A/B 场景。注意：部分移植
+# （缺论文正向 EMA 项）——身份发糊/发灰/异常时第一个关它（先于 TREAD）。
+dfm_lambda: 0.05
+dfm_mode: "vecor"
+
+loss_type: "huber"
+huber_c: 0.2
+huber_schedule: "snr"
+huber_snr_clamp_max: 2.0
+
+caption_dropout_rate: 0.01
+freq_balanced_dropout_strength: 0.0
+
+# ── 辅助 loss：角色全关（频域 loss 是纹理工具；感知类已证负收益）──────────
+aux_spectral_enabled: false
+aux_spectral_lambda: 0.065
+aux_spectral_use_wavelet: false
+aux_spectral_wavelet_lambda: 0.20   # 关着；若开按 universal_v1 保守档（0.30 有斑块前科）
+aux_spectral_t_gate: 0.55
+
+aux_perceptual_enabled: false
+aux_perceptual_lambda_lpips: 0.10
+aux_perceptual_lambda_dino: 0.01
+aux_perceptual_t_gate: 0.4
+aux_perceptual_lpips_net: "vgg"
+aux_perceptual_dino_local_path: ""
+aux_perceptual_cache_dir: "AnimaLoraToolkit/models/perceptual"
+aux_perceptual_use_checkpoint: true
+aux_perceptual_lpips_size: 512
+
+# ── eval（与画风线同网格，跨 run 跨任务可比）──────────────────────────────
+# 盲区提醒（v4 实证）：低 t eval 只度量拟合，识别细节的生成端表现要靠预览判。
+# 角色线重点盯中高 t 曲线是否过早见底 = 构图/背景记死（角色过拟合主征兆）。
+eval_every: 40
+eval_count: 4
+eval_t_grid: "0.1,0.3,0.5,0.7,0.9"
+eval_seed: 1234
+
+# ── 输出 ──────────────────────────────────────────────────────────────────
+output_dir: "./output/char-xxx"     # ★必改
+output_name: "char-xxx-anima-lokr"  # ★必改
+
+save_every_steps: 40
+save_state_every: 200
+keep_vae_on_gpu: true
+empty_cache_after_sample: false
+seed: 42
+resume_lora: ""
+
+sample_every: 0
+sample_steps: 40
+sample_infer_steps: 25
+sample_cfg_scale: 4.0
+sample_sampler_name: "er_sde"
+sample_scheduler: "beta"      # 对齐推理端/画风线（4dfac37 已支持训练内预览用 beta）
+sample_width: 0
+sample_height: 0
+sample_seed: 1234
+sample_negative_prompt: ""
+sample_prompt: "@ch4rtrigger, newest, safe, 1girl, masterpiece, best quality"  # ★必改 trigger
+
+loss_curve_steps: 1
+no_progress: false
+log_every: 1
+
+no_monitor: false
+monitor_host: "0.0.0.0"
+monitor_port: 8765
+no_browser: true

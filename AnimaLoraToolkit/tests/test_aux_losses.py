@@ -3,13 +3,19 @@ import sys
 import types
 import unittest
 
-import torch
+try:
+    import torch
+    HAS_TORCH = True
+except ModuleNotFoundError:
+    HAS_TORCH = False
+    torch = None
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from trainer.aux_losses import AuxLossConfig, PerceptualLossModule
+if HAS_TORCH:
+    from trainer.aux_losses import AuxLossConfig, PerceptualLossModule, spectral_loss
 
 
 class PerceptualGateTests(unittest.TestCase):
@@ -42,6 +48,7 @@ class PerceptualGateTests(unittest.TestCase):
         module._compute_pred_against_target = types.MethodType(compute_pred_against_target, module)
         return module
 
+    @unittest.skipUnless(HAS_TORCH, "torch is required")
     def test_perceptual_checkpoint_only_runs_gate_active_samples(self):
         module = self._module()
         x0_pred = torch.arange(4.0).view(4, 1, 1, 1).requires_grad_(True)
@@ -53,6 +60,26 @@ class PerceptualGateTests(unittest.TestCase):
         self.assertEqual(module.target_decode_calls, 1)
         self.assertEqual(module.pred_calls, 1)
         self.assertTrue(torch.equal(loss, x0_pred[0].mean()))
+
+
+class SpectralLossTests(unittest.TestCase):
+    @unittest.skipUnless(HAS_TORCH, "torch is required")
+    def test_spectral_loss_has_finite_gradients_at_zero_amplitude(self):
+        cfg = AuxLossConfig(
+            spectral_enabled=True,
+            spectral_use_wavelet=False,
+            spectral_t_gate=0.5,
+        )
+        x0_pred = torch.zeros(2, 1, 1, 8, 8, requires_grad=True)
+        x0_target = torch.randn_like(x0_pred)
+        t = torch.tensor([0.1, 0.2])
+
+        loss = spectral_loss(x0_pred, x0_target, t, cfg)
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(loss).all())
+        self.assertIsNotNone(x0_pred.grad)
+        self.assertTrue(torch.isfinite(x0_pred.grad).all())
 
 
 if __name__ == "__main__":

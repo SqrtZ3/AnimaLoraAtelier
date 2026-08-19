@@ -1,0 +1,236 @@
+# ════════════════════════════════════════════════════════════════════════════
+# fdy12 × CSFlow A/B 配置 —— 用来和已产出的 fdy12 成品对比
+#
+# 实验意图（单变量）：只把 timestep 采样从「三峰 + adaptive」换成「CSFlow」
+# （arXiv 2606.08833：数据集功率谱 × 人眼 CSF → 逐 t 采样权重）。其余一切对齐 fdy12。
+#
+# ── fdy12 基线来源 ──
+#   • 架构 + 优化器：从 training_state_step1600.pt 逐字确认（LoKr factor4 + DoRA native,
+#     rank32/alpha32, reg_dims 0-6:32/7-20:64-48/21-27:16, soap_sf lr2.5e-4 等）。
+#   • loss 侧：.pt 不存，按 6/20 时间点 + memory「三件齐上」推断 = 三峰 + ΔFM + spectral+wavelet
+#     + adaptive + TREAD + Eisbach0.35 + caption_dropout0.05 + self-perceptual SFT。
+#     ⚠ 若你记得 fdy12 的 loss 侧与此不同，改这里对齐——A/B 才干净。
+#
+# ── 本配置相对 fdy12 的「唯一」改动 ──
+#   timestep_sampling: mixed_logsnr_three → csflow
+#   adaptive_timestep: true → false   （CSFlow 已独占 t 轴，避免双重补偿）
+#   + csflow_* 三个键
+#   于是比较口径 = 「fdy12 的整条 t 流水线」 vs 「CSFlow 的 t 流水线」。
+#
+# ── 跑之前必做一步 ──
+#   python tools/compute_rapsd.py --data-dir ./Dataset/your-dataset \
+#       --out ./output/csflow/rapsd.json --res 1024 --max-images 300
+#   （像素域功率谱，一次性离线，零训练期开销）
+#
+# Eisbach 保持 0.35（不是 0.5）——你 2026-06-25 反馈 0.5 虽锐但丢大块细节/丰富度。
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── 模型路径 ──────────────────────────────────────────────────────────────
+transformer_path: "AnimaLoratoolkit/models/transformers/anima-base-v1.0.safetensors"
+vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
+text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-0.6B-Base"
+t5_tokenizer_path: "AnimaLoratoolkit/models/t5_tokenizer"
+
+# ── 数据集（与 fdy12 同集，对比才有意义）────────────────────────────────────
+data_dir: "./Dataset/your-dataset"
+resolution: 1024
+repeats: 1
+
+bucket_base_resos: [1024]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 3072
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.7
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+
+max_img_h: 0
+max_img_w: 0
+
+shuffle_caption: true
+keep_tokens: 1
+flip_augment: true
+tag_dropout: 0.1
+prefer_json: false
+cache_latents: true
+
+# ── LoRA / LoKr / DoRA（.pt 逐字确认）────────────────────────────────────────
+lora_type: "lokr"
+lora_rank: 32
+lora_alpha: 32.0
+lora_dropout: 0.0
+lokr_factor: 4
+lora_variant: "dora"
+dora_export_mode: "native"
+
+lora_targets:
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "output_proj"
+  - "mlp.layer1"
+  - "mlp.layer2"
+
+lora_exclude_patterns:
+  - ".*llm_adapter.*"
+
+lora_reg_dims:
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.(self_attn|cross_attn).*': 64
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.mlp.*': 48
+  '.*blocks\.2[1-7]\..*': 16
+  ".*self_attn.*": 32
+  ".*cross_attn.*": 32
+  ".*mlp.*": 32
+lora_reg_alphas:
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.(self_attn|cross_attn).*': 64
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.mlp.*': 48
+  '.*blocks\.2[1-7]\..*': 16
+  ".*self_attn.*": 32
+  ".*cross_attn.*": 32
+  ".*mlp.*": 32
+
+rank_dropout: 0.05
+module_dropout: 0.03
+loraplus_lr_ratio: 1.0
+
+# ── 优化器：soap_sf（.pt 逐字确认）──────────────────────────────────────────
+optimizer_type: "soap_sf"
+learning_rate: 2.5e-4
+lr_scheduler: "none"
+optimizer_args:
+  betas: [0.9, 0.95]
+  shampoo_beta: -1.0
+  eps: 1.0e-8
+  weight_decay: 0.01
+  precondition_frequency: 5
+  max_precond_dim: 10000
+  precond_in_state: false
+  merge_dims: false
+  precondition_1d: false
+  normalize_grads: false
+  data_format: "channels_first"
+  correct_bias: true
+  weight_lr_power: 2.0
+  r: 0.0
+  warmup_steps: 0
+
+epochs: 200
+max_steps: 0
+batch_size: 4
+effective_batch_size: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0
+grad_norm_log_every: 40
+mixed_precision: "bf16"
+grad_checkpoint: true
+num_workers: 4
+
+# ── Timestep：★★ 本实验的唯一改动 = CSFlow 替换三峰 ★★ ─────────────────────
+timestep_sampling: csflow          # was: mixed_logsnr_three
+csflow_rapsd_path: "./output/csflow/rapsd.json"   # 先跑 tools/compute_rapsd.py
+csflow_alpha: 1.0                  # 1.0 = 纯 CSFlow（最干净的 A/B）
+csflow_pixels_per_degree: 50.0     # 控 CSF 峰落点；50 → 峰≈中频
+
+flow_shift: 3.0
+schedule_shift: 1                  # 必须保持 1：CSFlow 已是最终分布，schedule_shift≠1 会再次扭曲
+timestep_t_min: 0.05
+timestep_t_max: 1.0
+timestep_stratified: true
+
+# 三峰参数留着但 mode=csflow 时不生效（保留便于切回对照）
+timestep_mix_low_prob: 0.40
+timestep_mix_high_prob: 0.20
+timestep_logsnr_mu: -6.0
+timestep_logsnr_sigma: 2.0
+
+adaptive_timestep: false           # was: true —— CSFlow 独占 t 轴，关掉避免双重补偿
+
+# TREAD（与 fdy12 一致）
+tread_enabled: true
+tread_ratio: 0.25
+tread_start_layer: 3
+tread_end_layer: -4
+
+loss_weighting_scheme: "none"
+weight_cap_ratio: 0
+min_snr_gamma: 0
+
+# ── 反均值回归 / loss（与 fdy12 一致）──────────────────────────────────────
+dfm_lambda: 0.05
+dfm_mode: "batch"
+
+loss_type: "huber"
+huber_c: 0.2
+huber_schedule: "snr"
+huber_snr_clamp_max: 2.0
+
+caption_dropout_rate: 0.05         # fdy12「三件齐上」之一
+
+# Eisbach：保持 0.35（不上 0.5——0.5 锐但丢丰富度/大块细节）
+eisbach_lambda: 0.35
+
+# ── 辅助 loss（与 fdy12 一致）──────────────────────────────────────────────
+aux_spectral_enabled: true
+aux_spectral_lambda: 0.065
+aux_spectral_use_wavelet: true
+aux_spectral_wavelet_lambda: 0.20
+aux_spectral_t_gate: 0.55
+
+# self-perceptual SFT：fdy12「三件齐上」之三。tap_block 保持 -1 以对齐 fdy12（A/B 隔离）；
+# 若想要显存/结构优化版（tap≈10），单独另跑一轮，别混进这个 A/B。
+aux_self_perceptual_enabled: true
+aux_self_perceptual_lambda: 0.05
+aux_self_perceptual_t_gate: 0.5
+aux_self_perceptual_tap_block: -1
+aux_self_perceptual_encode_t: 0.05
+
+aux_perceptual_enabled: false
+
+# ── eval（与 fdy12 同网格，eval_loss.csv 可直接对比）──────────────────────
+eval_every: 40
+eval_count: 4
+eval_t_grid: "0.1,0.3,0.5,0.7,0.9"
+eval_seed: 1234
+
+# ── 训练内遥测总线（trainer/telemetry.py）：探针 default-off，须在此显式开 ─────────
+# 纯观测：图盲（只读 latent 残差/权重/优化器 state），不进入 loss/采样/优化路径 →
+# 不改变训练动力学，A/B 单变量性质不受影响（O2 仅让 soap_sf 每步多一次 ‖update‖.norm()，
+# 不写任何优化相关 state，训练数值逐 bit 一致）。这个 A/B 里尤其值得开：L1 能把
+# 「CSFlow 把模型容量堆到哪个 (t × 频带)」直接画成数据，正面回答高 t 之争。
+telemetry_enabled: true            # master 开关；false 则下面全部 no-op
+telemetry_freq_bands: 3            # L1 径向频带数（低/中/高）→ eval_freq_loss.csv（随 eval 跑）
+telemetry_slope_window: 6          # L2 逐 t-bin 饱和斜率滑窗（最小二乘）→ eval_slope.csv（随 eval 跑）
+telemetry_optimizer_every: 40      # O1 sf_lag / O2 GG 曲率 κ+有效秩 / O3 逐 block trust ratio → telemetry_optimizer.csv（对齐 eval）
+telemetry_capacity_every: 200      # C1 逐 block LoKr ‖ΔW‖+有效秩（小 SVD，稀疏）→ telemetry_capacity.csv（对齐 save_state）
+
+# ── 输出 ──────────────────────────────────────────────────────────────────
+output_dir: "./output/csflow"
+output_name: "csflow"
+
+save_every_steps: 40
+save_state_every: 200
+keep_vae_on_gpu: true
+empty_cache_after_sample: false
+seed: 42
+resume_lora: ""
+
+sample_every: 0
+sample_steps: 40
+sample_infer_steps: 30
+sample_cfg_scale: 4.0
+sample_sampler_name: "er_sde"
+sample_scheduler: "beta"
+sample_seed: 1234
+sample_prompt: "@your-trigger, newest, safe, 1girl, masterpiece, best quality"   # ★必改：换成你数据集的 trigger
+
+loss_curve_steps: 1
+no_progress: false
+log_every: 1
+no_monitor: false
+monitor_host: "0.0.0.0"
+monitor_port: 8765
+no_browser: true

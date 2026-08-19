@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# PEP 563：注解延迟求值。forward() 签名用了 ``X | Y``，Python 3.9 求值注解会 TypeError。
+from __future__ import annotations
+
+import contextlib
 import math
 from typing import Any, Callable, List, Optional, Tuple, Union
 
@@ -22,7 +26,54 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
 from torch.distributed import get_process_group_ranks
-from torchvision import transforms
+
+
+def _resize_nearest(x: torch.Tensor, size) -> torch.Tensor:
+    """最近邻 resize 到 (H, W)，纯 torch 实现。
+
+    原实现是 ``torchvision.transforms.functional.resize(x, size, interpolation=NEAREST)``，
+    而这是**整个仓库运行路径上唯一一处 torchvision 使用**（`padding_mask` 对齐到 latent
+    分辨率，见 `_augment_image_dim` 调用点）。为它装 torchvision 在昇腾上是净负债：
+    pip 会连带把 torch 换成 CUDA 构建，torch_npu 当场不认（见 docs/ascend-npu.md §6
+    「最大的环境杀手」）。
+
+    数值等价性：torchvision 对 tensor 输入的 NEAREST 分支内部就是走
+    ``F.interpolate(mode="nearest")``（NEAREST 不做 antialias），所以这里是同一个
+    kernel、同一套取整规则。差别只在接口——torchvision 接受任意前导维 (..., H, W)，
+    ``F.interpolate`` 的 2D 空间插值只吃 4D，故这里把前导维折叠再还原。
+    本地对 8 组形状/dtype（identity / 上下采样 / 非整数比 / 3D / bf16 / 多通道）与
+    torchvision 逐 bit 对拍，全部相同。
+
+    旁证：``models/anima_modeling_core.py:1542``（Anima 实际走的那份）对同一处逻辑
+    本来就写的是 ``F.interpolate(..., mode="nearest")``。这里只是把旧文件对齐过去。
+    """
+    h, w = int(size[0]), int(size[1])
+    if x.shape[-2] == h and x.shape[-1] == w:
+        return x                      # 尺寸已对齐（训练/采样路径的常态）→ 直接返回
+    lead = x.shape[:-2]
+    flat = x.reshape(-1, 1, x.shape[-2], x.shape[-1])
+    out = torch.nn.functional.interpolate(flat, size=(h, w), mode="nearest")
+    return out.reshape(*lead, h, w)
+
+
+@contextlib.contextmanager
+def _fp32_autocast(dev_type: str):
+    """在支持 autocast 的加速器上开一个"不要降精度"的区域；其余设备 no-op。
+
+    与 ``models/anima_modeling_core._fp32_autocast`` 同义（两个文件互不 import，
+    刻意各留一份而不是跨模块依赖）——**改这里记得同步改那边**，完整理由写在那份的
+    docstring 里。摘要：昇腾的 autocast 只支持 fp16/bf16，传 fp32 会被 torch_npu
+    静默降级成 enabled=False（只打一条 warning），这里显式写成 enabled=False；
+    CUDA 路径保持 fp32 autocast 不动。
+    """
+    if dev_type == "cuda":
+        with torch.autocast(dev_type, dtype=torch.float32):
+            yield
+    elif dev_type == "npu":
+        with torch.autocast(dev_type, enabled=False):
+            yield
+    else:
+        yield
 
 
 def _rotate_half(x: torch.Tensor, interleaved: bool) -> torch.Tensor:
@@ -233,10 +284,12 @@ class RMSNorm(torch.nn.Module):
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    @torch.autocast('cuda', dtype=torch.float32)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        # 同 models/anima_modeling_core.py 的 RMSNorm：设备串不能写死在类定义期，
+        # 否则昇腾上这个 fp32 autocast 区域完全不生效。CUDA 上逐字节等价。
+        with _fp32_autocast(x.device.type):
+            output = self._norm(x.float()).type_as(x)
+            return output * self.weight
 
 
 # ---------------------- Feed Forward Network -----------------------
@@ -1376,9 +1429,7 @@ class MiniTrainDIT(nn.Module):
             - Otherwise, the positional embeddings are generated without considering fps.
         """
         if self.concat_padding_mask:
-            padding_mask = transforms.functional.resize(
-                padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
-            )
+            padding_mask = _resize_nearest(padding_mask, list(x_B_C_T_H_W.shape[-2:]))
             x_B_C_T_H_W = torch.cat(
                 [x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1
             )

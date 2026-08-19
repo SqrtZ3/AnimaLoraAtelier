@@ -12,14 +12,14 @@
        - https://huggingface.co/google/t5-v1_1-xxl/resolve/main/tokenizer_config.json
        - https://huggingface.co/google/t5-v1_1-xxl/resolve/main/special_tokens_map.json
        
-    2. Qwen3 Tokenizer (放到 models/text_encoders/):
+    2. Qwen3 Tokenizer (放到 models/text_encoders/Qwen3-0.6B-Base/):
        - https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/tokenizer.json
        - https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/vocab.json
        - https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/merges.txt
        - https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/tokenizer_config.json
        - https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/special_tokens_map.json
        
-    3. Qwen3 模型权重 (放到 models/text_encoders/):
+    3. Qwen3 模型权重 (放到 models/text_encoders/Qwen3-0.6B-Base/):
        - https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/model.safetensors
        
     国内镜像: 把 huggingface.co 替换为 hf-mirror.com
@@ -107,7 +107,7 @@ def main():
   T5 Tokenizer → models/t5_tokenizer/
     https://huggingface.co/google/t5-v1_1-xxl
     
-  Qwen3 Tokenizer → models/text_encoders/  
+  Qwen3 Tokenizer → models/text_encoders/Qwen3-0.6B-Base/  
     https://huggingface.co/Qwen/Qwen3-0.6B-Base
     
   国内用户: 把 huggingface.co 替换为 hf-mirror.com
@@ -133,7 +133,7 @@ def main():
     download_t5_tokenizer(base_dir / "t5_tokenizer")
     
     # 2. 下载 Qwen3 tokenizer
-    download_qwen3_tokenizer(base_dir / "text_encoders")
+    download_qwen3_tokenizer(base_dir / "text_encoders" / "Qwen3-0.6B-Base")
     
     print("\n" + "="*50)
     print("✅ Tokenizer 下载完成！")
@@ -146,7 +146,7 @@ def main():
     print("  2. VAE → models/vae/qwen_image_vae.safetensors")
     print("     https://huggingface.co/circlestone-labs/Anima")
     print()
-    print("  3. Qwen3 权重 → models/text_encoders/model.safetensors")
+    print("  3. Qwen3 权重 → models/text_encoders/Qwen3-0.6B-Base/model.safetensors")
     print("     https://huggingface.co/Qwen/Qwen3-0.6B-Base")
     print()
     print("  国内镜像: 把 huggingface.co 替换为 hf-mirror.com")

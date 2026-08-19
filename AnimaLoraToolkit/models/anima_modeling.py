@@ -5,7 +5,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from models.cosmos_predict2_modeling import MiniTrainDIT
+from models.anima_modeling_core import Anima as CoreAnima
+from models.anima_modeling_core import MiniTrainDIT
 
 
 def rotate_half(x):
@@ -25,8 +26,20 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim):
         super().__init__()
         self.rope_theta = 10000
-        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.int64).to(dtype=torch.float) / head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._head_dim = head_dim
+        self.register_buffer("inv_freq", self._make_inv_freq(), persistent=False)
+
+    def _make_inv_freq(self) -> torch.Tensor:
+        return 1.0 / (self.rope_theta ** (torch.arange(0, self._head_dim, 2, dtype=torch.int64).to(dtype=torch.float) / self._head_dim))
+
+    def reset_parameters(self) -> None:
+        """重算 ``inv_freq``（non-persistent buffer，checkpoint 永远填不到它）。
+
+        正常构造路径下 ``__init__`` 已经算好、本方法不会被调用；只有 meta device 构造
+        （trainer/models.py 的 fast_init）在 ``to_empty()`` 之后需要它——那时 buffer
+        里是未初始化内存。与 anima_modeling_core.RotaryEmbedding 保持一致。
+        """
+        self.inv_freq = self._make_inv_freq().to(self.inv_freq.device)
 
     @torch.no_grad()
     def forward(self, x, position_ids):
@@ -81,6 +94,8 @@ class LLMAdapterAttention(nn.Module):
             cos, sin = position_embeddings_context
             key_states = apply_rotary_pos_emb(key_states, cos, sin)
 
+        # 注：昇腾需要的 "Sq=1 广播 mask 展开" 在 ``LLMAdapter.forward`` 里一次性做完
+        # （两个 mask 的 query 都是 x，Sq 恒等），这里拿到的已经是可直接下发的形状。
         attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
 
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
@@ -186,6 +201,16 @@ class LLMAdapter(nn.Module):
 
         x = self.in_proj(self.embed(target_input_ids))
         context = source_hidden_states
+
+        # 昇腾：FlashAttentionScore 不接受 Sq 维为 1 的广播 mask（详见 utils/npu_compat.py）。
+        # 在这里一次性展开而不是在每个 attention 里做：self-attn 与 cross-attn 的 query 都是
+        # x（cross-attn 只换 k/v），两个 mask 的 Sq 都等于 x.shape[1]，而 mask 在整个 block
+        # 栈里不变 —— 放在 attention 层里等于对同一个张量重复展开 2×num_layers 次。
+        # CUDA/CPU 上 expand_attn_mask 是恒等映射，行为逐字节不变。
+        from utils.npu_compat import expand_attn_mask as _expand_attn_mask
+        target_attention_mask = _expand_attn_mask(target_attention_mask, x.shape[1])
+        source_attention_mask = _expand_attn_mask(source_attention_mask, x.shape[1])
+
         position_ids = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
         position_ids_context = torch.arange(context.shape[1], device=x.device).unsqueeze(0)
         position_embeddings = self.rotary_emb(x, position_ids)
@@ -195,7 +220,7 @@ class LLMAdapter(nn.Module):
         return self.norm(self.out_proj(x))
 
 
-class Anima(MiniTrainDIT):
+class Anima(CoreAnima):
     """
     Anima model - extends MiniTrainDIT (Cosmos-Predict2 base) with an LLMAdapter
     for processing dual text encoder outputs (Qwen3 + T5).

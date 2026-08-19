@@ -1,0 +1,302 @@
+# ════════════════════════════════════════════════════════════════════════════
+# 【实验衍生】inv_loss_ema 换骨 A/B —— 派生自 train_universal_v1.yaml
+#
+# 假设：用 EDM2 解析式 inv_loss_ema（数据驱动、近乎无旋钮的 per-t loss 均衡器）
+#       替换 adaptive_timestep（13 旋钮、采样侧定向补细节），在通用配置上不更差/更好。
+#
+# ⚠ 单变量纪律：相对基线【只动一处机制】= adaptive_timestep → inv_loss_ema。
+#   本文件相对 universal_v1 共改三行，但其中两行是同一处换骨的强制配套：
+#     · adaptive_timestep: true → false  （二者代码级互斥，不关会 raise）
+#     · loss_weighting_scheme: "none" → "inv_loss_ema"
+#   第三行 tread_enabled → false 不是新变量：它是为了对齐基线（见下）。
+#   其余一切（huber-snr / 三峰 / wavelet / ΔFM / 容量布局 / seed）锁死不动。
+#
+# ★基线对照 = 同样 TREAD-off 的 adaptive 跑（即你正在做的重基线 run）。
+#   若基线 TREAD 还开着，本文件就成了"TREAD + scheme"两处变量 → 归因报废。
+#   所以这里 tread_enabled 也设 false，与基线对齐。同 data/seed/步数对比。
+#
+# 归因轴：inv_loss_ema 卖点是"均衡 per-t 贡献"→ 看 eval_loss.csv 各 t 列是否更齐、
+#   低 t（t0.1/t0.3 细节带）是否不更差 + 到可用 LoRA 的步数 vs adaptive 基线。
+#   判负即弃——adaptive 是已证净正件，换骨实验默认要被它打败才有意义。
+# ════════════════════════════════════════════════════════════════════════════
+#
+# ── 以下为 train_universal_v1.yaml 原始头注（保留 provenance）──────────────────
+# 通用基准 v1 —— 跨数据集统一配置（2026-06）
+# 原则：不按数据集调参。换数据集时只改 ★必改 三项（data_dir/output/trigger），
+# 其余一律不动；每个数据集的 run 都是对本配置的一次重复验证。
+#
+# 入选标准 = 在机制上数据集无关（模型侧结论 / 训练域通用 / 属于固定工作流），
+# 且有 in-house 实证或强机制论证。逐项裁决：
+#
+# 【进通用默认】
+#   - 容量布局 7-20 attn64/mlp48、21-27=16：block 定位是模型侧结论（goutong10
+#     扫描），跨数据集成立；mlp48 治"高容量记住数据集不一致变体"是通用机制
+#   - soap_sf 4e-4 + 三峰(0.40/0.40/0.20) + adaptive_timestep：v2→v4 全线净正
+#   - ΔFM batch λ0.05：反条件均值回归（发灰）通用
+#   - aux_spectral FFT 0.065 + t_gate 0.55：in-house 实证"纹理主功臣"
+#   - [新] wavelet 分支 0.20：动漫域发丝必然存在=方向性纹理必然存在，不是
+#     某数据集的特例；0.30 有 config22 斑块前科，0.20+t_gate0.55 保守档
+#   - [新] tag_dropout_overrides {close-up: 0.5}：v4 证实"纹理特写子集"建集
+#     技法有效（纹理元素首次清晰），该技法会成为固定工作流 → close-up 门控
+#     是工作流级现象而非数据集特例。无 close-up tag 的数据集上是无操作，零风险
+#   - TREAD 0.25：v4 实测单步 -25%、无画质投诉，永久件
+#   - huber snr clamp2.0 / eval 常开同网格 / 单分辨率1024+不上采样
+#
+# 【排队待证（每个新数据集的 run 只带一个实验位，跨集表现一致才转正）】
+#   1. 三段退火：曲线时序 n=1（fymrie），且有未解张力——v4 光照（高t带）
+#      持续变好到 2000 步，退火砍高噪 0.20→0.10 可能伤这条线最强项。
+#      转正条件：新数据集 eval 曲线时序与 fymrie 吻合 + 想清楚砍高还是砍中
+#   2. vecor：换它不为提效而为去依赖（ΔFM batch 依赖 batch 内多样性，同质
+#      角色小集会退化）。转正条件：在遇到的第一个同质数据集上单变量 A/B
+#   3. LWD mask：与 spectral+wavelet 同频域；仅当 wavelet 转正后纹理仍不足
+#   4. inv_loss_ema：与 adaptive_timestep 代码级互斥（换骨不是加法），且目标
+#      重叠而 adaptive 已证净正 → 实际上永不进包
+#
+# 【唯一合法的按内容开关】flip_augment：非对称角色设定（单边饰品/异色瞳等）
+#   必须关——这是正确性开关不是调参。画风集默认开。
+#
+# 归因抓手：close-up解绑→常规构图无tag出细节；wavelet→方向纹理锐度；
+# TREAD→只看 it/s；eval t0.1 只度量拟合，细节带生成端表现靠预览判。
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── 模型路径 ──────────────────────────────────────────────────────────────
+transformer_path: "AnimaLoratoolkit/models/transformers/anima-base-v1.0.safetensors"
+vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
+text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-0.6B-Base"
+t5_tokenizer_path: "AnimaLoratoolkit/models/t5_tokenizer"
+
+# ── 数据集 ────────────────────────────────────────────────────────────────
+data_dir: "./Dataset/CHANGE_ME"      # ★必改（换集只动 ★ 三项）
+resolution: 1024
+repeats: 1
+
+bucket_base_resos: [1024]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 3072
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.7
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+
+max_img_h: 0
+max_img_w: 0
+
+shuffle_caption: true
+keep_tokens: 1
+flip_augment: true               # 非对称角色设定必须关（正确性开关，见头注）
+tag_dropout: 0.1
+# 工作流级解绑：纹理特写子集是固定建集技法 → close-up 门控跨集复现。
+# keep_tokens 免疫；数据集没有该 tag 时为无操作。
+tag_dropout_overrides:
+  close-up: 0.5
+prefer_json: false
+cache_latents: true
+
+# ── LoRA / LoKr / DoRA ────────────────────────────────────────────────────
+lora_type: "lokr"
+lora_rank: 32
+lora_alpha: 32.0
+lora_dropout: 0.0
+lokr_factor: 4
+lora_variant: "dora"
+dora_export_mode: "native"
+
+lora_targets:
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "output_proj"
+  - "mlp.layer1"
+  - "mlp.layer2"
+
+lora_exclude_patterns:
+  - ".*llm_adapter.*"
+
+# 容量布局（模型侧结论，跨数据集复用；mlp48 假设 v4 已验证）：
+#   7-20 attn 64：画风主带 headroom
+#   7-20 mlp  48：纹理存储位，64 会记住数据集不一致变体
+#   21-27 全体 16：容量过剩压细节，16 保明暗/对比底线
+#   0-6  32：保底（几何全网分布）
+lora_reg_dims:
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.(self_attn|cross_attn).*': 64
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.mlp.*': 48
+  '.*blocks\.2[1-7]\..*': 16
+  ".*self_attn.*": 32
+  ".*cross_attn.*": 32
+  ".*mlp.*": 32
+lora_reg_alphas:
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.(self_attn|cross_attn).*': 64
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.mlp.*': 48
+  '.*blocks\.2[1-7]\..*': 16
+  ".*self_attn.*": 32
+  ".*cross_attn.*": 32
+  ".*mlp.*": 32
+
+rank_dropout: 0.05
+module_dropout: 0.03
+loraplus_lr_ratio: 1.0
+
+lora_one_init_steps: 0
+lora_one_init_scale: 0.01
+
+# ── 优化器：soap_sf ───────────────────────────────────────────────────────
+optimizer_type: "soap_sf"
+learning_rate: 4e-4
+lr_scheduler: "none"
+
+optimizer_args:
+  betas: [0.9, 0.95]
+  shampoo_beta: -1.0
+  eps: 1.0e-8
+  weight_decay: 0.01
+  precondition_frequency: 5
+  max_precond_dim: 10000
+  precond_in_state: false
+  merge_dims: false
+  precondition_1d: false
+  normalize_grads: false
+  data_format: "channels_first"
+  correct_bias: true
+  weight_lr_power: 2.0
+  r: 0.0
+  warmup_steps: 0
+
+epochs: 200
+max_steps: 0                  # 开放式，看曲线收割
+batch_size: 4
+effective_batch_size: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0
+grad_norm_log_every: 40
+mixed_precision: "bf16"
+grad_checkpoint: true
+num_workers: 4
+
+# ── Timestep（三峰；退火在待证队列，保持禁用）─────────────────────────────
+flow_shift: 3.0
+timestep_sampling: mixed_logsnr_three
+timestep_mix_low_prob: 0.40
+timestep_mix_high_prob: 0.20
+timestep_mix_anneal_start: 0      # 排队位1：时序证据 n=1 + 高t带张力未解
+timestep_mix_anneal_end: 0
+timestep_mix_low_prob_end: -1.0
+timestep_mix_high_prob_end: -1.0
+timestep_logsnr_mu: -6.0
+timestep_logsnr_sigma: 2.0
+timestep_t_min: 0.05
+timestep_t_max: 1.0
+timestep_stratified: true
+timestep_laplace_mu: -1
+timestep_laplace_b: 0.75
+schedule_shift: 1
+
+adaptive_timestep: false        # [实验] 换骨：关 adaptive（与 inv_loss_ema 互斥），
+                                #        下方 adaptive_* 旋钮随之失效（保留以便回滚）
+adaptive_timestep_metric: "entropy_rate"
+disable_tlora_hooks: false
+use_precommit_lora_forward: false
+use_per_block_checkpoint: true
+adaptive_timestep_low_noise_gate: true
+adaptive_timestep_gate_n: 3.0
+adaptive_timestep_gate_c: 0.04
+adaptive_timestep_highfreq_weight: 0.14
+adaptive_timestep_bins: 8
+adaptive_timestep_ema_decay: 0.97
+adaptive_timestep_burn_in: 200
+adaptive_timestep_min_factor: 0.5
+adaptive_timestep_max_factor: 2.5
+adaptive_timestep_base_mix: 0.70
+adaptive_timestep_candidate_mult: 4
+
+# TREAD：v4 实测永久件。画质/收敛异常时仍是第一个关掉复跑的对象。
+tread_enabled: false            # [对齐基线] 与 TREAD-off 重基线对齐，非本实验变量
+tread_ratio: 0.25
+tread_start_layer: 3
+tread_end_layer: -4
+
+loss_weighting_scheme: "inv_loss_ema"  # [实验] 换骨主开关（EDM2 解析式 per-t loss 均衡）
+weight_cap_ratio: 0
+min_snr_gamma: 0
+detail_inv_t_min: 1.0
+detail_inv_t_max: 8.0
+
+noise_offset: 0
+noise_offset_min: 0
+noise_offset_random_strength: false
+pyramid_noise_iterations: 0
+pyramid_noise_discount: 0.3
+
+dfm_lambda: 0.05
+dfm_mode: "batch"             # 排队位2：同质角色小集上 A/B vecor（去 batch 多样性依赖）
+
+loss_type: "huber"
+huber_c: 0.2
+huber_schedule: "snr"
+huber_snr_clamp_max: 2.0      # 低 t 保留部分 L1 鲁棒——数据不统一时的抗脏保险
+
+caption_dropout_rate: 0.01
+freq_balanced_dropout_strength: 0.0
+
+lwd_mask_enabled: false       # 排队位3：与 spectral+wavelet 同频域，wavelet 转正后纹理仍不足才考虑
+lwd_mask_floor: 0.3
+
+# ── 辅助 loss ─────────────────────────────────────────────────────────────
+# wavelet 进通用默认：动漫域发丝=方向性纹理必然存在。0.20 保守档
+# （0.30+t_gate0.70 有 config22 斑块前科）。归因轴=方向纹理锐度。
+aux_spectral_enabled: true
+aux_spectral_lambda: 0.065
+aux_spectral_use_wavelet: true
+aux_spectral_wavelet_lambda: 0.20
+aux_spectral_t_gate: 0.55
+
+aux_perceptual_enabled: false
+aux_perceptual_lambda_lpips: 0.10
+aux_perceptual_lambda_dino: 0.01
+aux_perceptual_t_gate: 0.4
+aux_perceptual_lpips_net: "vgg"
+aux_perceptual_dino_local_path: ""
+aux_perceptual_cache_dir: "AnimaLoraToolkit/models/perceptual"
+aux_perceptual_use_checkpoint: true
+aux_perceptual_lpips_size: 512
+
+# ── eval（固定网格，跨 run 跨数据集可比）──────────────────────────────────
+eval_every: 40
+eval_count: 4
+eval_t_grid: "0.1,0.3,0.5,0.7,0.9"
+eval_seed: 1234
+
+# ── 输出 ──────────────────────────────────────────────────────────────────
+output_dir: "./output/CHANGE_ME"    # ★必改
+output_name: "CHANGE_ME"            # ★必改
+
+save_every_steps: 40
+save_state_every: 200
+keep_vae_on_gpu: true
+empty_cache_after_sample: false
+seed: 42
+resume_lora: ""
+
+sample_every: 0
+sample_steps: 40
+sample_infer_steps: 30
+sample_cfg_scale: 4.0
+sample_sampler_name: "er_sde"
+sample_scheduler: "beta"
+sample_width: 0
+sample_height: 0
+sample_seed: 1234
+sample_negative_prompt: ""
+sample_prompt: "@CHANGE_ME, newest, safe, 1girl,masterpiece, best quality"  # ★必改 trigger
+
+loss_curve_steps: 1
+no_progress: false
+log_every: 1
+
+no_monitor: false
+monitor_host: "0.0.0.0"
+monitor_port: 8765
+no_browser: true

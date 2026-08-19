@@ -1,0 +1,226 @@
+# ══════════════════════════════════════════════════════════════════
+# Krea 2 · 原生小体积实验：逐模块 rank 布局（reg_dims）2026-07-14
+#
+# 与 train_krea2_minimal_diag.yaml（goutong 成功基线）逐字段一致，
+# 唯一变量：加 lora_reg_dims + lora_reg_alphas —— 保留全 264 targets，
+# 但按"‖ΔW‖² 能量分布"给每组模块配不同 rank，让训练直接在目标 rank 上
+# 把容量填满，无需训练后 SVD 截断（原生小体积、无叠加压缩链路）。
+#
+# 依据（对成功基线 goutong-diag epoch20 的逐层取证 + 本地 header 精算）：
+#   · 能量分布：mlp_gate 53.4% + mlp_up 24.0%（合计 77%）≫ attn 全部 12.7%、
+#     mlp_down 6.0%、其余(txtfusion/tproj/tmlp/first/last) <1.5%。
+#   · 谱：mlp 热点层 r99=1–2、mlp_gate 组均 7.7 → r16 远够；attn 谱平
+#     (r99≈24–29) 但只占 13% 能量 → 低 rank 是"顺自然方向"的取舍。
+#   · 体积账（本地读 checkpoint header 精算）：全 264 均匀 r32 = 223.7MB，
+#     其中 attn 160 模块吃掉 95.5MB(占 43%) 只换 13% 能量 —— 体积浪费主因。
+#     本方案 reg_dims 精算成品 ≈ 75.5MB（264 模块全部命中规则，无落回 r32；
+#     rank 分布 r4×33 / r8×175 / r16×56）。
+#
+# 三档可选（改下面两组 rank 即可，reg_dims 与 reg_alphas 必须同步改，保 scaling=1）：
+#   · 温和(本配置)：mlp.gate/up=16, down=8, attn=8, 杂项=8, txtfusion.projector=4 → ~82MB
+#   · 激进(更小)  ：mlp.gate/up=12, down=6, attn=4  → ~51MB
+#   · 保守(近全量)：mlp.gate/up=24, down=12, attn=12 → ~114MB
+#
+# 判读方法（跑之前先记住）：
+#   A. step 0 采样必须正常 krea2 图（reg_dims 只改 rank 不改 step-0 中立性）。
+#   B. grad_norm（每 20 步）O(0.1~几)；恒 0 → 注入被绕过。
+#   C. 主判据：与全量 r32 基线（goutong-diag）**同 step** 对比 eval_loss 与采样，
+#      重点看画风还原 + 细节质感有没有因为 attn/杂项降 rank 而变差。
+#      预期：mlp 主战场 rank 充裕，画风/质感应与全量基线接近；若 attn r8 伤了
+#      结构/prompt 追随 → 把 attn 抬到 12（见"保守"档）。
+#   D. 若画风足够而想更小 → 走"激进"档（attn=4、mlp=12）再 A/B。
+#
+# ⚠ 单变量纪律：本文件除 reg_dims/reg_alphas 与 output 名外，与 minimal_diag 逐字段一致。
+#   若要和成功基线做干净对照，请用同一 Dataset/your-dataset 跑，别顺手改别的。
+# ══════════════════════════════════════════════════════════════════
+
+# ── 模型路径 ────────────────────────────────────────────────
+model_family: "krea2"
+transformer_path: "AnimaLoratoolkit/models/transformers/raw.safetensors"
+vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
+krea2_text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-VL-4B-Instruct"
+krea2_text_max_length: 512
+krea2_text_cache_entries: 128
+
+# ── 数据集 ──────────────────────────────────────────────────
+data_dir: "./Dataset/your-dataset"
+resolution: 1024
+repeats: 1
+
+# ── ARB 分桶（1024 基准 = RAW 分布内）────────────────────────
+bucket_base_resos: [1024]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 2048
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.0
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+max_img_h: 0
+max_img_w: 0
+
+# ── NaViT / FiT 全关（dense ARB 路径）───────────────────────
+navit_packing: false
+navit_native_resolution: false
+navit_token_budget: 16384
+navit_multiscale: false
+navit_pack_strategy: ffd
+navit_text_trim_padding: false
+fit_packed_training: false
+token_bucket: false
+bucket_drop_last: false
+torch_compile: false
+cache_latents: true
+cache_encode_tiled: true
+cache_encode_max_pixels: 16777216
+
+# ── 数据增强 / 打标（最小化：只留 shuffle + trigger 保护）─────
+shuffle_caption: true
+keep_tokens: 1
+flip_augment: true
+tag_dropout: 0.0
+caption_dropout_rate: 0.0
+freq_balanced_dropout_strength: 0.0
+prefer_json: false
+
+# ── LoRA 结构（纯 LoRA；全 264 targets；逐模块 rank 由 reg_dims 布局）──
+# 不写 lora_targets → family 默认 KREA2_DEFAULT_LORA_TARGETS（264 Linear）
+lora_type: "lora"
+lora_rank: 32                  # 全局兜底 rank（本配置 reg_dims 覆盖全部模块，兜底不生效）
+lora_alpha: 32.0
+lora_dropout: 0.0
+lora_init: "default"           # 不用 PiSSA
+lora_variant: "base"           # 不用 DoRA
+rank_dropout: 0.0
+module_dropout: 0.0
+loraplus_lr_ratio: 1.0
+
+# ── 逐模块 rank 布局（唯一新增变量）─────────────────────────
+# 语义：re.fullmatch，顺序即优先级，首个命中生效（lora.py _get_reg_dim）。
+# reg_alphas 与 reg_dims 逐条相同 → scaling = alpha/rank = 1（与 r32/a32 基线一致）。
+# 命中已本地全量验证：264 模块全部命中、无一落回全局 r32，精算 ~75.5MB
+#   （训练器应打印 rank 分布 r4×33, r8×175, r16×56）。
+# ★ txtfusion 规则排最前：它内部也有 attn/mlp 子层，若排在 attn/mlp 之后会被遮蔽
+#   （触发 shadow 审计 WARNING）。放最前 → 整条文本侧统一 r4（文本条件路径、低画风能量），
+#   且消除遮蔽告警。想给文本侧更多容量：把此行下移或为 txtfusion 单独设更高 rank。
+lora_reg_dims:
+  '.*txtfusion.*': 4           # 全部 txtfusion（projector + layerwise attn/mlp）：文本侧、低能量
+  '.*mlp\.gate':   16          # 主战场（53.4% 能量），组均 r99=7.7，r16 充裕
+  '.*mlp\.up':     16          # 24.0% 能量
+  '.*mlp\.down':   8           # 6.0% 能量
+  '.*attn\..*':    8           # 主 block attn（12.7% 能量、谱平但低能量 → 低 rank 取舍）
+  '.*tproj.*':     8           # tproj.1（调制投影；低 rank 亦利于 ComfyUI 部署少 OOM 风险）
+  '.*':            8           # 兜底：first / last.linear / tmlp / txtmlp（架构入口/出口/时步，保 r8）
+lora_reg_alphas:
+  '.*txtfusion.*': 4
+  '.*mlp\.gate':   16
+  '.*mlp\.up':     16
+  '.*mlp\.down':   8
+  '.*attn\..*':    8
+  '.*tproj.*':     8
+  '.*':            8
+
+# ── 优化器（官方参考：AdamW / 1e-4 / 恒定）─────────────────
+optimizer_type: "adamw"
+learning_rate: 1e-4
+lr_scheduler: "none"
+optimizer_args:
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.01
+
+# ── 训练循环 ────────────────────────────────────────────────
+epochs: 200
+max_steps: 0
+batch_size: 4
+effective_batch_size: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0
+grad_norm_log_every: 20
+mixed_precision: "bf16"
+grad_checkpoint: true
+num_workers: 4
+
+# ── Timestep（官方 krea2_shift = logit_normal + res-shift）───
+flow_shift: 1.0
+timestep_sampling: logit_normal
+timestep_stratified: true
+timestep_t_min: 0.0
+timestep_t_max: 1.0
+schedule_shift: 1
+krea2_res_shift: true
+krea2_shift_min_res: 256
+krea2_shift_max_res: 1280
+krea2_shift_y1: 0.5
+krea2_shift_y2: 1.15
+adaptive_timestep: false
+
+# ── 主 loss（官方 flow-matching = 纯 MSE）───────────────────
+loss_type: "l2"
+loss_weighting_scheme: "none"
+weight_cap_ratio: 0
+min_snr_gamma: 0
+
+# ── 噪声 / 辅助 loss 全关 ───────────────────────────────────
+noise_offset: 0
+noise_offset_min: 0
+noise_offset_random_strength: false
+pyramid_noise_iterations: 0
+pyramid_noise_discount: 0.3
+eisbach_lambda: 0.0
+dfm_lambda: 0.0
+aux_spectral_enabled: false
+lwd_mask_enabled: false
+aux_perceptual_enabled: false
+
+# ── eval（判读主指标；t=0.1 不动是调度必然，看 0.5/0.9）──────
+eval_every: 40
+eval_count: 16
+eval_t_grid: "0.1,0.5,0.9,0.97"
+eval_seed: 1234
+
+# ── 遥测 ────────────────────────────────────────────────────
+telemetry_enabled: true
+telemetry_freq_bands: 3
+telemetry_slope_window: 6
+telemetry_optimizer_every: 0
+telemetry_capacity_every: 0
+
+# ── 输出 / 保存 ─────────────────────────────────────────────
+output_dir: "./output/krea2-regdim"
+output_name: "krea2-regdim"
+save_every: 1
+save_every_steps: 0
+save_state_every: 100
+keep_vae_on_gpu: true
+empty_cache_after_sample: false
+seed: 42
+resume_lora: ""
+resume_state: ""
+stage_timing_every: 20
+stage_timing_warmup: 0
+
+# ── 采样出图（RAW 上预览：CFG 图，步数要足）─────────────────
+sample_every: 1
+sample_steps: 0
+sample_infer_steps: 50
+sample_cfg_scale: 4.5
+sample_sampler_name: "euler"
+sample_scheduler: "simple"
+sample_width: 0
+sample_height: 0
+sample_seed: 1234
+sample_negative_prompt: ""
+sample_prompt: "@g0ut0ng style, 1girl,blue hair,blush,arona (blue archive),classroom"
+
+# ── 日志 / 监控 ─────────────────────────────────────────────
+loss_curve_steps: 1
+no_progress: false
+log_every: 1
+no_monitor: false
+monitor_host: "0.0.0.0"
+monitor_port: 8765
+no_browser: true

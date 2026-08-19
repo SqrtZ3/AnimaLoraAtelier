@@ -7,7 +7,7 @@
 # ============================================================================
 transformer_path: "models/transformers/anima-preview.safetensors"
 vae_path: "models/vae/qwen_image_vae.safetensors"
-text_encoder_path: "models/text_encoders"
+text_encoder_path: "models/text_encoders/Qwen3-0.6B-Base"
 t5_tokenizer_path: "models/t5_tokenizer"  # 本地 T5 tokenizer，避免联网
 
 # ============================================================================

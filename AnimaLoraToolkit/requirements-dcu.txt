@@ -1,0 +1,64 @@
+# ==============================================================================
+#  海光 DCU（K100-AI / DTK 26.04）依赖清单
+#
+#  ★ 这里**故意不列 torch / torchvision / torchaudio / triton**。
+#    它们由 DTK 基础镜像提供（das 适配版，HIP 后端）。任何一句
+#    `pip install torch` 都会把它换成 PyPI 的 CUDA 构建，且**不报错**——
+#    之后 torch.cuda.is_available() 变 False，报错全指向奇怪的地方。
+#    配合 constraints-dcu.txt 一起用，pip 就永远动不了它们：
+#
+#        python tools/dcu_gen_constraints.py > constraints-dcu.txt
+#        pip install --prefer-binary -c constraints-dcu.txt -r requirements-dcu.txt
+#
+#  ★ 分三档。只想开训 → 只装 [必需]。
+# ==============================================================================
+
+# ---------- [必需] anima_train.py:ensure_dependencies() 的硬门槛 --------------
+# 这 7 个缺任何一个，训练脚本启动即 SystemExit(1)。
+numpy
+Pillow>=10.0.0
+safetensors>=0.4.0
+transformers==4.57.6
+sentencepiece>=0.1.99
+einops>=0.8.0
+pyyaml>=6.0.1
+
+# transformers 的隐式依赖里唯一需要点名的：protobuf（T5/Qwen tokenizer 转换用）
+protobuf>=3.20.0
+
+# ---------- [强烈建议] 日志/进度/监控，缺了能跑但很难看 -----------------------
+tqdm>=4.66.0
+rich>=13.7.0
+omegaconf>=2.3.0
+psutil>=5.9.0
+
+# ---------- [可选] GUI / 监控端口（run_dcu.sh 的 monitor）--------------------
+# fastapi>=0.104.0
+# uvicorn>=0.24.0
+# python-multipart>=0.0.6
+# pydantic>=2.5.0
+
+# ---------- [可选] 评估 / 取证工具链（tools/*.py、aux perceptual loss）--------
+# 注意：lpips / pytorch-fid / pytorch-msssim / torchmetrics 依赖 torch(+torchvision)。
+# 有 constraints 兜底时装它们是安全的；没有 constraints 千万别装。
+# scipy>=1.10.0
+# scikit-image>=0.20.0
+# pandas>=2.0.0
+# matplotlib>=3.7.0
+# lpips>=0.1.4
+# pytorch-msssim>=0.2.1
+# pytorch-fid>=0.3.0
+
+# ---------- [可选] 实验跟踪 --------------------------------------------------
+# wandb>=0.16.0
+
+# ---------- [DCU 上明确不要装] ----------------------------------------------
+# torch / torchvision / torchaudio  → 镜像自带 das 版，装了就毁
+# torch_npu                         → 昇腾专有，DCU 上 torch.cuda.* 直接就是 DCU
+# xformers                          → 无 HIP 轮子（docs/hygon-dcu.md §4）
+# bitsandbytes                      → 无 DCU 后端，8-bit 优化器不可用
+# flash-attn                        → 需 CUDA 编译
+# diffusers / peft / accelerate / lycoris-lora
+#   → **训练运行路径不 import 它们**（LoKr 是本仓库自实现，不走 lycoris 包；
+#      utils/__init__.py 里那几个依赖它们的工具 anima_train.py 并不加载）。
+#      昇腾上装了是历史惯性，DCU 上建议先不装，少四个能拖 torch 的包。

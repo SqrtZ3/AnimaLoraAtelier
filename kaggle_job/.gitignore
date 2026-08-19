@@ -1,0 +1,3 @@
+# 从 Kaggle 拉回来的运行产物（含 jax 编译缓存，几十个文件）——不进仓库
+output/
+__pycache__/

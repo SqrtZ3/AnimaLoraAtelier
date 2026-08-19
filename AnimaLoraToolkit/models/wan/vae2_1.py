@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
+import os
 
 import torch
 import torch.cuda.amp as amp
@@ -8,6 +9,57 @@ import torch.nn.functional as F
 from einops import rearrange
 
 CACHE_T = 2
+
+
+# ── VAE 自注意力的 query 分块开关（opt-in，默认关）────────────────────────────
+#
+# AttentionBlock 是**单头、全局**自注意力，token 数 N = (H/8)·(W/8)，且 head_dim 等于
+# 该层通道数（本仓库配置下最深层 = 384）。在有 flash / mem-efficient SDPA 后端的平台上
+# 显存随 N 线性增长；但当 SDPA 落到 math backend（逐元素物化 softmax(q@kᵀ)）时显存是
+# O(N²)：1712×2432 的图 N=65056，fp32 的 N×N 就是 15.77 GiB，单张就能打爆 64GB 卡。
+#
+# 分块做法：按 query 切块，每块对**全部** K/V 做一次 SDPA。每个 query 的 softmax 归一化
+# 域仍是全部 key，所以这是逐元素数学恒等（非近似），只是把峰值显存从 N² 降到 chunk·N。
+# 见 tests/test_vae_attn_chunk.py 的对拍。
+#
+# 0 = 关闭（与改动前逐字节同一条代码路径）。>0 = query 块大小（token 数）。
+# 也可用环境变量 ANIMA_VAE_ATTN_CHUNK 覆盖（便于在不改 yaml 的排查脚本里开）。
+_VAE_ATTN_CHUNK_TOKENS = 0
+
+
+def set_vae_attn_chunk_tokens(n: int) -> int:
+    """设置 VAE 自注意力的 query 分块大小（token 数）。0 = 关闭。返回生效值。"""
+    global _VAE_ATTN_CHUNK_TOKENS
+    n = int(n or 0)
+    if n < 0:
+        raise ValueError(f"vae_attn_chunk_tokens 必须 ≥0，收到 {n}")
+    _VAE_ATTN_CHUNK_TOKENS = n
+    return _VAE_ATTN_CHUNK_TOKENS
+
+
+def get_vae_attn_chunk_tokens() -> int:
+    env = os.environ.get("ANIMA_VAE_ATTN_CHUNK")
+    if env:
+        try:
+            return max(0, int(env))
+        except ValueError:
+            logging.getLogger(__name__).warning(
+                "ANIMA_VAE_ATTN_CHUNK=%r 不是整数，忽略", env)
+    return _VAE_ATTN_CHUNK_TOKENS
+
+
+def _chunked_sdpa(q, k, v, chunk: int):
+    """按 query 分块的 SDPA。数学上与 F.scaled_dot_product_attention(q,k,v) 恒等。
+
+    q/k/v: [B, H, N, D]。chunk ≤0 或 N ≤ chunk 时直接走整块 SDPA（零开销回退）。
+    """
+    n = q.shape[-2]
+    if chunk <= 0 or n <= chunk:
+        return F.scaled_dot_product_attention(q, k, v)
+    outs = []
+    for s in range(0, n, chunk):
+        outs.append(F.scaled_dot_product_attention(q[..., s:s + chunk, :], k, v))
+    return torch.cat(outs, dim=-2)
 
 
 class CausalConv3d(nn.Conv3d):
@@ -245,11 +297,9 @@ class AttentionBlock(nn.Module):
                                                          3, dim=-1)
 
         # apply attention
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-        )
+        # 单头全局注意力，N=(h·w) 在原生分辨率下可达数万；SDPA 落到 math backend 时
+        # 显存是 O(N²)（见文件头 _VAE_ATTN_CHUNK_TOKENS）。开关关闭时走原来的整块 SDPA。
+        x = _chunked_sdpa(q, k, v, get_vae_attn_chunk_tokens())
         x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
 
         # output

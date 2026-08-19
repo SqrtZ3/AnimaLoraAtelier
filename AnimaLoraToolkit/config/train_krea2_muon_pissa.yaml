@@ -1,0 +1,247 @@
+# ════════════════════════════════════════════════════════════════════
+# Krea 2 训练配置 · Muon-SF + Full LoRA + PiSSA + DoRA
+#
+# 核心变更（vs baseline_v2 的 LoKr factor=2 + soap_sf）：
+#   1. optimizer_type: soap_sf -> muon_sf（无 GG/Q 矩阵，优化器状态只剩
+#      z buffer + 2D 动量；注意这一项本来就不是显存大头，见下）
+#   2. lora_type: lokr -> lora（标准 LoRA；baseline_v2 是 LoKr f2，
+#      容量 ≈ 标准 LoRA 一半，不是 f8 的 12.5%）
+#   3. lora_init: pissa（SVD 主成分初始化，同 rank 下收敛更快）
+#   4. lora_variant: dora（幅度+方向分解）
+#   5. lora_rank: 24 -> 文件约 201MB（bf16）
+#
+# 显存账本（诚实版，12B bf16 / batch 4 × budget 16384 / GC 开）：
+#   模型权重:      ~24 GB（冻结，不变）
+#   文本编码器:    ~8 GB（Qwen3-VL-4B 常驻——caption 增强使 LRU 缓存命不中）
+#   激活:          大头。按 navit 实测线性模型 ≈10GB + 0.52MB/token，
+#                  4×16384 token ≈ 34GB 级。想省显存先动 batch_size/grad_accum。
+#   优化器状态:    z buffer + 2D 动量，<1 GB（LoRA 参数量级）
+#   -> muon_sf 相对 soap_sf 省的是"优化器状态"这一小项；总占用主要由
+#      激活与常驻权重决定，切优化器不会显著降峰值。
+#
+# 与官方对齐的部分（不变）：
+#   - timestep: logit_normal + krea2_res_shift（官方 mu 内插）
+#   - loss: l2 / none weighting（官方 flow-matching 默认）
+#   - lora_targets: family 默认 263 Linear（不含 tproj.1）
+#   - krea2_shift 参数: y1=0.5, y2=1.15, 256-1280
+#
+# Muon-SF 使用说明：
+#   - lr_scheduler 必须 "none"（SF 内置调度）
+#   - 优化器自带 train()/eval() 切换，trainer 已有 hasattr 守护
+#   - ns_steps=5 默认足够；大矩阵可加到 10（通常无质量差异）
+#   - betas[0]=0.9 是 SF 插值权重，betas[1]=0.95 是 1D 参数二阶矩衰减
+#   - momentum=0.95 是 2D 路径 NS 输入的内层动量（Keller Muon 同款；
+#     SF 平均替代的是 schedule，替代不了 NS 前的梯度平滑，勿设 0）
+#   - warmup_steps 可设 50-100 稳定早期（可选）
+#
+# PiSSA 导出说明：
+#   - dora_export_mode=native 时成品自动折叠为 rank-2r 标准 LoRA
+#     （ΔW = [B|−B₀]@[A;A₀]，PiSSA 官方转换），ComfyUI 直接可用；
+#     resume_lora 读该文件会自动切回 A/B/init 无损续训
+# ══════════════════════════════════════════════════════════════════
+
+# ── 模型路径 ────────────────────────────────────────────────
+model_family: "krea2"
+transformer_path: "AnimaLoratoolkit/models/transformers/raw.safetensors"
+vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
+krea2_text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-VL-4B-Instruct"
+krea2_text_max_length: 512
+krea2_text_cache_entries: 128
+
+# ── 数据集 ──────────────────────────────────────────────────
+data_dir: "./Dataset/your-dataset"
+resolution: 1024
+repeats: 1
+
+# ── ARB 分桶 ────────────────────────────────────────────────
+bucket_base_resos: [1536]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 3072
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.7
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+max_img_h: 0
+max_img_w: 0
+
+# ── NaViT 块对角打包 ────────────────────────────────────────
+navit_packing: true
+navit_native_resolution: true
+navit_token_budget: 16384
+fit_max_tokens: 32768000
+fit_warn_tokens: 32768000
+navit_max_images_per_pack: 0
+navit_multiscale: true
+navit_multiscale_token_ladder: "4096"
+navit_pack_strategy: ffd
+navit_text_trim_padding: false
+cache_latents: true
+cache_encode_tiled: true
+cache_encode_max_pixels: 16777216
+fit_packed_training: false
+token_bucket: false
+bucket_drop_last: false
+torch_compile: false
+
+# ── 数据增强 / 打标 ───────────────────────────────────────
+shuffle_caption: true
+keep_tokens: 1
+flip_augment: true
+tag_dropout: 0.1
+tag_dropout_overrides:
+  close-up: 0.5
+caption_dropout_rate: 0.01
+freq_balanced_dropout_strength: 0.0
+prefer_json: false
+
+# ── LoRA 结构：Full LoRA + DoRA + PiSSA init ──────────────
+# ★ lora_type=lora: 标准 LoRA（非 LoKr），100% 容量
+# ★ lora_init=pissa: SVD 主成分初始化（arxiv:2404.02948）
+#   - 要求 alpha = rank（scaling=1）保证 step 0 净 delta=0
+#   - 同 rank 下收敛更快，rank 24 + PiSSA ≈ rank 32 普通初始化
+# ★ lora_variant=dora: 幅度+方向分解，已支持 lora_type=lora
+lora_type: "lora"
+lora_rank: 24
+lora_alpha: 24.0              # ★ 必须等于 rank（PiSSA 要求 scaling=1）
+lora_dropout: 0.0
+lora_init: "pissa"            # "default"(kaiming+zero) | "pissa"(SVD主成分)
+lora_variant: "dora"
+dora_export_mode: "native"
+# ★ 两个开关都开 = DoRA 省显存的关键（12B/263 targets 下 GB 级差异）：
+# - fast_norm: ⟨W,ΔW⟩ 收缩在 bf16 上做，不物化 fp32 W 副本（误差 ~1e-3）
+# - detach_norm: ||W+ΔW|| 按 DoRA 论文 Sec 4.3 / PEFT 参考实现 detach 出
+#   梯度图（否则每层一份 W 引用参与 backward 再收缩）。梯度语义与论文
+#   推荐一致，但与 detach=false 的历史 run 不可直接对比。
+dora_fast_norm: true
+dora_detach_norm: true
+
+rank_dropout: 0.0
+module_dropout: 0.0
+loraplus_lr_ratio: 1.0
+
+# ── 优化器：Muon-SF（Newton-Schulz + Schedule-Free）──────
+# ★ 零 GG/Q 矩阵：优化器状态仅 z buffer（参数级别大小）
+# ★ 2D 走 Newton-Schulz 正交化（类似 Shampoo 预条件）
+# ★ 1D 走 AdamW fallback（bias、DoRA scale）
+# ★ 原生 bf16：NS 迭代在 bf16 下数值稳定
+optimizer_type: "muon_sf"
+learning_rate: 2e-3            # Muon lr ≈ 0.02 for full-model; LoRA 需更低
+lr_scheduler: "none"           # SF 必须 none
+optimizer_args:
+  betas: [0.9, 0.95]           # [SF插值权重, 1D参数二阶矩衰减]
+  ns_steps: 5                  # Newton-Schulz 迭代步数
+  momentum: 0.95               # 2D 路径 NS 输入的内层动量（Muon 同款，勿设 0）
+  weight_decay: 0.00001        # 解耦权重衰减
+  eps: 1.0e-8
+  weight_lr_power: 2.0         # Polyak 平均权重
+  r: 0.0                       # 步幂（0=均匀平均）
+  warmup_steps: 50             # 前几步线性 warmup（可选，稳定早期）
+  correct_bias: true           # 1D 参数 AdamW bias correction
+
+# ── 训练循环 ────────────────────────────────────────────────
+epochs: 200
+max_steps: 0
+batch_size: 4
+effective_batch_size: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0
+grad_norm_log_every: 20
+mixed_precision: "bf16"
+grad_checkpoint: true
+num_workers: 4
+
+# ── Timestep 采样（官方 krea2_shift）────────────────────────
+flow_shift: 1.0
+timestep_sampling: logit_normal
+timestep_stratified: true
+timestep_t_min: 0.0
+timestep_t_max: 1.0
+schedule_shift: 1
+
+# ── krea2 分辨率感知 shift ────────────────────────────────────
+krea2_res_shift: true
+krea2_shift_min_res: 256
+krea2_shift_max_res: 1280
+krea2_shift_y1: 0.5
+krea2_shift_y2: 1.15
+
+adaptive_timestep: false
+
+# ── 主 loss ────────────────────────────────────────────────
+loss_type: "l2"
+loss_weighting_scheme: "none"
+weight_cap_ratio: 0
+min_snr_gamma: 0
+
+# ── 噪声 ────────────────────────────────────────────────────
+noise_offset: 0
+noise_offset_min: 0
+noise_offset_random_strength: false
+pyramid_noise_iterations: 0
+pyramid_noise_discount: 0.3
+
+# ── 辅助 loss ────────────────────────────────────────────────
+eisbach_lambda: 0.0            # 先关，确认基线收敛后再调
+dfm_lambda: 0.0
+dfm_mode: "vecor"
+aux_spectral_enabled: false
+aux_spectral_lambda: 0.065
+aux_spectral_use_wavelet: true
+aux_spectral_wavelet_lambda: 0.20
+aux_spectral_t_gate: 0.55
+lwd_mask_enabled: false
+lwd_mask_floor: 0.3
+aux_perceptual_enabled: false
+
+# ── eval ────────────────────────────────────────────────────
+eval_every: 40
+eval_count: 16
+eval_t_grid: "0.1,0.5,0.9,0.97"
+eval_seed: 1234
+
+# ── 遥测 ────────────────────────────────────────────────────
+telemetry_enabled: true
+telemetry_freq_bands: 3
+telemetry_slope_window: 6
+telemetry_optimizer_every: 0
+telemetry_capacity_every: 0
+
+# ── 输出 / 保存 ─────────────────────────────────────────────
+output_dir: "./output/krea2-muon"
+output_name: "krea2-muon-pissa"
+save_every: 1
+save_every_steps: 0
+save_state_every: 100
+keep_vae_on_gpu: true
+empty_cache_after_sample: false
+seed: 42
+resume_lora: ""
+resume_state: ""
+stage_timing_every: 20
+stage_timing_warmup: 0
+
+# ── 采样出图 ─────────────────────────────────────────────────
+sample_every: 1
+sample_steps: 0
+sample_infer_steps: 30
+sample_cfg_scale: 4.5
+sample_sampler_name: "er_sde"
+sample_scheduler: "beta"
+sample_width: 0
+sample_height: 0
+sample_seed: 1234
+sample_negative_prompt: ""
+sample_prompt: "@g0ut0ng style, 1girl"
+
+# ── 日志 / 监控 ─────────────────────────────────────────────
+loss_curve_steps: 1
+no_progress: false
+log_every: 1
+no_monitor: false
+monitor_host: "0.0.0.0"
+monitor_port: 8765
+no_browser: true

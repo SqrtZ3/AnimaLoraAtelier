@@ -20,10 +20,42 @@ transformer_path: "models/transformers/anima-preview3-base.safetensors"
 vae_path: "models/vae/qwen_image_vae.safetensors"
 
 # Qwen3 文本编码器目录。文本编码器冻结；路径错会直接无法编码 prompt。
-text_encoder_path: "models/text_encoders"
+text_encoder_path: "models/text_encoders/Qwen3-0.6B-Base"
 
 # T5 tokenizer 目录。Anima 的 LLM adapter 使用 Qwen embedding + T5 token ids。
 t5_tokenizer_path: "models/t5_tokenizer"
+
+# ============================================================================
+# 模型族（model family）—— opt-in，默认 anima 行为不变
+# ============================================================================
+
+# DiT 底模族："anima"（默认）或 "krea2"（Krea 2 单流 MMDiT 12B）。
+# krea2 时：transformer_path 指官方 raw.safetensors（训练一律用 RAW，推理可上 Turbo）；
+# vae_path 仍是上面的 qwen_image_vae.safetensors（两家同一 VAE，latent 缓存通用）；
+# text_encoder_path / t5_tokenizer_path 不使用。详见 docs/krea2-family.md。
+model_family: "anima"
+
+# [krea2] Qwen3-VL-4B-Instruct 的 HuggingFace 目录（model_family=krea2 必填）。
+krea2_text_encoder_path: ""
+
+# [krea2] 官方 encoder 的用户文本 token 预算（模板前后缀之外）。默认 512=官方 encoder.py
+# 值（右截断，超长 caption 丢尾部）。设 <=0（如 0）=无上限：不截断、动态 pad，超长 caption
+# 全保留；仅在你的部署侧（ComfyUI/官方）同样不截时才用，否则训练/推理条件会不一致。
+krea2_text_max_length: 512
+
+# [krea2] 文本特征 LRU cache 条目数。每条 [L,12,2560] 压缩特征、典型 tag caption 数 MB；
+# caption 静态时命中率≈100%。128 条 ≈ 1GB 量级显存。
+krea2_text_cache_entries: 128
+
+# [krea2] 训练 t 的分辨率感知 shift（模型原生调度 α=exp(mu(token 数))，navit 逐图）。
+# true=对齐官方推理时间步分布；开着它时 schedule_shift 建议保持 1.0 避免双重偏移。
+krea2_res_shift: true
+
+# [krea2] mu 线性内插端点（官方默认：256px→y1=0.5、1280px→y2=1.15；1024²≈shift 2.48）。
+krea2_shift_min_res: 256
+krea2_shift_max_res: 1280
+krea2_shift_y1: 0.5
+krea2_shift_y2: 1.15
 
 # ============================================================================
 # 数据集与 Caption
@@ -41,8 +73,30 @@ reg_repeats: 1
 # 正则集统一 caption。留空则读取正则图自己的 caption。
 reg_caption: ""
 
-# 训练分辨率。Anima 原生 1024；调高吃显存且慢，调低可能损失细节/光照层次。
+# 训练分辨率。默认也是 ARB 的主 base 边长。Anima 原生 1024；调高吃显存且慢，调低可能损失细节/光照层次。
 resolution: 1024
+
+# 多级 ARB base 边长。显式列表优先；例如 [512, 768, 1024] 会生成三档面积层。
+# 留空/[] 且 bucket_max_base_reso=0 时保持旧行为：只围绕 resolution² 生成宽高比桶。
+# 留空/[] 且 bucket_max_base_reso>0 时自动展开 base 范围。
+bucket_base_resos: []
+
+# 自动 base 范围。例：min=512/max=2048/step=256 -> [512,768,1024,1280,1536,1792,2048]。
+# 显式 bucket_base_resos 非空时这三个值会被忽略。
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+
+# 禁止上采样进桶。true 时，600x600 不会被拉到 768/1024，而会选择不超过原图尺寸的最近桶
+# （受 min_bucket_reso / bucket_reso_steps 约束，通常落到 512）。适合细节补充集。
+bucket_no_upscale: false
+
+# 允许的最大上采样倍率。0=不限；1.25 表示最多放大 25%。
+# 若 bucket_no_upscale=true，则等价于最大 1.0，优先生效。
+bucket_max_upscale: 0.0
+
+# 打印原图尺寸 -> bucket 的分配报告，方便先看 4K/小裁切实际落在哪些桶。
+bucket_report: false
 
 # 全局重复次数。调大等价增加每 epoch 步数；小数据集可用，但太大会让 epoch 统计失真。
 repeats: 1
@@ -64,6 +118,14 @@ prefer_json: true
 
 # 缓存 VAE latent。开启后训练更快；首次编码耗时。开启 flip_augment 时本补丁会翻转 latent。
 cache_latents: true
+
+# Keep VAE resident on GPU after latent caching. This costs VRAM but avoids CPU/GPU swaps when
+# in-training sampling is frequent.
+keep_vae_on_gpu: false
+
+# When VAE is offloaded, clear PyTorch's CUDA cache after sampling. Set false to keep allocator
+# warm if frequent sampling causes the next training step to re-allocate from scratch.
+empty_cache_after_sample: true
 
 # ============================================================================
 # LoRA / LoKr
@@ -155,7 +217,22 @@ max_steps: 0
 # 单步 batch。调大梯度更稳、Prodigy 估计更稳，但吃显存；batch 1 时建议 grad_accum 补足。
 batch_size: 4
 
+# 按真实图片数做精确累积。0=关闭，使用 grad_accum；>0 时 DataLoader 会在窗口边界
+# 拆分同桶 micro-batch，确保每个 optimizer.step() 来自该数量的图片均值梯度。
+# 适合 Lion/C-Lion 在分辨率桶很碎、小 batch 很多时稳定方向；不会丢图、补图或二次裁切。
+effective_batch_size: 0
+
+# Legacy reference batch for old experiments. This simulates the old BucketBatchSampler with the
+# reference batch size and counts old optimizer steps from completed old bucket batches.
+# Set to the old native batch, e.g. 4, when effective_batch_size is much larger and you still
+# want sampling/saving intervals expressed in old-step experience.
+reference_batch_size: 0
+
+# Old grad_accum used by reference step simulation. Keep 1 if the old training used native batch=4.
+reference_grad_accum: 1
+
 # 梯度累积。有效 batch=batch_size*grad_accum；调大会变稳但响应变慢。
+# 当 effective_batch_size > 0 时会被忽略。
 grad_accum: 1
 
 # 对 ProdigyPlus 必须保持 1.0；实际步长由 d/d0/d_coef 自适应。
@@ -197,7 +274,7 @@ num_workers: 0
 # Optimizer 选择与 ProdigyPlusScheduleFree 全参数
 # ============================================================================
 
-# "prodigyplus" / "adamw" / "adamw8bit"。
+# "prodigyplus" / "adamw" / "adamw8bit" / "soap"。
 optimizer_type: "prodigyplus"
 
 # 旧字段兼容：仅当 optimizer_args 未给 d0/use_stableadamw 时作为兜底。
@@ -306,6 +383,30 @@ optimizer_args:
   # 若要试：factored=false 且 eps=1e-8。
   use_focus: false
 
+# ── SOAP 参考配置（optimizer_type: "soap" 时使用）────────────────────────
+# SOAP = Shampoo preconditioner + Adam in Shampoo eigenbasis。它不自动估计全局 LR，
+# 因此更适合当前这种 timestep / aux loss / loss weighting 都很实验性的训练环境：
+# 宏观步长仍由 learning_rate + scheduler 控制，优化器只负责矩阵方向预条件。
+#
+# 推荐首跑：
+# optimizer_type: "soap"
+# learning_rate: 2.0e-5
+# lr_scheduler: "cosine"
+# lr_scheduler_eta_min: 2.0e-6
+# grad_clip_max_norm: 1.0
+# loraplus_lr_ratio: 1.0
+# optimizer_args:
+#   betas: [0.95, 0.95]          # Adam 动量与二阶矩；SOAP 论文常用较低 beta2
+#   shampoo_beta: -1             # -1 表示复用 beta2
+#   eps: 1.0e-8
+#   weight_decay: 0.01
+#   precondition_frequency: 10   # 每 N 步更新一次 eigenbasis；越小越贵但反应快
+#   max_precond_dim: 512         # 首跑安全值；稳定但偏弱时再试 1024
+#   precondition_1d: false       # DoRA scale 等 1D 参数退化为 Adam-like 更新
+#   normalize_grads: false       # true 会抹掉部分 loss 权重幅度信息，首跑关闭
+#   correct_bias: true
+#   merge_dims: false            # LoKr 矩阵保持原形状，不合并维度
+
 # ============================================================================
 # Flow Matching / timestep / 噪声增强 / loss 权重
 # ============================================================================
@@ -399,6 +500,18 @@ pyramid_noise_iterations: 0
 # pyramid_noise_discount：每层衰减。0.2-0.4 较稳；越高低频影响越强。
 pyramid_noise_discount: 0.3
 
+# ── Improved Immiscible Diffusion（arXiv 2505.18521）KNN 噪声选择 ──────────────
+# 机理：标准训练把每张图扩散到整个噪声空间，不同图轨迹在噪声层大量交叠(miscibility)，
+# 去噪目标是"多图混合"→难优化。immiscible 给每张图配一个更近的噪声，缩短 flow 轨迹、
+# 降低混合 → 目标更少歧义 → 收敛加速（论文 from-scratch 上 >4×）。
+# 本仓库用 KNN 变种：逐样本采 immiscible_k 个候选高斯噪声，选与该图 latent L2 最近者。
+# per-sample、形状无关 → 与 NaViT 异形逐图打包兼容；关闭时与旧行为逐 bit 等价。
+# ⚠ 注意：论文战绩是 from-scratch 训练"加速"，非 LoRA 微调"画质"；对暗部粒状高频这类
+#   aleatoric 细节，效果点在中~高 t，t→0 处 x_t≈x_0 收益有限。旧版 immiscible(pool)
+#   曾致推理斑块，首次务必单变量 A/B、盯采样图是否出现斑块或多样性塌缩，k 从小值起。
+immiscible_enabled: false   # true 开启；默认 false = no-op
+immiscible_k: 4             # 候选噪声数；1=关，越大混合越低/收敛越快，但偏离纯高斯越多(4~8 起)
+
 # caption_dropout_rate：整条 caption 置空概率，训练无条件分支，提升 CFG 表现。
 # 0.03-0.08 常用；>0.2 容易学不到具体内容。
 caption_dropout_rate: 0.05
@@ -416,11 +529,29 @@ save_every: 0
 # 每 N optimizer step 保存 LoRA。建议与 sample_steps 对齐，方便选 checkpoint。
 save_every_steps: 100
 
+# Save every N ref_step instead of optimizer step. Requires reference_batch_size > 0.
+save_every_reference_steps: 0
+
 # 每 N step 保存完整训练状态。可断点续训，但文件更大。
 save_state_every: 500
 
+# 每 N epoch 保存完整训练状态（epoch 末尾触发）。0=关闭。
+# 与按 step 的 save_state_every 完全独立，可同时开：文件名分别是
+#   training_state_step{N}.pt / training_state_epoch{E}_step{N}.pt，互不覆盖。
+# 用途：每 epoch 步数不固定（ARB/navit 打包下 len(dataloader) 会变）时，按 step 的
+# cadence 很难正好落在 epoch 边界；这个开关保证"每个 epoch 末尾一定有一个可续训的点"。
+# 该 epoch 若已由 save_every 写过 LoRA 成品，这里就只写 .pt，不再重复写同内容的 safetensors。
+save_state_every_epochs: 0
+
 # 从完整训练状态恢复。空字符串表示不用。
 resume_state: ""
+
+# resume 时是否跳过 checkpoint 所在 epoch 内已消费的 batch（默认 true = 从中断处接续）。
+# 依据：三个 batch sampler 的洗牌都只用 random.Random(seed + epoch)，同一 epoch 号的
+# batch 序列逐 batch 可复现，所以"跳过前 N 个"是精确的。数据集或分批配置变了（指纹不
+# 匹配）、或读到旧版本存的 state（没有位置信息）时会自动放弃 skip 并打印告警。
+# 设 false 回到旧行为：从该 epoch 开头重跑整个 epoch（那一段数据会被重复训练）。
+resume_skip_consumed_batches: true
 
 # 随机种子。固定可复现预览；不同 seed 可检查泛化稳定性。
 seed: 42
@@ -435,6 +566,10 @@ sample_every: 0
 # 每 N step 采样。过小会拖慢训练；40-200 适合观察小数据集过拟合点。
 sample_steps: 100
 
+# Sample every N ref_step instead of optimizer step. Requires reference_batch_size > 0.
+# For frequent sampling, consider keep_vae_on_gpu=true and empty_cache_after_sample=false.
+sample_reference_steps: 0
+
 # 单 prompt 采样。若 sample_prompts 非空，通常会轮换多 prompt。
 sample_prompt: "newest, safe, 1girl, masterpiece, best quality"
 
@@ -443,6 +578,38 @@ sample_prompts:
   - "newest, safe, 1girl, masterpiece, best quality"
   - "newest, safe, 1girl, cinematic lighting, backlit, detailed background"
   - "newest, safe, 1girl, bright sunlight, outdoor, dynamic pose"
+
+# ── 预览提示词取自训练集 caption（opt-in，默认 off = 与不写这些键完全等价）──
+# 动机：手写 prompt 与训练分布有距离，看到的"没还原"可能只是 prompt 不在分布内。
+# 直接用训练集的打标做预览，看的是"同一条 caption，底模 vs 当前 LoRA"的差别。
+#
+#   off  —— 只用上面的 sample_prompts（默认）
+#   mix  —— 每次采样以 sample_dataset_prompt_ratio 的概率改从训练集 caption 随机取，
+#           其余走 sample_prompts；手写与训练集分布对照着看
+#   only —— 全部取自训练集 caption（sample_prompts 可留空）
+sample_dataset_prompts: "off"
+
+# mix 模式下取训练集 caption 的概率（0~1）。off/only 时无效。
+sample_dataset_prompt_ratio: 0.5
+
+# each —— 每次采样都重新随机抽一条（多样性高，但每张预览的 prompt 不同，跨 step 不可比）
+# once —— 训练开始时随机抽定 N 条，之后全程在这 N 条里轮换（跨 step 可比，推荐用来看还原度）
+sample_dataset_prompt_pick: "each"
+
+# pick=once 时抽定的条数。多于 caption 池大小会被截断。
+sample_dataset_prompt_count: 4
+
+# 追加到训练集 caption 末尾的固定后缀（例如 ",a"）。留空=原样使用。
+sample_dataset_prompt_suffix: ""
+#
+# 说明：
+# - 取的是打标文件里的**原文**，不做 shuffle_caption / tag_dropout（预览要可比）；
+#   JSON caption 走 caption_utils 组装但 shuffle/dropout 全关。
+# - 同一张图被 `10_xxx` 目录前缀重复计入时只算一条，避免随机抽样被加权。
+# - 抽词用独立 RNG，不动全局 random / torch RNG，因此不影响训练数值；
+#   sample_seed 非 0 时取词序列跨 run 可复现。
+# - 非 off 时，每张预览图旁会写一个同名 .txt 记录本次实际用的 prompt。
+# - 开启但读不到任何 caption 会在模型加载前直接报错退出（fail-fast），不静默回退。
 
 # CFG。Anima 常用 3.5-5。过高会硬、糊或过饱和；过低 prompt 服从弱。
 sample_cfg_scale: 4.0
@@ -489,6 +656,15 @@ monitor_port: 8765
 # 不自动打开浏览器。服务器/云端建议 true。
 no_browser: true
 
+# ── 分阶段计时（opt-in default-off，定位 NaViT vs ARB 速度根因）─────────────
+# flash varlen 已实测与 xformers 等速（attention 非瓶颈），本开关用 CUDA event 分阶段
+# 计时 text_encode / forward / loss / aux / backward / optimizer 等，写 stage_timing.csv。
+# 0 = 关（默认，零开销/行为中立）。开启后每 N 步采样一次，仅被采样步末尾 sync 一次，
+# 稳态 it/s 在非采样步测量不受影响。分析：python tools/analyze_stage_timing.py --csv <output_dir>/stage_timing.csv
+stage_timing_every: 0
+# 计时跳过前 N 步（cudnn autotune / cache 冷），仅 stage_timing_every>0 时生效。
+stage_timing_warmup: 10
+
 # ============================================================================
 # 命令行专用参数提示
 # ============================================================================
@@ -532,3 +708,17 @@ no_browser: true
 #    - 自动 _find_factor 降级
 #    - ComfyUI 键名兼容（lokr_w1/w2_a/w2_b）
 #    小数据集若失败模式难解，可考虑后续接入 lycoris-lora 拿 Tucker 收益。
+
+# ══════════════════════════════════════════════════════════════════
+# 冻结底模量化（opt-in, default-off；详见 docs/base-quant.md）
+# ══════════════════════════════════════════════════════════════════
+# 只量化冻结底模的 Linear（LoRA adapter 全程 bf16）。none 时与历史逐 bit 等价。
+# 收益（krea2 12.9B）：fp8 权重 25.8→12.9GB（H20 可走 fp8 GEMM 提速）；
+# fp4 →6.8GB（H20 无 fp4 tensor core，自动退 dequant-bf16 = 纯省显存）。
+# fail-fast 组合：dora / lora_one_init_steps / torch_compile / 非 bf16。
+base_quant: "none"             # none | fp8 | fp4
+base_quant_gemm: "auto"        # auto=探测到 _scaled_mm 就走量化 GEMM；on=强制(失败报错)；off=只省显存
+base_quant_fp8_scale: "auto"   # auto=优先 rowwise(H20/sm90, torch>=2.5)，退 tensorwise
+base_quant_fp8_grad: false     # 反向 dL/dx 也走 fp8（e5m2 梯度；更快但多一层量化噪声，先 A/B）
+base_quant_include: null       # null=family 默认（krea2: blocks/txtfusion/txtmlp；anima: blocks）
+base_quant_skip: null          # 额外排除的 regex 列表（fullmatch 逻辑层名）

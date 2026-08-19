@@ -1,0 +1,157 @@
+# ==============================================================================
+#  Anima LoRA 训练 · 海光 DCU 镜像（国家超算互联网 scnet · Dockerfile 构建方式）
+#
+#  按平台《构建镜像规则》写成：
+#    https://www.scnet.cn/help/docs/mainsite/container-service/image-management/build-rules/
+#
+#  ★ 平台的 COPY 约定：所有 COPY/ADD 的源路径**相对于家目录下的 dockerFileTemp**
+#    （/public/home/${username}/dockerFileTemp，即 Notebook 里的 /root/private_data/dockerFileTemp）。
+#    用 AnimaLoraToolkit/tools/scnet_stage_dockerfile.sh 一键把上下文准备好。
+#
+#  ★ 平台的硬性要求（缺了实例起不来）：openssh-server、sudo、/opt/conda/bin/jupyter。
+#    基础镜像三样都有，本文件**不动它们**，也不覆盖 CMD/ENTRYPOINT ——
+#    平台按启动路径扫描 IDE，覆盖掉会导致创建实例失败。末尾有一道自检守着这三样。
+#
+#  ★ 体积规则：限制的是 **docker 单层 ≤ 15GB**，不是镜像总大小。所以下面刻意把
+#    「依赖」「代码」「（可选）权重」拆成不同的 RUN/COPY 层，任一层都远小于 15GB。
+# ==============================================================================
+
+# 平台 DCU 基础镜像。控制台不展示这个地址，是直接查光源 harbor 的 registry API 拿到的：
+#   GET https://image.sourcefind.cn:5000/v2/dcu/admin/base/jupyterlab-pytorch/tags/list
+# 并用 config blob 的环境变量跟运行中的实例逐项对拍确认（AMDGPU_TARGETS /
+# MOFED_VERSION / MIOPEN_FIND_MODE / DTKROOT / HF_ENDPOINT 五项全同），
+# 所以这不是猜的。同名还有一个 `-shca` 变体，用途不明，别乱换。
+# 该镜像 Entrypoint=docker-entrypoint.sh、Cmd=/bin/bash —— 本文件不覆盖，原样继承。
+ARG BASE_IMAGE=image.sourcefind.cn:5000/dcu/admin/base/jupyterlab-pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.11-devel
+FROM ${BASE_IMAGE}
+
+LABEL module="jupyter" \
+      description="Anima LoRA training on Hygon DCU (DTK 26.04 / torch 2.9.0+das)"
+
+USER root
+SHELL ["/bin/bash", "-c"]
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+# 构建机的出网方式。scnet 的容器是走内网 HTTP 代理的，构建服务是否同样需要代理未知：
+#   - 不需要：保持 BUILD_PROXY 为空即可
+#   - 需要：--build-arg BUILD_PROXY=http://preset:xxxx@10.16.1.51:3128
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG BUILD_PROXY=
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    http_proxy=${BUILD_PROXY} https_proxy=${BUILD_PROXY} \
+    HTTP_PROXY=${BUILD_PROXY} HTTPS_PROXY=${BUILD_PROXY} \
+    no_proxy=localhost,127.0.0.1
+
+# --- 层 1：记录基线 -----------------------------------------------------------
+# 这是判断「后面有没有被污染」的唯一依据。das 版 torch 一旦被 PyPI 的 CUDA 版覆盖，
+# 报错会全部指向奇怪的地方，所以先把原始状态钉在镜像里。
+#
+# ★ 两个踩过的坑，改法都在这一条里：
+#   (a) 构建期必须先 `. /opt/dtk/env.sh` —— DTK 环境是基础镜像的 docker-entrypoint.sh
+#       在**容器启动时**设的，RUN 不走 entrypoint，裸 import torch 会报
+#       `librocm_smi64.so.2: cannot open shared object file`。
+#   (b) 不能写成 `python -c ... | tee f`：管道的退出码取的是 tee 的，永远成功，
+#       后面的 `&&` 照走 —— 上一次构建里这一步**报错了但没拦住**。改成先写文件再 cat。
+RUN set -eu; \
+    . /opt/dtk/env.sh; \
+    mkdir -p /opt/anima-build; \
+    python -c "import torch;print('BASE torch=',torch.__version__,'hip=',torch.version.hip,'cuda=',torch.version.cuda)" > /opt/anima-build/base_torch.txt; \
+    cat /opt/anima-build/base_torch.txt; \
+    python -m pip list > /opt/anima-build/base_pip_freeze.txt
+
+# --- 层 2：冻结不可动的包 -----------------------------------------------------
+# 镜像里**没有 torchvision**，而仓库原 requirements.txt 写着 torchvision>=0.15.0 ——
+# pip 会从 PyPI 装它，连带把 das 版 torch 换成 CUDA 构建。constraints 把 torch/numpy
+# 钉死之后，任何想换它们的包会**报错**而不是静默替换。
+COPY anima-lora-train/AnimaLoraToolkit/tools/dcu_gen_constraints.py /opt/anima-build/
+RUN python /opt/anima-build/dcu_gen_constraints.py > /opt/anima-build/constraints-dcu.txt \
+ && cat /opt/anima-build/constraints-dcu.txt
+
+# --- 层 3：依赖（改 requirements 时只有这层失效）------------------------------
+COPY anima-lora-train/AnimaLoraToolkit/requirements-dcu.txt /opt/anima-build/
+RUN python -m pip install --prefer-binary --root-user-action=ignore \
+        -c /opt/anima-build/constraints-dcu.txt \
+        -r /opt/anima-build/requirements-dcu.txt \
+ && python -m pip install --prefer-binary --root-user-action=ignore \
+        -c /opt/anima-build/constraints-dcu.txt \
+        wandb accelerate
+
+# --- 层 3.5：DAS 生态轮子（flash_attn / triton，2026-08-18 真机验证通过）------------
+# 这两个包 PyPI 上只有 NVIDIA CUDA 版（`pip index versions flash-attn` 全是 cu 段），
+# 必须装海光光源 DAS1.8 的预编译轮子（torch290 / cp311 段 = torch 2.9.0+das.opt1.dtk2604
+# / py3.11，与本镜像配套）。装上后 DAS torch 的 SDPA flash 后端被激活（运行时 dlopen
+# flash_attn_2_cuda*.so）：无 mask SDPA 峰值显存 32.57 → 0.34 GiB（S=16384），
+# 数值 max|Δ|=4.88e-4。版本核实与获取方式见
+# AnimaLoraToolkit/docs/dcu-attn-backend-research.md。
+# pytest 是 flash_attn import 链的硬依赖（flash_attn_triton.py 模块级 import）。
+# ★ 构建期到 download.sourcefind.cn:65024 的公网可达性：tuna 直连可达（§9 实测），
+#   该站公网证书正常（本地 curl 200 验证）；若构建机访问不通，把两个 wheel 下载到
+#   dockerFileTemp 再 COPY（参照层 6 的权重做法）。
+ARG DAS_FLASH_ATTN_URL=https://download.sourcefind.cn:65024/directlink/4/flash_attn/DAS1.8/flash_attn-2.8.3+das.opt1.dtk2604.torch290-cp311-cp311-manylinux_2_28_x86_64.whl
+ARG DAS_TRITON_URL=https://download.sourcefind.cn:65024/directlink/4/triton/DAS1.8/triton-3.5.1+das.opt1.dtk2604.torch290-cp311-cp311-manylinux_2_28_x86_64.whl
+RUN set -eu; \
+    python -m pip install --root-user-action=ignore "${DAS_FLASH_ATTN_URL}" "${DAS_TRITON_URL}"; \
+    python -m pip install --root-user-action=ignore pytest
+
+# --- 层 4：环境脚本 -----------------------------------------------------------
+# DTK 的 env.sh 不在 /etc/profile.d 里（不 source 就 import torch 报
+# libgalaxyhip.so.5 找不到）；出网代理只存在于 jupyter 进程的环境里，ssh 会话拿不到。
+COPY anima-lora-train/AnimaLoraToolkit/tools/scnet_env.sh /etc/profile.d/zz-scnet-env.sh
+RUN chmod 0755 /etc/profile.d/zz-scnet-env.sh \
+ && echo '[ -f /etc/profile.d/zz-scnet-env.sh ] && . /etc/profile.d/zz-scnet-env.sh' >> /root/.bashrc
+
+# --- 层 4.5：前端 IDE（jupyterlab 升级 + code-server）--------------------------
+# 平台构建镜像页可指定两个 IDE 的启动路径（路径存在才会展示）：
+#   jupyter: /opt/conda/bin/jupyter  —— 软链，pip 升级不动它
+#   VSCode : /usr/lib/code-server/bin/code-server  —— 基础镜像不带，需自装
+# jupyterlab 升级走 tuna 直连（构建期实测可达）；code-server 官方分发在
+# code-server.dev / github releases，scnet 出网实测 SSL timeout（2026-08-18），
+# 所以 tarball 由用户本地下载后放进 dockerFileTemp/（构建上下文）再 COPY，
+# 文件名形如 code-server-<版本>-linux-amd64.tar.gz（下面用通配符匹配）。
+# 升级/替换 code-server 时只需换 dockerFileTemp 里的 tarball，只有这层缓存失效。
+RUN python -m pip install --upgrade --root-user-action=ignore "jupyterlab>=4.2,<5"
+COPY code-server-*-linux-amd64.tar.gz /opt/anima-build/
+RUN set -eu; \
+    mkdir -p /usr/lib/code-server; \
+    tar -xzf /opt/anima-build/code-server-*-linux-amd64.tar.gz \
+        -C /usr/lib/code-server --strip-components=1; \
+    ln -sf /usr/lib/code-server/bin/code-server /usr/local/bin/code-server; \
+    /usr/lib/code-server/bin/code-server --version
+
+# --- 层 5：代码 ---------------------------------------------------------------
+# stage 脚本已经剔掉 .git / 权重 / 数据集 / 输出，这层约 45MB。
+COPY anima-lora-train/ /opt/anima-lora-train/
+
+# --- 层 6（可选，默认关闭）：把权重也固化进镜像 --------------------------------
+# 默认**不带**：权重在平台共享目录里本来就有（每个节点都能读），塞进镜像只会让每次
+# 拉取多传 5.6GB。要做成完全自包含的参赛产物时，把权重放进 dockerFileTemp/anima_models/
+# 再解开下面两行。5.6GB 单层，远低于 15GB 上限。
+# COPY anima_models/ /opt/anima_models/
+# ENV ANIMA_MODELS_DIR=/opt/anima_models
+
+# --- 层 7：★ 硬门槛 -----------------------------------------------------------
+# ★ 这里**不能用 heredoc**。scnet 用的是 docker legacy builder，它把 RUN 的多行命令
+#   压成一行，`python - <<'PY' ... PY` 会退化成
+#       warning: here-document at line 1 delimited by end-of-file (wanted `PY')
+#   校验一行都不跑，这一步却「成功」—— 上一次构建就是这样，门槛完全没生效。
+#   所以校验写成仓库里的真实脚本 tools/dcu_image_selfcheck.py，这里只调用它。
+#
+# 检查项：torch 仍是 HIP 构建、numpy 仍是 1.x、训练必需依赖齐全、平台必需组件
+#        （sshd / sudo / /opt/conda/bin/jupyter）齐全、环境脚本已安装。
+# 任一不过则 build 失败。
+RUN set -eu; \
+    . /opt/dtk/env.sh; \
+    python /opt/anima-lora-train/AnimaLoraToolkit/tools/dcu_image_selfcheck.py
+
+# 构建期代理不该留在运行期环境里（凭据会随实例变，由 zz-scnet-env.sh 动态读取）
+ENV http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY=
+
+ENV ANIMA_DCU=1
+WORKDIR /opt/anima-lora-train
+
+# ★ 不设 CMD/ENTRYPOINT：沿用基础镜像的 IDE 启动方式。平台按启动路径扫描 IDE，
+#   覆盖掉会导致创建实例失败。

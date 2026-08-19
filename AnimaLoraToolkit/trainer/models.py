@@ -18,11 +18,12 @@ import importlib.util
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
 
-from trainer.checkpoint import _load_safetensors_state_dict, _load_weights_best_effort
+from trainer.checkpoint import _load_safetensors_into_model
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +44,15 @@ def find_diffusion_pipe_root():
 
 
 def load_module_from_path(module_name, file_path):
-    """动态加载 Python 模块"""
+    """动态加载 Python 模块
+
+    必须在 exec_module 之前把模块注册到 sys.modules，否则模块内定义的
+    @dataclass 装饰器在 CPython 3.12+ 会因 sys.modules.get(cls.__module__)
+    返回 None 而抛 AttributeError（bpo-120492）。
+    """
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -74,39 +81,74 @@ _RECOMPUTABLE_BUFFER_PATTERNS = (
 )
 
 
-def _filter_recomputable_buffers(sd: dict, model) -> dict:
-    """从 checkpoint state_dict 中滤掉 shape 不匹配的 derivative buffer。
+# RoPE 派生 buffer 所属模块的属性名。fast_init 路径下这些模块的 buffer 是从 arange
+# 重算的（不是训练学到的），必须在 to_empty() 之后显式 reset_parameters()。
+_POS_EMBEDDER_MODULE_SUFFIXES = ("pos_embedder", "extra_pos_embedder")
 
-    背景：把 `max_img_h` 从 240 改成 288 后，`pos_embedder.seq` 的 model 端 shape 从
-    (128,) 变成 (144,)（取决于 max(len_h, len_w, len_t)）。但 checkpoint 里的 seq 还是
-    旧 shape；`model.load_state_dict(..., strict=False)` 在某些 PyTorch 版本会因为
-    shape mismatch 直接 raise RuntimeError，而不是吞掉。
 
-    这里只滤 derivative buffer，不影响任何学到的参数（weights/biases/learnable pos）。
+def _build_anima_on_meta(Anima, config):
+    """在 meta device 上构造 Anima，再 to_empty 到 CPU。
+
+    为什么：2.09B 参数的默认随机初始化（kaiming_uniform_ 等）是纯 CPU 串行开销，
+    本地 16 线程实测 26.5s，算力受限的节点上实测 301.5s —— 而这些随机值随即会被
+    checkpoint 权重整个覆盖，一个字节都用不上。meta 构造把这段降到接近 0。
+
+    代价与防线：``to_empty()`` 分配的是**未初始化内存**，任何没被 checkpoint 填过的
+    参数/buffer 都会是垃圾值（且不会报错，只会让训练悄悄跑歪）。所以本函数返回它显式
+    重算过的 key 集合，由 ``_assert_no_uninitialized`` 与加载结果对账，对不上就 raise。
+
+    返回 ``(model, recomputed_keys)``。
     """
-    model_sd = model.state_dict()
-    out = {}
-    dropped = []
-    for k, v in sd.items():
-        # 看裸 key（剥离常见 prefix 之前）是否含有 derivative buffer 关键字
-        recomputable = any(pat in k for pat in _RECOMPUTABLE_BUFFER_PATTERNS)
-        if recomputable and k in model_sd and tuple(v.shape) != tuple(model_sd[k].shape):
-            dropped.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+    with torch.device("meta"):
+        model = Anima(**config)
+    model.to_empty(device="cpu")
+
+    # 需要显式重算的两类模块：
+    #   1) RoPE 位置嵌入 —— 它的 buffer 在 ckpt 里有，但 shape 跟着 max_img_* 变，
+    #      加载时按 recomputable 丢弃（见 _RECOMPUTABLE_BUFFER_PATTERNS）。
+    #   2) 任何持有 **non-persistent buffer** 的模块 —— 这类 buffer 不进 state_dict，
+    #      checkpoint 永远填不到（如 llm_adapter.rotary_emb.inv_freq）。
+    persistent = set(model.state_dict().keys())
+    recomputed: set[str] = set()
+    for mname, m in model.named_modules():
+        own_buffers = [f"{mname}.{b}" if mname else b for b, _ in m.named_buffers(recurse=False)]
+        needs = (mname.split(".")[-1].endswith(_POS_EMBEDDER_MODULE_SUFFIXES)
+                 or any(k not in persistent for k in own_buffers))
+        if not needs or not hasattr(m, "reset_parameters"):
             continue
-        out[k] = v
-    if dropped:
-        for name, ck_shape, md_shape in dropped[:5]:
-            logger.info(
-                "Drop recomputable buffer from ckpt: %s (ckpt=%s, model=%s) — 模型 reset_parameters() 会重算",
-                name, ck_shape, md_shape,
-            )
-        if len(dropped) > 5:
-            logger.info("  ... 共 %d 个 recomputable buffer 被跳过", len(dropped))
-    return out
+        m.reset_parameters()
+        recomputed.update(own_buffers)
+    return model, recomputed
+
+
+def _assert_no_uninitialized(model, load_info: dict, recomputed: set) -> None:
+    """fail-fast：确认 fast_init 之后模型里没有残留的未初始化内存。
+
+    未被 checkpoint 填过的 key = ``missing``（ckpt 里根本没有）∪ ``skipped``（ckpt 里有
+    但 shape 不匹配、被当作 recomputable 丢掉）。这些必须全部落在 ``recomputed`` 里。
+    另外 state_dict 不含 non-persistent buffer，单独再查一遍。
+    """
+    unfilled = set(load_info.get("missing", ())) | set(load_info.get("skipped", ()))
+    persistent = set(model.state_dict().keys())
+    non_persistent = {n for n, _ in model.named_buffers()} - persistent
+    leftover = sorted((unfilled | non_persistent) - set(recomputed))
+    if leftover:
+        raise RuntimeError(
+            f"fast_init（meta 构造）后有 {len(leftover)} 个参数/buffer 既没被 checkpoint "
+            f"填充、也没被显式重算，内容是未初始化内存：{leftover[:10]}"
+            f"{' ...' if len(leftover) > 10 else ''}。"
+            f"请设 fast_init=false（回到 CPU 随机初始化路径）并反馈这个列表 —— "
+            f"这说明模型结构里新增了 fast_init 不认识的、需要真初始化的张量。"
+        )
+    logger.info(
+        "[fast_init] 校验通过：%d 个 key 由 checkpoint 填充，%d 个 RoPE 派生 buffer 已重算，"
+        "无未初始化残留。", len(model.state_dict()) - len(unfilled), len(recomputed),
+    )
 
 
 def load_anima_model(transformer_path, device, dtype, repo_root,
-                     max_img_h: int = 240, max_img_w: int = 240, max_frames: int = 128):
+                     max_img_h: int = 240, max_img_w: int = 240, max_frames: int = 128,
+                     fast_init: bool = False):
     """加载 Anima transformer 模型。
 
     `max_img_h` / `max_img_w` 控制 RoPE position embedding 的 `seq` buffer 长度上限
@@ -118,8 +160,8 @@ def load_anima_model(transformer_path, device, dtype, repo_root,
 
     Anima 当前没有启用 `extra_per_block_abs_pos_emb`（learnable pos embedding 是关掉的），
     所以加大这两个值**只会改变 RoPE 的 arange buffer 长度**，不会破坏权重加载兼容性。
-    seq buffer 是 derivative tensor（recomputable from arange），shape 不匹配时被
-    `_filter_recomputable_buffers` 滤掉，模型仍按构造时的正确 shape 工作。
+    seq buffer 是 derivative tensor（recomputable from arange），shape 不匹配时
+    `_load_safetensors_into_model(skip_buffer_patterns=...)` 跳过，模型仍按构造时的正确 shape 工作。
     """
     from safetensors import safe_open
 
@@ -184,14 +226,32 @@ def load_anima_model(transformer_path, device, dtype, repo_root,
         rope_t_extrapolation_ratio=1.0,
     )
 
-    model = Anima(**config)
+    # 构造与权重加载都是纯 CPU 且都以分钟计（2.09B 参数）。分开计时：算力受限的节点上
+    # 这两段能占掉启动的绝大部分，不切开就只能看到一个几分钟的"卡住"。
+    _t0 = time.perf_counter()
+    if fast_init:
+        model, _recomputed = _build_anima_on_meta(Anima, config)
+    else:
+        model, _recomputed = Anima(**config), None
+    _t_build = time.perf_counter() - _t0
 
-    sd = _load_safetensors_state_dict(Path(transformer_path))
-    sd = _filter_recomputable_buffers(sd, model)
-    _load_weights_best_effort(model, sd, label="Transformer")
+    _t0 = time.perf_counter()
+    _info = _load_safetensors_into_model(
+        model, Path(transformer_path), label="Transformer",
+        skip_buffer_patterns=_RECOMPUTABLE_BUFFER_PATTERNS,
+    )
+    _t_load = time.perf_counter() - _t0
+    logger.info(
+        "Transformer 启动耗时: 构造%s %.1fs + 权重加载 %.1fs (torch 线程数=%d)",
+        "(meta, 跳过随机初始化)" if fast_init else "(CPU 随机初始化)",
+        _t_build, _t_load, torch.get_num_threads(),
+    )
+    if fast_init:
+        _assert_no_uninitialized(model, _info, _recomputed)
 
     # 如果 checkpoint 中完全没有 llm_adapter 权重，随机初始化会把 cross-attn 条件搞乱，直接禁用更安全
-    has_llm_adapter = any("llm_adapter" in k for k in sd.keys())
+    with safe_open(transformer_path, framework="pt", device="cpu") as f:
+        has_llm_adapter = any("llm_adapter" in k for k in f.keys())
     if not has_llm_adapter and hasattr(model, "llm_adapter"):
         try:
             model.llm_adapter = None
@@ -205,10 +265,22 @@ def load_anima_model(transformer_path, device, dtype, repo_root,
     return model
 
 
-def load_vae(vae_path, device, dtype, repo_root):
-    """加载 VAE"""
+def load_vae(vae_path, device, dtype, repo_root, attn_chunk_tokens: int = 0):
+    """加载 VAE
+
+    `attn_chunk_tokens` > 0 时开启 VAE 自注意力的 query 分块（数学恒等，把 math-SDPA
+    后端下 O(N²) 的峰值显存降到 O(chunk·N)）。0 = 关闭，走原来的整块 SDPA。
+    """
     wan_vae = load_module_from_path("wan_vae", repo_root / "wan" / "vae2_1.py")
     WanVAE = wan_vae.WanVAE_
+
+    if int(attn_chunk_tokens or 0) > 0:
+        wan_vae.set_vae_attn_chunk_tokens(int(attn_chunk_tokens))
+        logger.info(
+            "[vae-attn] query 分块已启用：chunk=%d token。VAE 中间块是单头全局注意力，"
+            "SDPA 落到 math backend 时显存 O(N²)；分块后峰值 ≈ chunk·N，数学恒等（非近似）。",
+            int(attn_chunk_tokens),
+        )
 
     cfg = dict(
         dim=96, z_dim=16, dim_mult=[1, 2, 4, 4],
@@ -218,8 +290,7 @@ def load_vae(vae_path, device, dtype, repo_root):
 
     model = WanVAE(**cfg).eval().requires_grad_(False)
 
-    sd = _load_safetensors_state_dict(Path(vae_path))
-    _load_weights_best_effort(model, sd, label="VAE")
+    _load_safetensors_into_model(model, Path(vae_path), label="VAE")
     model = model.to(device=device, dtype=dtype)
 
     # VAE 归一化参数
@@ -245,6 +316,32 @@ def load_vae(vae_path, device, dtype, repo_root):
     return wrapper
 
 
+_QWEN_LEGACY_SUBDIR = "Qwen3-0.6B-Base"
+
+
+def _resolve_qwen_dir(qwen_path):
+    """兼容旧布局的路径解析。
+
+    Qwen3-0.6B 的权重/tokenizer 原本平铺在 `models/text_encoders/` 根目录，与 Krea2 的
+    `text_encoders/Qwen3-VL-4B-Instruct/` 层级不对称，已整理进 `text_encoders/Qwen3-0.6B-Base/`。
+    但训练 yaml 不随代码一起推送，云端可能仍写着旧的根目录路径 —— 这里做一次显式兜底：
+    只有当目标目录**没有** config.json、而其下 `Qwen3-0.6B-Base/` 有时才改写，并打 warning。
+    路径写对时本函数是恒等的，不引入任何行为变化。
+    """
+    p = Path(qwen_path)
+    if (p / "config.json").exists():
+        return qwen_path
+    legacy = p / _QWEN_LEGACY_SUBDIR
+    if (legacy / "config.json").exists():
+        logger.warning(
+            "text_encoder_path=%r 下没有 config.json，已自动改用 %r（Qwen3-0.6B 已从 "
+            "text_encoders/ 根目录整理进子目录）。建议更新 yaml 里的 text_encoder_path。",
+            str(p), str(legacy),
+        )
+        return str(legacy)
+    return qwen_path
+
+
 def load_text_encoders(qwen_path, t5_tokenizer_path, device, dtype):
     """加载文本编码器。
 
@@ -256,6 +353,7 @@ def load_text_encoders(qwen_path, t5_tokenizer_path, device, dtype):
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer, T5Tokenizer
 
+    qwen_path = _resolve_qwen_dir(qwen_path)
     qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_path, trust_remote_code=True)
 
     try:

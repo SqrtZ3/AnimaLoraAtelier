@@ -47,9 +47,13 @@ python -m kaggle auth login
 
 ```powershell
 cd anima_train
-python build_job.py --config ..\..\AnimaLoraToolkit\config\train_anima.yaml
+python build_job.py --config ..\..\AnimaLoraToolkit\config\private\train_tpu_ashima.yaml `
+    --extra-args "--max-steps 40" `
+    --env ANIMA_DATA_DIR=/kaggle/input/datasets/ilovebg/ashima-anima2-tpu-cache `
+    --env ANIMA_OUTPUT_DIR=/kaggle/working/out `
+    --hf-model circlestone-labs/Anima:split_files/diffusion_models/anima-base-v1.0.safetensors:f7382c4bf9d7ffe4ceea593a0adbb470c56dd79b
 cd ..
-.\kaggle_run.ps1 -Username 你的用户名 -Accelerator TpuV5E8 -TimeoutSec 40000 `
+.\kaggle_run.ps1 -Username 你的用户名 -Accelerator TpuV5E8 -TimeoutSec 7200 `
     -JobDir anima_train -FilePattern '(.*\.safetensors|.*\.npz|.*\.json|.*\.log)$'
 ```
 
@@ -60,14 +64,35 @@ cd ..
 正常 import —— **不是**首尾拼接（10 个模块互相带命名空间引用，拼接会静默覆盖同名
 顶层函数）。脚本带源码 sha，本地跑过的代码与真机逐字节相同。
 
-权重与缓存走 Kaggle Models / Datasets，在 `kernel-metadata.json` 里挂，路径用环境
-变量覆盖 yaml（yaml 本身不动，两个后端共用同一份）：
+### 权重与数据从哪来（2026-08-19 首秀定案的形态）
 
-```
-ANIMA_TRANSFORMER=/kaggle/input/anima-base/anima-base-v1.0.safetensors
-ANIMA_DATA_DIR=/kaggle/input/<latent+textfeat 缓存>
-ANIMA_OUTPUT_DIR=/kaggle/working/out
-```
+- **底模走 job 内 HF 直下**（`--hf-model <repo>:<文件>[:<revision>]`），不走 Kaggle
+  Models：本机上传 4.2GB 太慢，而 Kaggle → HF 实测 **10~13 秒**拉完。revision 钉死，
+  且 HF 文件的 X-Linked-ETag 已与本地那份的 sha256 核对一致（bd43b7cf…），
+  对拍环境与真机权重逐字节相同。repo 是 public 非 gated，不需要 token。
+- **数据缓存走 Kaggle Dataset**（私有），`dataset_sources` 挂进 metadata。
+  latent / textfeat 两份缓存都由 PyTorch 侧离线产出：`tools/cache_latents.py`
+  （图像侧，本仓库新增）+ `tools/cache_text_features.py`（文本侧，含
+  `--empty-caption` 给 caption_dropout 用）。
+- **挂载布局已变（实测）**：dataset 现在在 `/kaggle/input/datasets/<owner>/<slug>/`，
+  不再是 `/kaggle/input/<slug>/`。路径用 `--env ANIMA_DATA_DIR=...` 烘焙进脚本，
+  运行时 `_override_paths` 用它覆盖 yaml 里的本地路径（yaml 本身不动，两个后端
+  共用同一份）。写错路径的代价是一轮白跑 —— 拿不准就先跑 `input_probe/`
+  （CPU、零配额）把 `/kaggle/input` 的实际布局打出来。
+
+### 首秀实测（2026-08-19，v5e-8，ashima-anima2，C12 全套开关）
+
+40 步全过：loss 0.005~0.017 随图数正常波动、gnorm 0.001~0.01 无爆炸、
+填充率 93.6~99.4%；稳态步时与布局探针的 16.9k tok/s 工作点吻合；
+40 步 + 14 种布局的首次全量编译合计 ~9.6 分钟。LoKr+DoRA 存档键名
+`lora_unet_blocks_N_*.lokr_w1/lokr_w2_a/lokr_w2_b/dora_scale/alpha`，
+ComfyUI 可直接加载。两个坑都记在案：
+
+1. **dataset 刚传完有处理窗口**：`datasets status` 变 ready 之前 push 的 kernel
+   挂载不到它（FileNotFoundError），白烧 ~1 分钟 TPU。等 ready 再推。
+2. **驱动脚本会吃到陈旧 COMPLETE**：同一 kernel 连续 push 时，轮询的第一拍可能
+   读到上一跑的 COMPLETE 提前退出、拉回旧产物。看到"疑似失败但状态还在 RUNNING"
+   时以 `kernels status` 为准，跑完用 `-PullOnly` 补拉。
 
 **先跑 `--plan-only`**（本地即可，零配额）：它把配置摘要、数据集 token 分布、
 打包报告（布局数/填充率/成步率）、适配器结构与参数量全打出来。三个数决定 8 卡
@@ -270,15 +295,18 @@ python probe_tpu_splash.py --interpret --ref-len 512 --skip-slow
 
 | 路径 | 作用 |
 |---|---|
-| `kaggle_run.ps1` | 本地驱动：改写 metadata → 看配额 → push → 轮询 → 拉产物 → 再看配额 |
+| `kaggle_run.ps1` | 本地驱动：改写 metadata → 看配额 → push → 轮询 → 拉产物 → 再看配额。**用 `pwsh`（PS7）跑**：文件是无 BOM 的 UTF-8，Windows PowerShell 5.1 会按 GBK 误读中文注释直接解析失败 |
 | `splash_probe/kernel-metadata.json` | kernel 元数据（`kernel_type: script`，`id` 由驱动脚本填用户名） |
 | `splash_probe/probe_tpu_splash.py` | 探针本体，自包含、无仓库依赖 |
+| `anima_train/` | 真训练 job：`build_job.py` 打包（`--env`/`--hf-model`/`--extra-args`），生成物 `anima_train_job.py` 不进 git |
+| `input_probe/` | 零配额（CPU）诊断：`/kaggle/input` 实际挂载布局打出来，dataset 路径拿不准时先跑它 |
 | `output/<slug>/` | 拉回的产物（驱动脚本自动创建） |
 
 ## 后续（探针通过之后才做）
 
-真正训练时的形态是：代码走 Kaggle Dataset，权重走 Kaggle Models，入口脚本只有几十行，
-`dataset_sources` / `model_sources` 在 metadata 里挂上。产物写 `/kaggle/working`，
-run 结束后拉回来传成新的 dataset version，作为下一棒的输入——12h 断点可以这样自动接棒。
+~~真正训练时的形态是：代码走 Kaggle Dataset，权重走 Kaggle Models~~ **已落地，
+见上面"真训练 job"**：代码 base64 内嵌进单文件脚本，权重 job 内 HF 直下（钉 revision），
+数据走私有 Kaggle Dataset。产物写 `/kaggle/working`，run 结束后拉回来传成新的
+dataset version，作为下一棒的输入——12h 断点可以这样自动接棒。
 
-真正的硬约束是 **20h/周**，接棒自动化解决不了它。
+真正的硬约束是 **20h/周**（本周已用 ~1.4h，含探针与首秀），接棒自动化解决不了它。

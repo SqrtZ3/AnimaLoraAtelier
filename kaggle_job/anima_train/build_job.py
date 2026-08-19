@@ -53,6 +53,15 @@ def main() -> int:
     ap.add_argument("--config", required=True, help="训练 yaml（会被内嵌进脚本）")
     ap.add_argument("--extra-args", default="",
                     help="追加给 run_train 的命令行参数，如 --max-steps 50")
+    ap.add_argument("--env", action="append", default=[],
+                    help="烘焙进脚本的 ANIMA_* 环境变量，如 "
+                         "--env ANIMA_DATA_DIR=/kaggle/input/ashima-cache。"
+                         "job 的 _override_paths 用它覆盖 yaml 里的本地路径")
+    ap.add_argument("--hf-model", default="",
+                    help="从 HF 直下半成品权重：<repo>:<文件名>[:<revision>]，如 "
+                         "circlestone-labs/Anima:split_files/diffusion_models/"
+                         "anima-base-v1.0.safetensors:f7382c4...。脚本会在 import jax "
+                         "之后、run_train 之前下载，并把 ANIMA_TRANSFORMER 指到产物")
     a = ap.parse_args()
 
     blobs, digest = {}, hashlib.sha256()
@@ -63,17 +72,34 @@ def main() -> int:
     cfg_raw = Path(a.config).read_bytes()
     digest.update(cfg_raw)
 
+    env_kv = {}
+    for item in a.env:
+        k, _, v = item.partition("=")
+        if not k or not v:
+            raise SystemExit(f"--env 需要 KEY=VAL 形式，收到 {item!r}")
+        env_kv[k] = v
+    hf = ()
+    if a.hf_model:
+        parts = a.hf_model.split(":")
+        if len(parts) not in (2, 3):
+            raise SystemExit("--hf-model 需要 <repo>:<文件名>[:<revision>]")
+        hf = tuple(parts)
+
     body = _TEMPLATE.format(
         preamble=(HERE / "_preamble.py").read_text(encoding="utf-8"),
         blobs=repr(blobs),
         cfg=repr(base64.b64encode(cfg_raw).decode()),
         sha=digest.hexdigest()[:16],
         extra=repr(a.extra_args.split()),
+        env=repr(env_kv),
+        hf=repr(hf),
     )
     OUT.write_text(body, encoding="utf-8")
     compile(body, str(OUT), "exec")          # 语法自检，别推上去才炸
     print(f"已生成 {OUT}（{len(body.splitlines())} 行，源码 sha {digest.hexdigest()[:16]}）")
-    print(f"内嵌模块 {len(MODULES)} 个 + 配置 {Path(a.config).name}")
+    print(f"内嵌模块 {len(MODULES)} 个 + 配置 {Path(a.config).name}"
+          + (f"，env {sorted(env_kv)}" if env_kv else "")
+          + (f"，HF 直下 {hf[0]}:{hf[1]}" if hf else ""))
     return 0
 
 
@@ -92,6 +118,8 @@ from pathlib import Path
 _BLOBS = {blobs}
 _CFG = {cfg}
 _EXTRA = {extra}
+_ENV = {env}            # build_job --env 烘焙的路径覆盖（ANIMA_* ）
+_HF = {hf}              # build_job --hf-model 烘焙的 (repo, 文件名[, revision])
 
 _PKG = Path("/kaggle/working/jax_tpu")
 if not _PKG.parent.exists():                 # 本地干跑
@@ -103,6 +131,30 @@ _CFG_PATH = _PKG / "train.yaml"
 _CFG_PATH.write_bytes(base64.b64decode(_CFG))
 sys.path.insert(0, str(_PKG))
 print(f"[ INFO ] 已解包 {{len(_BLOBS)}} 个模块 -> {{_PKG}}", flush=True)
+
+for _k, _v in _ENV.items():
+    os.environ.setdefault(_k, _v)
+    print(f"[ INFO ] env {{_k}} = {{os.environ[_k]}}", flush=True)
+
+if _HF:
+    # HF 直下底模（public repo，enable_internet=true 即可，无需 token）。
+    # 钉 revision 是为了与本地对拍环境逐字节一致 —— 本地那份的 sha256 已与
+    # HF 的 X-Linked-ETag 核对过。下载走 /kaggle/working（系统盘未必装得下 4.2GB）。
+    os.environ.setdefault("HF_HOME", "/kaggle/working/hf_cache")
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        import subprocess as _sp
+        _sp.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"],
+                check=True)
+        from huggingface_hub import hf_hub_download
+    _repo, _file = _HF[0], _HF[1]
+    _rev = _HF[2] if len(_HF) > 2 else None
+    _t0 = __import__("time").time()
+    _p = hf_hub_download(_repo, _file, revision=_rev)
+    os.environ.setdefault("ANIMA_TRANSFORMER", _p)
+    print(f"[ INFO ] HF {{_repo}}:{{_file}} -> {{_p}}"
+          f"（{{__import__('time').time() - _t0:.0f}}s）", flush=True)
 
 
 def _override_paths(path):

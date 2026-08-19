@@ -1,0 +1,101 @@
+# Krea2-TPU 真机冒烟配置（随机权重 tiny 构型 + 合成数据，零门槛验证全链路）
+# 用途：在 Kaggle v5e-8 上验证 FSDP 加载/splash 内核/训练步/导出的真机行为，
+#       不验证画质（权重与数据都是合成的）。
+model_family: "krea2"
+transformer_path: "D:/Datasets/_staging/krea2-tiny-model/tiny.safetensors"
+vae_path: "unused"                       # TPU 不做编码，路径只占位
+krea2_text_encoder_path: "unused"        # 文本特征已缓存
+data_dir: "D:/Datasets/_staging/krea2-tiny-data"
+resolution: 512
+repeats: 8                               # 16 张 x 8 = 128 实例，凑得出 8 卡一步
+navit_packing: true
+navit_native_resolution: true
+navit_token_budget: 16384                # = 8 卡 x 2048（tiny 模型小，budget 小）
+navit_multiscale: false
+navit_pack_strategy: "ffd"
+flip_augment: false                      # 合成缓存没有 latent_flipped
+caption_dropout_rate: 0.0
+lora_type: "lora"
+lora_rank: 8
+lora_alpha: 8.0
+lokr_factor: 4
+lora_variant: "base"
+rank_dropout: 0.0
+module_dropout: 0.0
+loraplus_lr_ratio: 1.0
+optimizer_type: "adamw"
+learning_rate: 1e-3
+optimizer_args:
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.0
+epochs: 3
+max_steps: 0                             # 由 --extra-args 控制
+grad_accum: 1
+grad_clip_max_norm: 1.0
+mixed_precision: "bf16"
+grad_checkpoint: true
+flow_shift: 1.0
+timestep_sampling: "logit_normal"
+timestep_stratified: false
+timestep_t_min: 0.0
+timestep_t_max: 1.0
+schedule_shift: 1.0
+timestep_mix_low_prob: 0.5
+timestep_mix_high_prob: 0.25
+timestep_logsnr_mu: -6.0
+timestep_logsnr_sigma: 2.0
+timestep_laplace_mu: 0.0
+timestep_laplace_b: 0.5
+timestep_mix_anneal_start: 0
+timestep_mix_anneal_end: 0
+timestep_mix_low_prob_end: -1.0
+timestep_mix_high_prob_end: -1.0
+krea2_res_shift: true
+krea2_shift_min_res: 256
+krea2_shift_max_res: 1280
+krea2_shift_y1: 0.5
+krea2_shift_y2: 1.15
+loss_type: "mse"
+huber_c: 0.1
+huber_schedule: "constant"
+huber_snr_clamp_max: 10.0
+loss_weighting_scheme: "none"
+min_snr_gamma: 5.0
+detail_inv_t_min: 1.0
+detail_inv_t_max: 5.0
+immiscible_enabled: false
+immiscible_k: 4
+eisbach_lambda: 0.0
+dfm_lambda: 0.0
+dfm_mode: "vecor"
+aux_spectral_enabled: false
+aux_spectral_lambda: 0.05
+aux_spectral_use_wavelet: false
+aux_spectral_wavelet_lambda: 0.05
+aux_spectral_t_gate: 0.7
+adaptive_timestep: false
+adaptive_timestep_metric: "slope"
+adaptive_timestep_bins: 16
+adaptive_timestep_ema_decay: 0.95
+adaptive_timestep_slope_slow_decay: -1.0
+adaptive_timestep_burn_in: 160
+adaptive_timestep_min_factor: 0.5
+adaptive_timestep_max_factor: 2.0
+adaptive_timestep_base_mix: 0.25
+adaptive_timestep_candidate_mult: 8
+adaptive_timestep_low_noise_gate: false
+adaptive_timestep_gate_n: 3.0
+adaptive_timestep_gate_c: 0.05
+adaptive_timestep_highfreq_weight: 0.25
+eval_every: 0
+eval_count: 0
+eval_t_grid: ""
+eval_seed: 1234
+output_dir: "./output"
+output_name: "krea2-tiny-smoke"
+save_every: 1
+save_every_steps: 0
+save_state_every: 0
+resume_state: ""
+log_every: 1

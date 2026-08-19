@@ -8,7 +8,11 @@
   "enable_gpu": "false",
   "enable_tpu": "false",
   "enable_internet": "false",
-  "dataset_sources": ["ilovebg/ashima-anima2-tpu-cache"],
+  "dataset_sources": [
+    "ilovebg/ashima-anima2-tpu-cache",
+    "ilovebg/krea2-tiny-data",
+    "ilovebg/krea2-tiny-model"
+  ],
   "competition_sources": [],
   "kernel_sources": [],
   "model_sources": []

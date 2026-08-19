@@ -60,9 +60,25 @@ cd ..
 `-FilePattern` **必须改**：默认值只拉 `*_probe*` 与 `*.log`，训练产物
 （`.safetensors` / 优化器状态 `.npz`）会被过滤掉，跑完了却什么也拿不回来。
 
-`build_job.py` 把 `jax_tpu/` 的 13 个模块 base64 进单文件脚本，运行时写回磁盘再
-正常 import —— **不是**首尾拼接（10 个模块互相带命名空间引用，拼接会静默覆盖同名
+`build_job.py` 把 `jax_tpu/` 的 14 个模块 base64 进单文件脚本，运行时写回磁盘再
+正常 import —— **不是**首尾拼接（模块互相带命名空间引用，拼接会静默覆盖同名
 顶层函数）。脚本带源码 sha，本地跑过的代码与真机逐字节相同。
+
+### Krea2 训练（`model_family: krea2`）
+
+同一条流水线，yaml 换 `model_family: krea2` 即可（run_train 自动分派到 FSDP
+路线）。三处与 Anima 不同的操作：
+
+- **底模**：`--hf-model krea/Krea-2-Raw:<文件名>[:<rev>]` —— **gated repo**，
+  先在 HF 网页接受 Krea 2 Community License，并把 token 配成 Kaggle Secrets
+  的 `HF_TOKEN`（job 启动时自动读，不落盘）。12.16B bf16 ~24GB，Kaggle→HF
+  直下，job 内 FSDP 分片加载（每卡 ~3GB）。
+- **文本缓存**：`tools/cache_text_features.py --model-family krea2`
+  （Qwen3-VL-4B 编码，键 `txt` [L,12,2560]，变长；约为 anima 格式 60 倍/token，
+  注意 dataset 体积）。latent 缓存与 Anima 完全同一份（同一个 VAE）。
+- **闸门**：改 `jax_tpu/` 后先跑 `tests/` 的 K1（krea2 前向对拍）+ K2
+  （FSDP 训练闭环），全绿再推。详见 `AnimaLoraToolkit/docs/krea2-family.md`
+  的「TPU 后端」节与 `config/train_krea2_tpu_template.yaml`。
 
 ### 权重与数据从哪来（2026-08-19 首秀定案的形态）
 
@@ -74,11 +90,13 @@ cd ..
   latent / textfeat 两份缓存都由 PyTorch 侧离线产出：`tools/cache_latents.py`
   （图像侧，本仓库新增）+ `tools/cache_text_features.py`（文本侧，含
   `--empty-caption` 给 caption_dropout 用）。
-- **挂载布局已变（实测）**：dataset 现在在 `/kaggle/input/datasets/<owner>/<slug>/`，
-  不再是 `/kaggle/input/<slug>/`。路径用 `--env ANIMA_DATA_DIR=...` 烘焙进脚本，
-  运行时 `_override_paths` 用它覆盖 yaml 里的本地路径（yaml 本身不动，两个后端
-  共用同一份）。写错路径的代价是一轮白跑 —— 拿不准就先跑 `input_probe/`
-  （CPU、零配额）把 `/kaggle/input` 的实际布局打出来。
+- **挂载布局两种并存（2026-08-20 实测）**：dataset 可能出现在
+  `/kaggle/input/datasets/<owner>/<slug>/`，也可能是 `/kaggle/input/<slug>/` ——
+  同一个 kernel 里两种同时存在（ashima 缓存走前者、新传的 krea2-tiny-* 走后者）。
+  路径用 `--env ANIMA_DATA_DIR=...` 烘焙进脚本，运行时 `_override_paths` 用它覆盖
+  yaml 里的本地路径（yaml 本身不动，两个后端共用同一份）。写错路径的代价是
+  一轮白跑 —— 拿不准就先跑 `input_probe/`（CPU、零配额）把 `/kaggle/input`
+  的实际布局打出来。
 
 ### 首秀实测（2026-08-19，v5e-8，ashima-anima2，C12 全套开关）
 

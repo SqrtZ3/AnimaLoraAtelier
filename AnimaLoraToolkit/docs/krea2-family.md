@@ -104,6 +104,33 @@ Allocation on device`，出图人物风格在、**背景崩成乱图**。
 （模型大 6 倍），token_budget 需在云端重新标定，建议从小预算起步。RAW 训练分布
 只到 1k：navit 多尺度大图超过 ~4096 token（1024²）属于底模分布外，谨慎。
 
+## TPU 后端（jax_tpu，`model_family: krea2`）
+
+Krea2 已接线到 Kaggle TPU v5e-8 训练链路（`run_train.py` 自动按 `model_family`
+分派）。与 Anima TPU 路线共用同一份 yaml / 同一条缓存→打包→训练管线，差别：
+
+| | Anima TPU | Krea2 TPU |
+|---|---|---|
+| 权重 | bf16 3.91GB，**单 chip 复制**，纯 DP | bf16 ~24GB > 15.7GiB，**FSDP 8 卡分片**（每卡 ~3GB），每层 remat 内 all_gather（真机 spmd_probe P1 定案：9.8k tok/s @ 16384/卡，单卡 3.05GiB） |
+| 序列 | 图像段 + cross-attn 定长文本槽 | **单流**：每图段 = [text ; image]，预算两边一起花；text 槽量化到 128 |
+| 文本缓存 | `cross` [512, 1024] | `txt` [L, 12, 2560]（12 层堆叠、**变长**），`tools/cache_text_features.py --model-family krea2` 产出（Qwen3-VL-4B） |
+| timestep | flow_shift/schedule_shift | `krea2_res_shift: true`（默认）：采样后按每图 image token 数施官方 mu shift；开着时 `schedule_shift` 必须 1.0（构造期 fail-fast，防双重偏移） |
+| LoRA 默认 targets | 10 个投影层 | 官方推荐**全部 264 个 Linear**（28 块×8 + txtfusion 33 + tmlp/txtmlp/tproj/first/last）；`lora_targets`/`lora_exclude_patterns` 语义不变 |
+| ΔFM/Eisbach/spectral | 已移植 | **同一份实现直接复用**（它们只作用在图像流 [ΣN, 64] 上，与文本怎么进模型无关） |
+| 显存上限 | 单图 ≤ 16384 token/卡 | 单图 **image + text 合计** ≤ 16384/卡（FSDP 实测 32768 OOM，spmd_probe P5） |
+
+- **remat 必须 != none**：FSDP 的 all_gather 要在 checkpoint 边界内，否则 28 层
+  全量权重同时活着（spmd_probe 第四跑 OOM 37.62G 的根因；构造期 fail-fast）。
+- `--unrolled/--packed-chunk/--packed-barrier` 是 Anima 打包路径的吞吐旋钮，
+  K2 的 scan+FSDP 路径未验证，构造期 fail-fast。
+- 底模走 build_job `--hf-model krea/Krea-2-Raw:<文件名>[:<rev>]` 直下：**gated
+  repo，需要在 HF 网页接受 Krea 2 Community License**，并把 token 配进 Kaggle
+  Secrets（键名 `HF_TOKEN`，job 启动时自动读取）。
+- 本地闸门：`jax_tpu/tests/` 的 K1（前向对拍，torch dump → jax check，fp32
+  rel ≤ 4e-6）与 K2（FSDP 训练闭环，8 伪造 CPU 设备）。改 `krea2_jax.py` /
+  `train.py` / `packing.py` / `data.py` 后先跑完这两道再上真机。
+- 训练配置模板：`config/train_krea2_tpu_template.yaml`。
+
 ## 验证状态（本地 RTX GPU，tests/test_krea2_modeling.py）
 
 - packed navit ≡ 逐图 dense 前向：fp32 max_abs_diff **1.4e-06**（SDPA 回退）/

@@ -18,6 +18,19 @@
 | ⑪ **全功能训练步** | `check_train_full.py` | 用户 yaml 那一整套开关同时打开时**每一条都真的接上了** | jax |
 | ⑫ 适配器对拍 | `dump_adapter_ref.py` → `check_adapter_parity.py` | LoKr/DoRA/adamw_snr ≡ `trainer/lora.py`+`utils/` | torch + jax |
 | ⑬ 目标函数对拍 | `dump_objective_ref.py` → `check_objective_parity.py` | Huber(snr)/逐图归约/Eisbach/spectral ≡ `trainer/objective.py`+`aux_losses.py` | torch + jax |
+| **K1** Krea2 前向对拍 | `dump_krea2_ref.py` → `check_krea2_parity.py` | `krea2_jax` ≡ `models/krea2_modeling.py`（逐 tap + LoRA 四区域） | torch + jax |
+| **K2** Krea2 端到端 | `check_train_loop_k2.py` | FSDP 分片训练闭环能学 + 分片≡全量 + 导出键名 | jax |
+
+K1/K2 是 **Krea2 模型族**（`model_family: krea2`，单流 MMDiT 12B + FSDP 权重分片）
+引入的。K1 用小构型随机权重（结构 parity 不需要 24GB 真权重），逐 tap 比对
+txtfusion/txtmlp/first/t_vec/逐块/最终输出，再挂合成 LoRA 比对四个区域
+（blocks/lw/rf/单例）的注入点；fp32 基线 rel ≤ 4e-6。K2 在 8 个伪造 CPU 设备上
+跑 shard_map + all_gather 的 FSDP 路径：T0 分片≡全量逐设备对拍（fp32 实测
+2.2e-07；bf16 下判据放宽到 5e-2 —— 拼权错误是 O(1) 量级，两种噪声差着
+数量级）、T1 step-0 中立、T4/T6 图像与文本**两级**填充都不参与 loss
+（K2 文本是变长的，填充全靠精细 segment_ids 隔离）、T2 真的在学、
+T5 存取往返 + 导出键名（`lora_unet_blocks_0_attn_wq` / `lora_unet_tproj_1`
+等 torch 模块路径）。
 
 ⑪⑫⑬ 是**功能移植**引入的（LoKr+DoRA、三峰/自适应 t、Huber、eisbach/ΔFM/spectral、
 immiscible、逐块 reg_dims）。⑪ 的每条断言都在防一种"不报错的失效"：适配器键名对不上

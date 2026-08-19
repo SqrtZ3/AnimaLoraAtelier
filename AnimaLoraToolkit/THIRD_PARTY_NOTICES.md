@@ -80,6 +80,10 @@
     checkpoint 直载，训练侧差异见该文件头部说明）
   - `trainer/model_family.py`（Qwen3-VL 编码模板/常量、分辨率感知 timestep shift
     公式移植自官方 encoder.py / sampling.py）
+  - `jax_tpu/krea2_jax.py`（同一架构的纯 JAX 前向移植，TPU 路线；与
+    `models/krea2_modeling.py` 逐算子对齐）
+  - `jax_tpu/flow.py` 的 `krea2_mu` / `krea2_res_shift_np`（官方 sampling.py
+    分辨率感知 shift 公式的 numpy 移植）
 
 ## ABBA-Adapters（论文方法移植）
 

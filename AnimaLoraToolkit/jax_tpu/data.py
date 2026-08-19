@@ -110,6 +110,7 @@ class Sample:
     grid: Tuple[int, int]          # (gh, gw) = patch 后的 token 网格
     tokens: int                    # gh * gw
     ms_target: int = 0             # >0 = navit_multiscale 的缩放副本（该档 token 上限）
+    txt_len: int = 0               # krea2：有效 caption token 数（anima 不用，恒 0）
 
     @property
     def name(self) -> str:
@@ -122,13 +123,17 @@ class CacheDataset:
 
     **不做任何编码，也不写盘。** 缺任一份就 fail-fast 并报出缺哪个 —— 静默跳过会
     让"训练集少了一半"这种事完全看不出来。
+
+    `family="krea2"` 时文本缓存换格式：`<stem>.textfeat.npz` 里是
+    `txt` [L, 12, 2560]（Qwen3-VL 12 层堆叠，bf16 位模式），**不定长** ——
+    navit 只打包有效 token（krea2_modeling.py 的口径），L 被记下来参与装箱。
     """
 
     def __init__(self, data_dir, patch: int = 2, txt_len: int = 512,
                  crossattn_dim: int = 1024, flip_prob: float = 0.0,
                  rng: Optional[np.random.RandomState] = None,
                  repeats: int = 1, multiscale: bool = False,
-                 caption_dropout: float = 0.0):
+                 caption_dropout: float = 0.0, family: str = "anima"):
         self.dir = Path(data_dir)
         self.patch, self.txt_len, self.crossattn_dim = patch, txt_len, crossattn_dim
         self.flip_prob = float(flip_prob)
@@ -136,6 +141,7 @@ class CacheDataset:
         self.repeats = max(int(repeats), 1)
         self.multiscale = bool(multiscale)
         self.caption_dropout = float(caption_dropout)
+        self.family = str(family or "anima").lower()
         self.samples: List[Sample] = []
         self._empty_ctx: Optional[np.ndarray] = None
         self._scan()
@@ -176,8 +182,14 @@ class CacheDataset:
                 bad.append(f"{stem.name}: latent {h}x{w} 不能被 patch {self.patch} 整除")
                 continue
             gh, gw = h // self.patch, w // self.patch
-            self.samples.append(Sample(stem, lat, txt, (gh, gw), gh * gw))
-            n_ms += self._scan_multiscale(stem, txt, bad)
+            tl = 0
+            if self.family == "krea2":
+                tl = self._txt_len_of(txt, stem.name, bad)
+                if tl < 0:
+                    continue
+            self.samples.append(Sample(stem, lat, txt, (gh, gw), gh * gw,
+                                       txt_len=tl))
+            n_ms += self._scan_multiscale(stem, txt, bad, tl)
 
         if self.multiscale and n_ms == 0:
             raise FileNotFoundError(
@@ -212,7 +224,24 @@ class CacheDataset:
         if not self.samples:
             raise FileNotFoundError(f"{self.dir} 里没找到任何图片")
 
-    def _scan_multiscale(self, stem: Path, txt: Path, bad: List[str]) -> int:
+    def _txt_len_of(self, txt: Path, name: str, bad: List[str]) -> int:
+        """krea2：读 textfeat 的 `txt` 键形状，返回有效 caption token 数。出错 -1。"""
+        with np.load(txt) as z:
+            if "txt" not in z.files:
+                bad.append(f"{name}: 无 txt 键（krea2 文本缓存是 [L,12,2560] 的 "
+                           f"txt，不是 anima 的 cross —— 检查缓存是不是用错编码器跑的）")
+                return -1
+            shape = z["txt"].shape
+        if len(shape) != 3 or shape[1] == 0 or shape[2] == 0:
+            bad.append(f"{name}: txt 形状 {shape}（应为 [L, n_layers, dim]）")
+            return -1
+        if shape[0] < 1:
+            bad.append(f"{name}: caption 0 token —— krea2 每图至少 1 个有效 token")
+            return -1
+        return int(shape[0])
+
+    def _scan_multiscale(self, stem: Path, txt: Path, bad: List[str],
+                         txt_len: int = 0) -> int:
         """扫 `<stem>.ms<档>.npz` sidecar，每个当成一条独立样本（共用同一份 caption）。"""
         if not self.multiscale:
             return 0
@@ -235,7 +264,7 @@ class CacheDataset:
                 continue
             gh, gw = h // self.patch, w // self.patch
             self.samples.append(Sample(stem, q, txt, (gh, gw), gh * gw,
-                                       ms_target=int(m.group(1))))
+                                       ms_target=int(m.group(1)), txt_len=txt_len))
             n += 1
         return n
 
@@ -258,6 +287,20 @@ class CacheDataset:
 
     def _read_ctx(self, path: Path, name: str) -> np.ndarray:
         with np.load(path) as z:
+            if self.family == "krea2":
+                if "txt" not in z.files:
+                    raise ValueError(f"{name}: 无 txt 键（krea2 文本缓存应为 "
+                                     f"[L, n_layers, dim]，不是 anima 的 cross）")
+                a = z["txt"]
+                # krea2 的 12 层堆叠每条约 30MB fp32 —— **不升 fp32**，uint16 位
+                # 模式原样返回，bitcast 留给 assemble 侧（host 内存与带宽都减半）。
+                if a.dtype == np.uint16:
+                    c = a
+                else:
+                    c = a.astype(np.float32)
+                if c.ndim != 3:
+                    raise ValueError(f"{name}: txt 形状 {c.shape}（应为 [L, n_layers, dim]）")
+                return c
             a = z["cross"]
             c = ((a.astype(np.uint32) << 16).view(np.float32)
                  if a.dtype == np.uint16 else a.astype(np.float32))
@@ -267,17 +310,20 @@ class CacheDataset:
         return c
 
     def load_ctx(self, s: Sample) -> np.ndarray:
-        """[txt_len, crossattn_dim] 的 cross 条件（fp32）。
-
-        长度不符直接 raise：cross 是**定长槽**，短了会让 cross-attn 的条件错位，
-        而且不报错（见模块 docstring）。
+        """anima：[txt_len, crossattn_dim] 的 cross 条件（fp32，定长槽）。
+        krea2：[L, n_layers, dim] 的 12 层文本特征（**变长**，量化槽的补齐在
+        assemble 侧做）。
 
         `caption_dropout` 命中时换成**空 caption 的那一份**，不是置零 —— 置零
         得到的不是"无条件"，而是一个模型从没见过的越界条件。
         """
         if self._empty_ctx is not None and self.rng.rand() < self.caption_dropout:
             return self._empty_ctx
-        return self._read_ctx(s.text_npz, s.name)
+        c = self._read_ctx(s.text_npz, s.name)
+        if self.family == "krea2" and c.shape[0] != s.txt_len:
+            raise ValueError(f"{s.name}: txt 长度 {c.shape[0]} != 扫描时的 "
+                             f"{s.txt_len}（缓存中途被改过？删掉重跑缓存）")
+        return c
 
     @property
     def canvas_hw(self) -> Tuple[int, int]:
@@ -290,13 +336,21 @@ class CacheDataset:
                 max(s.grid[1] for s in self.samples))
 
     # ── 调度 ──────────────────────────────────────────────────────────────────
-    def plan_packed(self, packer: Packer, shuffle: bool = True
-                    ) -> Tuple[List[List[Pack]], List[Pack]]:
-        """NaViT 打包：-> (steps, carry)，每个 step 是 `devices` 个同布局的 pack。"""
+    def plan_packed(self, packer, shuffle: bool = True):
+        """NaViT 打包：-> (steps, carry)，每个 step 是 `devices` 个同布局的 pack。
+
+        krea2 走 K2Packer（text+image 同序列，caption 长度参与装箱）。"""
         idx = self._order(shuffle)
-        packs = packer.build_packs([self.samples[i] for i in idx],
-                                   [self.samples[i].tokens for i in idx],
-                                   [self.samples[i].grid for i in idx])
+        samples = [self.samples[i] for i in idx]
+        if self.family == "krea2":
+            packs = packer.build_packs(samples,
+                                       [s.tokens for s in samples],
+                                       [s.txt_len for s in samples],
+                                       [s.grid for s in samples])
+        else:
+            packs = packer.build_packs(samples,
+                                       [s.tokens for s in samples],
+                                       [s.grid for s in samples])
         return packer.plan_steps(packs)
 
     def plan_buckets(self, planner: BucketPlanner, shuffle: bool = True
@@ -317,16 +371,20 @@ class CacheDataset:
         return self.rng.permutation(idx) if shuffle else idx
 
     # ── 取回一步的 latent / ctx ────────────────────────────────────────────────
-    def materialize_packed(self, packs: Sequence[Pack]):
+    def materialize_packed(self, packs):
         """-> (latents, ctxs)，形状与 `train.assemble_batch` 的要求一致：
-        每个 pack 一个 list，纯填充段给 None。"""
+        每个 pack 一个 list，纯填充段给 None。
+
+        krea2：ctxs 是**变长**的 [L_i, n_layers, dim]（有效 token 原样取出，
+        量化槽的补齐由 train.assemble_batch_k2 做）；纯填充段给 None。"""
         lats, ctxs = [], []
         for p in packs:
             ll, cc = [], []
             for it in p.items:
                 if it is None:                  # FFD 装箱余量段
                     ll.append(None)
-                    cc.append(np.zeros((self.txt_len, self.crossattn_dim), np.float32))
+                    cc.append(None if self.family == "krea2" else
+                              np.zeros((self.txt_len, self.crossattn_dim), np.float32))
                 else:
                     ll.append(self.load_tokens(it))
                     cc.append(self.load_ctx(it))

@@ -249,6 +249,249 @@ class Packer:
         return steps, carry
 
 
+# ── Krea2 打包（text+image 同一条单流序列）─────────────────────────────────────
+#
+# ## 与 Anima 打包的差别
+#
+# Anima 的段只有图像 token（文本走 cross-attn 的定长槽）；Krea2 是单流 MMDiT，
+# 每图的段 = [该图 text ; 该图 image]，预算花在同一条 combined 序列上。于是：
+#
+#   * 段的体积 = txt_q + img_q（text 槽量化到 txt_quantum=128、image 槽量化到
+#     quantum），FFD 按 combined 体积装箱；
+#   * **编译身份是二元组**（combined 段长元组, 各实段的 text 槽长元组）——主序列
+#     块对角内核看前者，txtfusion refiner 内核看后者；
+#   * 装箱余量段是纯填充（无 text 槽），与 Anima 同款；
+#   * 文本侧不需要 `navit_text_trim_padding` 那种开关：Krea2 navit 本来就只打包
+#     有效 caption token（量化槽内的一小截填充由精细 segment_ids 隔离），
+#     训练/eval 口径天然一致。
+@dataclass(frozen=True)
+class K2Layout:
+    """Krea2 一个 pack 的**编译身份**。
+
+    seg_lens  : combined 段长（量化后，含末尾纯填充段），sum == budget
+    txt_segs  : 各**实**段的 text 槽长（与 seg_lens 前 len(txt_segs) 项一一对应）
+    img_segs  : 各**实**段的 image 槽长（seg = txt + img）
+    """
+    budget: int
+    seg_lens: Tuple[int, ...]
+    txt_segs: Tuple[int, ...]
+    img_segs: Tuple[int, ...]
+
+    def __post_init__(self):
+        if sum(self.seg_lens) != self.budget:
+            raise ValueError(f"段长和 {sum(self.seg_lens)} != budget {self.budget}")
+        bad = [n for n in self.seg_lens if n % BLOCK]
+        if bad:
+            raise ValueError(f"段长必须是 {BLOCK} 的倍数（splash 块粒度），越界 {bad[:4]}")
+        if not (len(self.txt_segs) == len(self.img_segs) <= len(self.seg_lens)):
+            raise ValueError(f"txt/img 槽数 ({len(self.txt_segs)}/{len(self.img_segs)}) "
+                             f"与段数 {len(self.seg_lens)} 对不上")
+        for i, (tq, iq) in enumerate(zip(self.txt_segs, self.img_segs)):
+            if tq % BLOCK or iq % BLOCK:
+                raise ValueError(f"第 {i} 段槽长未对齐 {BLOCK}：txt={tq} img={iq}")
+            if tq + iq != self.seg_lens[i]:
+                raise ValueError(f"第 {i} 段 txt+img={tq + iq} != 段长 {self.seg_lens[i]}")
+
+    @property
+    def n_seg(self) -> int:
+        return len(self.seg_lens)
+
+    @property
+    def n_img_tokens(self) -> int:
+        """图像流总长（loss 侧）：各实段 image 槽之和。"""
+        return sum(self.img_segs)
+
+    @property
+    def n_txt_tokens(self) -> int:
+        return sum(self.txt_segs)
+
+    def static_positions(self) -> Tuple[np.ndarray, np.ndarray]:
+        """(txt_pos, img_pos)：两流在 combined 序列中的位置。
+
+        **只依赖布局字段**（与 pack 内容无关）——这正是它能进 make_grad_fn 的
+        编译期闭包的原因；K2Pack.index_arrays 复用同一份，两边永远不会漂。
+        """
+        txt_pos, img_pos = [], []
+        off = 0
+        for i, seg in enumerate(self.seg_lens):
+            if i < len(self.txt_segs):
+                tq, iq = self.txt_segs[i], self.img_segs[i]
+                txt_pos += list(range(off, off + tq))
+                img_pos += list(range(off + tq, off + tq + iq))
+            off += seg
+        return (np.asarray(txt_pos, np.int32), np.asarray(img_pos, np.int32))
+
+
+@dataclass
+class K2Pack:
+    """Krea2 一个 pack 的运行时内容。"""
+    layout: K2Layout
+    items: List[object] = field(default_factory=list)       # 各实段的样本引用
+    real_img_lens: List[int] = field(default_factory=list)  # 各实段真实 image token 数
+    real_txt_lens: List[int] = field(default_factory=list)  # 各实段真实 caption token 数
+    grids: List[Tuple[int, int]] = field(default_factory=list)
+
+    def index_arrays(self) -> Dict[str, np.ndarray]:
+        """造出喂给 attention / krea2_jax / loss 的全部索引数组。
+
+        combined 流 [B]：rows/cols（text/填充位=0）、mod_index（token→图，含填充
+            段映射到宿主段）、seg_self（精细段号；一切填充位 = PAD_SEG，彼此可见，
+            行不空 —— splash SegmentIds 的硬约束）
+        图像流 [Σimg_q]：rows/cols（RoPE/ΔFM 用）、mod_index、loss_mask（1=真 token）
+        文本流 [Σtxt_q]：txt_fine（精细段号，填充位 PAD_SEG）
+        静态位图：txt_pos / img_pos（两流在 combined 序列中的位置，**进编译身份**，
+            由 make_grad_fn 闭包持有，不走运行时数组）
+        """
+        L = self.layout
+        B = L.budget
+        rows = np.zeros(B, np.int32)
+        cols = np.zeros(B, np.int32)
+        mod_index = np.empty(B, np.int32)
+        seg_self = np.full(B, PAD_SEG, np.int32)
+        i_rows = np.zeros(L.n_img_tokens, np.int32)
+        i_cols = np.zeros(L.n_img_tokens, np.int32)
+        i_mod = np.empty(L.n_img_tokens, np.int32)
+        i_mask = np.zeros(L.n_img_tokens, np.float32)
+        t_fine = np.full(L.n_txt_tokens, PAD_SEG, np.int32)
+        txt_pos, img_pos = self.layout.static_positions()
+        off = i_off = t_off = 0
+        for i, seg in enumerate(L.seg_lens):
+            mod_index[off:off + seg] = i
+            if i < len(L.txt_segs):                     # 实段
+                tq, iq = L.txt_segs[i], L.img_segs[i]
+                rt = self.real_txt_lens[i]
+                ri = self.real_img_lens[i]
+                if not (0 < rt <= tq and 0 < ri <= iq):
+                    raise ValueError(f"第 {i} 段实长越界：txt {rt}/{tq} img {ri}/{iq}")
+                t_fine[t_off:t_off + rt] = i
+                h, w = self.grids[i]
+                if h * w != ri:
+                    raise ValueError(f"第 {i} 段网格 {h}x{w} != 真实 token 数 {ri}")
+                img_off = off + tq
+                seg_self[off:off + rt] = i
+                seg_self[img_off:img_off + ri] = i
+                rr, cc = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+                rows[img_off:img_off + ri] = rr.reshape(-1)
+                cols[img_off:img_off + ri] = cc.reshape(-1)
+                i_mod[i_off:i_off + iq] = i
+                i_rows[i_off:i_off + ri] = rr.reshape(-1)
+                i_cols[i_off:i_off + ri] = cc.reshape(-1)
+                i_mask[i_off:i_off + ri] = 1.0
+                i_off += iq
+                t_off += tq
+            off += seg
+        return {"rows_c": rows, "cols_c": cols, "mod_index_c": mod_index,
+                "seg_self": seg_self, "txt_fine": t_fine,
+                "rows_i": i_rows, "cols_i": i_cols, "mod_index_i": i_mod,
+                "loss_mask": i_mask,
+                "txt_pos": np.asarray(txt_pos, np.int32),
+                "img_pos": np.asarray(img_pos, np.int32)}
+
+    @property
+    def fill(self) -> float:
+        """有效填充率 = （真实 image + 真实 text）/ budget。它**直接等于**线性层
+        的算力利用率（填充 token 一样要过 MLP）。"""
+        return (sum(self.real_img_lens) + sum(self.real_txt_lens)) / self.layout.budget
+
+
+class K2Packer:
+    """Krea2 版装箱/成步：与 Packer 同策略（FFD + 布局分组凑 8 卡一步）。"""
+
+    def __init__(self, budget: int, quantum: int = 1024, txt_quantum: int = BLOCK,
+                 devices: int = 8):
+        if quantum % BLOCK or txt_quantum % BLOCK:
+            raise ValueError(f"quantum/txt_quantum 必须是 {BLOCK} 的倍数，"
+                             f"得到 {quantum}/{txt_quantum}")
+        if budget % quantum:
+            raise ValueError(f"budget {budget} 必须能被 quantum {quantum} 整除")
+        self.budget, self.quantum, self.txt_quantum = budget, quantum, txt_quantum
+        self.devices = devices
+        self._carry: List[K2Pack] = []
+
+    def build_packs(self, items: Sequence[object],
+                    token_counts: Sequence[int],
+                    txt_lens: Sequence[int],
+                    grids: Sequence[Tuple[int, int]]) -> List[K2Pack]:
+        """items/token_counts(image)/txt_lens(caption)/grids 一一对应。"""
+        if not (len(items) == len(token_counts) == len(txt_lens) == len(grids)):
+            raise ValueError("items / token_counts / txt_lens / grids 长度必须一致")
+        for n, tl, (h, w) in zip(token_counts, txt_lens, grids):
+            if h * w != n:
+                raise ValueError(f"网格 {h}x{w} != token 数 {n}")
+            if tl < 1:
+                raise ValueError("Krea2 要求每图至少 1 个有效 caption token"
+                                 "（krea2_modeling.py:1006 同款 fail-fast）")
+        vols = [quantize_len(n, self.quantum) + quantize_len(tl, self.txt_quantum)
+                for n, tl in zip(token_counts, txt_lens)]
+        packs = []
+        for group in ffd(vols, self.budget):
+            seg, tseg, iseg = [], [], []
+            real_i, real_t, gr, it = [], [], [], []
+            for i in group:
+                iq = quantize_len(token_counts[i], self.quantum)
+                tq = quantize_len(txt_lens[i], self.txt_quantum)
+                seg.append(tq + iq)
+                tseg.append(tq)
+                iseg.append(iq)
+                real_i.append(token_counts[i])
+                real_t.append(txt_lens[i])
+                gr.append(grids[i])
+                it.append(items[i])
+            rest = self.budget - sum(seg)
+            # 段序规范化：**实段**降序、纯填充段恒在末尾。段在 pack 里的先后是
+            # 自由的（调制走 mod_index、RoPE 走 rows/cols），但它进编译身份；
+            # 规范化是免费的去重（同一段长 multiset 只编译一次），且填充段恒
+            # 末尾让 K2Layout 的 txt/img 槽对齐规则（前 n 项为实段）天然成立。
+            order = sorted(range(len(seg)), key=lambda i: (-seg[i], i))
+            seg = [seg[i] for i in order]
+            tseg = [tseg[i] for i in order]
+            iseg = [iseg[i] for i in order]
+            real_i = [real_i[i] for i in order]
+            real_t = [real_t[i] for i in order]
+            gr = [gr[i] for i in order]
+            it = [it[i] for i in order]
+            if rest:
+                seg.append(rest)                # 纯填充段（无 text 槽，恒在末尾）
+            packs.append(K2Pack(
+                K2Layout(self.budget, tuple(seg), tuple(tseg), tuple(iseg)),
+                it, real_i, real_t, gr))
+        return packs
+
+    def plan_steps(self, packs: Sequence[K2Pack]) -> Tuple[List[List[K2Pack]], List[K2Pack]]:
+        """与 Packer.plan_steps 同语义：(steps, carry)，carry 跨轮顺延不丢样本。"""
+        by_layout: Dict[K2Layout, List[K2Pack]] = defaultdict(list)
+        for p in list(self._carry) + list(packs):
+            by_layout[p.layout].append(p)
+        steps, carry = [], []
+        for layout, ps in by_layout.items():
+            n = len(ps) // self.devices * self.devices
+            for i in range(0, n, self.devices):
+                steps.append(ps[i:i + self.devices])
+            carry.extend(ps[n:])
+        self._carry = carry
+        return steps, carry
+
+
+def report_k2(packs: Sequence[K2Pack], devices: int = 8) -> str:
+    """Krea2 打包质量报告（口径同 report()，填充率含 text 流）。"""
+    if not packs:
+        return "（无 pack）"
+    layouts = {p.layout for p in packs}
+    by = defaultdict(int)
+    for p in packs:
+        by[p.layout] += 1
+    full = sum(c // devices * devices for c in by.values())
+    fill = sum(sum(p.real_img_lens) + sum(p.real_txt_lens) for p in packs) \
+        / sum(p.layout.budget for p in packs)
+    lines = [f"pack {len(packs)} 个 | 布局 {len(layouts)} 种 "
+             f"(≈{len(layouts)}次全模型编译) | 有效填充率 {fill:.1%} | "
+             f"可成步 {full}/{len(packs)} 个 pack = {full // devices} 步"]
+    for layout, c in sorted(by.items(), key=lambda kv: -kv[1]):
+        lines.append(f"  seg{str(layout.seg_lens):<40} txt{str(layout.txt_segs):<20} "
+                     f"x{c:<4} 步 {c // devices} 余 {c % devices}")
+    return "\n".join(lines)
+
+
 # ── 分桶（ragged / 批维）调度 ─────────────────────────────────────────────────
 #
 # ## 与打包调度的关系

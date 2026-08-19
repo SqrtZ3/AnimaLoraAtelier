@@ -46,6 +46,15 @@ llm_adapter 默认不注入 LoRA（anima_train.py:1327 的 DEFAULT_EXCLUDE_PREFI
 用法：
     <torch-python> cache_text_features.py --data-dir <图片目录> \
         --text-encoder <models/text_encoders/Qwen3-0.6B-Base> [--overwrite]
+
+## krea2 模式（--model-family krea2）
+
+文本条件换成 Qwen3-VL-4B **12 层** hidden states 堆叠（krea2_modeling.py 头注），
+编码走 `trainer/model_family.py:298 encode_krea2_text`（含 `(tag:1.5)` 剥离与
+逐条压缩到有效 token）。落盘键是 `txt` [L, 12, 2560]（**变长**，bf16 位模式）
+—— TPU 的 navit 打包只取有效 token，不定长槽；`_empty.textfeat.npz` 同格式
+（caption_dropout 用）。`--transformer` 在该模式下不需要（TextFusion 在 DiT
+内部，离线侧无冻结支路要过）。
 """
 
 from __future__ import annotations
@@ -91,15 +100,18 @@ def read_caption(img: Path, prefer_json: bool = True) -> str | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model-family", default="anima", choices=("anima", "krea2"),
+                    help="anima（默认，历史行为）/ krea2（Qwen3-VL 12 层堆叠，键 txt）")
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--text-encoder", required=True,
-                    help="Qwen3-0.6B 目录（含 config.json）")
-    ap.add_argument("--transformer", required=True,
-                    help="anima-base-v1.0.safetensors —— **必需**，因为 cross 条件要过 "
-                         "它里面的 llm_adapter（见本文件 docstring）")
+                    help="anima: Qwen3-0.6B 目录；krea2: Qwen3-VL-4B-Instruct 目录")
+    ap.add_argument("--transformer", default=None,
+                    help="anima 必需：anima-base-v1.0.safetensors（cross 要过它里面的 "
+                         "llm_adapter，见本文件 docstring）。krea2 不需要")
     ap.add_argument("--t5-tokenizer", default=None,
                     help="默认用仓库的 AnimaLoraToolkit/models/t5_tokenizer")
     ap.add_argument("--max-length", type=int, default=512)
+    ap.add_argument("--batch", type=int, default=8, help="krea2 的批编码条数")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--no-json", action="store_true", help="忽略 .json，只读 .txt")
@@ -112,20 +124,82 @@ def main() -> int:
     repo = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repo))
     import torch
-    import torch.nn.functional as Fn
-    from trainer.models import (find_diffusion_pipe_root, load_anima_model,
-                                load_text_encoders)
-    from trainer.text_encode import (_build_qwen_text_from_prompt, encode_qwen,
-                                     tokenize_t5_weighted)
-
-    t5_dir = a.t5_tokenizer or str(repo / "models" / "t5_tokenizer")
 
     root = Path(a.data_dir)
     imgs = sorted(p for p in root.rglob("*") if p.suffix.lower() in IMG_EXT)
     if not imgs:
         print(f"{root} 下没找到图片")
         return 1
-    print(f"{len(imgs)} 张图，编码器 {a.text_encoder}，max_length={a.max_length}")
+    print(f"{len(imgs)} 张图，编码器 {a.text_encoder}，max_length={a.max_length}，"
+          f"family={a.model_family}")
+
+    if a.model_family == "krea2":
+        return main_krea2(a, repo, root, imgs, torch)
+    return main_anima(a, repo, root, imgs, torch)
+
+
+def main_krea2(a, repo, root, imgs, torch) -> int:
+    """krea2：Qwen3-VL 12 层堆叠 -> `txt` [L, 12, D]（变长，bf16 位模式）。"""
+    from trainer.model_family import (encode_krea2_text, load_krea2_text_encoder)
+
+    dev = torch.device(a.device)
+    handles = load_krea2_text_encoder(a.text_encoder, dev, torch.bfloat16)
+    meta = json.dumps({"version": VERSION, "family": "krea2",
+                       "max_length": a.max_length,
+                       "text_encoder": str(a.text_encoder),
+                       "txt_layers": 12}, ensure_ascii=False)
+
+    def encode_one(cap: str) -> np.ndarray:
+        with torch.no_grad():
+            cross, cmask = encode_krea2_text(handles, [cap], dev, a.max_length)
+        f = cross[0][cmask[0]]                       # 只留有效 token（navit 口径）
+        return _bf16_view(f)
+
+    done = skipped = missing = 0
+    for i, img in enumerate(imgs):
+        out = img.with_name(img.stem + ".textfeat.npz")
+        if out.exists() and not a.overwrite:
+            skipped += 1
+            continue
+        cap = read_caption(img, prefer_json=not a.no_json)
+        if cap is None:
+            missing += 1
+            print(f"  [跳过] {img.name} 没有 caption")
+            continue
+        v = encode_one(cap)
+        np.savez(out, txt=v, caption=np.array(cap), meta=np.array(meta))
+        done += 1
+        if (i + 1) % 20 == 0:
+            print(f"  {i + 1}/{len(imgs)} …")
+
+    if a.empty_caption:
+        out = root / "_empty.textfeat.npz"
+        if out.exists() and not a.overwrite:
+            print("_empty.textfeat.npz 已存在，跳过")
+        else:
+            v = encode_one("")
+            np.savez(out, txt=v, caption=np.array(""), meta=np.array(meta))
+            print(f"已写 {out.name}（caption_dropout 用，{v.shape[0]} token）")
+
+    print(f"完成：新写 {done}，已存在跳过 {skipped}，无 caption {missing}")
+    if done:
+        sz = out.stat().st_size / 1e6
+        print(f"单文件约 {sz:.2f}MB（12 层堆叠，约为 anima 格式的 60 倍/token），"
+              f"{len(imgs)} 张合计约 {sz * len(imgs):.0f}MB")
+    return 0
+
+
+def main_anima(a, repo, root, imgs, torch) -> int:
+    import torch.nn.functional as Fn
+    from trainer.models import (find_diffusion_pipe_root, load_anima_model,
+                                load_text_encoders)
+    from trainer.text_encode import (_build_qwen_text_from_prompt, encode_qwen,
+                                     tokenize_t5_weighted)
+
+    if not a.transformer:
+        print("--transformer 在 anima 模式下必需（cross 要过底模的 llm_adapter）")
+        return 1
+    t5_dir = a.t5_tokenizer or str(repo / "models" / "t5_tokenizer")
 
     dev = torch.device(a.device)
     qwen, qwen_tok, t5_tok = load_text_encoders(a.text_encoder, t5_dir, dev,

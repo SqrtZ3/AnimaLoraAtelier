@@ -206,13 +206,32 @@ def init(key, model_cfg, cfg: AdapterConfig, targets: Sequence[str],
     `dora_scale` 初值恰为 ‖W‖_row -> 缩放因子恒 1。两条都必须成立，否则第一步就
     偏了（本仓库落地新 adapter 的硬约束，见 skill 2.2）。
     """
+    if cfg.variant == "dora" and base_params is None:
+        raise ValueError("DoRA 需要 base_params 来初始化 dora_scale（=‖W‖_row）")
     plans = plan_targets(model_cfg, cfg, targets)
-    L = model_cfg.num_blocks
+    bw = None
+    if base_params is not None:
+        bw = lambda t: jnp.sum(_base_weight(base_params, t).astype(jnp.float32) ** 2,
+                               axis=-1)
+    return init_from_plans(key, cfg, plans, bw, dtype) + (plans,)
+
+
+def init_from_plans(key, cfg: AdapterConfig, plans: Dict[str, TargetPlan],
+                    base_row_sq_fn=None, dtype=jnp.float32
+                    ) -> Tuple[PyTree, PyTree]:
+    """init 的主体（与模型族无关）：按 plans 造 (trainable, consts)。
+
+    每个 target 的堆叠份数取 `len(plan.ranks)`（Anima = 28 块；Krea2 = 28/2/1）。
+    `base_row_sq_fn(target) -> [count, out]`（fp32 逐行平方范数）只在 DoRA 时
+    需要（None 且开 DoRA 会 fail-fast）。Krea2 用它从"加载时流式算好的逐行
+    范数"取值 —— 那边权重是分片的，不该为了取 DoRA 初值再 gather 一份全量。
+    """
     trainable: Dict[str, Any] = {}
     consts: Dict[str, Any] = {}
     keys = jax.random.split(key, len(plans) * 2)
     n = 0
     for t, pl in plans.items():
+        L = len(pl.ranks)
         rmax = pl.rmax
         rmask = np.zeros((L, rmax), np.float32)
         for i, r in enumerate(pl.ranks):
@@ -240,15 +259,14 @@ def init(key, model_cfg, cfg: AdapterConfig, targets: Sequence[str],
         n += 2
 
         if cfg.variant == "dora":
-            if base_params is None:
-                raise ValueError("DoRA 需要 base_params 来初始化 dora_scale（=‖W‖_row）")
-            w = _base_weight(base_params, t)          # [L, out, in]
-            row_sq = jnp.sum(w.astype(jnp.float32) ** 2, axis=-1)      # [L, out]
+            if base_row_sq_fn is None:
+                raise ValueError("DoRA 需要 base_row_sq_fn 来初始化 dora_scale（=‖W‖_row）")
+            row_sq = base_row_sq_fn(t).astype(jnp.float32)      # [L, out]
             p["dora"] = jnp.sqrt(jnp.maximum(row_sq, 1e-12))
             c["base_row_sq"] = row_sq                 # W 冻结 -> 全程不变，缓存
         trainable[t] = jax.tree.map(lambda x: x.astype(dtype), p)
         consts[t] = c
-    return trainable, consts, plans
+    return trainable, consts
 
 
 def _base_weight(base_params: PyTree, target: str) -> jnp.ndarray:
@@ -274,12 +292,15 @@ def _base_weight(base_params: PyTree, target: str) -> jnp.ndarray:
 
 # ── 每步的 dropout 掩码 ───────────────────────────────────────────────────────
 def sample_dropout(key, cfg: AdapterConfig, plans: Dict[str, TargetPlan],
-                   num_blocks: int, training: bool = True) -> Optional[PyTree]:
+                   num_blocks: Optional[int] = None, training: bool = True) -> Optional[PyTree]:
     """逐块逐 target 抽 rank/module dropout 掩码。返回 None = 不做 dropout。
 
     与 PyTorch 的差别只有"什么时候抽"：那边是每个模块 forward 时各抽各的，
     这边一次性抽好整棵树再喂进 scan。分布相同（都是逐模块独立伯努利），
     只有 RNG 消费顺序不同 —— 不影响任何统计性质。
+
+    `num_blocks` 缺省时按各 plan 自己的份数（len(ranks)）——Krea2 的
+    28/2/1 混合堆叠走这条；Anima 调用方显式传 28，行为不变。
     """
     if not (training and cfg.uses_dropout):
         return None
@@ -287,15 +308,16 @@ def sample_dropout(key, cfg: AdapterConfig, plans: Dict[str, TargetPlan],
     keys = jax.random.split(key, len(plans) * 2)
     n = 0
     for t, pl in plans.items():
+        L = int(num_blocks) if num_blocks is not None else len(pl.ranks)
         d: Dict[str, jnp.ndarray] = {}
         if cfg.rank_dropout > 0:
-            keep = (jax.random.uniform(keys[n], (num_blocks, pl.rmax))
+            keep = (jax.random.uniform(keys[n], (L, pl.rmax))
                     >= cfg.rank_dropout).astype(jnp.float32)
             # inverted dropout，scale 与 trainer/lora.py:954 逐字节一致（含 1e-6）
             d["rd"] = keep * (1.0 / (1.0 - cfg.rank_dropout + 1e-6))
         if cfg.module_dropout > 0:
             # **不做 1/(1-p) 补偿**，与 trainer/lora.py:1006 一致
-            d["md"] = (jax.random.uniform(keys[n + 1], (num_blocks,))
+            d["md"] = (jax.random.uniform(keys[n + 1], (L,))
                        >= cfg.module_dropout).astype(jnp.float32)
         n += 2
         out[t] = d
@@ -431,16 +453,27 @@ def _merged_row_norm(w, p, c, low, cfg) -> jnp.ndarray:
 # ── 导出 ──────────────────────────────────────────────────────────────────────
 def unstack(trainable: PyTree, plans: Dict[str, TargetPlan],
             num_blocks: int, cfg: AdapterConfig) -> Dict[str, Dict[str, np.ndarray]]:
-    """scan 布局 -> `{"blocks.{i}.{target}": {因子名: ndarray}}`，**按各块自己的
-    rank 切回去**（掩掉的通道恒为 0，切掉它们不改变任何数值，只是让产物与
-    PyTorch 侧逐块 rank 的文件同形）。
+    """scan 布局 -> `{"blocks.{i}.{target}": {因子名: ndarray}}`（Anima 命名）。"""
+    return unstack_named(trainable, plans, cfg,
+                         lambda t, i: f"blocks.{i}.{t}", num_blocks)
+
+
+def unstack_named(trainable: PyTree, plans: Dict[str, TargetPlan],
+                  cfg: AdapterConfig, key_fn, num_blocks: Optional[int] = None
+                  ) -> Dict[str, Dict[str, np.ndarray]]:
+    """**按各块自己的 rank 切回去**（掩掉的通道恒为 0，切掉它们不改变任何数值，
+    只是让产物与 PyTorch 侧逐块 rank 的文件同形）。
+
+    `key_fn(target, i)` 决定展开名 —— Krea2 的栈名带 layerwise/refiner 路径、
+    单例不展开，命名规则与 Anima 的 `blocks.{i}.{t}` 不同，但切片逻辑同一份。
     """
     out: Dict[str, Dict[str, np.ndarray]] = {}
     for t, pl in plans.items():
         p = trainable[t]
-        for i in range(num_blocks):
+        L = int(num_blocks) if num_blocks is not None else len(pl.ranks)
+        for i in range(L):
             r = pl.ranks[i]
-            key = f"blocks.{i}.{t}"
+            key = key_fn(t, i)
             if cfg.kind == "lokr":
                 mod = {"lokr_w1": np.asarray(p["w1"][i], np.float32),
                        "lokr_w2_a": np.asarray(p["w2a"][i][:, :r], np.float32),

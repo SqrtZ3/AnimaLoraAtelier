@@ -37,6 +37,7 @@ try:
     from . import adapters as AD
     from . import auxloss as X
     from . import flow as F
+    from . import krea2_jax as K2
     from . import optim as O
     from . import sched as S
     from . import train as T
@@ -44,6 +45,7 @@ except ImportError:
     import adapters as AD
     import auxloss as X
     import flow as F
+    import krea2_jax as K2
     import optim as O
     import sched as S
     import train as T
@@ -53,6 +55,9 @@ except ImportError:
 #: 已实现，直接进配置。
 _HANDLED = {
     "transformer_path", "data_dir", "repeats", "seed",
+    "model_family",
+    "krea2_res_shift", "krea2_shift_min_res", "krea2_shift_max_res",
+    "krea2_shift_y1", "krea2_shift_y2",
     "navit_packing", "navit_native_resolution", "navit_token_budget",
     "navit_multiscale", "navit_pack_strategy", "navit_text_trim_padding",
     "navit_max_images_per_pack", "navit_multiscale_loss_weight",
@@ -95,6 +100,7 @@ _HANDLED = {
 #: 这些键在这里是 no-op，但**不是**"没实现"——语义已经烘焙进 npz 了。
 _CACHE_SIDE = {
     "vae_path", "text_encoder_path", "t5_tokenizer_path", "resolution",
+    "krea2_text_encoder_path", "krea2_text_max_length", "krea2_text_cache_entries",
     "bucket_base_resos", "bucket_min_base_reso", "bucket_max_base_reso",
     "bucket_base_reso_steps", "min_bucket_reso", "max_bucket_reso",
     "bucket_reso_steps", "bucket_max_aspect_ratio", "bucket_no_upscale",
@@ -181,6 +187,8 @@ class RunConfig:
     transformer_path: Path
     output_dir: Path
     output_name: str
+    #: 模型族：anima（默认，与历史逐一等价）/ krea2（单流 MMDiT + FSDP）
+    family: str = "anima"
     devices: int = 8
     #: **单卡** token 预算（= yaml 的 navit_token_budget / devices）
     budget: int = 16384
@@ -206,6 +214,13 @@ class RunConfig:
     resume_state: str = ""
     #: 未移植但被显式放行（--allow-unported）的键，训练开始时要再打印一次。
     waived: Tuple[str, ...] = ()
+    #: krea2 分辨率感知 timestep shift（官方 sampling.py 的训练侧等价，
+    #: trainer/model_family.py:399 同公式；family=krea2 时默认开）。
+    krea2_res_shift: bool = True
+    krea2_shift_min_res: int = 256
+    krea2_shift_max_res: int = 1280
+    krea2_shift_y1: float = 0.5
+    krea2_shift_y2: float = 1.15
 
 
 def load_yaml(path) -> Dict[str, Any]:
@@ -236,11 +251,14 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
           canvas_hw: Tuple[int, int] = (0, 0)) -> RunConfig:
     """yaml dict -> RunConfig。`canvas_hw` 由数据侧扫描后回填（aux_spectral 用）。"""
     waived = _check_coverage(d, allow_unported)
-    _check_navit(d)
+    family = str(d.get("model_family", "anima") or "anima").lower()
+    if family not in ("anima", "krea2"):
+        raise ValueError(f"model_family={family!r} 不认识（TPU 后端支持 anima / krea2）")
+    _check_navit(d, family)
 
     # ── 适配器 ───────────────────────────────────────────────────────────────
     targets = _expand_targets(d.get("lora_targets") or [],
-                              d.get("lora_exclude_patterns") or [])
+                              d.get("lora_exclude_patterns") or [], family)
     acfg = AD.AdapterConfig(
         kind=str(d.get("lora_type", "lora")).lower(),
         variant=str(d.get("lora_variant", "base") or "base").lower(),
@@ -299,11 +317,19 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
         huber_schedule=str(d.get("huber_schedule", "constant")).lower(),
         huber_snr_clamp_max=_f(d, "huber_snr_clamp_max", 10.0),
         weighting=str(d.get("loss_weighting_scheme", "none")).lower(),
-        min_snr_gamma=_f(d, "min_snr_gamma", 0.0) or 5.0,
+        min_snr_gamma=_f(d, "min_snr_gamma", 5.0),
         detail_inv_t_min=_f(d, "detail_inv_t_min", 1.0),
         detail_inv_t_max=_f(d, "detail_inv_t_max", 5.0),
         immiscible_k=(_i(d, "immiscible_k", 4) if _b(d, "immiscible_enabled") else 1),
     )
+
+    # min_snr_gamma<=0 只在 weighting=min_snr 时是错配置（权重恒 0，loss 恒 0，
+    # 不报错）；其它 scheme 不读它，留着无影响。
+    if (fcfg.weighting == "min_snr" and fcfg.min_snr_gamma <= 0):
+        raise ValueError(
+            f"loss_weighting_scheme=min_snr 但 min_snr_gamma={fcfg.min_snr_gamma}："
+            f"权重 = min(gamma/snr, 1) 会恒为 0，loss 恒 0 且看起来一切正常。"
+            f"PyTorch 侧默认 5.0。")
 
     aux = X.AuxConfig(
         eisbach_lambda=_f(d, "eisbach_lambda"),
@@ -355,6 +381,7 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
         transformer_path=Path(str(d.get("transformer_path", ""))),
         output_dir=Path(str(d.get("output_dir", "./output"))),
         output_name=str(d.get("output_name", "anima-tpu")),
+        family=family,
         devices=devices, budget=total_budget // devices,
         max_images_per_pack=_i(d, "navit_max_images_per_pack", 0),
         repeats=max(_i(d, "repeats", 1), 1),
@@ -372,6 +399,11 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
         log_every=max(_i(d, "log_every", 1), 1),
         resume_state=str(d.get("resume_state", "") or ""),
         waived=tuple(waived),
+        krea2_res_shift=_b(d, "krea2_res_shift", True),
+        krea2_shift_min_res=_i(d, "krea2_shift_min_res", 256),
+        krea2_shift_max_res=_i(d, "krea2_shift_max_res", 1280),
+        krea2_shift_y1=_f(d, "krea2_shift_y1", 0.5),
+        krea2_shift_y2=_f(d, "krea2_shift_y2", 1.15),
     )
 
 
@@ -407,35 +439,49 @@ def _check_coverage(d: Dict[str, Any], allow: bool) -> List[str]:
     return [x.strip().split(" =")[0] for x in on]
 
 
-def _check_navit(d: Dict[str, Any]) -> None:
+def _check_navit(d: Dict[str, Any], family: str = "anima") -> None:
     """NaViT 相关的硬前提。都是"开了会静默出错"的那一类。"""
     if not _b(d, "navit_packing", True):
         raise ValueError("TPU 后端只实现了 NaViT 打包路线（与分桶对照路线），"
                          "navit_packing 必须为 true")
-    if _b(d, "navit_text_trim_padding"):
+    if family == "anima" and _b(d, "navit_text_trim_padding"):
         raise ValueError(
             "navit_text_trim_padding=true：训练去掉 512-pad 而 eval/采样/ARB 都带 pad，"
             "cross-attn 条件不一致会让 eval_loss 冲高且拟合变差（memory "
-            "[[navit-text-trim-train-eval-mismatch]] 的 A/B 实证）。TPU 侧不实现这条路。")
+            "[[navit-text-trim-train-eval-mismatch]] 的 A/B 实证）。TPU 侧不实现这条路。"
+            "（krea2 无此问题：navit 本来就只打包有效 caption token。）")
     strat = str(d.get("navit_pack_strategy", "ffd")).lower()
     if strat != "ffd":
         raise ValueError(f"navit_pack_strategy={strat!r} 未移植；packing.py 只实现了 ffd")
     mp = str(d.get("mixed_precision", "bf16")).lower()
     if mp not in ("bf16", "bfloat16"):
         raise ValueError(f"mixed_precision={mp!r}：TPU 后端只走 bf16 前向 + fp32 master")
+    if (family == "krea2" and _b(d, "krea2_res_shift", True)
+            and abs(_f(d, "schedule_shift", 1.0) - 1.0) > 1e-6):
+        # 与 docs/krea2-family.md 同一建议：res_shift 已在任何 timestep mode 之后
+        # 按分辨率施加官方 shift，再叠 schedule_shift 就是双重偏移。
+        raise ValueError(
+            f"krea2_res_shift 开着时 schedule_shift 必须保持 1.0（得到 "
+            f"{_f(d, 'schedule_shift', 1.0)}）—— 两者是同一个 shift 施加两次"
+            f"（docs/krea2-family.md 的口径）。要手动调度就关 krea2_res_shift。")
 
 
-def _expand_targets(names, excludes) -> Tuple[str, ...]:
+def _expand_targets(names, excludes, family: str = "anima") -> Tuple[str, ...]:
     """yaml 的裸 target 名（`q_proj`）展开成内部全名（`self_attn.q_proj` 等）。
 
     PyTorch 侧 `lora_targets` 是按模块名子串匹配的，所以 `q_proj` 会同时命中
     self_attn 与 cross_attn；这里照此展开，再套 `lora_exclude_patterns`。
+    krea2：全名表换成单流 MMDiT 的 264 个 Linear（krea2_jax.lora_target_shapes，
+    缺省 = 官方/musubi 推荐的"DiT 全部 Linear"）。
     """
     import re
-    all_t = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
-             "self_attn.output_proj", "cross_attn.q_proj", "cross_attn.k_proj",
-             "cross_attn.v_proj", "cross_attn.output_proj",
-             "mlp.layer1", "mlp.layer2")
+    if family == "krea2":
+        all_t = tuple(sorted(K2.lora_target_shapes(K2.Krea2Config())))
+    else:
+        all_t = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                 "self_attn.output_proj", "cross_attn.q_proj", "cross_attn.k_proj",
+                 "cross_attn.v_proj", "cross_attn.output_proj",
+                 "mlp.layer1", "mlp.layer2")
     if not names:
         picked = list(all_t)
     else:
@@ -445,8 +491,16 @@ def _expand_targets(names, excludes) -> Tuple[str, ...]:
             raise ValueError(f"lora_targets 里这些没匹配到任何模块：{miss}；"
                              f"可选 {list(all_t)}")
     pats = [re.compile(str(p)) for p in (excludes or [])]
-    picked = [t for t in picked if not any(p.fullmatch(f"blocks.0.{t}") or p.search(t)
-                                           for p in pats)]
+    if family == "krea2":
+        def excluded(t):
+            # 与 Anima 同规则：展开名 fullmatch 或 target 名 search，任一命中即排除
+            cnt = K2.lora_target_shapes(K2.Krea2Config())[t][0]
+            ex = K2.expand_name(t, 0, cnt)
+            return any(p.fullmatch(ex) or p.search(t) for p in pats)
+        picked = [t for t in picked if not excluded(t)]
+    else:
+        picked = [t for t in picked if not any(
+            p.fullmatch(f"blocks.0.{t}") or p.search(t) for p in pats)]
     if not picked:
         raise ValueError("lora_targets 与 lora_exclude_patterns 相消，一个模块都没剩下")
     return tuple(picked)
@@ -461,6 +515,8 @@ def _parse_grid(s) -> Tuple[float, ...]:
 def summary(rc: RunConfig) -> str:
     a, f, x = rc.tcfg.adapter, rc.tcfg.flow, rc.tcfg.aux
     lines = [
+        f"模型族 {rc.family}"
+        + ("（单流 MMDiT + FSDP 权重分片）" if rc.family == "krea2" else ""),
         f"数据 {rc.data_dir}  输出 {rc.output_dir}/{rc.output_name}",
         f"预算 全局 {rc.budget * rc.devices} = {rc.devices} 卡 x {rc.budget}/卡"
         f" | quantum {rc.quantum} | repeats {rc.repeats}"
@@ -476,7 +532,10 @@ def summary(rc: RunConfig) -> str:
         f" grad_accum={rc.tcfg.grad_accum}",
         f"t 采样 {f.t_mode} shift={f.flow_shift} low={f.mix_low_prob}"
         f" high={f.mix_high_prob} logsnr=({f.logsnr_mu},{f.logsnr_sigma})"
-        f" 分层={f.stratified} 范围=[{f.t_min},{f.t_max}]",
+        f" 分层={f.stratified} 范围=[{f.t_min},{f.t_max}]"
+        + (f" | krea2_res_shift mu({rc.krea2_shift_min_res}px={rc.krea2_shift_y1},"
+           f"{rc.krea2_shift_max_res}px={rc.krea2_shift_y2})"
+           if rc.family == "krea2" and rc.krea2_res_shift else ""),
         f"loss {f.loss_type}(c={f.huber_c}, {f.huber_schedule}, clamp={f.huber_snr_clamp_max})"
         f" 加权={f.weighting} immiscible_k={f.immiscible_k}",
         f"aux eisbach={x.eisbach_lambda} dfm={x.dfm_lambda}({x.dfm_mode})"

@@ -94,9 +94,11 @@ PYTHONUTF8=1 python -m kaggle datasets create -p .
 ```
 
 注意：
-- 上传的是**私有** dataset（默认），挂载路径是
-  `/kaggle/input/datasets/<用户名>/<slug>/`（**不是**旧的 `/kaggle/input/<slug>/`，
-  2026-08 实测布局已变；拿不准就用 `kaggle_job/input_probe/` 零配额探一下）。
+- 上传的是**私有** dataset（默认）。**两种挂载布局并存（2026-08-20 实测）**：
+  早先传的 ashima 缓存在 `/kaggle/input/datasets/<用户名>/<slug>/`，
+  新传的 krea2-tiny-* 却在 `/kaggle/input/<slug>/` —— 同一个 kernel 里两种都在。
+  推之前拿不准就用 `kaggle_job/input_probe/` 零配额探一下（把 dataset_sources
+  挂上后跑一遍，它会打印 /kaggle/input 的实际树）。
 - `datasets status <用户名>/<slug>` 显示 **ready 之后**才能 push kernel，
   否则挂载不到（白烧约 1 分钟 TPU）。
 - PNG 必须一起传：TPU 扫描靠图片文件发现 stem（像素从不被读）。若在意隐私，
@@ -181,3 +183,23 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$PWD/kaggle_run.ps1" \
 20 epoch / 148 步全程 29.4 分钟（含 14 种布局首次编译），稳态 6~9s/步，
 单次 TPU 消耗 ~0.5h 配额。checkpoint 约 7~8 步一份（epoch 边界），32MB/份。
 作为外推：这个数据集规模下"再训 10 倍"（200 epoch）约 5h，一周配额够跑 3~4 次。
+
+## Krea2 的差异点（`model_family: krea2`）
+
+整体流程不变（同一份 yaml、同一条缓存→上传→build→push 管线），差别只在：
+
+- **① 文本缓存换工具档**：`tools/cache_text_features.py --model-family krea2`
+  （`--text-encoder` 指 Qwen3-VL-4B-Instruct 目录，不需要 `--transformer`）。
+  产物键 `txt` [L,12,2560] **变长**，体积约为 anima 格式的 60 倍/token，
+  上传 dataset 前留意大小。latent 缓存与 Anima 同一条命令（同一个 VAE）。
+- **② yaml**：`model_family: krea2` + `krea2_res_shift: true`（默认；开着时
+  `schedule_shift` 必须 1.0，构造期 fail-fast）。模板
+  `AnimaLoraToolkit/config/train_krea2_tpu_template.yaml`。预算语义不变
+  （全局 = 8×单卡），但 K2 的段含 text 槽 —— **单图 image+text 合计 ≤ 16384/卡**。
+- **④ 底模**：`--hf-model krea/Krea-2-Raw:<文件>[:<rev>]`，**gated** —— 先在
+  HF 网页接受协议，token 配成 Kaggle Secrets 的 `HF_TOKEN`。job 内 FSDP
+  分片加载（每卡 ~3GB），host 不持全量。
+- **⑤ plan-only**：输出里布局行会带 `txt(...)`（各实段 text 槽长）。
+- **真机约束**：remat 不能 none（FSDP all_gather 要在 checkpoint 内）；
+  `--unrolled/--packed-chunk/--packed-barrier` 未在 K2 验证，构造期拦。
+- **闸门**：改 `jax_tpu/` 后先跑 tests 的 K1 + K2 再推（见 tests/README.md）。

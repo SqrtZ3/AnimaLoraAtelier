@@ -232,13 +232,3 @@ class AdaptiveTimestepSampler:
             setattr(self, name, v)
 
 
-def anneal_mix_prob(base: float, end: float, step: int,
-                    start: int, stop: int) -> float:
-    """三峰路由概率的线性退火（objective.py:314）。
-
-    `end < 0` 或 `stop <= start` 视为禁用（恒返 base）——yaml 默认就是这样。
-    """
-    if end < 0 or stop <= start:
-        return float(base)
-    prog = min(max((step - start) / float(stop - start), 0.0), 1.0)
-    return float(base) + (float(end) - float(base)) * prog

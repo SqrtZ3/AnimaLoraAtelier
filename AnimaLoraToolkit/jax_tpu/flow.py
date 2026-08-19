@@ -282,6 +282,40 @@ def sample_t_np(rng: np.random.RandomState, n: int, cfg: FlowConfig) -> np.ndarr
     return finish_t(base_t_np(rng, n, cfg), cfg, np).astype(np.float32)
 
 
+# ── krea2 分辨率感知 shift（官方 sampling.py 的训练侧等价）─────────────────────
+def krea2_mu(image_tokens: float, min_res: int = 256, max_res: int = 1280,
+             y1: float = 0.5, y2: float = 1.15, patch_px: int = 16) -> float:
+    """trainer/model_family.py:387 的同公式（官方 mu 在两端点间线性内插）。
+
+    image_tokens = (H/16)·(W/16)。1024² → mu≈0.906，exp(mu)≈2.48（"shift 2.5 @1024"）。
+    """
+    x1 = (min_res // patch_px) ** 2
+    x2 = (max_res // patch_px) ** 2
+    slope = (y2 - y1) / (x2 - x1)
+    return slope * float(image_tokens) + (y1 - slope * x1)
+
+
+def krea2_res_shift_np(t: np.ndarray, image_tokens: np.ndarray,
+                       min_res: int = 256, max_res: int = 1280,
+                       y1: float = 0.5, y2: float = 1.15) -> np.ndarray:
+    """逐图施加 t' = αt/(1+(α−1)t)，α=exp(mu(该图 image token 数))。
+
+    trainer/model_family.py:399 的 numpy 版。挂点与 schedule_shift 相同（任何
+    timestep mode 采样之后、送进模型之前）；自适应采样器的分桶口径 = 施加后
+    的最终 t（与 PyTorch 侧 anima_train.py 的顺序一致）。
+    """
+    t = np.asarray(t, np.float32)
+    toks = np.asarray(image_tokens, np.float32).reshape(-1)
+    if toks.shape[0] != t.reshape(-1).shape[0]:
+        raise ValueError(f"image_tokens 数 {toks.shape[0]} != t 数 {t.reshape(-1).shape[0]}")
+    x1 = (min_res // 16) ** 2
+    x2 = (max_res // 16) ** 2
+    slope = (y2 - y1) / (x2 - x1)
+    alpha = np.exp(slope * toks + (y1 - slope * x1)).astype(np.float32)
+    out = alpha * t / (1.0 + (alpha - 1.0) * t)
+    return out.astype(np.float32)
+
+
 # ── 加噪 / 目标 ───────────────────────────────────────────────────────────────
 def make_noisy_and_target(latent: jnp.ndarray, noise: jnp.ndarray, t: jnp.ndarray):
     """objective.py:1523-1524。

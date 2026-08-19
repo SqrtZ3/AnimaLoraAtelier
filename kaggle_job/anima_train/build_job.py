@@ -44,7 +44,7 @@ OUT = HERE / "anima_train_job.py"
 #: 打包哪些模块。顺序无所谓（运行时是正常 import），但列表要全 ——
 #: 漏一个会在真机上报 ModuleNotFoundError，白烧一轮配额。
 MODULES = ("adapters.py", "anima_jax.py", "attention.py", "auxloss.py", "config.py",
-           "data.py", "export.py", "flow.py", "optim.py", "packing.py",
+           "data.py", "export.py", "flow.py", "krea2_jax.py", "optim.py", "packing.py",
            "sched.py", "train.py", "run_train.py")
 
 
@@ -137,9 +137,9 @@ for _k, _v in _ENV.items():
     print(f"[ INFO ] env {{_k}} = {{os.environ[_k]}}", flush=True)
 
 if _HF:
-    # HF 直下底模（public repo，enable_internet=true 即可，无需 token）。
-    # 钉 revision 是为了与本地对拍环境逐字节一致 —— 本地那份的 sha256 已与
-    # HF 的 X-Linked-ETag 核对过。下载走 /kaggle/working（系统盘未必装得下 4.2GB）。
+    # HF 直下底模。public repo 匿名即可；gated repo（如 krea/Krea-2-Raw）需要
+    # token —— 从 Kaggle Secrets 读 HF_TOKEN（网页里 Add-ons -> Secrets 配一次，
+    # 不落盘不进脚本）。
     os.environ.setdefault("HF_HOME", "/kaggle/working/hf_cache")
     try:
         from huggingface_hub import hf_hub_download
@@ -148,10 +148,17 @@ if _HF:
         _sp.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"],
                 check=True)
         from huggingface_hub import hf_hub_download
+    _token = None
+    try:
+        from kaggle_secrets import UserSecretsClient
+        _token = UserSecretsClient().get_secret("HF_TOKEN")
+        print("[ INFO ] 已从 Kaggle Secrets 读 HF_TOKEN（gated repo 用）", flush=True)
+    except Exception:
+        pass
     _repo, _file = _HF[0], _HF[1]
     _rev = _HF[2] if len(_HF) > 2 else None
     _t0 = __import__("time").time()
-    _p = hf_hub_download(_repo, _file, revision=_rev)
+    _p = hf_hub_download(_repo, _file, revision=_rev, token=_token)
     os.environ.setdefault("ANIMA_TRANSFORMER", _p)
     print(f"[ INFO ] HF {{_repo}}:{{_file}} -> {{_p}}"
           f"（{{__import__('time').time() - _t0:.0f}}s）", flush=True)

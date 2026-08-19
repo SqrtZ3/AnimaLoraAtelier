@@ -63,7 +63,8 @@ try:                                   # 作为包导入
     from . import export as EX
     from . import flow as F
     from . import optim as O
-    from .packing import Layout, Pack
+    from . import krea2_jax as K2
+    from .packing import K2Layout, Layout, Pack
 except ImportError:                    # jax_tpu/ 直接在 sys.path 上（tests/ 走这条）
     import adapters as AD
     import anima_jax as A
@@ -72,7 +73,8 @@ except ImportError:                    # jax_tpu/ 直接在 sys.path 上（tests
     import export as EX
     import flow as F
     import optim as O
-    from packing import Layout, Pack
+    import krea2_jax as K2
+    from packing import K2Layout, Layout, Pack
 
 PyTree = Any
 
@@ -417,7 +419,7 @@ def apply_update(state, grads, cfg: O.AdamWConfig):
     return new_state, diag
 
 
-def accumulate(acc, grads, n: int):
+def accumulate(acc, grads):
     """梯度累加（host 侧驱动，跨布局也成立）。
 
     **在 fp32 上累加**：`grad_fn` 里参数在进 `value_and_grad` 之前就被降到 bf16，
@@ -471,14 +473,19 @@ def assemble_batch(packs: Sequence[Pack], latents, ctxs, t: np.ndarray,
                              "loss_mask", "seg_self", "seg_cross", "seg_txt")}
     for p, lat_list, ctx_list in zip(packs, latents, ctxs):
         idx = p.index_arrays()
+        if len(lat_list) != layout.n_seg or len(ctx_list) != layout.n_seg:
+            # 少给一段就有一段被静默当成纯填充 —— 那张图整段丢失，不报错。
+            raise ValueError(
+                f"latents/ctxs 每 pack 必须给齐 {layout.n_seg} 段（纯填充段给 None），"
+                f"拿到 {len(lat_list)}/{len(ctx_list)}")
         lat = np.zeros((B, model_cfg.out_dim), np.float32)
         ctx = np.zeros((layout.kv_txt, model_cfg.crossattn_dim), np.float32)
         off = 0
         for j, seg in enumerate(layout.seg_lens):
-            L = lat_list[j] if j < len(lat_list) else None
+            L = lat_list[j]
             if L is not None:
                 lat[off:off + L.shape[0]] = L
-            C = ctx_list[j] if j < len(ctx_list) else None
+            C = ctx_list[j]
             if C is not None:
                 ctx[j * layout.txt_len:(j + 1) * layout.txt_len] = C
             off += seg
@@ -587,3 +594,224 @@ def _jsonable(obj):
     if isinstance(d, (list, tuple)):
         return [_jsonable(v) for v in d]
     return d if isinstance(d, (int, float, str, bool, type(None))) else str(d)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Krea2（单流 MMDiT + FSDP）——与上面 Anima 部分共用 _loss_core / optim / flow /
+# auxloss，差别只在：① 前向是 krea2_jax（text+image 同序列）；② 权重分片，
+# all_gather 在 remat 内（spmd_probe P1）；③ loss 只作用在图像流上。
+# ═════════════════════════════════════════════════════════════════════════════
+def init_adapter_k2(key, model_cfg: K2.Krea2Config, acfg: AD.AdapterConfig,
+                    targets, base_row_sq=None):
+    """Krea2 适配器初始化（见 krea2_jax.init_adapters_k2）。"""
+    return K2.init_adapters_k2(key, model_cfg, acfg, targets, base_row_sq)
+
+
+def local_loss_k2(lora, consts, params, batch, model_cfg: K2.Krea2Config,
+                  tcfg: TrainConfig, plans, main_fn, rf_fn, key,
+                  txt_pos, img_pos, g: int, mesh_axis: str = "d",
+                  fsdp_ndev: int = 8):
+    """Krea2 打包布局下一个 pack 在**本卡**上的 loss。
+
+    与 Anima 的 local_loss 的差别只有"模型怎么跑"：加噪/目标/逐图 loss/
+    aux（eisbach/ΔFM/spectral）全部复用 —— 那些数学只作用在**图像流**
+    [Σimg_q, 64] 上，与文本怎么进模型无关。
+    """
+    b = batch
+    seg_i = b["mod_index_i"]                       # 图像流 token → 图
+    lat = b["latent"]                              # [Σimg_q, 64]
+    ssum = lambda x: X.seg_sum(x, seg_i, g)
+    bcast = lambda v: jnp.take(v, seg_i)
+
+    k_noise, k_drop, k_neg = jax.random.split(key, 3)
+    noise = F.immiscible_noise(k_noise, lat, b["loss_mask"], ssum, bcast,
+                               tcfg.flow.immiscible_k)
+    noisy, target = F.make_noisy_and_target(lat, noise, bcast(b["t"])[:, None])
+
+    drop = AD.sample_dropout(k_drop, tcfg.adapter, plans)
+    ctxs = K2.split_ctx_regions(lora, consts, drop, tcfg.adapter)
+    pred = K2.forward_packed(
+        params, model_cfg, noisy.astype(tcfg.dtype), b["t"], b["txt"],
+        b["rows_c"], b["cols_c"], b["mod_index_c"], txt_pos, img_pos,
+        main_fn, rf_fn, K2.attention_dense_gqa,
+        loras=ctxs, remat=tcfg.remat, mesh_axis=mesh_axis, fsdp_ndev=fsdp_ndev)
+
+    # _loss_core 要的 b 是图像流的键名（rows/cols/loss_mask/t/ms_weight）
+    b2 = {"t": b["t"], "loss_mask": b["loss_mask"],
+          "rows": b["rows_i"], "cols": b["cols_i"]}
+    if "ms_weight" in b:
+        b2["ms_weight"] = b["ms_weight"]
+    return _loss_core(pred, lat, noisy, target, b2, g, seg_i, tcfg, k_neg,
+                      tcfg.aux.canvas_hw)
+
+
+def fsdp_pspec(params, mesh_axis: str = "d", ndev: int = 8):
+    """由**真实**权重树推 shard_map 的 in_spec：优先读数组自身的分片布局
+    （加载/堆叠时定下的，最权威），host 侧未分片的数组才回退到
+    krea2_jax.fsdp_shard_pred 的按形状判据。"""
+    from jax.sharding import PartitionSpec as P
+
+    def spec(x):
+        sh = getattr(x, "sharding", None)
+        s = getattr(sh, "spec", None)
+        if s is not None:
+            return s
+        return (P(*([None] * (x.ndim - 1) + [mesh_axis]))
+                if K2.fsdp_shard_pred(x.shape, ndev) else P())
+    return jax.tree.map(spec, params)
+
+
+def make_grad_fn_k2(model_cfg: K2.Krea2Config, tcfg: TrainConfig, plans,
+                    layout: K2Layout, mesh, pspec, interpret: bool = False,
+                    grad: bool = True, mesh_axis: str = "d"):
+    """为一种 K2 布局编译"求梯度"函数。签名与 `make_grad_fn` 一致。
+
+    两种注意力几何（见 krea2_jax 模块头）：
+      * 主序列块对角：段 = combined（text+image），48 Q 头（KV 12→48 展开）
+      * refiner 块对角：段 = text 槽，20 头
+      * layerwise：逐 token 12×12 稠密（无 mask，不需要内核）
+
+    `pspec` = fsdp_pspec(真实权重树)：分片权重的 in_spec。
+    """
+    from jax.sharding import PartitionSpec as P
+
+    coarse = list(layout.seg_lens)
+    txtc = list(layout.txt_segs)
+    g = layout.n_seg
+    txt_pos, img_pos = (jnp.asarray(a) for a in layout.static_positions())
+
+    main_attn = AT.make_splash_attn(coarse, coarse, model_cfg.heads,
+                                    model_cfg.head_dim, interpret=interpret)
+    rf_attn = AT.make_splash_attn(txtc, txtc, model_cfg.txtheads,
+                                  model_cfg.txt_head_dim, interpret=interpret)
+    # GQA：splash 只认等头数，KV 头在内核外 repeat_interleave 展开（krea2_jax
+    # 的 wrap_attn_gqa；与 torch 侧 repeat_interleave 逐 bit 相同）
+    main_gqa = K2.wrap_attn_gqa(main_attn, model_cfg.heads)
+
+    def per_shard(lora, consts, params, b, key):
+        self_fn = AT.bind_segments(main_gqa, b["seg_self"][0], b["seg_self"][0])
+        rf_fn = AT.bind_segments(rf_attn, b["txt_fine"][0], b["txt_fine"][0])
+        one = {k: v[0] for k, v in b.items()}
+        kk = jax.random.fold_in(key, jax.lax.axis_index(mesh_axis))
+        loss, per = local_loss_k2(lora, consts, params, one, model_cfg, tcfg,
+                                  plans, self_fn, rf_fn, kk, txt_pos, img_pos,
+                                  g, mesh_axis,
+                                  fsdp_ndev=mesh.shape[mesh_axis])
+        return loss[None], per[None]
+
+    dspec = {k: P(mesh_axis) for k in
+             ("latent", "t", "txt", "rows_c", "cols_c", "mod_index_c", "seg_self",
+              "txt_fine", "rows_i", "cols_i", "mod_index_i", "loss_mask",
+              "ms_weight")}
+    return _finish_grad_fn_k2(per_shard, mesh, pspec, dspec, tcfg, grad)
+
+
+def _finish_grad_fn_k2(per_shard, mesh, pspec, dspec, tcfg: TrainConfig,
+                       grad: bool = True):
+    """k2 版 _finish_grad_fn：唯一差别是 params 的 in_spec 是分片树（pspec），
+    其余（lora/consts 复制、梯度转置自动 psum、eval 降 dtype）与 Anima 相同。"""
+    from jax.sharding import PartitionSpec as P
+
+    smapped = _shard_map(per_shard, mesh,
+                         (P(), P(), pspec, dspec, P()), (P("d"), P("d")))
+
+    def loss_fn(lora, consts, params, b, key):
+        loss, per = smapped(lora, consts, params, b, key)
+        return jnp.mean(loss), per
+
+    if not grad:
+        @jax.jit
+        def eval_fn(lora, consts, params, b, key):
+            fwd = jax.tree.map(lambda x: x.astype(tcfg.dtype), lora)
+            loss, per = loss_fn(fwd, consts, params, b, key)
+            return loss, per, None
+        return eval_fn
+
+    @jax.jit
+    def grad_fn(lora, consts, params, b, key):
+        fwd = jax.tree.map(lambda x: x.astype(tcfg.dtype), lora)
+        (loss, per), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+            fwd, consts, params, b, key)
+        return loss, per, grads
+    return grad_fn
+
+
+def assemble_batch_k2(packs, latents, ctxs, t: np.ndarray,
+                      model_cfg: K2.Krea2Config, dtype, ms_weight=None
+                      ) -> Dict[str, jnp.ndarray]:
+    """把同布局的 N 个 K2 pack 拼成 [N, ...] 的 batch（K2Pack 版 assemble_batch）。
+
+    latents[i][j] = 第 i 个 pack 第 j 段的 patchified latent [n_j, 64]（纯填充段 None）
+    ctxs[i][j]    = 同上的**变长**文本特征 [L_j, 12, txtdim]（纯填充段 None）
+    t: [N*G]（G = n_seg 含填充段；填充段的 t 采样了但被 loss_mask/valid 丢掉，
+        与 Anima 同口径）
+    """
+    layout = packs[0].layout
+    if any(p.layout != layout for p in packs):
+        raise ValueError("同一步的 pack 必须同布局（一个编译产物只有一种 mask）")
+    B, G, N = layout.budget, layout.n_seg, len(packs)
+    NI, NT = layout.n_img_tokens, layout.n_txt_tokens
+    if t.shape != (N * G,):
+        raise ValueError(f"t 的长度 {t.shape} != pack 数 × 段数 = {N * G}")
+    n_layers = model_cfg.txtlayers
+    keys = ("latent", "txt", "rows_c", "cols_c", "mod_index_c", "seg_self",
+            "txt_fine", "rows_i", "cols_i", "mod_index_i", "loss_mask")
+    out: Dict[str, list] = {k: [] for k in keys}
+    for p, lat_list, ctx_list in zip(packs, latents, ctxs):
+        idx = p.index_arrays()
+        if len(lat_list) != len(layout.txt_segs) or len(ctx_list) != len(layout.txt_segs):
+            raise ValueError(
+                f"latents/ctxs 每 pack 必须给齐 {len(layout.txt_segs)} 个实段"
+                f"（纯填充段不在其列），拿到 {len(lat_list)}/{len(ctx_list)}")
+        lat = np.zeros((NI, model_cfg.in_dim), np.float32)
+        # txt 缓存多半是 uint16 位模式（bf16）—— 零数组与赋值都按来料 dtype，
+        # bitcast 留到最后一次性做（见 data._read_ctx 的内存注记）。
+        c0 = next((c for c in ctx_list if c is not None), None)
+        txt_dt = c0.dtype if c0 is not None else np.float32
+        txt = np.zeros((NT, n_layers, model_cfg.txtdim), txt_dt)
+        i_off = t_off = 0
+        for j, (tq, iq) in enumerate(zip(layout.txt_segs, layout.img_segs)):
+            L_ = lat_list[j]
+            if L_ is not None:
+                lat[i_off:i_off + L_.shape[0]] = L_
+            C = ctx_list[j]
+            if C is not None:
+                if C.shape[0] > tq:
+                    raise ValueError(
+                        f"第 {j} 段文本 {C.shape[0]} token > 槽长 {tq}：caption "
+                        f"dropout 换入的空 caption 比原 caption 还长？这不允许 —— "
+                        f"空 caption 的 token 数必须 <= 槽长")
+                txt[t_off:t_off + C.shape[0]] = C
+            i_off += iq
+            t_off += tq
+        out["latent"].append(lat)
+        out["txt"].append(txt)
+        for k in ("rows_c", "cols_c", "mod_index_c", "seg_self", "txt_fine",
+                  "rows_i", "cols_i", "mod_index_i", "loss_mask"):
+            out[k].append(idx[k])
+
+    batch = {k: jnp.asarray(np.stack(v)) for k, v in out.items()}
+    if batch["txt"].dtype == jnp.uint16:
+        batch["txt"] = jax.lax.bitcast_convert_type(batch["txt"], jnp.bfloat16)
+    batch["txt"] = batch["txt"].astype(dtype)
+    batch["t"] = jnp.asarray(t.reshape(N, G).astype(np.float32))
+    # ms_weight 恒存在（同 assemble_batch 的理由：键集进 in_specs，全 1 会被 XLA 折叠）
+    batch["ms_weight"] = jnp.asarray(
+        np.ones((N, G), np.float32) if ms_weight is None
+        else np.asarray(ms_weight, np.float32).reshape(N, G))
+    return batch
+
+
+def save_lora_k2(path, state, tcfg: TrainConfig, plans,
+                 extra: Optional[Dict] = None) -> Path:
+    """Krea2 适配器导出（torch 模块路径命名，ComfyUI 与仓库 PyTorch 侧同键名）。"""
+    flat = K2.unstack_k2(state["master"], plans, tcfg.adapter)
+    a = tcfg.adapter
+    meta = {"step": str(int(state["step"])), "model_family": "krea2",
+            "lora_type": a.kind, "lora_variant": a.variant, "rank": str(a.rank),
+            "alpha": str(a.alpha if a.alpha is not None else a.rank),
+            "lokr_factor": str(a.factor), "remat": tcfg.remat,
+            "t_mode": tcfg.flow.t_mode, "flow_shift": str(tcfg.flow.flow_shift),
+            "loss_type": tcfg.flow.loss_type, "lr": str(tcfg.adamw.lr),
+            **{k: str(v) for k, v in (extra or {}).items()}}
+    return EX.export_adapter(path, flat, meta)

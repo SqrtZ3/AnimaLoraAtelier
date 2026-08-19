@@ -87,6 +87,11 @@ class AuxConfig:
         if self.spectral_enabled and min(self.canvas_hw) <= 0:
             raise ValueError("aux_spectral 需要 canvas_hw（FFT 画布尺寸），"
                              "由数据侧按数据集最大网格填入")
+        if self.dfm_lambda > 0 and min(self.canvas_hw) <= 0:
+            # ΔFM 的裁剪+resize 支路与 spectral 共用同一个画布原语（to_canvas），
+            # 没画布会在 trace 里报一个看不出根因的 gather 越界
+            raise ValueError("dfm_lambda>0 需要 canvas_hw（裁剪支路的画布尺寸），"
+                             "由数据侧按数据集最大网格填入")
 
     @property
     def any_enabled(self) -> bool:

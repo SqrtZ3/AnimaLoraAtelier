@@ -13,15 +13,15 @@
 
 ---
 
-## ⚠️ 先读我：蜈蚣式分支模型
+## 分支模型：链式推进（建议先读）
 
-本仓库的功能演进是**链式**的，像一条蜈蚣：每条新分支从前一条分支的尖端切出，因此——
+本仓库采用**链式分支**推进：每一节新分支从上一节分支的尖端切出，链上任意一节都完整包含其全部前置工作。因此：
 
-- **最新分支永远包含全部历史工作**；想要全部功能，直接用链条末端的分支（当前为 `feat/tpu-probe`）。
-- 腿与腿之间**不是**并行的 feature 分支：从任何一条腿切出，都自动带上之前所有腿的工作。
-- `main` 只在里程碑时收编整条链，不追每一步。**2026-08-19 已把全链合并回 main**（合并零冲突），此后克隆 main 即得全量功能；日常更新继续发生在链条末端，main 待下一个里程碑再收编。
+- **最新功能永远位于链条末端的分支**（当前为 `feat/tpu-probe`）。
+- 各节分支并非并行的独立功能分支：从任何一节切出，都会自动带上之前所有节的工作。
+- `main` 按里程碑收编整条链，不追踪每一步。**2026-08-19 已完成一次全链合并**（零冲突），当前克隆 main 即得全量功能；此后的日常更新仍发生在链条末端，main 于下一个里程碑再收编。
 
-| 腿（分支） | 收官 | 主要内容（腿内主题与分支名大致对应，跨腿混做是常态，精确归因见 `git log`） |
+| 节（分支） | 收官 | 主要内容（节内主题与分支名大致对应，跨节协作是常态，精确归因见 `git log`） |
 |---|---|---|
 | `codex-soap-optimizer` | 2026-05-23 | 基础期（**已在 main**）：ARB 长宽比分桶、Kohya 式参数族、`trainer/` 模块化重构、Spectral/Perceptual 辅助 loss、T-LoRA / infonoise、ProdigyPlus |
 | `dev/adopt-optimizer` | 2026-05-26 | 优化器实验起步：SOAP / ADOPT / Lion / C-Lion、参考步采样进度 |
@@ -108,6 +108,20 @@ docs/superpowers/            设计文档（plans / specs）
 | **海光 DCU K100-AI**（gfx936 / DTK） | 真机跑通 | `run_dcu.sh`；`docs/hygon-dcu.md`、`docs/dcu-image-release.md`、`docs/scnet-image-build.md`；`Dockerfile.dcu`（DAS 预编译 flash_attn/triton 轮子 + 构建期自检 + 前端 IDE）；单机 8 卡数据并行；VAE/注意力分块防 O(S²) |
 | **昇腾 Ascend 910B**（启智/OpenI） | 真机跑通 | `run_npu.sh`；`docs/ascend-npu.md`；`utils/npu_compat.py` 兼容层 + `npu_probe.py` 能力探针 + `npu_setup_image.sh` 镜像装配；含 torch_npu 广播 matmul backward bug 的定位与绕行 |
 | **Google TPU v5e-8** | JAX 全套移植 + Kaggle 实测 | `AnimaLoraToolkit/jax_tpu/`（C12 配方：LoKr+DoRA、三峰+自适应 t、Huber(snr)、Eisbach/ΔFM/spectral）；`kaggle_job/` CLI 工作台（探针 → torch_xla → 真训练）；FSDP 实测 9.8k tokens/s、并行效率 95% |
+
+### 8.1 环境与依赖（跨架构参考）
+
+DCU 侧有一份**实测**的完整环境锁定：[`AnimaLoraToolkit/requirements-dcu-freeze.txt`](AnimaLoraToolkit/requirements-dcu-freeze.txt) —— 训练镜像内 `pip freeze` 的原样输出（含 IDE 层与基础镜像自带包，不可直接 `pip install -r`）。核心组合：`torch==2.9.0+das.opt1.dtk2604` + `flash_attn==2.8.3+das.opt1.dtk2604.torch290` + `triton==3.5.1+das.opt1.dtk2604.torch290`（均为 DAS 适配轮子，PyPI 无）+ `transformers==4.57.6` + `numpy==1.25.0`（constraints 钉死）。
+
+以该实测组合为基线，其余架构的对应关系推断如下——**除标注「实测」外均为推断，未逐项验证**：
+
+| 组件 | 海光 DCU（实测） | NVIDIA CUDA（推断） | 昇腾 NPU（推断） | TPU（推断） |
+|---|---|---|---|---|
+| 框架 | `torch 2.9.0+das`（DTK 26.04 基础镜像自带） | `torch 2.9.x + cu130`（见快速开始） | `torch + torch_npu`，版本组合由 CANN 版本决定（`npu_recon.sh` 实测侦察） | JAX：Kaggle 镜像自带 jax 0.10.2，自举升级至 0.11.0 实测可行；torch_xla 钉旧版 libtpu（实测存在版本剪刀） |
+| 注意力后端 | `flash_attn 2.8.3+das` / `triton 3.5.1+das` | 官方 `flash-attn` / `xformers`；sm120 有 flash backward IMA 已知问题（krea2 txtfusion 路径已强制 MATH 后端绕行） | 昇腾原生算子（仓库自实现 `npu_tnd` / `sdpa_seg` / 广播 mask 展开适配） | `jax_tpu` 自实现块对角打包注意力 |
+| torchvision | 镜像内不装（constraints 防误装） | 正常安装（`requirements.txt`） | **不装**（实测：昇腾上安装会破坏环境） | 训练路径不依赖 |
+| 核心训练依赖 | `transformers 4.57.6` / `tokenizers 0.22.2` / `safetensors 0.7.0` / `sentencepiece 0.2.2` / `einops 0.8.2` / `omegaconf 2.3.1` | 同左——纯 Python / 通用轮子包可直接对齐 DCU 实测版本 | 同左（与硬件无关；sentencepiece 已进启动预检） | JAX 路线为独立精简依赖集（`jax_tpu/`）；torch_xla 路线同左 |
+| 需成套钉死的组合 | torch/triton/numpy（constraints-dcu.txt） | torch + flash-attn/xformers 的 CUDA·sm 匹配 | torch ↔ torch_npu ↔ CANN ↔ 驱动 四层对齐 | libtpu ↔ jax ↔ torch_xla 三者成套（Kaggle 上已实测裁决） |
 
 ### 9. 可观测性与训练运维
 

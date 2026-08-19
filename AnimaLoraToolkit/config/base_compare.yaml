@@ -7,7 +7,7 @@
 # 模型路径
 transformer_path: "AnimaLoratoolkit/models/transformers/anima-preview3-base.safetensors"
 vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
-text_encoder_path: "AnimaLoratoolkit/models/text_encoders"
+text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-0.6B-Base"
 t5_tokenizer_path: "AnimaLoratoolkit/models/t5_tokenizer"
 
 # 数据集：先用你正在观察 loss 的同一个数据集
@@ -102,7 +102,7 @@ sample_width: 0
 sample_height: 0
 sample_seed: 0
 sample_negative_prompt: ""
-sample_prompt: " @your-trigger,newest, safe, 1girl, masterpiece, best quality"
+sample_prompt: "@your-trigger,newest, safe, 1girl, masterpiece, best quality"
 
 # 诊断日志
 loss_curve_steps: 1

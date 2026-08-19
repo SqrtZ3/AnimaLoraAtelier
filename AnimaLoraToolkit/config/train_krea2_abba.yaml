@@ -1,0 +1,229 @@
+# ══════════════════════════════════════════════════════════════════
+# Krea 2 · ABBA 等预算 A/B（2026-07-11）
+#
+# 与 train_krea2_minimal_diag.yaml（= goutong 成功基线）**逐字段一致**，
+# 唯一变量：lora_type lora → abba。其他任何字段都不要动，保持单变量归因。
+#
+# ABBA (arXiv:2505.14238)：ΔW = √α1·√α2 ·(B1A1)∘(B2A2)
+#   · lora_rank: 32 → r1=r2=16，参数量 = LoRA r32 完全同预算，KR 有效秩上限 256
+#   · abba_alpha 不设 → 官方口径 alpha1=alpha2=r1=16
+#   · init：(B1,A1)=W0 截断 SVD，B2=0 → step 0 净 ΔW=0；
+#     注入阶段多一次逐层 svd_lowrank（264 层，GPU 上约 1 分钟）
+#   · LR 沿用基线 1e-4（首跑单变量）。若 500 步内 loss 出现尖峰/发散，
+#     降到 5e-5 重跑并记录 —— Hadamard 调制的梯度尺度与 LoRA 不完全同量纲，
+#     论文只在 LLM 上标定过，这是已知不确定性。
+#
+# 判读（对照 goutong 基线的曲线）：
+#   A. step 0 采样必须正常（ΔW=0 保证；若坏 → 注入路径 bug，停）。
+#   B. eval_loss t=0.5/0.9 与基线同窗口对比：追平 → ABBA 可用；
+#      显著差 → Hadamard 流形也不适配，回 LoRA+压缩路线。
+#   C. epoch 成品默认只含 native abba_* 因子（≈235MB，与 LoRA r32 基线同体积，
+#      下载友好）。部署件下载后本地转换（KR 物化+可选截断，秒级）：
+#        python tools/abba_export_lora.py epoch.safetensors deploy.safetensors --energy 0.999
+#      （abba_export_kr: true 可让云端直出 ComfyUI 直载文件，但 ~1.9GB，不建议）
+#
+# 显存：KR 前向 ≈ 一个 rank-256 LoRA（中间激活 (B,*,256)/层 + KR 因子
+# ~23MB/大层），比基线略高，96GB 应充裕；若 OOM 先降 batch_size 4→2 报告。
+#
+# 官方依据（每条都可回查）：
+#   · krea-ai/krea-2 README："The model has been trained to generate
+#     upto 1k resolution"（RAW 只训到 1k）→ 桶基准从 1536 降回 1024。
+#     预训练分辨率阶段 256/512/1024（Krea 2 Technical Report）。
+#   · musubi-tuner docs/krea2.md：adamw / LR 1e-4 / rank=alpha=32 /
+#     targets=DiT 全 264 Linear（musubi 口径；本仓库默认 263，移除 tproj.1）/
+#     timestep krea2_shift / RAW 训练。
+#   · 官方 sampling.py：CFG = uncond + g·(cond−uncond)（本仓库同形），
+#     官方 --cfg 默认 4.5、README RAW 示例 3.5 + 52 steps。
+#
+# 相对 train_krea2_muon_pissa.yaml 砍掉的变量（全部回官方口径）：
+#   1. muon_sf + PiSSA + DoRA  → adamw + 默认 init + 纯 LoRA
+#      （该三件套 07-10 22:29 才修完六处 bug，云端从未验证）
+#   2. lr 5e-4 → 1e-4（官方参考值）
+#   3. bucket 1536 → 1024（RAW 分布内；1536≈9216 token 是分布外，
+#      且 res-shift 线性外推到 α≈4.3，t 被压到 0.75+，细节学习被饿死）
+#   4. navit 打包/multiscale/native → 关（dense ARB，一次只测一条前向路径；
+#      packed≡dense 本地已验证 1.4e-6，但云端端到端两条都没跑过，先测简单的）
+#   5. eisbach / tag_dropout / caption_dropout → 0（纯净信号）
+#
+# 判读方法（跑之前先记住）：
+#   A. step 0 基线采样必须是正常的 krea2 图（不糊不崩）。若 step 0 就坏
+#      → 条件/推理路径有 bug，别继续训，回来报告。
+#   B. grad_norm 日志（每 20 步）应为 O(0.1~几)。恒 0 → LoRA 被绕过。
+#   C. loss 本身抖动大，看 eval_loss（每 40 步、固定 t 网格）：t=0.5/0.9
+#      应在 500~1500 步内单调下降。t=0.1 纹丝不动是 res-shift 调度的必然，
+#      不是欠拟合证据。
+#   D. 过拟合冒烟（可选、最强判据）：数据集换成 10~20 张的子集 +
+#      repeats: 30，若 1000 步后采样仍看不到训练集特征 → 代码问题实锤。
+#
+# 显存预期：dense bs=4 @1024²（4096 img token + ≤512 text），12B bf16 +
+# per-block checkpoint + AdamW(LoRA rank32 ≈ 1GB fp32 状态)，96GB 充裕。
+# ══════════════════════════════════════════════════════════════════
+
+# ── 模型路径 ────────────────────────────────────────────────
+model_family: "krea2"
+transformer_path: "AnimaLoratoolkit/models/transformers/raw.safetensors"
+vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
+krea2_text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-VL-4B-Instruct"
+krea2_text_max_length: 512
+krea2_text_cache_entries: 128
+
+# ── 数据集 ──────────────────────────────────────────────────
+data_dir: "./Dataset/your-dataset"
+resolution: 1024
+repeats: 1
+
+# ── ARB 分桶（1024 基准 = RAW 分布内）────────────────────────
+bucket_base_resos: [1024]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 2048
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.0
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+max_img_h: 0
+max_img_w: 0
+
+# ── NaViT / FiT 全关（dense ARB 路径）───────────────────────
+navit_packing: false
+navit_native_resolution: false
+navit_token_budget: 16384
+navit_multiscale: false
+navit_pack_strategy: ffd
+navit_text_trim_padding: false
+fit_packed_training: false
+token_bucket: false
+bucket_drop_last: false
+torch_compile: false
+cache_latents: true
+cache_encode_tiled: true
+cache_encode_max_pixels: 16777216
+
+# ── 数据增强 / 打标（最小化：只留 shuffle + trigger 保护）─────
+shuffle_caption: true
+keep_tokens: 1
+flip_augment: true
+tag_dropout: 0.0
+caption_dropout_rate: 0.0
+freq_balanced_dropout_strength: 0.0
+prefer_json: false
+
+# ── ABBA 结构（唯一变量：lora → abba；targets 仍为 family 默认全 Linear）──
+# 不写 lora_targets → family 默认 KREA2_DEFAULT_LORA_TARGETS（264 Linear）
+lora_type: "abba"
+lora_rank: 32                  # → r1=r2=16，参数预算 = LoRA r32
+# abba_alpha: 16.0             # 默认即 r1（官方口径），无需显式设
+lora_alpha: 32.0               # abba 路径不消费此值（保留字段防 diff 噪声）
+lora_dropout: 0.0
+lora_init: "default"           # 不用 PiSSA
+lora_variant: "base"           # 不用 DoRA
+rank_dropout: 0.0
+module_dropout: 0.0
+loraplus_lr_ratio: 1.0
+
+# ── 优化器（官方参考：AdamW / 1e-4 / 恒定）─────────────────
+optimizer_type: "adamw"
+learning_rate: 1e-4
+lr_scheduler: "none"
+optimizer_args:
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.01
+
+# ── 训练循环 ────────────────────────────────────────────────
+epochs: 200
+max_steps: 0
+batch_size: 4
+effective_batch_size: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0
+grad_norm_log_every: 20
+mixed_precision: "bf16"
+grad_checkpoint: true
+num_workers: 4
+
+# ── Timestep（官方 krea2_shift = logit_normal + res-shift）───
+flow_shift: 1.0
+timestep_sampling: logit_normal
+timestep_stratified: true
+timestep_t_min: 0.0
+timestep_t_max: 1.0
+schedule_shift: 1
+krea2_res_shift: true
+krea2_shift_min_res: 256
+krea2_shift_max_res: 1280
+krea2_shift_y1: 0.5
+krea2_shift_y2: 1.15
+adaptive_timestep: false
+
+# ── 主 loss（官方 flow-matching = 纯 MSE）───────────────────
+loss_type: "l2"
+loss_weighting_scheme: "none"
+weight_cap_ratio: 0
+min_snr_gamma: 0
+
+# ── 噪声 / 辅助 loss 全关 ───────────────────────────────────
+noise_offset: 0
+noise_offset_min: 0
+noise_offset_random_strength: false
+pyramid_noise_iterations: 0
+pyramid_noise_discount: 0.3
+eisbach_lambda: 0.0
+dfm_lambda: 0.0
+aux_spectral_enabled: false
+lwd_mask_enabled: false
+aux_perceptual_enabled: false
+
+# ── eval（判读主指标；t=0.1 不动是调度必然，看 0.5/0.9）──────
+eval_every: 40
+eval_count: 16
+eval_t_grid: "0.1,0.5,0.9,0.97"
+eval_seed: 1234
+
+# ── 遥测 ────────────────────────────────────────────────────
+telemetry_enabled: true
+telemetry_freq_bands: 3
+telemetry_slope_window: 6
+telemetry_optimizer_every: 0
+telemetry_capacity_every: 0
+
+# ── 输出 / 保存 ─────────────────────────────────────────────
+output_dir: "./output/krea2-abba"
+output_name: "krea2-abba"
+save_every: 1
+save_every_steps: 0
+save_state_every: 100
+keep_vae_on_gpu: true
+empty_cache_after_sample: false
+seed: 42
+resume_lora: ""
+resume_state: ""
+stage_timing_every: 20
+stage_timing_warmup: 0
+
+# ── 采样出图（RAW 上预览：CFG 图，步数要足）─────────────────
+# cfg 4.5 = 官方 guidance 3.5（README RAW 示例值；官方默认 4.5→这里 5.5）
+# RAW 本身出图偏"原始"，别拿它和 Turbo 成品比 —— 看的是画风有没有进去。
+sample_every: 1
+sample_steps: 0
+sample_infer_steps: 50
+sample_cfg_scale: 4.5
+sample_sampler_name: "euler"
+sample_scheduler: "simple"
+sample_width: 0
+sample_height: 0
+sample_seed: 1234
+sample_negative_prompt: ""
+sample_prompt: "@g0ut0ng style, 1girl,blue hair,blush,arona (blue archive),classroom"
+
+# ── 日志 / 监控 ─────────────────────────────────────────────
+loss_curve_steps: 1
+no_progress: false
+log_every: 1
+no_monitor: false
+monitor_host: "0.0.0.0"
+monitor_port: 8765
+no_browser: true

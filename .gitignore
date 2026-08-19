@@ -9,8 +9,13 @@ AnimaLoraToolkit/monitor_data/*
 # Optimizer / training-state checkpoints (can be multi-GB — e.g. SOAP GG/Q matrices)
 *.pt
 *.ckpt
+# 大模型权重 —— 走外部下载脚本，不入库（.py 源码与 tokenizer 配置仍保留）
+*.safetensors
+*.pth
+*.bin
 
 # Personal / experimental training configs (kept local, not shared)
+AnimaLoraToolkit/config/private/
 AnimaLoraToolkit/config/train_my_1024.yaml
 AnimaLoraToolkit/config/train_my_1536.yaml
 AnimaLoraToolkit/config/train_my_soap_sf.yaml
@@ -28,3 +33,6 @@ block_profile_all.csv
 
 # Windows 下误把 `> /dev/null` 写成 `> nul` 会在仓库根生成的空文件
 nul
+
+# 误提交的 venv —— 迁移 GitHub 时从历史挖掉，当前版本也不再 track
+AnimaLoraToolkit/venv/

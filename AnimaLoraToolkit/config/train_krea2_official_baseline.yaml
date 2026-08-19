@@ -1,0 +1,228 @@
+# ══════════════════════════════════════════════════════════════════
+# Krea 2 训练配置 · 官方标准基线（最贴官方配方版）
+#
+# 与 train_krea2_baseline.yaml（LoKr+DoRA+soap_sf 版）的定位区别：
+#   那版保留了你的结构/优化器变量；这版把可对齐官方的全部对齐，只保留两项
+#   你点名要的本仓库能力：navit 打包（吞吐工程，不改数学）+ eisbach（锐度）。
+#
+# 官方依据（均带出处）：
+#   · musubi-tuner krea2 文档：标准 LoRA rank/alpha=32、targets=DiT 全 264 Linear（musubi 口径；
+#     本仓库默认 263，移除 tproj.1 避免 ComfyUI 推理 OOM）、
+#     timestep=krea2_shift（分辨率感知）、RAW 训练。
+#     https://github.com/kohya-ss/musubi-tuner/blob/main/docs/krea2.md
+#   · JahJedi 实跑配方：AdamW / LR 1e-4 / rank 32 / 800 图 16 epoch ≈ 13k 步(bs=1)。
+#     https://huggingface.co/JahJedi/krea2-character-lora-recipe
+#   · 本仓库 krea2_res_shift 精确复刻官方 sampling.py 的 mu 线性内插
+#     （@1024²≈exp(0.906)=2.48，与 musubi "shift 2.5 @1024" 同口径）。
+#
+# ★ 相对 LoKr+DoRA 版的变更（每一条都是"贴官方"）：
+#   1. lora_type lokr+dora → 标准 lora，rank/alpha 32（官方推荐结构）
+#   2. targets：显式 8 条+排除 txtfusion（224 Linear）→ 不写，走 family 默认
+#      全 264 Linear（含 first/last.linear/tmlp/tproj/txtmlp/txtfusion —— 上一版
+#      注释声称对齐官方 264 但实际只有 224，这版真正对齐）
+#   3. optimizer soap_sf/4e-4 → adamw/1e-4 恒定 LR（官方参考）
+#   4. weight_decay 0.01（torch AdamW 默认 = musubi 不传参时的行为）。
+#      ⚠ 你的 Klein 50 跑实测风格最优 1e-5、0.001 已过火 —— 官方保真与你的
+#      实测在这里冲突。若这版出现"loss 平 + 不过拟合"，第一个动的就是它（→1e-4）。
+#   5. timestep：logit_normal + krea2_res_shift（=官方 krea2_shift），无三峰/adaptive
+#   6. t_min/t_max 0/1（官方无截断；上一版 0.05 下限在 res-shift 后本就几乎不触发）
+#   7. loss l2、无加权、无 snr、正则 dropout 全 0
+#
+# 保留（你点名 + 吞吐工程，不影响单图数学）：
+#   · navit 打包全套（budget 16384 / multiscale / ffd / native res / trim off）
+#   · eisbach_lambda 0.15（逐图 detached 权重，只缩放样本梯度贡献）
+#   · 数据侧管线（shuffle/tag_dropout/flip）沿用你的既有设置，与上一版一致，
+#     便于两版之间只归因"结构+优化器+正则"这一组变量。
+#
+# 步数预期（JahJedi 口径换算）：navit budget 16384 ≈ 4 图/步 → 一轮完整参考
+# 训练约 3000-3500 步；首个画风信号预计 800-1500 步。
+# ══════════════════════════════════════════════════════════════════
+
+# ── 模型路径 ────────────────────────────────────────────────
+model_family: "krea2"
+transformer_path: "AnimaLoratoolkit/models/transformers/raw.safetensors"
+vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
+krea2_text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-VL-4B-Instruct"
+krea2_text_max_length: 512
+krea2_text_cache_entries: 128
+
+# ── 数据集 ──────────────────────────────────────────────────
+data_dir: "./Dataset/your-dataset"          # ★必改
+resolution: 1024
+repeats: 1
+
+# ── ARB 分桶 ────────────────────────────────────────────────
+bucket_base_resos: [1536]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 3072
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.7
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+max_img_h: 0
+max_img_w: 0
+
+# ── NaViT 块对角打包（保留，吞吐工程）────────────────────────
+navit_packing: true
+navit_native_resolution: true
+navit_token_budget: 16384
+fit_max_tokens: 32768000
+fit_warn_tokens: 32768000
+navit_max_images_per_pack: 0
+navit_multiscale: true
+navit_multiscale_token_ladder: "2304,4096"
+navit_pack_strategy: ffd
+navit_text_trim_padding: false
+cache_latents: true
+cache_encode_tiled: true
+cache_encode_max_pixels: 16777216
+fit_packed_training: false
+token_bucket: false
+bucket_drop_last: false
+torch_compile: false
+
+# ── 数据增强 / 打标（沿用你的既有管线，与 LoKr 版一致）───────
+shuffle_caption: true
+keep_tokens: 1
+flip_augment: true
+tag_dropout: 0.1
+tag_dropout_overrides:
+  close-up: 0.5
+caption_dropout_rate: 0.01
+freq_balanced_dropout_strength: 0.0
+prefer_json: false
+
+# ── LoRA 结构（官方推荐：标准 LoRA rank/alpha 32、全 264 Linear）──
+# 不写 lora_targets / lora_exclude_patterns → 走 family 默认
+# KREA2_DEFAULT_LORA_TARGETS（28 block 全部投影 + txtfusion + txtmlp +
+# tmlp + tproj + first + last.linear = 264 个 Linear，musubi 文档口径）。
+lora_type: "lora"
+lora_rank: 32
+lora_alpha: 32.0
+lora_dropout: 0.0
+lora_variant: "base"           # 无 DoRA —— 官方是纯 LoRA
+
+rank_dropout: 0.0
+module_dropout: 0.0
+loraplus_lr_ratio: 1.0
+
+# ── 优化器（官方参考：AdamW / 1e-4 / 恒定）─────────────────
+optimizer_type: "adamw"
+learning_rate: 1e-4
+lr_scheduler: "none"           # 恒定 LR（本仓库无 constant_with_warmup；none=constant）
+optimizer_args:
+  betas: [0.9, 0.999]          # torch AdamW 默认
+  eps: 1.0e-8
+  weight_decay: 0.01           # torch AdamW 默认（见文件头 ★4 的冲突说明）
+
+# ── 训练循环 ────────────────────────────────────────────────
+epochs: 200
+max_steps: 0
+batch_size: 4
+effective_batch_size: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0        # musubi max_grad_norm 默认
+grad_norm_log_every: 20
+mixed_precision: "bf16"
+grad_checkpoint: true
+num_workers: 4
+
+# ── Timestep 采样（官方 krea2_shift = logit_normal + res_shift）──
+flow_shift: 1.0
+timestep_sampling: logit_normal
+timestep_stratified: true      # 分位分层降方差（不改分布，保留）
+timestep_t_min: 0.0            # 官方无截断
+timestep_t_max: 1.0
+schedule_shift: 1
+
+# ── krea2 分辨率感知 shift（官方调度，默认端点，勿改）────────
+krea2_res_shift: true
+krea2_shift_min_res: 256
+krea2_shift_max_res: 1280
+krea2_shift_y1: 0.5
+krea2_shift_y2: 1.15
+
+adaptive_timestep: false
+
+# ── 主 loss（官方 flow-matching = MSE）──────────────────────
+loss_type: "l2"
+loss_weighting_scheme: "none"
+weight_cap_ratio: 0
+min_snr_gamma: 0
+
+# ── 噪声 ────────────────────────────────────────────────────
+noise_offset: 0
+noise_offset_min: 0
+noise_offset_random_strength: false
+pyramid_noise_iterations: 0
+pyramid_noise_discount: 0.3
+
+# ── 逐图正则 / 辅助 loss（只留 eisbach，你点名保留）──────────
+eisbach_lambda: 0.15
+
+dfm_lambda: 0.0
+dfm_mode: "vecor"
+aux_spectral_enabled: false
+aux_spectral_lambda: 0.065
+aux_spectral_use_wavelet: true
+aux_spectral_wavelet_lambda: 0.20
+aux_spectral_t_gate: 0.55
+lwd_mask_enabled: false
+lwd_mask_floor: 0.3
+aux_perceptual_enabled: false
+
+# ── eval ────────────────────────────────────────────────────
+# ★ 注意：官方 res-shift 下 t<0.15 波段几乎不被采样（@1024² P(t'<0.1)≈0.1%），
+#   eval@t=0.1 在这个基准下"纹丝不动"是调度的必然，不是欠拟合证据。
+#   判断拟合请主要盯 t=0.5 / 0.9 与采样图。
+eval_every: 40
+eval_count: 16
+eval_t_grid: "0.1,0.5,0.9,0.97"
+eval_seed: 1234
+
+# ── 遥测 ────────────────────────────────────────────────────
+telemetry_enabled: true
+telemetry_freq_bands: 3
+telemetry_slope_window: 6
+telemetry_optimizer_every: 0
+telemetry_capacity_every: 0
+
+# ── 输出 / 保存 ─────────────────────────────────────────────
+output_dir: "./output/krea2-official"      # ★必改
+output_name: "krea2-official"              # ★必改
+save_every: 1
+save_every_steps: 0
+save_state_every: 100
+keep_vae_on_gpu: true
+empty_cache_after_sample: false
+seed: 42
+resume_lora: ""
+resume_state: ""
+stage_timing_every: 20
+stage_timing_warmup: 0
+
+# ── 采样出图 ─────────────────────────────────────────────────
+sample_every: 1
+sample_steps: 0
+sample_infer_steps: 30
+sample_cfg_scale: 4.5          # 官方 RAW cfg=3.5 → 本仓库 1+3.5=4.5
+sample_sampler_name: "er_sde"
+sample_scheduler: "beta"
+sample_width: 0
+sample_height: 0
+sample_seed: 1234
+sample_negative_prompt: ""
+sample_prompt: "fdy, 1girl"   # ★必改 trigger
+
+# ── 日志 / 监控 ─────────────────────────────────────────────
+loss_curve_steps: 1
+no_progress: false
+log_every: 1
+no_monitor: false
+monitor_host: "0.0.0.0"
+monitor_port: 8765
+no_browser: true

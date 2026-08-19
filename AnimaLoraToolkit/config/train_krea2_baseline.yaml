@@ -1,0 +1,274 @@
+# ══════════════════════════════════════════════════════════════════
+# Krea 2 训练配置 · 官方基准对齐版（诊断 under-fitting 用）
+#
+# 目的：先用一份"尽量贴官方 krea2 参考配方"的干净基准，确认能正常拟合，
+#       再把你的进阶特性（三峰/dfm/spectral/adaptive）一项一项加回来做归因。
+#
+# 依据（均带出处）：
+#   · musubi-tuner 官方 krea2 文档：rank/alpha=32、targets=全264 Linear（musubi 口径；
+#     本仓库默认 263，移除 tproj.1）、
+#     timestep=shift(discrete_flow_shift 2.5 @1024²)或 krea2_shift、RAW 训练/Turbo 推理。
+#     https://github.com/kohya-ss/musubi-tuner/blob/main/docs/krea2.md
+#   · JahJedi 实跑配方：LR 1e-4 / AdamW、rank 32、shift 2.5、16 epoch、
+#     800 图 = 13,152 步（bs=1）→ 换算 bs≈4 约 3300 步才是一轮完整训练。
+#     https://huggingface.co/JahJedi/krea2-character-lora-recipe
+#   · 本仓库 krea2_res_shift(y1=0.5→exp1.65 @256²、y2=1.15→exp3.16 @1280²)
+#     精确复刻官方 1.6~3.2 的分辨率感知曲线，@1024²≈2.48（本地实测分布中位 t≈0.71）。
+#
+# ★ 相对你上一版（三峰+65536budget+0.01wd+多aux）的核心变更：
+#   1. token_budget 65536 → 16384（你的已知稳态 ~77GB；65536 是误改）
+#   2. timestep：三峰(48%高噪)+adaptive → 官方 shift-only（logit_normal + res_shift）
+#      —— 有效分布中位从 0.94 拉回 0.71，中段(0.3-0.7)从 12% 提到 44%
+#   3. weight_decay 0.01 → 1e-4（Klein 50跑：风格最优 1e-5，0.001 已过火；0.01 过度正则）
+#   4. rank_dropout/module_dropout → 0（欠拟合期不该加正则）
+#   5. LR 1e-3 → 4e-4（你 memory 实测甜点；官方 AdamW 是 1e-4）
+#   6. loss huber+snr → l2/mse（对齐官方 flow-matching 默认；huber_snr 会削高 t 梯度）
+#   7. lokr_factor 4 → 2（提容量）；去掉逐块 reg_dims（先均匀，减少 confound）
+#   8. dfm/spectral aux 关闭；eisbach 保留（你要的锐度）
+# ══════════════════════════════════════════════════════════════════
+
+# ── 模型路径 ────────────────────────────────────────────────
+model_family: "krea2"
+transformer_path: "AnimaLoratoolkit/models/transformers/raw.safetensors"
+vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
+krea2_text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-VL-4B-Instruct"
+krea2_text_max_length: 512
+krea2_text_cache_entries: 128
+
+# ── 数据集 ──────────────────────────────────────────────────
+data_dir: "./Dataset/your-dataset"          # ★必改
+resolution: 1024
+repeats: 1
+
+# ── ARB 分桶 ────────────────────────────────────────────────
+bucket_base_resos: [1536]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 3072
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.7
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+max_img_h: 0
+max_img_w: 0
+
+# ── NaViT 块对角打包 ────────────────────────────────────────
+navit_packing: true
+navit_native_resolution: true
+navit_token_budget: 16384       # ★ 你的已知稳态（~77GB）。不要用 65536。
+fit_max_tokens: 32768000
+fit_warn_tokens: 32768000
+navit_max_images_per_pack: 0
+navit_multiscale: true
+navit_multiscale_token_ladder: "2304,4096"   # 768²(2304)~1024²(4096)，贴合 RAW 分布
+navit_pack_strategy: ffd
+navit_text_trim_padding: false
+cache_latents: true
+cache_encode_tiled: true
+cache_encode_max_pixels: 16777216
+fit_packed_training: false
+token_bucket: false
+bucket_drop_last: false
+torch_compile: false
+
+# ── 数据增强 / 打标 ─────────────────────────────────────────
+shuffle_caption: true
+keep_tokens: 1
+flip_augment: true
+tag_dropout: 0.1
+tag_dropout_overrides:
+  close-up: 0.5
+caption_dropout_rate: 0.01
+freq_balanced_dropout_strength: 0.0
+prefer_json: false
+
+# ── LoKr / DoRA 结构 ────────────────────────────────────────
+# 官方默认是全 264 Linear（musubi 口径；本仓库 263，移除 tproj.1）、full-LoRA rank/alpha 32。这里保留你的 LoKr+DoRA。
+# ★ lokr_factor 必须保持 4：你用 SOAP，预条件矩阵 GG 建在特征维 out_dim=out_features/factor 上，
+#   factor 降一半 → GG 面积×4 → eigh 直接 OOM（factor=2 已实测炸 96GB）。
+# ★ 要加容量请动 lora_rank（GG 只含 rank×rank，几乎免费），不要动 factor：
+#     欠拟合就 lora_rank: 32 → 48 或 64（alpha 同步），显存基本不变。
+lora_type: "lokr"
+lora_rank: 32
+lora_alpha: 32.0
+lora_dropout: 0.0
+lokr_factor: 4
+lora_variant: "dora"           # 想更贴官方/更少变量：删掉这行（纯 LoKr，无 DoRA）
+dora_export_mode: "native"
+
+lora_targets:
+  - "attn.wq"
+  - "attn.wk"
+  - "attn.wv"
+  - "attn.wo"
+  - "attn.gate"
+  - "mlp.gate"
+  - "mlp.up"
+  - "mlp.down"
+
+lora_exclude_patterns:
+  - ".*txtfusion.*"
+
+# 逐块 reg_dims 先不用（均匀 rank）——它是另一个 confound，基准确认后再加。
+rank_dropout: 0.0              # 欠拟合期关闭（原 0.05）
+module_dropout: 0.0            # 欠拟合期关闭（原 0.03）
+loraplus_lr_ratio: 1.0
+
+# ── 优化器（soap_sf）───────────────────────────────────────
+# 官方参考是 AdamW / LR 1e-4。这里保留你的 soap_sf，LR 用你 memory 实测甜点 4e-4。
+# ★ 若这版 eval@t=0.1 仍纹丝不动，最保真的对照是切官方：
+#     optimizer_type: adamw, learning_rate: 1e-4, lr_scheduler: constant_with_warmup
+optimizer_type: "soap_sf"
+learning_rate: 4e-4            # 1e-3 → 4e-4（你 memory 甜点；官方 AdamW=1e-4）
+lr_scheduler: "none"
+optimizer_args:
+  betas: [0.9, 0.95]
+  shampoo_beta: -1.0
+  eps: 1.0e-8
+  weight_decay: 0.0001         # ★ 0.01 → 1e-4（过度正则是"不过拟合+loss平"的一大主因）
+  precondition_frequency: 5
+  max_precond_dim: 10000       # SOAP 显存安全阀：>此维度的参数跳过预条件(GG=None)。
+                               # 若将来仍紧张，降到 4096/2048 可大幅砍 GG/eigh 显存。
+  precond_in_state: false      # 保持（resume 显存 fix 依赖它）
+  merge_dims: false
+  precondition_1d: false
+  normalize_grads: false
+  data_format: "channels_first"
+  correct_bias: true
+  weight_lr_power: 2.0
+  r: 0.0
+  warmup_steps: 0
+
+# ── 训练循环 ────────────────────────────────────────────────
+# ★ 步数预期修正：官方参考 800 图训 16 epoch = 13,152 步(bs=1)。
+#   你 bs≈4(navit 16384 budget ≈ 4×1024²/步) → 一轮完整训练约 3000-3500 步，
+#   首个画风信号预计 800-1500 步。900 步"不见拟合"其实只到参考预算的 ~27%。
+epochs: 200
+max_steps: 0
+batch_size: 4
+effective_batch_size: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0
+grad_norm_log_every: 20        # 调密一点，方便你把 grad_norm 量级发我判断
+mixed_precision: "bf16"
+grad_checkpoint: true
+num_workers: 4
+
+# ── Timestep 采样（官方 krea2 = shift-only）─────────────────
+# 官方做法：base 分布 = logit_normal(未额外 shift)，由 krea2_res_shift 提供
+# 分辨率感知调度（= musubi 的 --timestep_sampling krea2_shift）。
+# 不用三峰、不用 adaptive —— 这是基准。有效分布中位 t≈0.71、中段占 44%。
+flow_shift: 1.0                # ★ 3.0 → 1.0：base 不额外偏移，shift 全交给 res_shift
+timestep_sampling: logit_normal   # ★ 三峰 → 官方 shift-only
+timestep_stratified: true      # 分位分层降方差（保留，无副作用）
+timestep_t_min: 0.05
+timestep_t_max: 1.0
+schedule_shift: 1              # krea2_res_shift 接管，这里保持 1.0
+# 三峰/logsnr 参数在 logit_normal 模式下不生效，保留仅备将来切回：
+timestep_mix_low_prob: 0.35
+timestep_mix_high_prob: 0.15
+timestep_logsnr_mu: -6.0
+timestep_logsnr_sigma: 2.4
+timestep_mix_anneal_start: 0
+timestep_mix_anneal_end: 0
+timestep_mix_low_prob_end: -1.0
+timestep_mix_high_prob_end: -1.0
+timestep_laplace_mu: -1
+timestep_laplace_b: 0.75
+
+# ── krea2 分辨率感知 shift（= 官方调度，保持默认，勿改）────────
+krea2_res_shift: true
+krea2_shift_min_res: 256
+krea2_shift_max_res: 1280
+krea2_shift_y1: 0.5            # exp(0.5)=1.65 @256²  ← 官方 ~1.6
+krea2_shift_y2: 1.15          # exp(1.15)=3.16 @1280² ← 官方 ~3.2；@1024²≈2.48 ← 官方 2.5
+
+# ── 自适应 timestep（基准关闭 —— 它是重采样 confound）─────────
+adaptive_timestep: false
+
+# ── 主 loss（对齐官方 flow-matching = MSE）──────────────────
+# huber+snr 会把高 t 梯度削成极弱 L1（δ@t0.94≈0.02），欠拟合期先不用。
+# 若数据脏想要鲁棒：loss_type huber + huber_c 0.2 + huber_schedule constant（别用 snr）。
+loss_type: "l2"
+loss_weighting_scheme: "none"
+weight_cap_ratio: 0
+min_snr_gamma: 0
+
+# ── 噪声 ────────────────────────────────────────────────────
+noise_offset: 0
+noise_offset_min: 0
+noise_offset_random_strength: false
+pyramid_noise_iterations: 0
+pyramid_noise_discount: 0.3
+
+# ── 逐图正则 / 辅助 loss ────────────────────────────────────
+# eisbach 保留（你要的锐度：逐图 unpatchify 回网格算空间能量障碍权重）。
+eisbach_lambda: 0.15
+
+# dfm / spectral：基准关闭，确认能拟合后再逐个加回做归因。
+dfm_lambda: 0.0
+dfm_mode: "vecor"
+aux_spectral_enabled: false
+aux_spectral_lambda: 0.065
+aux_spectral_use_wavelet: true
+aux_spectral_wavelet_lambda: 0.20
+aux_spectral_t_gate: 0.55
+lwd_mask_enabled: false
+lwd_mask_floor: 0.3
+aux_perceptual_enabled: false
+
+# ── 其它训练开关 ────────────────────────────────────────────
+use_precommit_lora_forward: false
+use_per_block_checkpoint: true
+
+# ── eval（★ 盯 eval@t=0.1 判断低噪细节波段是否在学）──────────
+eval_every: 40
+eval_count: 16
+eval_t_grid: "0.1,0.5,0.9,0.97"
+eval_seed: 1234
+
+# ── 遥测 ────────────────────────────────────────────────────
+telemetry_enabled: true
+telemetry_freq_bands: 3
+telemetry_slope_window: 6
+telemetry_optimizer_every: 0
+telemetry_capacity_every: 0
+
+# ── 输出 / 保存 ─────────────────────────────────────────────
+output_dir: "./output/krea2-baseline"      # ★必改
+output_name: "krea2-baseline"              # ★必改
+save_every: 1
+save_every_steps: 0
+save_state_every: 100
+keep_vae_on_gpu: true
+empty_cache_after_sample: false
+seed: 42
+resume_lora: ""
+resume_state: ""              # ★ 从零起；要续训再填
+stage_timing_every: 20
+stage_timing_warmup: 0
+
+# ── 采样出图 ─────────────────────────────────────────────────
+sample_every: 1
+sample_steps: 0
+sample_infer_steps: 30
+sample_cfg_scale: 4.5          # 官方 RAW cfg=3.5 → 本仓库 1+3.5=4.5
+sample_sampler_name: "er_sde"
+sample_scheduler: "beta"
+sample_width: 0
+sample_height: 0
+sample_seed: 1234
+sample_negative_prompt: ""
+sample_prompt: "fdy, 1girl"   # ★必改 trigger
+
+# ── 日志 / 监控 ─────────────────────────────────────────────
+loss_curve_steps: 1
+no_progress: false
+log_every: 1
+no_monitor: false
+monitor_host: "0.0.0.0"
+monitor_port: 8765
+no_browser: true

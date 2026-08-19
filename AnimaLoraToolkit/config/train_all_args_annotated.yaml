@@ -20,7 +20,7 @@ transformer_path: "models/transformers/anima-preview3-base.safetensors"
 vae_path: "models/vae/qwen_image_vae.safetensors"
 
 # Qwen3 文本编码器目录。文本编码器冻结；路径错会直接无法编码 prompt。
-text_encoder_path: "models/text_encoders"
+text_encoder_path: "models/text_encoders/Qwen3-0.6B-Base"
 
 # T5 tokenizer 目录。Anima 的 LLM adapter 使用 Qwen embedding + T5 token ids。
 t5_tokenizer_path: "models/t5_tokenizer"
@@ -534,6 +534,14 @@ save_every_reference_steps: 0
 
 # 每 N step 保存完整训练状态。可断点续训，但文件更大。
 save_state_every: 500
+
+# 每 N epoch 保存完整训练状态（epoch 末尾触发）。0=关闭。
+# 与按 step 的 save_state_every 完全独立，可同时开：文件名分别是
+#   training_state_step{N}.pt / training_state_epoch{E}_step{N}.pt，互不覆盖。
+# 用途：每 epoch 步数不固定（ARB/navit 打包下 len(dataloader) 会变）时，按 step 的
+# cadence 很难正好落在 epoch 边界；这个开关保证"每个 epoch 末尾一定有一个可续训的点"。
+# 该 epoch 若已由 save_every 写过 LoRA 成品，这里就只写 .pt，不再重复写同内容的 safetensors。
+save_state_every_epochs: 0
 
 # 从完整训练状态恢复。空字符串表示不用。
 resume_state: ""

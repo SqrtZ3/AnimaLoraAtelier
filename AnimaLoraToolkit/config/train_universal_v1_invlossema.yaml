@@ -62,7 +62,7 @@
 # ── 模型路径 ──────────────────────────────────────────────────────────────
 transformer_path: "AnimaLoratoolkit/models/transformers/anima-base-v1.0.safetensors"
 vae_path: "AnimaLoratoolkit/models/vae/qwen_image_vae.safetensors"
-text_encoder_path: "AnimaLoratoolkit/models/text_encoders"
+text_encoder_path: "AnimaLoratoolkit/models/text_encoders/Qwen3-0.6B-Base"
 t5_tokenizer_path: "AnimaLoratoolkit/models/t5_tokenizer"
 
 # ── 数据集 ────────────────────────────────────────────────────────────────

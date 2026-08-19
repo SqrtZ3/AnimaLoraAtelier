@@ -4,7 +4,8 @@ r"""闸门⑬下半：JAX 的主 loss / 逐图 aux ≟ PyTorch 侧实现。
 
 ## 判据分三档，因为这三类项的可移植性本来就不同
 
-  * **逐 bit / 1e-6 档**：Huber δ、loss map、逐图 masked 归约、Eisbach。
+  * **逐 bit / 1e-6 档**：Huber δ、loss map、逐图 masked 归约、Eisbach、
+    VeCoR 裁剪+resize（运行时裁剪参数 + 静态画布 gather，全静态形状）。
     这些在打包布局下是精确可移植的（Eisbach 靠"熵对位置排列不变"这一条）。
   * **1e-3 档**：spectral 的 FFT 那一支。TPU 侧把每图散射进静态画布再 FFT，
     零填充 = 同一 DTFT 的更细采样，幅度谱的**均值**只差归一化（已补偿），
@@ -109,6 +110,29 @@ def main() -> int:
     #    小波那一支仍是精确的（只统计完全落在图内的块）。这里判的是"补偿之后
     #    量级对得上"，**不是**逐 bit —— 数据集里图越接近画布，这个残差越小。
     check("画布放大 2.7x（零填充+补偿）", spec((6, 8)), z["spectral"], tol=0.10)
+
+    # 5b 之后：VeCoR 的裁剪+resize 支路。两张图网格不同（16x12 与 10x8 latent
+    # 像素），验"逐图运行时网格 + 固定参数逐点一致"。放在 ⑥ 前是因为它是
+    # 1e-6 档的精确判据，不是分布档。
+    print("\n⑥+ VeCoR 裁剪+resize 支路（固定参数，逐点比 token 域负样本）")
+    ga = z["vecor_a"][None, :, None]          # [1, 16, 1, 16, 12]
+    gb = z["vecor_b"][None, :, None]          # [1, 16, 1, 10, 8]
+    ta_, tb_ = _grid_to_tok(ga), _grid_to_tok(gb)      # [48, 64], [20, 64]
+    tok = jnp.concatenate([ta_, tb_], axis=0)
+    vseg = jnp.asarray([0] * 48 + [1] * 20)
+    vrows = jnp.concatenate([jnp.repeat(jnp.arange(8), 6),
+                             jnp.repeat(jnp.arange(5), 4)])
+    vcols = jnp.concatenate([jnp.tile(jnp.arange(6), 8),
+                             jnp.tile(jnp.arange(4), 5)])
+    vmask = jnp.ones((68,), jnp.float32)
+    got = X._vecor_crop_resize_params(
+        tok, vseg, vrows, vcols, vmask, 2, (8, 6),
+        jnp.asarray(z["vecor_ratio"]), jnp.asarray(z["vecor_top"]),
+        jnp.asarray(z["vecor_left"]))
+    check("crop+resize 图A（满画布 8x6 网格）", np.asarray(got[:48]),
+          np.asarray(_grid_to_tok(z["vecor_neg_a"][None, :, None])), tol=1e-5)
+    check("crop+resize 图B（画布内 5x4 网格）", np.asarray(got[48:]),
+          np.asarray(_grid_to_tok(z["vecor_neg_b"][None, :, None])), tol=1e-5)
 
     print("\n⑥ 三峰 t 采样的分位点（RNG 不同，只比分布）")
     fcfg = F.FlowConfig(t_mode="mixed_logsnr_three", flow_shift=3.0,

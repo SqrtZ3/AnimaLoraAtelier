@@ -197,7 +197,16 @@ def _loss_core(pred, lat, noisy, target, b, g: int, seg, tcfg: TrainConfig,
     if au.eisbach_lambda > 0:
         graded = graded * X.eisbach_weight(pred, mask, seg, g, au.eisbach_lambda)
     if au.dfm_lambda > 0:
-        neg = X.vecor_negative(key, target, seg, g)
+        # 逐图 50/50：通道乱序 vs 裁剪+resize（objective.py:955 同粒度）。
+        # 两支都全量算出来再 where —— where 的常量折叠不存在于运行时数据，
+        # 但这样能保住"一个布局一份编译产物"，分支不进编译身份。
+        k_coin, k_perm, k_crop = jax.random.split(key, 3)
+        coin = jax.random.uniform(k_coin, (g,)) < 0.5
+        neg = jnp.where(
+            bcast(coin)[:, None],
+            X.vecor_negative(k_perm, target, seg, g),
+            X.vecor_crop_resize(k_crop, target, seg, b["rows"], b["cols"],
+                                mask, g, canvas_hw))
         neg_img, _ = F.per_image_loss(pred, neg, mask, t, fl, ssum, delta_tok)
         graded = graded - float(au.dfm_lambda) * neg_img
     if "ms_weight" in b:

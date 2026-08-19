@@ -23,12 +23,17 @@ r"""逐图辅助项：Eisbach 障碍权重 / ΔFM(VeCoR) 负样本 / spectral(FF
 （若图省事直接对 64 维取均值，就变成 4 个像素先平均再算熵，熵会系统性偏低，
 且不报错。）
 
-**ΔFM(VeCoR) —— 只移植了两支增强中的一支（诚实标注）。**
+**ΔFM(VeCoR) —— 两支增强都已移植。**
 PyTorch 每次调用在"通道乱序"与"随机裁剪后 resize 回原尺寸"之间各 50% 二选一。
-通道乱序是逐 token 的置换，可精确移植；裁剪+resize 需要**该图的真实网格**，
-而打包布局下网格是运行时量（不进编译身份，否则布局数爆炸）。所以这里**只做通道
-乱序**，等价于把原实现的随机二选一固定到其中一支。这会改变负样本的分布 ——
-`dfm_lambda=0.05` 下影响有限，但它是真实差异，不要当成等价实现。
+通道乱序是逐 token 的置换，直接精确移植。裁剪+resize 曾被判为不可移植（"图的
+真实网格是运行时量"）——后来意识到**运行时标量 ≠ 运行时形状**：裁剪参数
+(ratio/top/left) 只是数值，采样坐标可以在 jnp 里由它们算出、gather 取四角做
+双线性，全部静态形状。网格本身从每段的 `max(rows)+1` 现推，散射进固定画布用
+`to_canvas`（spectral 同款原语）。两条支路都由核内随机数逐图二选一，与
+objective.py:955 同粒度。另一个曾考虑过的方案是 host 侧预生成负样本，**不成立**：
+增强作用在 velocity target 上（v = noise − x0，objective.py:963-969 的 `_tg`），
+而噪声是核内 immiscible 采样（依赖 latent 的 KNN），host 拿不到 —— 只能核内做。
+好在裁剪与双线性都是线性算子，crop(v) = crop(noise) − crop(x0)，对象无歧义。
 
 **spectral —— 移植了，但 FFT 走"零填充到静态画布"。**
 打包布局下每图的 (h, w) 是运行时量，而 FFT 需要静态形状。这里把每图散射进一个
@@ -145,7 +150,6 @@ def vecor_negative(key, target: jnp.ndarray, seg: jnp.ndarray, g: int) -> jnp.nd
     """VeCoR 负目标：对每张图独立地把 16 个 latent 通道乱序（objective.py:955-961）。
 
     保证非恒等（撞上恒等置换就 roll 一位），与原实现一致。返回与 target 同形。
-    **只实现了通道乱序这一支**，理由见模块 docstring。
     """
     perms = jax.random.permutation(key, jnp.tile(jnp.arange(LATENT_CH), (g, 1)),
                                    axis=1, independent=True)          # [G, 16]
@@ -153,6 +157,101 @@ def vecor_negative(key, target: jnp.ndarray, seg: jnp.ndarray, g: int) -> jnp.nd
     perms = jnp.where(ident, jnp.roll(perms, 1, axis=1), perms)
     t = target.astype(jnp.float32).reshape(*target.shape[:-1], LATENT_CH, PATCH * PATCH)
     return jnp.take_along_axis(t, perms[seg][:, :, None], axis=-2).reshape(target.shape)
+
+
+def crop_resize_canvas(canvas, ratio, top, left, gh, gw, hw):
+    """逐图"随机裁剪 + align_corners=False 双线性拉回原尺寸"（纯函数，便于对拍）。
+
+    canvas [G, 16, Hc, Wc]（to_canvas 的产物）；ratio/top/left [G] 是运行时
+    参数（标量数组，不是形状）；gh/gw [G] 是每图真实的 patch 网格高宽。
+    返回同形画布，图外位置恒 0。
+
+    坐标口径与 torch F.interpolate(mode='bilinear', align_corners=False) 一致：
+    src = (dst+0.5)·(in/out) − 0.5，越界取边框。**clamp 必须在裁剪框相对坐标里做**
+    （clip 到 [0, ch−1]）再平移 top/left —— 先平移再 clamp 到图边会让"出界回落到
+    裁剪框边行"错成"插值到框外一行"（本地对拍抓到过，图 A 首行全错）。
+    """
+    g = canvas.shape[0]
+    hc, wc = hw
+    Hc, Wc = hc * PATCH, wc * PATCH                       # 画布（latent 像素）
+    H = (gh * PATCH).astype(jnp.float32)                  # 每图真实高宽（latent 像素）
+    W = (gw * PATCH).astype(jnp.float32)
+    ch = jnp.maximum((H * ratio).astype(jnp.int32), 2)    # objective.py:964-965
+    cw = jnp.maximum((W * ratio).astype(jnp.int32), 2)
+
+    ys = jnp.arange(Hc, dtype=jnp.float32)[None, :]
+    xs = jnp.arange(Wc, dtype=jnp.float32)[None, :]
+    # 先 clamp 裁剪框相对坐标（[0, ch−1] / [0, cw−1]），再平移 —— 见 docstring
+    sy = jnp.clip((ys + 0.5) * (ch / H)[:, None] - 0.5,
+                  0.0, (ch - 1)[:, None].astype(jnp.float32)) \
+        + top.astype(jnp.float32)[:, None]                # [G, Hc]
+    sx = jnp.clip((xs + 0.5) * (cw / W)[:, None] - 0.5,
+                  0.0, (cw - 1)[:, None].astype(jnp.float32)) \
+        + left.astype(jnp.float32)[:, None]               # [G, Wc]
+    y0 = jnp.floor(sy).astype(jnp.int32)
+    wy = sy - y0
+    x0 = jnp.floor(sx).astype(jnp.int32)
+    wx = sx - x0
+    y1 = jnp.minimum(y0 + 1, (H.astype(jnp.int32) - 1)[:, None])
+    x1 = jnp.minimum(x0 + 1, (W.astype(jnp.int32) - 1)[:, None])
+
+    ct = canvas.transpose(0, 2, 3, 1)                     # [G, Hc, Wc, 16]
+    GI = jnp.broadcast_to(jnp.arange(g)[:, None, None], (g, Hc, Wc))
+    Y0 = jnp.broadcast_to(y0[:, :, None], (g, Hc, Wc))
+    Y1 = jnp.broadcast_to(y1[:, :, None], (g, Hc, Wc))
+    X0 = jnp.broadcast_to(x0[:, None, :], (g, Hc, Wc))
+    X1 = jnp.broadcast_to(x1[:, None, :], (g, Hc, Wc))
+    WY = jnp.broadcast_to(wy[:, :, None], (g, Hc, Wc))[..., None]
+    WX = jnp.broadcast_to(wx[:, None, :], (g, Hc, Wc))[..., None]
+    out = (ct[GI, Y0, X0] * (1 - WY) * (1 - WX) + ct[GI, Y0, X1] * (1 - WY) * WX
+           + ct[GI, Y1, X0] * WY * (1 - WX) + ct[GI, Y1, X1] * WY * WX)
+
+    inside = ((ys < H[:, None])[:, :, None] & (xs < W[:, None])[:, None, :])
+    out = jnp.where(inside[..., None], out, 0.0)
+    return out.transpose(0, 3, 1, 2)                      # 回到 [G, 16, Hc, Wc]
+
+
+def vecor_crop_resize(key, target, seg, rows, cols, mask, g, hw) -> jnp.ndarray:
+    """VeCoR 负目标的另一支：随机裁 60-90% 区域再双线性拉回（objective.py:962-969）。
+
+    每图的 (ratio, top, left) 由 key 在核内抽出 —— 都是运行时**数值**，采样坐标
+    由它们在 jnp 里现算，全部静态形状，不进编译身份。网格从段内 max(rows/cols)
+    现推（打包与分桶两条布局共用；分桶路线的 seg/rows/cols 由 local_loss_ragged
+    摊平后传入，语义相同）。返回与 target 同形的 token 域负样本。
+    """
+    gh = (seg_max(rows, seg, g) + 1).astype(jnp.int32)    # [G] 每图 patch 网格
+    gw = (seg_max(cols, seg, g) + 1).astype(jnp.int32)
+    k_r, k_t, k_l = jax.random.split(key, 3)
+    ratio = 0.6 + 0.3 * jax.random.uniform(k_r, (g,))     # objective.py:964
+    H, W = gh * PATCH, gw * PATCH
+    ch = jnp.maximum((H * ratio).astype(jnp.int32), 2)
+    cw = jnp.maximum((W * ratio).astype(jnp.int32), 2)
+    top = jax.random.randint(k_t, (g,), 0, H - ch + 1)    # objective.py:966-967
+    left = jax.random.randint(k_l, (g,), 0, W - cw + 1)
+    return _vecor_crop_resize_params(target, seg, rows, cols, mask, g, hw,
+                                     ratio, top, left)
+
+
+def _vecor_crop_resize_params(target, seg, rows, cols, mask, g, hw,
+                              ratio, top, left) -> jnp.ndarray:
+    """参数显式给定的版本 —— 对拍闸门（tests/check_objective_parity.py ⑦）直接调它。
+
+    ratio/top/left 的语义与 objective.py:963-968 一致：ratio ∈ [0.6, 0.9]，
+    裁剪框 (top, left, max(int(H·ratio),2), max(int(W·ratio),2))，双线性拉回
+    (H, W)（H/W = 各图自己的 latent 像素高宽）。"""
+    gh = (seg_max(rows, seg, g) + 1).astype(jnp.int32)
+    gw = (seg_max(cols, seg, g) + 1).astype(jnp.int32)
+    canvas = to_canvas(target, seg, rows, cols, mask, g, hw)      # [G,16,Hc,Wc]
+    out = crop_resize_canvas(canvas, ratio, top, left, gh, gw, hw)
+
+    # 读回 token：token (r, c) 在画布网格里的扁平下标是 r*wc + c（与 data.patchify
+    # 的 r*gw + c 同序，wc 是画布网格宽）；64 维通道序 (ch, ph, pw) 与之一致。
+    hc, wc = hw
+    o = out.transpose(0, 2, 3, 1)                         # [G, Hc, Wc, 16]
+    o = o.reshape(g, hc, PATCH, wc, PATCH, LATENT_CH)
+    o = o.transpose(0, 1, 3, 5, 2, 4).reshape(g, hc * wc,
+                                              LATENT_CH * PATCH * PATCH)
+    return o[seg, rows * wc + cols]
 
 
 # ── spectral ─────────────────────────────────────────────────────────────────

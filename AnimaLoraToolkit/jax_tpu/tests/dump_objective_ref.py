@@ -82,6 +82,27 @@ def main() -> int:
                   logsnr_mu=-6.0, logsnr_sigma=2.4)
     out["three_q"] = np.quantile(ts.numpy(), np.linspace(0.05, 0.95, 19))
 
+    # ── ⑦ VeCoR 裁剪+resize 负样本支路（固定参数逐点比）────────────────────────
+    # 负样本的数学就是 objective.py:963-969 的那两行（裁 60-90% + align_corners=False
+    # 双线性拉回），这里原样复刻并固定全部随机量，供 jax 侧逐点比。
+    # 两张图**网格不同**（16x12 与 10x8 latent 像素），专门验"逐图运行时网格"。
+    import torch.nn.functional as Fn
+    va = torch.randn(C, 16, 12)
+    vb = torch.randn(C, 10, 8)
+    v_ratio = np.array([0.75, 0.62], np.float32)
+    v_top = np.array([2, 1], np.int32)
+    v_left = np.array([1, 2], np.int32)
+    v_negs = []
+    for im, r, tp, lf in zip((va, vb), v_ratio, v_top, v_left):
+        h, w = im.shape[-2:]
+        ch_, cw_ = max(int(h * float(r)), 2), max(int(w * float(r)), 2)
+        crop = im[None, :, int(tp):int(tp) + ch_, int(lf):int(lf) + cw_]
+        v_negs.append(Fn.interpolate(crop, size=(h, w), mode="bilinear",
+                                     align_corners=False)[0])
+    out.update(vecor_a=va.numpy(), vecor_b=vb.numpy(),
+               vecor_ratio=v_ratio, vecor_top=v_top, vecor_left=v_left,
+               vecor_neg_a=v_negs[0].numpy(), vecor_neg_b=v_negs[1].numpy())
+
     OUT.parent.mkdir(parents=True, exist_ok=True)
     np.savez(OUT, **out)
     print(f"已写 {OUT}（{len(out)} 项）")

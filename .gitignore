@@ -5,3 +5,34 @@ output/*
 **/__pycache__
 AnimaLoraToolkit/monitor_data/*
 *.log
+
+# Optimizer / training-state checkpoints (can be multi-GB — e.g. SOAP GG/Q matrices)
+*.pt
+*.ckpt
+# 大模型权重 —— 走外部下载脚本，不入库（.py 源码与 tokenizer 配置仍保留）
+*.safetensors
+*.pth
+*.bin
+
+# Personal / experimental training configs (kept local, not shared)
+AnimaLoraToolkit/config/private/
+AnimaLoraToolkit/config/train_my_1024.yaml
+AnimaLoraToolkit/config/train_my_1536.yaml
+AnimaLoraToolkit/config/train_my_soap_sf.yaml
+
+# Local MCP server (not shared — contains machine-specific paths)
+mcp_server/
+.mcp.json
+
+# run.sh / vram_monitor.sh 的运行期产物（stop 脚本自 c5286cd 起默认不自删）
+vram_timeline.csv
+stop_anima_training.sh
+
+# 本地取证/分析的中间产物（逐层 profile 表等）
+block_profile_all.csv
+
+# Windows 下误把 `> /dev/null` 写成 `> nul` 会在仓库根生成的空文件
+nul
+
+# 误提交的 venv —— 迁移 GitHub 时从历史挖掉，当前版本也不再 track
+AnimaLoraToolkit/venv/

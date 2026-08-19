@@ -2,4 +2,7 @@
 *.bin filter=lfs diff=lfs merge=lfs -text
 *.pth filter=lfs diff=lfs merge=lfs -text
 *.pt filter=lfs diff=lfs merge=lfs -text
-*.zip filter=lfs diff=lfs merge=lfs -text
+# 昇腾/Linux 上要执行的脚本强制 LF —— Windows 下 CRLF 会导致 bad interpreter: ...^M
+# 根目录的 run*.sh 原本不在这条规则里 —— 在 Windows 上编辑后推上去，Linux 侧会拿到
+# CRLF，症状是 bash 报 command not found（行尾多了 CR）+ set: - : invalid option（实际踩过）。
+*.sh text eol=lf

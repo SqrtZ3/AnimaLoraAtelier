@@ -62,6 +62,11 @@ def main() -> int:
                          "circlestone-labs/Anima:split_files/diffusion_models/"
                          "anima-base-v1.0.safetensors:f7382c4...。脚本会在 import jax "
                          "之后、run_train 之前下载，并把 ANIMA_TRANSFORMER 指到产物")
+    ap.add_argument("--hf-stream", action="store_true",
+                    help="不落盘：把 ANIMA_TRANSFORMER 写成 HF resolve URL，由 "
+                         "krea2_jax 的 HTTP Range 加载边下边训（Krea-2-Raw 26GB > "
+                         "/kaggle/working 的 ~20GB 上限时唯一可行路）。**仅 krea2**——"
+                         "anima 加载器不支持 URL。token 照走 --env HF_TOKEN=...")
     a = ap.parse_args()
 
     blobs, digest = {}, hashlib.sha256()
@@ -93,6 +98,7 @@ def main() -> int:
         extra=repr(a.extra_args.split()),
         env=repr(env_kv),
         hf=repr(hf),
+        stream=repr(bool(a.hf_stream)),
     )
     OUT.write_text(body, encoding="utf-8")
     compile(body, str(OUT), "exec")          # 语法自检，别推上去才炸
@@ -120,6 +126,7 @@ _CFG = {cfg}
 _EXTRA = {extra}
 _ENV = {env}            # build_job --env 烘焙的路径覆盖（ANIMA_* ）
 _HF = {hf}              # build_job --hf-model 烘焙的 (repo, 文件名[, revision])
+_STREAM = {stream}      # build_job --hf-stream：底模不落盘，走 HTTP Range 流式
 
 _PKG = Path("/kaggle/working/jax_tpu")
 if not _PKG.parent.exists():                 # 本地干跑
@@ -134,37 +141,56 @@ print(f"[ INFO ] 已解包 {{len(_BLOBS)}} 个模块 -> {{_PKG}}", flush=True)
 
 for _k, _v in _ENV.items():
     os.environ.setdefault(_k, _v)
-    print(f"[ INFO ] env {{_k}} = {{os.environ[_k]}}", flush=True)
+    # 凭证类值不落日志（Kaggle 网页/拉回的日志都可能被看到）
+    _show = "***" if any(s in _k.upper() for s in ("TOKEN", "SECRET", "KEY")) \\
+            else os.environ[_k]
+    print(f"[ INFO ] env {{_k}} = {{_show}}", flush=True)
 
 if _HF:
-    # HF 直下底模。public repo 匿名即可；gated repo（如 krea/Krea-2-Raw）需要
-    # token —— 从 Kaggle Secrets 读 HF_TOKEN（网页里 Add-ons -> Secrets 配一次，
-    # 不落盘不进脚本）。
-    os.environ.setdefault("HF_HOME", "/kaggle/working/hf_cache")
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError:
-        import subprocess as _sp
-        _sp.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"],
-                check=True)
-        from huggingface_hub import hf_hub_download
-    _token = None
-    try:
-        from kaggle_secrets import UserSecretsClient
-        _token = UserSecretsClient().get_secret("HF_TOKEN")
-        print("[ INFO ] 已从 Kaggle Secrets 读 HF_TOKEN（gated repo 用）", flush=True)
-    except Exception as e:
-        # 不静默吞掉：Secret 未配/不可读都落回匿名下载；若 repo 是 gated 的，
-        # hf_hub_download 会以 401 清晰报错。
-        print(f"[ INFO ] HF_TOKEN 不可用（{{type(e).__name__}}: {{e}}），走匿名下载",
-              flush=True)
+    # gated repo（如 krea/Krea-2-Raw）需要 token —— 优先环境变量（build_job
+    # --env HF_TOKEN=... 烘焙，绕开 Secrets 服务），再回落 Kaggle Secrets
+    #（网页 Add-ons -> Secrets，注意它**按 kernel 逐个 attach**，且未 attach
+    # 时服务回 HTTP 400，会被 kaggle_web_client 的 except 顺序误报成
+    # "ConnectionError"）。
+    _token = os.environ.get("HF_TOKEN") or None
+    if _token:
+        print("[ INFO ] HF_TOKEN 来自环境变量（--env 烘焙）", flush=True)
+    else:
+        try:
+            from kaggle_secrets import UserSecretsClient
+            _token = UserSecretsClient().get_secret("HF_TOKEN")
+            print("[ INFO ] 已从 Kaggle Secrets 读 HF_TOKEN", flush=True)
+        except Exception as e:
+            # 不静默吞掉：Secret 未配/未 attach 给本 kernel 时落回匿名；
+            # gated repo 会由后续请求以 401 清晰报错。
+            print(f"[ INFO ] HF_TOKEN 不可用（{{type(e).__name__}}: {{e}}），走匿名",
+                  flush=True)
     _repo, _file = _HF[0], _HF[1]
-    _rev = _HF[2] if len(_HF) > 2 else None
-    _t0 = __import__("time").time()
-    _p = hf_hub_download(_repo, _file, revision=_rev, token=_token)
-    os.environ.setdefault("ANIMA_TRANSFORMER", _p)
-    print(f"[ INFO ] HF {{_repo}}:{{_file}} -> {{_p}}"
-          f"（{{__import__('time').time() - _t0:.0f}}s）", flush=True)
+    _rev = _HF[2] if len(_HF) > 2 else "main"
+    if _STREAM:
+        # 流式（仅 krea2）：26GB 装不下 /kaggle/working（~20GB），ANIMA_TRANSFORMER
+        # 写成 resolve URL，krea2_jax._read_safetensors_map 走 HTTP Range 逐 tensor
+        # 拉取、即刻分片上卡，host 与磁盘都不持全量。secrets 来的 token 抬进 env
+        #（krea2_jax 从 env 读）。
+        _url = f"https://huggingface.co/{{_repo}}/resolve/{{_rev}}/{{_file}}"
+        if _token:
+            os.environ.setdefault("HF_TOKEN", _token)
+        os.environ.setdefault("ANIMA_TRANSFORMER", _url)
+        print(f"[ INFO ] 流式底模 {{_url}}", flush=True)
+    else:
+        os.environ.setdefault("HF_HOME", "/kaggle/working/hf_cache")
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            import subprocess as _sp
+            _sp.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"],
+                    check=True)
+            from huggingface_hub import hf_hub_download
+        _t0 = __import__("time").time()
+        _p = hf_hub_download(_repo, _file, revision=_rev, token=_token)
+        os.environ.setdefault("ANIMA_TRANSFORMER", _p)
+        print(f"[ INFO ] HF {{_repo}}:{{_file}} -> {{_p}}"
+              f"（{{__import__('time').time() - _t0:.0f}}s）", flush=True)
 
 
 def _override_paths(path):

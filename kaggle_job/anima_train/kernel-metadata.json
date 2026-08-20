@@ -9,9 +9,7 @@
   "enable_tpu": "true",
   "enable_internet": "true",
   "dataset_sources": [
-    "ilovebg/ashima-anima2-tpu-cache",
-    "ilovebg/krea2-tiny-data",
-    "ilovebg/krea2-tiny-model"
+    "ilovebg/modare-krea2-tpu-cache"
   ],
   "competition_sources": [],
   "kernel_sources": [],

@@ -121,6 +121,32 @@ Krea2 已接线到 Kaggle TPU v5e-8 训练链路（`run_train.py` 自动按 `mod
 
 - **remat 必须 != none**：FSDP 的 all_gather 要在 checkpoint 边界内，否则 28 层
   全量权重同时活着（spmd_probe 第四跑 OOM 37.62G 的根因；构造期 fail-fast）。
+- **底模加载：HTTP Range 流式（2026-08-20 首训定案）**。`raw.safetensors`
+  26.3GB 装不下 Kaggle `/kaggle/working`（~20GB），直下不可行；本地出口到 HF
+  实测 0.15~0.4MB/s（aria2c 16 线程同），"本地下完再传 dataset"要 ~24h。
+  定案：`krea2_jax._read_safetensors_map` 认 http(s) URL——header 两次小 GET，
+  之后 8 线程并发预取逐 tensor range GET（在飞字节上限 4GB），读出字节与本地
+  文件逐 bit 相同（tests/check_http_range.py 对拍 120 次读取全等，含 302 链）。
+  真机实测 24GiB 用 219.6s（~110MB/s）。job 侧用 build_job `--hf-stream`
+  （把 ANIMA_TRANSFORMER 写成 resolve URL）+ `--env HF_TOKEN=...`。
+  gated repo 的 token：Kaggle Secrets 网页 attach 在 script kernel 上不可靠
+  （未 attach 时服务回 HTTP 400，被 kaggle_web_client 的 except 顺序误报成
+  "ConnectionError"），env 烘焙是可靠路径（build_job 对 TOKEN/SECRET/KEY
+  类 env 的日志打印已脱敏；生成的 anima_train_job.py 被 gitignore，token
+  不进 git）。
+- **HBM 账目（真 12B 首训实测，与 spmd_probe 的裸模型口径不同）**：
+  完整训练图（LoKr 264 层 + ΔFM/Eisbach/spectral + huber-snr）的单个
+  executable 驻留 ~11.9G/布局（12288/卡时实测 reserve 11.94G），
+  16384/卡时运行期 HLO temporaries 18.15G（均 > 15.75G 上限，两轮 OOM 实录）。
+  spmd_probe P1 的"16384/卡 3.05GiB"是裸模型探针口径，别拿来规划真训练。
+  **定案工作点**：`navit_token_budget: 81920`（8×10240/卡）+ K2 路径
+  **单布局驻留**（run_train.py：换布局时驱逐旧 executable 并 gc，同布局下次
+  靠 --jax-cache 磁盘编译缓存秒回；布局数只影响编译次数，不再决定生死）。
+  modare 数据集（159 张，最大 4096 img token）上 5 布局 / 填充率 ~81% /
+  每 epoch 9 步 / 18 epoch 178 步全程 ~53 分钟（含流式加载 3.7min +
+  布局编译）。multiscale 对本数据集是空操作（plan_multiscale_copy 只降不升，
+  全数据集 ≤ ladder 档 → 0 sidecar；GPU 侧同函数同行为），yaml 里关掉即可
+  （TPU 侧 multiscale=true 且无 sidecar 会 fail-fast）。
 - **caption dropout**：换入的空 caption 比扫描时的原 caption 短，
   `assemble_batch_k2` 会按实际长度把 `seg_self`/`txt_fine` 的剩余区间重标
   PAD_SEG（运行时数组，不进编译身份）——否则零值会被 txtmlp 的 bias 穿透成
@@ -133,12 +159,16 @@ Krea2 已接线到 Kaggle TPU v5e-8 训练链路（`run_train.py` 自动按 `mod
   同构；方向安全，详见 `jax_tpu/sched.py` 的 `update` docstring）。
 - `--unrolled/--packed-chunk/--packed-barrier` 是 Anima 打包路径的吞吐旋钮，
   K2 的 scan+FSDP 路径未验证，构造期 fail-fast。
-- 底模走 build_job `--hf-model krea/Krea-2-Raw:<文件名>[:<rev>]` 直下：**gated
-  repo，需要在 HF 网页接受 Krea 2 Community License**，并把 token 配进 Kaggle
-  Secrets（键名 `HF_TOKEN`，job 启动时自动读取）。
+- 底模走 build_job `--hf-model krea/Krea-2-Raw:<文件名>[:<rev>]`：**gated
+  repo，需要在 HF 网页接受 Krea 2 Community License**。raw.safetensors 26.3GB
+  > /kaggle/working 的 ~20GB 上限，直下装不下——必须加 `--hf-stream`（HTTP
+  Range 流式加载，见上文「底模加载：HTTP Range 流式」），token 用
+  `--env HF_TOKEN=...` 烘焙进 job（Secrets 的网页 attach 对 script kernel
+  不可靠，同上）。
 - 本地闸门：`jax_tpu/tests/` 的 K1（前向对拍，torch dump → jax check，fp32
   rel ≤ 4e-6）与 K2（FSDP 训练闭环，8 伪造 CPU 设备）。改 `krea2_jax.py` /
-  `train.py` / `packing.py` / `data.py` 后先跑完这两道再上真机。
+  `train.py` / `packing.py` / `data.py` / `run_train.py` 后先跑完这两道再上
+  真机；动 HTTP Range 加载路径加跑 `check_http_range.py`。
 - 训练配置模板：`config/train_krea2_tpu_template.yaml`。
 
 ## 验证状态（本地 RTX GPU，tests/test_krea2_modeling.py）

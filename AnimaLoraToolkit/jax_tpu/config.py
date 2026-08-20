@@ -184,7 +184,7 @@ class RunConfig:
     tcfg: T.TrainConfig
     adaptive: S.AdaptiveConfig
     data_dir: Path
-    transformer_path: Path
+    transformer_path: Path          # 本地 Path，或 http(s) URL str（K2 流式 Range 加载）
     output_dir: Path
     output_name: str
     #: 模型族：anima（默认，与历史逐一等价）/ krea2（单流 MMDiT + FSDP）
@@ -245,6 +245,14 @@ def _i(d, k, default=0):
 def _b(d, k, default=False):
     v = d.get(k, default)
     return bool(default if v is None else v)
+
+
+def _weight_path(v: Any):
+    """底模路径：本地文件转 Path；http(s) URL（流式 Range 加载，见
+    krea2_jax._read_safetensors_map）必须原样保留——Path() 会把
+    "https://" 塌成 "https:/"。"""
+    s = str(v or "")
+    return s if s.startswith(("http://", "https://")) else Path(s)
 
 
 def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
@@ -378,7 +386,7 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
     return RunConfig(
         tcfg=tcfg, adaptive=adaptive,
         data_dir=Path(str(d.get("data_dir", "."))),
-        transformer_path=Path(str(d.get("transformer_path", ""))),
+        transformer_path=_weight_path(d.get("transformer_path", "")),
         output_dir=Path(str(d.get("output_dir", "./output"))),
         output_name=str(d.get("output_name", "anima-tpu")),
         family=family,

@@ -196,9 +196,19 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$PWD/kaggle_run.ps1" \
   `schedule_shift` 必须 1.0，构造期 fail-fast）。模板
   `AnimaLoraToolkit/config/train_krea2_tpu_template.yaml`。预算语义不变
   （全局 = 8×单卡），但 K2 的段含 text 槽 —— **单图 image+text 合计 ≤ 16384/卡**。
-- **④ 底模**：`--hf-model krea/Krea-2-Raw:<文件>[:<rev>]`，**gated** —— 先在
-  HF 网页接受协议，token 配成 Kaggle Secrets 的 `HF_TOKEN`。job 内 FSDP
-  分片加载（每卡 ~3GB），host 不持全量。
+- **④ 底模**：`--hf-model krea/Krea-2-Raw:<文件>[:<rev>] --hf-stream
+  --env HF_TOKEN=<只读token>`。**gated** —— 先在 HF 网页接受协议。
+  raw.safetensors 26.3GB > /kaggle/working 的 ~20GB 上限，直下装不下；
+  `--hf-stream` 让 krea2_jax 走 HTTP Range 流式加载（8 线程预取，真机
+  ~110MB/s，零磁盘占用，字节与文件逐 bit 相同，tests/check_http_range.py
+  对拍）。token 用 `--env` 烘焙（Secrets 的网页 attach 对 script kernel
+  不可靠：未 attach 时服务回 HTTP 400，被误报成 "ConnectionError"）；
+  build_job 对凭证类 env 的日志打印已脱敏，生成物不进 git。
+  job 内 FSDP 分片加载（每卡 ~3GB），host 不持全量。
+- **HBM**：真 12B 训练图（LoKr+aux 全开）单 executable 驻留 ~12G/布局，
+  16384/卡 与 12288/卡 都 OOM 过——工作点 `navit_token_budget: 81920`
+  （8×10240/卡）+ K2 单布局驻留（换布局驱逐旧 executable，run_train.py）。
+  spmd_probe 的 16384/卡账是裸模型探针口径，别拿来规划真训练。
 - **⑤ plan-only**：输出里布局行会带 `txt(...)`（各实段 text 槽长）。
 - **真机约束**：remat 不能 none（FSDP all_gather 要在 checkpoint 内）；
   `--unrolled/--packed-chunk/--packed-barrier` 未在 K2 验证，构造期拦。

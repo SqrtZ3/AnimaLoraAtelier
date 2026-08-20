@@ -568,7 +568,16 @@ def main_k2(a, raw) -> int:
     eval_fns: Dict[Any, Any] = {}
 
     def get_grad_fn(layout):
+        # K2 的 executable 驻留 ~10G/份（v5e-8 真机：12288/卡布局 reserve
+        # 11.94G），两个布局同时驻留必 OOM —— 只留当前布局，换布局时驱逐旧
+        # 的（executable 析构释放 program 内存；同布局下次靠 --jax-cache 的
+        # 磁盘编译缓存秒回，steps 按布局分组连续，驱逐次数 = 布局数/epoch）。
         if layout not in grad_fns:
+            if grad_fns:
+                import gc
+                grad_fns.clear()
+                eval_fns.clear()
+                gc.collect()
             t = time.time()
             grad_fns[layout] = T.make_grad_fn_k2(mcfg, rc.tcfg, plans, layout,
                                                  mesh, pspec, a.interpret)

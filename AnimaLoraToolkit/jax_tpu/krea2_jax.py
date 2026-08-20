@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import struct
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
@@ -614,10 +615,21 @@ _DT = {"BF16": jnp.bfloat16, "F16": jnp.float16, "F32": jnp.float32}
 _NP = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32}
 
 
-def _read_safetensors_map(path: str):
+def _read_safetensors_map(path: str, token: Optional[str] = None):
     """{name: (dtype_str, shape, reader)} + __metadata__——reader() 才真的读字节
     （每次自开文件，调用方可以在头部解析完之后的任何时刻读；24GB 文件不做
-    一次性物化）。"""
+    一次性物化）。
+
+    `path` 可以是 http(s) URL（HF resolve 链接）：此时走 HTTP Range 请求——
+    header 两次小 GET（8B 长度 + JSON 头），之后每 tensor 一次 range GET。
+    Kaggle 的 /kaggle/working 只有 ~20GB 装不下 26GB 的 Krea-2-Raw，而
+    Kaggle←HF 实测 300+MB/s，流式读比"下载落盘再读"省一整圈磁盘与等待。
+    字节内容与原文件逐 bit 相同（safetensors 是纯字节寻址格式，Range 语义
+    由 HTTP 保证），所以数值与本地文件路径完全等价。gated repo 传 `token`
+    （Bearer），重定向到 CDN 后**不再带**（签名 URL 自含授权，多带 Authorization
+    有被 CDN 拒的案例）。"""
+    if str(path).startswith(("http://", "https://")):
+        return _read_safetensors_map_http(path, token)
     with open(path, "rb") as f:
         hlen = struct.unpack("<Q", f.read(8))[0]
         hdr = json.loads(f.read(hlen))
@@ -639,6 +651,106 @@ def _read_safetensors_map(path: str):
              for name, m in hdr.items()}, meta)
 
 
+def _http_final_url(url: str, token: Optional[str]) -> str:
+    """解析 HF resolve 的 302 链，返回最终（CDN 签名）URL。用 Range: 0-0 探，
+    避免 HEAD 在某些 CDN 配置下不返回签名跳转。"""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.geturl()
+
+
+def _http_range_get(url: str, start: int, end_excl: int,
+                    token: Optional[str] = None, tries: int = 4) -> bytes:
+    """GET [start, end_excl)。带有限重试（连接重置/5xx 时指数退避）。"""
+    import time
+    import urllib.request
+    last = None
+    for i in range(tries):
+        try:
+            req = urllib.request.Request(
+                url, headers={"Range": f"bytes={start}-{end_excl - 1}"})
+            if token:
+                req.add_header("Authorization", f"Bearer {token}")
+            with urllib.request.urlopen(req, timeout=300) as r:
+                body = r.read()
+            if len(body) != end_excl - start:
+                raise IOError(f"range 响应长度 {len(body)} != 期望 {end_excl - start}")
+            return body
+        except Exception as e:  # noqa: BLE001 —— 记录后重试，最后一次抛出
+            last = e
+            if i + 1 < tries:
+                time.sleep(2.0 * (2 ** i))
+    raise RuntimeError(f"HTTP range GET [{start},{end_excl}) 重试 {tries} 次仍失败"
+                       f"（最后错误：{type(last).__name__}: {last}）")
+
+
+def _read_safetensors_map_http(url: str, token: Optional[str],
+                               workers: int = 8,
+                               inflight_budget: int = 4 << 30):
+    """`_read_safetensors_map` 的 HTTP Range 版（见它的 docstring）。
+
+    **并发预取**：构建 map 时就把全部 tensor 的 range GET 按文件序提交给线程池
+    （串行逐 tensor 的固定开销叠加实测让 26GB 加载拖到 10 分钟级；并发把 TLS/RTT
+    开销摊掉）。reader() 只是取回对应 future 的结果，语义与同步读完全一致。
+    `inflight_budget` 限制在飞字节数（默认 4GB），防止 800 个 future 同时完成把
+    26GB 全堆进 host 内存。每 1GB 打一行进度（流式加载曾经"静默 10 分钟"被
+    误判成卡死）。"""
+    import concurrent.futures
+    import threading
+    import time
+
+    final = _http_final_url(url, token)
+    # CDN 签名 URL 之后不再需要 Authorization（且不该再带）。
+    cdn_token = token if final == url else None
+    raw8 = _http_range_get(final, 0, 8, cdn_token)
+    hlen = struct.unpack("<Q", raw8)[0]
+    hdr = json.loads(_http_range_get(final, 8, 8 + hlen, cdn_token))
+    meta = hdr.pop("__metadata__", None) or {}
+    base = 8 + hlen
+
+    pool = concurrent.futures.ThreadPoolExecutor(workers)
+    cond = threading.Condition()
+    inflight = [0]                                # 在飞字节数
+    total_bytes = sum(m["data_offsets"][1] - m["data_offsets"][0]
+                      for m in hdr.values())
+    done_bytes = [0]
+    t0 = time.time()
+
+    def make_reader(m):
+        s0, e0 = m["data_offsets"]
+        shape, dt = m["shape"], _NP[m["dtype"]]
+        sz = e0 - s0
+
+        with cond:
+            while inflight[0] + sz > inflight_budget:
+                cond.wait()
+            inflight[0] += sz
+        fut = pool.submit(_http_range_get, final, base + s0, base + e0, cdn_token)
+
+        def _release(_f):
+            with cond:
+                inflight[0] -= sz
+                cond.notify_all()
+        fut.add_done_callback(_release)
+
+        def read() -> np.ndarray:
+            raw = fut.result()
+            done_bytes[0] += len(raw)
+            gb = done_bytes[0] / (1 << 30)
+            if int(gb) > int((done_bytes[0] - len(raw)) / (1 << 30)):
+                print(f"    [流式] {gb:.0f}/{total_bytes / (1 << 30):.0f}GiB "
+                      f"({done_bytes[0] / 1e6 / max(time.time() - t0, 1e-9):.0f}MB/s)",
+                      flush=True)
+            return np.frombuffer(raw, dtype=dt).reshape(shape)
+        return read
+
+    return ({name: (m["dtype"], m["shape"], make_reader(m))
+             for name, m in hdr.items()}, meta)
+
+
 def _to_jax(arr: np.ndarray, dt_str: str, dtype) -> jnp.ndarray:
     if dt_str == "BF16":
         out = jax.lax.bitcast_convert_type(jnp.asarray(arr), jnp.bfloat16)
@@ -650,7 +762,8 @@ def _to_jax(arr: np.ndarray, dt_str: str, dtype) -> jnp.ndarray:
 def load_safetensors_krea2(path: str, dtype=jnp.bfloat16,
                            shard_put: Optional[Callable] = None,
                            row_norms_out: Optional[Dict[str, np.ndarray]] = None,
-                           cfg: Optional["Krea2Config"] = None
+                           cfg: Optional["Krea2Config"] = None,
+                           token: Optional[str] = None,
                            ) -> Tuple[PyTree, Krea2Config]:
     """把 Krea-2-Raw 的 safetensors 读成 JAX pytree。
 
@@ -666,7 +779,8 @@ def load_safetensors_krea2(path: str, dtype=jnp.bfloat16,
     平方范数，按键 `{堆叠target: [count, out]}` 填入 —— DoRA 的 dora_scale 初值
     来源（权重随后就分片了，不该再 gather 回来算）。
     """
-    entries, st_meta = _read_safetensors_map(path)
+    entries, st_meta = _read_safetensors_map(
+        path, token if token is not None else os.environ.get("HF_TOKEN"))
     if cfg is None:
         if "krea2_config" in st_meta:
             # 自描述 ckpt（本仓库 dump/转换工具会写）：非发布构型就靠它 ——

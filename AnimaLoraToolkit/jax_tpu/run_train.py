@@ -607,6 +607,10 @@ def main_k2(a, raw) -> int:
                     t_vec, _img_tokens_of(packs),
                     rc.krea2_shift_min_res, rc.krea2_shift_max_res,
                     rc.krea2_shift_y1, rc.krea2_shift_y2)
+                # 与 PyTorch 同序：res_shift 之后再过 t_range（anima_train.py
+                # :3962 的 apply_t_range 在 krea2_shift_timesteps 之后）——
+                # 否则显式设 timestep_t_min/t_max 时移位后的 t 会越出值域。
+                t_vec = np.asarray(F.t_range_clip(t_vec, fcfg, np), np.float32)
             batch = T.assemble_batch_k2(packs, lats, ctxs, t_vec, mcfg,
                                         rc.tcfg.dtype,
                                         _ms_weights(packs, rc.ms_loss_weight))

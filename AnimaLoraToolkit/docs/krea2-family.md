@@ -114,13 +114,23 @@ Krea2 已接线到 Kaggle TPU v5e-8 训练链路（`run_train.py` 自动按 `mod
 | 权重 | bf16 3.91GB，**单 chip 复制**，纯 DP | bf16 ~24GB > 15.7GiB，**FSDP 8 卡分片**（每卡 ~3GB），每层 remat 内 all_gather（真机 spmd_probe P1 定案：9.8k tok/s @ 16384/卡，单卡 3.05GiB） |
 | 序列 | 图像段 + cross-attn 定长文本槽 | **单流**：每图段 = [text ; image]，预算两边一起花；text 槽量化到 128 |
 | 文本缓存 | `cross` [512, 1024] | `txt` [L, 12, 2560]（12 层堆叠、**变长**），`tools/cache_text_features.py --model-family krea2` 产出（Qwen3-VL-4B） |
-| timestep | flow_shift/schedule_shift | `krea2_res_shift: true`（默认）：采样后按每图 image token 数施官方 mu shift；开着时 `schedule_shift` 必须 1.0（构造期 fail-fast，防双重偏移） |
+| timestep | flow_shift/schedule_shift | `krea2_res_shift: true`（默认）：采样后按每图 image token 数施官方 mu shift；开着时 `schedule_shift` 必须 1.0（构造期 fail-fast，防双重偏移）。shift 之后再过一次 `t_range` 截断（与 PyTorch 侧 `anima_train.py` 的顺序一致） |
 | LoRA 默认 targets | 10 个投影层 | 官方推荐**全部 264 个 Linear**（28 块×8 + txtfusion 33 + tmlp/txtmlp/tproj/first/last）；`lora_targets`/`lora_exclude_patterns` 语义不变 |
 | ΔFM/Eisbach/spectral | 已移植 | **同一份实现直接复用**（它们只作用在图像流 [ΣN, 64] 上，与文本怎么进模型无关） |
 | 显存上限 | 单图 ≤ 16384 token/卡 | 单图 **image + text 合计** ≤ 16384/卡（FSDP 实测 32768 OOM，spmd_probe P5） |
 
 - **remat 必须 != none**：FSDP 的 all_gather 要在 checkpoint 边界内，否则 28 层
   全量权重同时活着（spmd_probe 第四跑 OOM 37.62G 的根因；构造期 fail-fast）。
+- **caption dropout**：换入的空 caption 比扫描时的原 caption 短，
+  `assemble_batch_k2` 会按实际长度把 `seg_self`/`txt_fine` 的剩余区间重标
+  PAD_SEG（运行时数组，不进编译身份）——否则零值会被 txtmlp 的 bias 穿透成
+  假 token 参与注意力（dropout 样本不再是干净的无条件）。
+- **裸张量（norm scale / mod.lin / bias）随 `mixed_precision` 存储**：对齐
+  PyTorch 训练侧 `model.to(dtype)` 全转的行为（用前升 fp32 的算子语义不变），
+  两个后端的 bf16 训练数值因此逐 bit 可对照。
+- **自适应采样器的分桶口径**：反馈喂的是 res_shift 后的最终 t，候选分桶是
+  res_shift 前口径（采样发生在 t 与图配对之前，架构性错位，与 PyTorch 侧
+  同构；方向安全，详见 `jax_tpu/sched.py` 的 `update` docstring）。
 - `--unrolled/--packed-chunk/--packed-barrier` 是 Anima 打包路径的吞吐旋钮，
   K2 的 scan+FSDP 路径未验证，构造期 fail-fast。
 - 底模走 build_job `--hf-model krea/Krea-2-Raw:<文件名>[:<rev>]` 直下：**gated

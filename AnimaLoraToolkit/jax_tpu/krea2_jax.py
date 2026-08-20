@@ -656,9 +656,11 @@ def load_safetensors_krea2(path: str, dtype=jnp.bfloat16,
 
     `shard_put` 非 None 时逐张读出**即刻** `jax.device_put(arr, shard_put(name, arr))`
     —— host 从不持有全量副本（24GB 底模在 Kaggle 上的标准姿势）；None 时全量落
-    默认设备（本地对拍/小模型用）。RMSNorm scale / mod.lin 这类**裸张量**保 fp32
-    （torch 里它们就是 fp32 Parameter，参与 fp32 调制加法后才降 dtype），矩阵
-    一律降到 `dtype`。
+    默认设备（本地对拍/小模型用）。RMSNorm scale / mod.lin / bias 这类裸张量
+    **随 `dtype` 存储**（不特殊保 fp32）：torch 训练侧是 `model.to(dtype)` 全转
+    （model_family.py:135 附近），存储即经一轮 bf16 舍入；这里随 dtype 存 +
+    用前升 fp32（rms_norm_zc）/ 降运行 dtype（调制加法、bias），两条路径都与
+    torch 训练侧逐 bit 一致。fp32 对拍（K1）时 dtype=fp32 → 全 fp32，不受影响。
 
     `row_norms_out` 给一个 dict 时，边读边流式算好每个 Linear 权重的 fp32 逐行
     平方范数，按键 `{堆叠target: [count, out]}` 填入 —— DoRA 的 dora_scale 初值
@@ -704,14 +706,14 @@ def load_safetensors_krea2(path: str, dtype=jnp.bfloat16,
             mod, np.zeros((1, arr_f32.shape[0]), np.float64))[0] += \
             np.sum(arr_f32.astype(np.float64) ** 2, axis=-1)
 
-    def get(name: str, keep_f32: bool = False) -> jnp.ndarray:
+    def get(name: str) -> jnp.ndarray:
         dt, _shape, rd = entries[name]
         raw = rd()
         if row_norms_out is not None:
             f32 = ((raw.astype(np.uint32) << 16).view(np.float32)
                    if dt == "BF16" else raw.astype(np.float32))
             note_row_sq(name, f32)
-        out = _to_jax(raw, dt, jnp.float32 if keep_f32 else dtype)
+        out = _to_jax(raw, dt, dtype)
         if shard_put is not None:
             out = jax.device_put(out, shard_put(name, out))
         return out
@@ -719,20 +721,20 @@ def load_safetensors_krea2(path: str, dtype=jnp.bfloat16,
     def lin(name: str, bias: bool = False) -> Dict[str, Any]:
         m = {"w": get(f"{name}.weight")}
         if bias:
-            m["b"] = get(f"{name}.bias", keep_f32=True)
+            m["b"] = get(f"{name}.bias")
         return m
 
     def block(b: str, has_mod: bool) -> Dict[str, Any]:
         d = {
-            "prenorm": get(f"{b}.prenorm.scale", keep_f32=True),
-            "postnorm": get(f"{b}.postnorm.scale", keep_f32=True),
+            "prenorm": get(f"{b}.prenorm.scale"),
+            "postnorm": get(f"{b}.postnorm.scale"),
             "attn": {n: get(f"{b}.attn.{n}.weight") for n in ("wq", "wk", "wv", "gate", "wo")}
-                   | {"qnorm": get(f"{b}.attn.qknorm.qnorm.scale", keep_f32=True),
-                      "knorm": get(f"{b}.attn.qknorm.knorm.scale", keep_f32=True)},
+                   | {"qnorm": get(f"{b}.attn.qknorm.qnorm.scale"),
+                      "knorm": get(f"{b}.attn.qknorm.knorm.scale")},
             "mlp": {n: get(f"{b}.mlp.{n}.weight") for n in ("gate", "up", "down")},
         }
         if has_mod:
-            d["mod_lin"] = get(f"{b}.mod.lin", keep_f32=True)
+            d["mod_lin"] = get(f"{b}.mod.lin")
         return d
 
     params = {
@@ -744,14 +746,14 @@ def load_safetensors_krea2(path: str, dtype=jnp.bfloat16,
             "projector": get("txtfusion.projector.weight"),
             "refiner": [block(f"txtfusion.refiner_blocks.{i}", False) for i in range(2)],
         },
-        "txtmlp_norm": get("txtmlp.0.scale", keep_f32=True),
+        "txtmlp_norm": get("txtmlp.0.scale"),
         "txtmlp1": lin("txtmlp.1", bias=True), "txtmlp3": lin("txtmlp.3", bias=True),
         "blocks": [block(f"blocks.{i}", True) for i in range(cfg.layers)],
         "last": {
-            "norm": get("last.norm.scale", keep_f32=True),
+            "norm": get("last.norm.scale"),
             "linear_w": get("last.linear.weight"),
-            "linear_b": get("last.linear.bias", keep_f32=True),
-            "mod_lin": get("last.modulation.lin", keep_f32=True),
+            "linear_b": get("last.linear.bias"),
+            "mod_lin": get("last.modulation.lin"),
         },
     }
     return params, cfg

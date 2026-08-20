@@ -180,14 +180,22 @@ def _base(d, cfg: FlowConfig, xp):
     return xp.clip(_t_from_draws(d, cfg, xp), EPS, 1.0 - EPS)
 
 
+def t_range_clip(t, cfg: FlowConfig, xp=jnp):
+    """≡ `apply_t_range`（objective.py:329）：恒 clamp 到 [max(t_min,1e-4),
+    min(t_max,1-1e-4)]，lo>hi 交换。finish_t 的最后一段与 K2 res_shift 之后
+    共用 —— PyTorch 侧的顺序是 res_shift 之后再过它（anima_train.py:3962）。"""
+    lo = max(float(cfg.t_min), EPS)
+    hi = min(float(cfg.t_max), 1.0 - EPS)
+    if lo > hi:
+        lo, hi = hi, lo
+    return xp.clip(t, lo, hi)
+
+
 def finish_t(t, cfg: FlowConfig, xp=jnp):
     """≡ `apply_timestep_schedule_shift` + `apply_t_range`（objective.py:307/329）。"""
     if abs(cfg.schedule_shift - 1.0) > 1e-6 and cfg.schedule_shift > 0:
         t = _shift(t, cfg.schedule_shift)
-    t = xp.clip(t, EPS, 1.0 - EPS)
-    if cfg.t_min > 0.0 or cfg.t_max < 1.0:
-        t = xp.clip(t, max(cfg.t_min, EPS), min(cfg.t_max, 1.0 - EPS))
-    return t
+    return t_range_clip(t, cfg, xp)
 
 
 def _finish(t, cfg: FlowConfig, xp):

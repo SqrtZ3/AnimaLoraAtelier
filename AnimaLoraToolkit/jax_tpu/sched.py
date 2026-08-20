@@ -114,6 +114,13 @@ class AdaptiveTimestepSampler:
         注意"裸"的含义：eisbach 权重、ΔFM 负项、multiscale 权重都**不能**乘进来
         —— 那些是"要不要让这张图影响参数"的旋钮，不是"这个 t 学得怎么样"的度量。
         PyTorch 侧同样是拿未经乘算的 `per_image_loss` 喂进来的。
+
+        Krea2 口径说明（与 PyTorch 侧同构）：K2 训练喂进来的是 res_shift **后**
+        的最终 t（模型实际经历的 t），而 sample() 里候选分桶用的是 res_shift
+        **前**的值 —— 两者错一个逐图不同的单调映射。这是架构性的：采样发生在
+        t 与图的配对之前，候选分桶拿不到各图的分辨率。错位方向安全（统计上
+        偏向多练难区域，不会错训）；若哪天要消它，得让 sample 知道逐位置
+        tokens 并重做配对语义（改动大、且要动 PyTorch 侧，暂未做）。
         """
         if not self.cfg.enabled:
             return

@@ -64,7 +64,7 @@ try:                                   # 作为包导入
     from . import flow as F
     from . import optim as O
     from . import krea2_jax as K2
-    from .packing import K2Layout, Layout, Pack
+    from .packing import PAD_SEG, K2Layout, Layout, Pack
 except ImportError:                    # jax_tpu/ 直接在 sys.path 上（tests/ 走这条）
     import adapters as AD
     import anima_jax as A
@@ -74,7 +74,7 @@ except ImportError:                    # jax_tpu/ 直接在 sys.path 上（tests
     import flow as F
     import optim as O
     import krea2_jax as K2
-    from packing import K2Layout, Layout, Pack
+    from packing import PAD_SEG, K2Layout, Layout, Pack
 
 PyTree = Any
 
@@ -770,6 +770,7 @@ def assemble_batch_k2(packs, latents, ctxs, t: np.ndarray,
         txt_dt = c0.dtype if c0 is not None else np.float32
         txt = np.zeros((NT, n_layers, model_cfg.txtdim), txt_dt)
         i_off = t_off = 0
+        c_off = 0                              # combined 序列的段偏移（text 实位在段首）
         for j, (tq, iq) in enumerate(zip(layout.txt_segs, layout.img_segs)):
             L_ = lat_list[j]
             if L_ is not None:
@@ -782,8 +783,20 @@ def assemble_batch_k2(packs, latents, ctxs, t: np.ndarray,
                         f"dropout 换入的空 caption 比原 caption 还长？这不允许 —— "
                         f"空 caption 的 token 数必须 <= 槽长")
                 txt[t_off:t_off + C.shape[0]] = C
+                rt = p.real_txt_lens[j]
+                if C.shape[0] < rt:
+                    # caption dropout 换入的空 caption 比扫描时的原 caption 短：
+                    # 精细 mask 必须按**实际填入**重标，否则 [len, rt) 的零值被当成
+                    # 有效 caption —— refiner 里掺零 logit 稀释注意力，主序列里被
+                    # txtmlp 的 bias 穿透成非零假 token 参与图像注意力（dropout
+                    # 样本不再是干净的无条件）。seg_self/txt_fine 是运行时数组，
+                    # 不进编译身份；mod_index/rows/cols 不受影响（调制按图、
+                    # text 位坐标恒 0）。
+                    idx["txt_fine"][t_off + C.shape[0]:t_off + rt] = PAD_SEG
+                    idx["seg_self"][c_off + C.shape[0]:c_off + rt] = PAD_SEG
             i_off += iq
             t_off += tq
+            c_off += layout.seg_lens[j]
         out["latent"].append(lat)
         out["txt"].append(txt)
         for k in ("rows_c", "cols_c", "mod_index_c", "seg_self", "txt_fine",

@@ -526,8 +526,12 @@ def forward_packed(params: PyTree, cfg: Krea2Config,
     def _text_stack(p_txt):
         p = g(p_txt)
         sg = None if loras is None else loras.get("single")
+        # 内层 remat="none"：外层 jax.checkpoint 已丢掉文本栈全部中间量（反向
+        # 整栈重算一次），内层再逐块包 checkpoint 只会让每块在反向时再重算
+        # 一遍（嵌套 remat 双算），一分显存都省不了。
         h = text_fusion(p["txtfusion"], cfg, txt_stack,
-                        layerwise_attn_fn, refiner_attn_fn, loras=loras, remat=remat)
+                        layerwise_attn_fn, refiner_attn_fn, loras=loras,
+                        remat="none")
         return txtmlp_forward(p, h, loras=sg)
 
     txt = jax.checkpoint(_text_stack)({

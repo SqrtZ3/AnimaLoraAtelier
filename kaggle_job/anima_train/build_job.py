@@ -153,8 +153,11 @@ if _HF:
         from kaggle_secrets import UserSecretsClient
         _token = UserSecretsClient().get_secret("HF_TOKEN")
         print("[ INFO ] 已从 Kaggle Secrets 读 HF_TOKEN（gated repo 用）", flush=True)
-    except Exception:
-        pass
+    except Exception as e:
+        # 不静默吞掉：Secret 未配/不可读都落回匿名下载；若 repo 是 gated 的，
+        # hf_hub_download 会以 401 清晰报错。
+        print(f"[ INFO ] HF_TOKEN 不可用（{{type(e).__name__}}: {{e}}），走匿名下载",
+              flush=True)
     _repo, _file = _HF[0], _HF[1]
     _rev = _HF[2] if len(_HF) > 2 else None
     _t0 = __import__("time").time()

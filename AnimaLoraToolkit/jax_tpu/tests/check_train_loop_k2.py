@@ -216,6 +216,32 @@ def main() -> int:
     ok("loss 逐 bit 不变", float(m0["loss"]) == float(m_6["loss"]),
        f"{float(m0['loss']):.8f} vs {float(m_6['loss']):.8f}")
 
+    print("\nT8 caption dropout：换入短 caption 后，原有效区间被精细 mask 隔离：")
+    # 模拟 dropout：每卡第 0 段的 caption 截短（空 caption 的角色）。修复前
+    # [len, rt) 的零值被按扫描长度标成有效，txtmlp 的 bias 会把它穿透成非零
+    # 假 token 参与 refiner 与主序列注意力；修复后 assemble_batch_k2 把该区间
+    # 重标 PAD_SEG —— 扰动它必须逐 bit 不影响 loss。
+    ctxs_d = [[c[: max(1, c.shape[0] // 2)] for c in per] for per in ctxs]
+    rt0 = batch_packs[0].real_txt_lens[0]
+    lo = max(1, rt0 // 2)
+    batch_d = T.assemble_batch_k2(batch_packs, lats, ctxs_d, t_vec, mcfg,
+                                  tcfg.dtype)
+    tf_d = np.asarray(batch_d["txt_fine"])
+    ss_d = np.asarray(batch_d["seg_self"])
+    remark_ok = bool((tf_d[:, lo:rt0] == PK.PAD_SEG).all()
+                     and (ss_d[:, lo:rt0] == PK.PAD_SEG).all())
+    ok("重标生效（[len, rt) -> PAD_SEG）", remark_ok,
+       f"txt_fine/seg_self 区间 [:, {lo}:{rt0}]")
+    _, m_d = step(O.init_state(lora), params, batch_d)
+    b8 = dict(batch_d)
+    pert8 = np.asarray(batch_d["txt"]).copy()
+    pert8[:, lo:rt0] += 100.0
+    b8["txt"] = jnp.asarray(pert8)
+    _, m_8 = step(O.init_state(lora), params, b8)
+    ok("扰动已隔离区间，loss 逐 bit 不变",
+       float(m_d["loss"]) == float(m_8["loss"]),
+       f"{float(m_d['loss']):.8f} vs {float(m_8['loss']):.8f}")
+
     print("\nT3 梯度确实跨了 8 卡：")
     b3 = dict(batch)
     lat3 = np.asarray(batch["latent"]).copy()

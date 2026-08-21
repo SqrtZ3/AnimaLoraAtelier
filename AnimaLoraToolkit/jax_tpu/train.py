@@ -325,7 +325,7 @@ def make_grad_fn(model_cfg: A.AnimaConfig, tcfg: TrainConfig, plans, layout: Lay
     # （本地 check_train_loop 抓到过 UnexpectedTracerError）。而且构造很贵
     # （真机 735ms），本就该按布局只做一次。
     # seg_cap 只统计**实段**：自然长度布局里 <1024 的纯填充段若参与取 min，
-    # 会把全盘反向块拖进 512/256 退让链（见 attention.make_splash_attn）。
+    # 会把全盘反向块拖进退让链（见 attention.make_splash_attn 与 BWD_BLOCK_PREF）。
     real_cap = min(layout.real_seg_lens)
     self_attn = AT.make_splash_attn(coarse, coarse, model_cfg.num_heads,
                                     model_cfg.head_dim, interpret=interpret,

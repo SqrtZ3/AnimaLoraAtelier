@@ -253,7 +253,9 @@ def main() -> int:
 
     print(f"\n{'*** 通过 ***' if FAIL == 0 else f'*** {FAIL} 项失败 ***'}"
           f"  ({OK} OK / {FAIL} FAIL)")
-    return 0
+    # 这里原来无条件 return 0 —— 闸门打印 FAIL 却以成功退出，跑批脚本一律当绿。
+    # 其余 check_*.py 都是 `return 0 if not bad else 1`，这条是漏网的。
+    return 0 if FAIL == 0 else 1
 
 
 def _unstack_params(params):

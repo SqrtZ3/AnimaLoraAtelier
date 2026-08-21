@@ -239,10 +239,20 @@ def make_splash_attn(q_seg_lens: Sequence[int], kv_seg_lens: Sequence[int],
 
     `seg_cap` = 反向块上限，默认取所有段的最短段（跨段的反向块会产生 partial
     mask block，见 `_block_sizes`）。自然长度布局里 <1024 的纯填充段不该参与
-    这个 min——否则全盘反向块被拖进 512/256 退让链（真机实测 1024 比默认快
-    ~2x，见 BWD_BLOCK_PREF）。调用方传**实段**最短长（packing 侧
+    这个 min——否则全盘反向块被拖进退让链（BWD_BLOCK_PREF 的真机数：1024
+    fused 142ms、512 fused 157ms 约 1.1x、默认 128 非 fused 288ms 约 2x；
+    256 fused 没量过）。调用方传**实段**最短长（packing 侧
     `Layout.real_seg_lens`）；代价只是填充段边界处可能多出几个 partial block
     （会被物化进 kernel，纯 perf，数值不变）。
+
+    **`seg_cap` 只是零 partial block 的必要条件，不是充分条件**：还要求块长整除
+    每个段的累积偏移。Anima（段长全是 quantum >= 1024 的倍数）满足；K2 的
+    combined 段含 128 量化文本槽，段边界几乎从不 1024 对齐 —— 本地合成池上
+    455 个边界只有 0~1 个对齐，所以 K2 的反向本来就在物化 partial mask block
+    （`_BlockDiag` 不带 `mask_function`，splash 会退成物化 `partial_mask_blocks`
+    而不是编进 kernel，所以是显存/带宽账，不会报错）。这是**本改动之前就有**的，
+    条数与 HBM 占用还没人量过：host 侧数一下 MaskInfo.partial_mask_blocks 的
+    第 0 维即可，不需要 TPU。
     """
     import jax.numpy as jnp
     sk, _ = _import_splash()

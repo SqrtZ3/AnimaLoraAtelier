@@ -18,6 +18,8 @@
 | ⑪ **全功能训练步** | `check_train_full.py` | 用户 yaml 那一整套开关同时打开时**每一条都真的接上了** | jax |
 | ⑫ 适配器对拍 | `dump_adapter_ref.py` → `check_adapter_parity.py` | LoKr/DoRA/adamw_snr ≡ `trainer/lora.py`+`utils/` | torch + jax |
 | ⑬ 目标函数对拍 | `dump_objective_ref.py` → `check_objective_parity.py` | Huber(snr)/逐图归约/Eisbach/spectral ≡ `trainer/objective.py`+`aux_losses.py` | torch + jax |
+| ⑭ **打包不变量** | `check_pack_invariants.py` | 「自然长度」打包的 RNG 兼容双射 / 布局数方向 / 结构不变量 | 纯 numpy |
+| **preflight** | `enum_quantum_advisor.py --config <yaml>` | 用这次的 yaml+数据集扫出该传的 `--quantum` | numpy + pyyaml |
 | **K1** Krea2 前向对拍 | `dump_krea2_ref.py` → `check_krea2_parity.py` | `krea2_jax` ≡ `models/krea2_modeling.py`（逐 tap + LoRA 四区域） | torch + jax |
 | **K2** Krea2 端到端 | `check_train_loop_k2.py` | FSDP 分片训练闭环能学 + 分片≡全量 + 导出键名 | jax |
 
@@ -31,6 +33,19 @@ txtfusion/txtmlp/first/t_vec/逐块/最终输出，再挂合成 LoRA 比对四�
 （K2 文本是变长的，填充全靠精细 segment_ids 隔离）、T2 真的在学、
 T5 存取往返 + 导出键名（`lora_unet_blocks_0_attn_wq` / `lora_unet_tproj_1`
 等 torch 模块路径）。
+
+⑭ 是「pack 补齐到自然长度」引入的（`packing.PACK_Q`）。它守的四条都是**不报错的
+失效**：RNG 兼容重排错位会让新旧 loss 曲线悄悄对不上，去重逻辑坏掉会白编译一次
+全模型。它同时把一个**被写错的结论**钉成回归：commit 1b12432 声称「布局数不变」，
+实际上旧口径的布局身份 `sorted(实段 ∪ {budget − Σ实段})` 是非单射的，正确的说法是
+**新布局数 >= 旧布局数**（最小反例见脚本 T2a）。真实数据集上差几个要跑
+`enum_quantum_advisor.py` 看，不能靠推理免测。
+
+`enum_quantum_advisor.py` 不是闸门，是**每次开训前跑一遍的 preflight**。自然长度
+打包之后装箱紧不紧已经不买算力了（每 epoch 总 token 与分组无关），`quantum` 成了
+唯一剩下的 FLOPs 杠杆，同时又压着反向块档位、布局数、入步图率三个反向轴 ——
+这三条的权衡是逐数据集的，必须扫。它直接调 `packing` 与 `data.CacheDataset`，
+不复刻逻辑。
 
 ⑪⑫⑬ 是**功能移植**引入的（LoKr+DoRA、三峰/自适应 t、Huber、eisbach/ΔFM/spectral、
 immiscible、逐块 reg_dims）。⑪ 的每条断言都在防一种"不报错的失效"：适配器键名对不上

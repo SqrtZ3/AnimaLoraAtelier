@@ -6,9 +6,28 @@
 段装进全局 budget（显存容量上限，语义不变），pack 总长 = **自然长度**
 `round_up(Σ实段, PACK_Q)`，取整余量（< PACK_Q，仅 quantum < PACK_Q 时非零）才
 追加一个纯填充段。round 到 1024 是为了让 splash 反向块恒能取 1024（真机实测
-比 512/256 快约 2x，见 attention.BWD_BLOCK_PREF）。这样 budget 维度的 padding
-浪费整个消失，布局身份不变（= 实段 multiset；旧版 padding 段长 = budget − Σ实段
-本就是可推导的冗余）。
+1024 fused 142ms / 512 fused 157ms / 默认 128 非 fused 288ms，见
+attention.BWD_BLOCK_PREF —— 掉到 512 只慢约 1.1x，掉到 128 才是 2x）。这样
+budget 维度的 padding 浪费整个消失。
+
+**收益是算力口径的推算，不是真机计时**：Σ自然长度 / (pack 数 × budget) 就是
+步时的预期比值（填充 token 与真 token 一样过 MLP 与块对角注意力）。真机步时
+收益会小于它 —— host 侧采样/组 batch、优化器、all-reduce 这些固定开销不随
+token 数缩。
+
+## 布局数：新口径 >= 旧口径，**不是"不变"**
+
+新布局身份 = 实段 multiset（单射）；旧口径（补齐到 budget）的身份是
+`sorted(实段 ∪ {budget − Σ实段})`，**非单射** —— 填充段长恰好撞上某个实段长时，
+两种不同的实段组合会被合并成同一次编译。budget=10240 的最小反例：实段
+`{5120}` 与 `{5120, 5120}` 的旧元组都是 `(5120, 5120)`，新口径拆成两个布局。
+
+所以正确的说法是「**新布局数 >= 旧布局数，差多少取决于数据**」。
+`tests/check_pack_invariants.py` 把这条方向性断言 + 上面那个反例固化成闸门；
+随机 fuzz 里约 5% 的样本池会 +1..+3。真实数据集上要不要在意，跑
+`tests/enum_quantum_advisor.py` 看，别靠推理免测：多一个布局在 Anima 路径上
+只是多一次编译（磁盘缓存摊掉），在 K2 的单布局驻留路径上是多一次/epoch 的
+驱逐重载。
 
 ## 这个模块存在的理由
 
@@ -76,6 +95,12 @@ class Layout:
     为让新旧两条代码路径的 RNG 消费逐 bit 一致，仍按旧槽数 t_slots 采样，再用
     t_gather（新段序第 p 段 -> 旧槽位下标）重排。直接构造 Layout 时留默认即可
     （t_slots=0 -> 按 n_seg 采样，不重排）。
+
+    **这是一次性的 A/B 兼容层，做完新旧曲线对比就该摘掉。** 留着的代价是
+    `budget`（一个 config 值）经 `rest_old` 永久地隐式决定 t 采样的 RNG 流 ——
+    换 budget 就换随机流，而它本该只是显存容量上限。摘除时：删掉这两个字段、
+    `Packer/K2Packer` 里 `rest_old/pad_old/t_gather` 的推导、`run_train._sample_t`，
+    `_sample_t` 退回 `sampler.sample(rng, len(packs) * layout.n_seg, ...)`。
     """
     total_len: int
     seg_lens: Tuple[int, ...]
@@ -109,7 +134,12 @@ class Layout:
     @property
     def real_seg_lens(self) -> Tuple[int, ...]:
         """实段段长（排除纯填充段）。反向块上限（seg_cap）只统计它们：< PACK_Q 的
-        填充段若参与取 min 会把全盘反向块拖小（512/256 退让是真机实测的减速）。"""
+        填充段若参与取 min 会把全盘反向块拖小。按 attention.BWD_BLOCK_PREF 的真机
+        数：1024 fused 142ms / 512 fused 157ms（约 1.1x）/ 默认 128 非 fused 288ms
+        （约 2x），256 fused 没量过。**这不是纯防御**：K2 的 combined 段 =
+        128 量化文本槽 + 图像槽，Σ实段几乎从不 1024 对齐，所以每个 pack 都带取整
+        余量段；本地合成池上 quantum=1024 时旧口径有 ~70% 的 pack 会掉进
+        256/128 档。"""
         return tuple(s for i, s in enumerate(self.seg_lens) if i != self.pad_idx)
 
     @property
@@ -353,6 +383,11 @@ class K2Layout:
                              f"与段数 {len(self.seg_lens)} 对不上")
         if len(self.seg_lens) - len(self.txt_segs) > 1:
             raise ValueError("至多一个纯填充段（取整余量，恒在末尾）")
+        if self.t_slots:                      # 校验与 Anima Layout 对称
+            if len(self.t_gather) != len(self.seg_lens) or \
+                    any(not 0 <= g < self.t_slots for g in self.t_gather):
+                raise ValueError(f"t_gather 必须是 {len(self.seg_lens)} 个 [0, "
+                                 f"{self.t_slots}) 内的下标，得到 {self.t_gather}")
         for i, (tq, iq) in enumerate(zip(self.txt_segs, self.img_segs)):
             if tq % BLOCK or iq % BLOCK:
                 raise ValueError(f"第 {i} 段槽长未对齐 {BLOCK}：txt={tq} img={iq}")

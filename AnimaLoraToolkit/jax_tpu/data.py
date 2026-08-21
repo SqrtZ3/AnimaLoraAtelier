@@ -26,6 +26,14 @@ numpy 没有原生 bfloat16，磁盘上是 uint16 位模式。**直接 `.view(np
 模式解释错**（静默出错），必须先转 uint16 再 bitcast：
 `jax.lax.bitcast_convert_type(jnp.asarray(a_uint16), jnp.bfloat16)`。
 
+## 缓存目录里**不需要放图片**
+
+`_stems` 优先按图片文件名推 stem，一张图片都没有时回退到按 `<stem>.npz` 推。
+TPU 侧从不读像素（只取文件名），caption 也已烘焙进 textfeat —— 而缓存目录通常要
+上传到 Kaggle 这类外部平台，那边的内容审查会因为训练图直接删库。所以**上传用的
+缓存目录只放 npz**。闸门 `tests/check_cache_scan.py` 钉死「两种模式样本集逐条相同」
+与「sidecar 不被当成样本本体」。
+
 ## multiscale（`navit_multiscale`）
 
 PyTorch 侧的多尺度阶梯把每张图的**低 token 档缩放副本**编码进独立的 sidecar
@@ -67,6 +75,8 @@ except ImportError:
 
 LATENT_CHANNELS = 16
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+#: `<stem>.ms<档>.npz` 多尺度 sidecar 的后缀（无图目录下推 stem 时要排掉）
+_MS_SIDECAR = re.compile(r"\.ms\d+$")
 
 
 def _read_maybe_bf16(z, key: str) -> np.ndarray:
@@ -154,11 +164,37 @@ class CacheDataset:
                     f"  跑 tools/cache_text_features.py --empty-caption 补上。")
             self._empty_ctx = self._read_ctx(q, "_empty")
 
+    def _stems(self) -> List[Path]:
+        """样本 stem 列表。有图片就按图片名推；**一张图片都没有时按 `<stem>.npz` 推**。
+
+        回退分支是为了让缓存 dataset 能**完全不含像素**。TPU 侧本来就不读图片
+        （这个函数只取文件名，从不 open），caption 也早烘焙进 `<stem>.textfeat.npz`，
+        所以原图放进缓存目录是纯多余的暴露 —— 而缓存目录常常要上传到 Kaggle 这类
+        外部平台，那里的内容审查会因为训练图直接删库。别再靠 0 字节占位图绕。
+
+        回退时要把 sidecar 从 stem 里排掉，否则 `a.textfeat.npz` 会被当成一个叫
+        `a.textfeat` 的样本，然后去找不存在的 `a.textfeat.npz` 的 textfeat：
+          * `<stem>.textfeat.npz` —— 文本特征（`_empty.textfeat.npz` 一并排掉）
+          * `<stem>.ms<档>.npz`   —— 多尺度副本，由 `_scan_multiscale` 挂到本体上
+        """
+        imgs = {p.with_suffix("") for p in self.dir.iterdir()
+                if p.suffix.lower() in IMG_EXT}
+        if imgs:
+            return sorted(imgs)
+        out = set()
+        for p in self.dir.iterdir():
+            if p.suffix.lower() != ".npz":
+                continue
+            base = p.name[:-len(".npz")]
+            if base.endswith(".textfeat") or _MS_SIDECAR.search(base):
+                continue
+            out.add(p.with_suffix(""))
+        return sorted(out)
+
     def _scan(self) -> None:
         missing_lat, missing_txt, bad, no_flip = [], [], [], []
         n_ms = 0
-        stems = sorted({p.with_suffix("") for p in self.dir.iterdir()
-                        if p.suffix.lower() in IMG_EXT})
+        stems = self._stems()
         for stem in stems:
             lat, txt = stem.with_suffix(".npz"), Path(str(stem) + ".textfeat.npz")
             if not lat.exists():
@@ -222,7 +258,9 @@ class CacheDataset:
             raise FileNotFoundError(
                 f"{self.dir} 的缓存不完整，拒绝静默跳过：\n  " + "\n  ".join(parts))
         if not self.samples:
-            raise FileNotFoundError(f"{self.dir} 里没找到任何图片")
+            raise FileNotFoundError(
+                f"{self.dir} 里没找到任何样本：既没有图片文件，也没有"
+                f"`<stem>.npz`（sidecar `.textfeat.npz` / `.ms<档>.npz` 不算）。")
 
     def _txt_len_of(self, txt: Path, name: str, bad: List[str]) -> int:
         """krea2：读 textfeat 的 `txt` 键形状，返回有效 caption token 数。出错 -1。"""

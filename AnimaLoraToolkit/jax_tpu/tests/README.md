@@ -19,6 +19,7 @@
 | ⑫ 适配器对拍 | `dump_adapter_ref.py` → `check_adapter_parity.py` | LoKr/DoRA/adamw_snr ≡ `trainer/lora.py`+`utils/` | torch + jax |
 | ⑬ 目标函数对拍 | `dump_objective_ref.py` → `check_objective_parity.py` | Huber(snr)/逐图归约/Eisbach/spectral ≡ `trainer/objective.py`+`aux_losses.py` | torch + jax |
 | ⑭ **打包不变量** | `check_pack_invariants.py` | 「自然长度」打包的 RNG 兼容双射 / 布局数方向 / 结构不变量 | 纯 numpy |
+| ⑮ **无图缓存** | `check_cache_scan.py` | 缓存目录不含图片时样本集逐条不变 + sidecar 不被当样本 | 纯 numpy |
 | **preflight** | `enum_quantum_advisor.py --config <yaml>` | 用这次的 yaml+数据集扫出该传的 `--quantum` | numpy + pyyaml |
 | **K1** Krea2 前向对拍 | `dump_krea2_ref.py` → `check_krea2_parity.py` | `krea2_jax` ≡ `models/krea2_modeling.py`（逐 tap + LoRA 四区域） | torch + jax |
 | **K2** Krea2 端到端 | `check_train_loop_k2.py` | FSDP 分片训练闭环能学 + 分片≡全量 + 导出键名 | jax |
@@ -33,6 +34,14 @@ txtfusion/txtmlp/first/t_vec/逐块/最终输出，再挂合成 LoRA 比对四�
 （K2 文本是变长的，填充全靠精细 segment_ids 隔离）、T2 真的在学、
 T5 存取往返 + 导出键名（`lora_unet_blocks_0_attn_wq` / `lora_unet_tproj_1`
 等 torch 模块路径）。
+
+⑮ 守的是一条**外部平台**约束：TPU 侧从不读像素（`_stems` 只取文件名），
+所以缓存 dataset 里放原图是纯多余的暴露 —— 2026-08-21 真实吃过一次，
+`jan-krea2-tpu-cache` 连 96 张原图一起传上 Kaggle，被按 NSFW 条款**整个删掉**
+并向账号告警。现在 `CacheDataset` 无图时按 `<stem>.npz` 推 stem，上传目录只放
+npz。它同时守 sidecar 不被当成样本本体 —— `a.textfeat.npz` 若被当样本会报一个
+假的「缺 textfeat」，`a.ms4096.npz` 被当样本则让副本数两遍、**训练集凭空变大
+而日志上看不出来**。
 
 ⑭ 是「pack 补齐到自然长度」引入的（`packing.PACK_Q`）。它守的四条都是**不报错的
 失效**：RNG 兼容重排错位会让新旧 loss 曲线悄悄对不上，去重逻辑坏掉会白编译一次

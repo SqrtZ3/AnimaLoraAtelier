@@ -208,7 +208,8 @@ def bind_segments(attn: Callable, fine_q, fine_kv) -> Callable:
 
 def make_splash_attn(q_seg_lens: Sequence[int], kv_seg_lens: Sequence[int],
                      num_heads: int, head_dim: int,
-                     fine_q=None, fine_kv=None, interpret: bool = False
+                     fine_q=None, fine_kv=None, interpret: bool = False,
+                     seg_cap: Optional[int] = None
                      ) -> Callable:
     """构造 (q,k,v)->out 的块对角注意力。q/k/v 布局 [S, H, D]（与模型侧一致）。
 
@@ -235,6 +236,13 @@ def make_splash_attn(q_seg_lens: Sequence[int], kv_seg_lens: Sequence[int],
 
     自注意力：kv_seg_lens = q_seg_lens。
     cross-attn：q 是图像段、kv 是文本段，段数必须相同（第 i 图看第 i 段文本）。
+
+    `seg_cap` = 反向块上限，默认取所有段的最短段（跨段的反向块会产生 partial
+    mask block，见 `_block_sizes`）。自然长度布局里 <1024 的纯填充段不该参与
+    这个 min——否则全盘反向块被拖进 512/256 退让链（真机实测 1024 比默认快
+    ~2x，见 BWD_BLOCK_PREF）。调用方传**实段**最短长（packing 侧
+    `Layout.real_seg_lens`）；代价只是填充段边界处可能多出几个 partial block
+    （会被物化进 kernel，纯 perf，数值不变）。
     """
     import jax.numpy as jnp
     sk, _ = _import_splash()
@@ -247,8 +255,9 @@ def make_splash_attn(q_seg_lens: Sequence[int], kv_seg_lens: Sequence[int],
     if (fine_q is None) != (fine_kv is None):
         raise ValueError("fine_q / fine_kv 必须同时给或同时不给")
     q_seg, kv_seg = segment_ids(q_seg_lens), segment_ids(kv_seg_lens)
-    # 反向块上限取最短段：跨段的反向块会产生 partial mask block（见 _block_sizes）
-    seg_cap = min(min(q_seg_lens), min(kv_seg_lens))
+    if seg_cap is None:
+        # 反向块上限取最短段：跨段的反向块会产生 partial mask block（见 _block_sizes）
+        seg_cap = min(min(q_seg_lens), min(kv_seg_lens))
     kernel = _splash_kernel(q_seg.tobytes(), kv_seg.tobytes(),
                             int(q_seg.shape[0]), int(kv_seg.shape[0]),
                             num_heads, interpret, seg_cap)

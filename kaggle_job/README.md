@@ -125,6 +125,11 @@ yaml 的 `navit_token_budget` 在 GPU 上是一步一个 pack 的预算；TPU �
 量级（anima-mem-probe：32768 OOM）。于是"一步看多少 token"在两个后端上是同一个数，
 梯度噪声量级可比。不整除时直接报错，不四舍五入。
 
+注意 budget 只是 **FFD 装箱的容量上限**：每个 pack 实际只补齐到自己的**自然长度**
+`round_up(Σ实段, 1024)`（jax_tpu/packing.py 的 PACK_Q），不再补齐到 budget ——
+每个布局本来就独立编译，统一长度买不到任何东西。填充率日志的分母也是自然总长，
+另打了"容量"（Σ自然总长/budget）供对照。
+
 ## 架构裁决（2026-08-14，`arch_probe` 第二跑，v5e-8 真机）
 
 块对角内核可行之后，这一轮问的是**整条路能不能走**：静态图（E）、显存（F）、
@@ -144,7 +149,7 @@ yaml 的 `navit_token_budget` 在 GPU 上是一步一个 pack 的预算；TPU �
 **≈ 14GB / 15.7GiB**。**结论：必须 FSDP 分片 + 全层梯度检查点，且 L=16384 已经贴顶**，
 想留余量只能降 `navit_token_budget`。注意 GPU 上靠 fp8/fp4 省显存那条路在 TPU 上不存在。
 
-### E 静态图：必须走「补齐固定预算 + 编译期 mask + 布局缓存」
+### E 静态图：必须走「布局定长（自然长度）+ 编译期 mask + 布局缓存」
 
 - **运行时 `jax.Array` mask 路线被否决**（原本最理想的"一个图打天下"）：
   - 显存上死：L=16384 的稠密 bool mask 单 head 256MB，48 head 共 12GB，
@@ -153,6 +158,9 @@ yaml 的 `navit_token_budget` 在 GPU 上是一步一个 pack 的预算；TPU �
     （理论 0.250）→ 运行时 mask **只部分跳块**。
 - **补齐到固定 token 预算是便宜的**：padding 自成一段，填充率 95% 时相对开销仅 **1.3%**
   （99%→0.1%，90%→5.1%）。这样张量 shape 恒定，XLA 只编译一次。
+  （2026-08-20 起更进一步：补齐目标从 budget 缩到该布局的自然长度
+  `round_up(Σ实段, 1024)`，budget 维度的 padding 浪费整个消失，见上"全局 token
+  预算怎么对账"。）
 - **不等长段有 ~18% 的额外税**：真实 ragged pack（7 段不等长含 padding 段）实测比
   0.203 vs 理论 0.172，偏差 18.2%；4 等长段时偏差 <1%。仍是 ~5× 加速，可接受。
 
@@ -165,7 +173,9 @@ yaml 的 `navit_token_budget` 在 GPU 上是一步一个 pack 的预算；TPU �
 
 ### 由此得到的 TPU 版 navit 形态
 
-1. 每图 token 数**量化到有限档位**，pack **补齐到 `navit_token_budget`**，padding 自成一段。
+1. 每图 token 数**量化到有限档位**，pack 补齐到自己的**自然长度**
+   `round_up(Σ实段, 1024)`（不再补齐到 `navit_token_budget` —— 每个布局本来就
+   独立编译，budget 只是装箱容量上限），取整余量自成一段。
 2. 段长对齐 128（前一轮结论），按「段长组成」缓存 `make_splash_mha` 可调用对象。
 3. FSDP 分片权重 + 全层梯度检查点。
 4. 布局种类数（本地枚举，`token_budget=16384`）：

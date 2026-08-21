@@ -324,10 +324,15 @@ def make_grad_fn(model_cfg: A.AnimaConfig, tcfg: TrainConfig, plans, layout: Lay
     # tracer 并被 _splash_kernel 的 lru_cache 缓存下来，泄漏到下一次 trace
     # （本地 check_train_loop 抓到过 UnexpectedTracerError）。而且构造很贵
     # （真机 735ms），本就该按布局只做一次。
+    # seg_cap 只统计**实段**：自然长度布局里 <1024 的纯填充段若参与取 min，
+    # 会把全盘反向块拖进 512/256 退让链（见 attention.make_splash_attn）。
+    real_cap = min(layout.real_seg_lens)
     self_attn = AT.make_splash_attn(coarse, coarse, model_cfg.num_heads,
-                                    model_cfg.head_dim, interpret=interpret)
+                                    model_cfg.head_dim, interpret=interpret,
+                                    seg_cap=real_cap)
     cross_attn = AT.make_splash_attn(coarse, txt, model_cfg.num_heads,
-                                     model_cfg.head_dim, interpret=interpret)
+                                     model_cfg.head_dim, interpret=interpret,
+                                     seg_cap=min(real_cap, layout.txt_len))
 
     def per_shard(lora, consts, params, b, key):
         # 精细 segment_ids 是**运行时**数组，随 pack 变化但形状固定 -> 不触发重编译。
@@ -465,7 +470,7 @@ def assemble_batch(packs: Sequence[Pack], latents, ctxs, t: np.ndarray,
     layout = packs[0].layout
     if any(p.layout != layout for p in packs):
         raise ValueError("同一步的 pack 必须同布局（一个编译产物只有一种 mask）")
-    B, G, N = layout.budget, layout.n_seg, len(packs)
+    B, G, N = layout.total_len, layout.n_seg, len(packs)
     if t.shape != (N * G,):
         raise ValueError(f"t 的长度 {t.shape} != pack 数 × 段数 = {N * G}")
     out: Dict[str, list] = {k: [] for k in
@@ -681,7 +686,10 @@ def make_grad_fn_k2(model_cfg: K2.Krea2Config, tcfg: TrainConfig, plans,
     txt_pos, img_pos = (jnp.asarray(a) for a in layout.static_positions())
 
     main_attn = AT.make_splash_attn(coarse, coarse, model_cfg.heads,
-                                    model_cfg.head_dim, interpret=interpret)
+                                    model_cfg.head_dim, interpret=interpret,
+                                    # seg_cap 只统计实段（排除 <1024 的纯填充段），
+                                    # 同 make_grad_fn 的注记。
+                                    seg_cap=min(layout.real_seg_lens))
     rf_attn = AT.make_splash_attn(txtc, txtc, model_cfg.txtheads,
                                   model_cfg.txt_head_dim, interpret=interpret)
     # GQA：splash 只认等头数，KV 头在内核外 repeat_interleave 展开（krea2_jax
@@ -749,7 +757,7 @@ def assemble_batch_k2(packs, latents, ctxs, t: np.ndarray,
     layout = packs[0].layout
     if any(p.layout != layout for p in packs):
         raise ValueError("同一步的 pack 必须同布局（一个编译产物只有一种 mask）")
-    B, G, N = layout.budget, layout.n_seg, len(packs)
+    B, G, N = layout.total_len, layout.n_seg, len(packs)
     NI, NT = layout.n_img_tokens, layout.n_txt_tokens
     if t.shape != (N * G,):
         raise ValueError(f"t 的长度 {t.shape} != pack 数 × 段数 = {N * G}")

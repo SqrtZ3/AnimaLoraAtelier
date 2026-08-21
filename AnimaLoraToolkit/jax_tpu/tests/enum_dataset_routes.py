@@ -127,25 +127,26 @@ def ffd(sizes, budget):
 
 
 def packed_route(toks, q, budget):
-    """段长降序规范化，与 packing.Packer.build_packs 一致。"""
+    """实段降序规范化 + 补齐到自然长度，与 packing.Packer.build_packs 一致。"""
     qs = [quantize(n, q) for n in toks]
     groups = ffd(qs, budget)
     if groups is None:
         return None
-    layouts, imgs, real = Counter(), defaultdict(int), 0
+    layouts, imgs, real, padded = Counter(), defaultdict(int), 0, 0
     for g in groups:
         seg = sorted((qs[i] for i in g), reverse=True)
-        rest = budget - sum(seg)
-        if rest:
-            seg.append(rest)
-            seg.sort(reverse=True)
+        total = quantize(sum(seg), 1024)       # 自然长度（packing.PACK_Q）
+        if total > sum(seg):                   # 取整余量 -> 末尾的纯填充段
+            seg.append(total - sum(seg))
         layouts[tuple(seg)] += 1
         imgs[tuple(seg)] += len(g)
         real += sum(toks[i] for i in g)
+        padded += total
     steps = sum(c // DEVICES for c in layouts.values())
     in_imgs = sum(imgs[k] * (c // DEVICES * DEVICES) // c
                   for k, c in layouts.items())
-    return {"fill": real / (len(groups) * budget), "ids": len(layouts),
+    return {"fill": real / padded, "cap": padded / (len(groups) * budget),
+            "ids": len(layouts),
             "steps": steps, "in_imgs": in_imgs, "n": len(toks),
             "packs": len(groups), "per_pack": len(toks) / len(groups),
             "layouts": layouts}
@@ -177,7 +178,8 @@ def show(tag, r):
         print(f"    {tag:<24} 单图/单桶放不下这个 budget")
         return
     extra = f"  pack {r['packs']} 图/pack {r['per_pack']:.2f}" if r["packs"] else ""
-    print(f"    {tag:<24} 填充 {r['fill']:>5.1%}  编译身份 {r['ids']:>3}"
+    cap = f"  容量 {r['cap']:>5.1%}" if "cap" in r else ""
+    print(f"    {tag:<24} 填充 {r['fill']:>5.1%}{cap}  编译身份 {r['ids']:>3}"
           f"  成步 {r['steps']:>3}  入步图 {r['in_imgs']:>4}/{r['n']}"
           f" ({r['in_imgs'] / r['n']:>3.0%}){extra}")
 
@@ -237,7 +239,7 @@ def main(argv):
             print("  （x8 及以上才能自己凑成一步；x1 的长尾靠 plan_steps 顺延到下一轮）")
             for lay, c in r["layouts"].most_common(12):
                 print(f"    {str(lay):<52} x{c:<3} 段数 {len(lay)}"
-                      f" 填充 {sum(lay) / a.dump:.0%}")
+                      f" 容量 {sum(lay) / a.dump:.0%}")
     return 0
 
 

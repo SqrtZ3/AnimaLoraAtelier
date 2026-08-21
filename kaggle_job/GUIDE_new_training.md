@@ -71,6 +71,8 @@ cd AnimaLoraToolkit
   `base_quant`、`wandb_*`、整族 `sample_*`（TPU 无训练期采样）、`save_state_every_epochs`。
 - **budget 规则**：`navit_token_budget` 在 TPU 解释为**全局**预算（8 卡纯 DP），
   必须被 8 整除；单卡 = 全局/8，v5e 实测上限量级是 16384/卡（32768 OOM）。
+  它只是 **FFD 装箱的容量上限**：每个 pack 实际补齐到自己的自然长度
+  `round_up(Σ实段, 1024)`，不再补齐到 budget。
   **硬约束：数据集里单图最大 token 数必须 ≤ 单卡预算**，否则打包器 fail-fast
   （"单段 N > budget"）。token 数 ≈ (W//16)×(H//16)。ashima 数据集最大 16268 →
   只能 16384/卡（这就是"工作点 B" 8192/卡 对本数据集不成立的原因）。
@@ -133,7 +135,8 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
 ```
 
 看三个数（决定 8 卡用没用完）：
-- **填充率**（线性层算力利用率上界；<90% 说明 packing 浪费大，调 quantum/budget）
+- **填充率**（线性层算力利用率上界，分母是自然总长；<90% 说明量化浪费大，
+  调 quantum。"容量利用率"是分母为 budget 的对照口径，看装箱容量浪不浪费）
 - **成步率**（能凑齐 8 个同布局 pack 的比例；小数据集天然低，顺延是设计行为）
 - **布局数**（= 全模型编译次数；爆炸就调大 `--quantum`）
 

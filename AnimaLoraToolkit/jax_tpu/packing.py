@@ -1,4 +1,14 @@
-"""NaViT 打包：把任意分辨率的图片装进固定 token 预算的 pack，并控制布局种类。
+"""NaViT 打包：把任意分辨率的图片装进 budget 容量上限内的 pack，并控制布局种类。
+
+## 补齐到「自然长度」，不是 budget
+
+每个布局本来就独立编译（见下），所以 pack **不需要统一长度**：FFD 只负责把量化
+段装进全局 budget（显存容量上限，语义不变），pack 总长 = **自然长度**
+`round_up(Σ实段, PACK_Q)`，取整余量（< PACK_Q，仅 quantum < PACK_Q 时非零）才
+追加一个纯填充段。round 到 1024 是为了让 splash 反向块恒能取 1024（真机实测
+比 512/256 快约 2x，见 attention.BWD_BLOCK_PREF）。这样 budget 维度的 padding
+浪费整个消失，布局身份不变（= 实段 multiset；旧版 padding 段长 = budget − Σ实段
+本就是可推导的冗余）。
 
 ## 这个模块存在的理由
 
@@ -45,6 +55,7 @@ import numpy as np
 
 BLOCK = 128          # splash 块粒度；quantum 必须是它的倍数
 PAD_SEG = -1         # 自注意力里填充 token 的段号（它们彼此可见，行不空）
+PACK_Q = 1024        # pack 自然长度的取整粒度：让 splash 反向块恒能取 1024
 
 
 def quantize_len(n: int, quantum: int) -> int:
@@ -56,24 +67,50 @@ def quantize_len(n: int, quantum: int) -> int:
 class Layout:
     """一个 pack 的**编译身份**。同 Layout 的 pack 共用一份编译产物。
 
-    seg_lens 含末尾的纯填充段（FFD 装箱余量），故恒有 sum(seg_lens) == budget。
+    total_len 是该布局的**自然长度** = round_up(Σ实段, PACK_Q)，不再是全局 budget
+    （budget 只剩 FFD 装箱容量上限一个语义，在 Packer 上）。seg_lens 实段降序、
+    纯填充段（取整余量，长 < PACK_Q）恒在末尾，恒有 sum(seg_lens) == total_len。
+
+    t_slots / t_gather 是 **RNG 兼容信息（不进编译身份，compare=False）**：
+    旧版（补齐到 budget）每个 pack 按含填充段的段数采 t，填充段的 t 采了被丢；
+    为让新旧两条代码路径的 RNG 消费逐 bit 一致，仍按旧槽数 t_slots 采样，再用
+    t_gather（新段序第 p 段 -> 旧槽位下标）重排。直接构造 Layout 时留默认即可
+    （t_slots=0 -> 按 n_seg 采样，不重排）。
     """
-    budget: int
+    total_len: int
     seg_lens: Tuple[int, ...]
     txt_len: int
+    pad_idx: int = -1                                # 纯填充段下标（恒在末尾）；-1=无
+    t_slots: int = field(default=0, compare=False)
+    t_gather: Tuple[int, ...] = field(default=(), compare=False)
 
     def __post_init__(self):
-        if sum(self.seg_lens) != self.budget:
-            raise ValueError(f"段长和 {sum(self.seg_lens)} != budget {self.budget}")
+        if sum(self.seg_lens) != self.total_len:
+            raise ValueError(f"段长和 {sum(self.seg_lens)} != total_len {self.total_len}")
         bad = [n for n in self.seg_lens if n % BLOCK]
         if bad:
             raise ValueError(f"段长必须是 {BLOCK} 的倍数（splash 块粒度），越界 {bad[:4]}")
         if self.txt_len % BLOCK:
             raise ValueError(f"txt_len 必须是 {BLOCK} 的倍数，得到 {self.txt_len}")
+        if not (-1 <= self.pad_idx <= len(self.seg_lens) - 1):
+            raise ValueError(f"pad_idx {self.pad_idx} 越界（-1 或 [0, {len(self.seg_lens)})）")
+        if self.pad_idx != -1 and self.pad_idx != len(self.seg_lens) - 1:
+            raise ValueError("纯填充段恒在末尾（实段降序规范化后追加）")
+        if self.t_slots:
+            if len(self.t_gather) != len(self.seg_lens) or \
+                    any(not 0 <= g < self.t_slots for g in self.t_gather):
+                raise ValueError(f"t_gather 必须是 {len(self.seg_lens)} 个 [0, "
+                                 f"{self.t_slots}) 内的下标，得到 {self.t_gather}")
 
     @property
     def n_seg(self) -> int:
         return len(self.seg_lens)
+
+    @property
+    def real_seg_lens(self) -> Tuple[int, ...]:
+        """实段段长（排除纯填充段）。反向块上限（seg_cap）只统计它们：< PACK_Q 的
+        填充段若参与取 min 会把全盘反向块拖小（512/256 退让是真机实测的减速）。"""
+        return tuple(s for i, s in enumerate(self.seg_lens) if i != self.pad_idx)
 
     @property
     def max_chunk(self) -> int:
@@ -112,7 +149,7 @@ class Pack:
         loss_mask  [B] 1=真 token
         """
         L = self.layout
-        B = L.budget
+        B = L.total_len
         seg_self = np.full(B, PAD_SEG, np.int32)
         seg_cross = np.empty(B, np.int32)
         mod_index = np.empty(B, np.int32)
@@ -141,9 +178,9 @@ class Pack:
 
     @property
     def fill(self) -> float:
-        """有效填充率：真实 token / budget。它**直接等于**线性层的算力利用率
+        """有效填充率：真实 token / 自然总长。它**直接等于**线性层的算力利用率
         （填充 token 一样要过 MLP）。"""
-        return sum(self.real_lens) / self.layout.budget
+        return sum(self.real_lens) / self.layout.total_len
 
 
 # ── 装箱 ──────────────────────────────────────────────────────────────────────
@@ -188,6 +225,10 @@ class Packer:
         if budget % quantum:
             raise ValueError(f"budget {budget} 必须能被 quantum {quantum} 整除，"
                              f"否则装箱余量凑不出合法的填充段")
+        if budget % PACK_Q:
+            raise ValueError(f"budget {budget} 必须是 {PACK_Q} 的倍数：pack 总长向上"
+                             f"取整到 {PACK_Q}（自然长度），budget 作为容量上限必须"
+                             f"装得下取整结果")
         self.budget, self.quantum, self.txt_len = budget, quantum, txt_len
         self.devices = devices
         self._carry: List[Pack] = []      # 上一轮凑不满 8 个的余量
@@ -205,29 +246,47 @@ class Packer:
         packs = []
         for group in ffd(q, self.budget):
             seg = [q[i] for i in group]
-            rest = self.budget - sum(seg)
             real = [token_counts[i] for i in group]
             gr = [grids[i] for i in group]
             it = [items[i] for i in group]
-            if rest:                       # 装箱余量 -> 一个纯填充段
-                seg.append(rest)
-                real.append(0)
-                gr.append((0, 0))
-                it.append(None)
-            # **段序规范化成降序**：段在 pack 里的先后是自由的（每段各算各的，
+            # **实段降序规范化**：段在 pack 里的先后是自由的（每段各算各的，
             # AdaLN 走 mod_index、RoPE 走 rows/cols，都不依赖段序），但它进了
-            # Layout 的编译身份。FFD 在 bin 内本就是降序，唯独末尾追加的填充段
-            # 可能比它前面的段大（真实数据集实测出现过 (2944, 2944, 26880)），
-            # 于是同一段长 multiset 会拿到两种 Layout -> 白编译一次全模型。
-            # 排序是免费的去重；your-dataset 上当前尚未撞到同 multiset 的
-            # 两种序（白多 0），这里是防御性规范化，不改变任何已有布局的语义。
+            # Layout 的编译身份。排序是免费的去重：同一段长 multiset 只编译一次
+            # （否则 FFD 的装箱顺序会让同一 multiset 拿到两种 Layout，白编译一次
+            # 全模型）。纯填充段不参与排序，恒在末尾。
             order = sorted(range(len(seg)), key=lambda i: (-seg[i], i))
             seg = [seg[i] for i in order]
             real = [real[i] for i in order]
             gr = [gr[i] for i in order]
             it = [it[i] for i in order]
-            packs.append(Pack(Layout(self.budget, tuple(seg), self.txt_len),
-                              it, real, gr))
+            # 自然长度：只补齐到 Σ实段 向上取整 PACK_Q，不再补齐到 budget。
+            total = quantize_len(sum(seg), PACK_Q)
+            rest = total - sum(seg)
+            # RNG 兼容（见 Layout.t_slots）：旧版补齐到 budget，段序是"实段 + 旧
+            # 填充段"整体降序，旧填充段落在 pad_old = #{实段 >= 旧余量} 处。
+            rest_old = self.budget - sum(seg)
+            t_slots = len(seg) + (1 if rest_old else 0)
+            pad_old = sum(1 for s in seg if s >= rest_old) if rest_old else -1
+            pad_idx = -1
+            if rest:                       # 取整余量 -> 一个纯填充段（恒在末尾）
+                seg.append(rest)
+                real.append(0)
+                gr.append((0, 0))
+                it.append(None)
+                pad_idx = len(seg) - 1
+            # 新段序第 p 段 -> 旧槽位：实段 rank rj 在旧版的位置是
+            # rj + (rj >= pad_old)；新填充位复用旧填充槽（它的 t 反正被丢）。
+            # rest > 0 时必有 rest_old > 0（total <= budget），pad_old 不会越界。
+            t_gather = []
+            rj = 0
+            for p in range(len(seg)):
+                if p == pad_idx:
+                    t_gather.append(pad_old)
+                else:
+                    t_gather.append(rj + (1 if 0 <= pad_old <= rj else 0))
+                    rj += 1
+            packs.append(Pack(Layout(total, tuple(seg), self.txt_len, pad_idx,
+                                     t_slots, tuple(t_gather)), it, real, gr))
         return packs
 
     def plan_steps(self, packs: Sequence[Pack]) -> Tuple[List[List[Pack]], List[Pack]]:
@@ -260,7 +319,7 @@ class Packer:
 #     quantum），FFD 按 combined 体积装箱；
 #   * **编译身份是二元组**（combined 段长元组, 各实段的 text 槽长元组）——主序列
 #     块对角内核看前者，txtfusion refiner 内核看后者；
-#   * 装箱余量段是纯填充（无 text 槽），与 Anima 同款；
+#   * 取整余量段（round 到 PACK_Q 的余量）是纯填充（无 text 槽），与 Anima 同款；
 #   * 文本侧不需要 `navit_text_trim_padding` 那种开关：Krea2 navit 本来就只打包
 #     有效 caption token（量化槽内的一小截填充由精细 segment_ids 隔离），
 #     训练/eval 口径天然一致。
@@ -268,24 +327,32 @@ class Packer:
 class K2Layout:
     """Krea2 一个 pack 的**编译身份**。
 
-    seg_lens  : combined 段长（量化后，含末尾纯填充段），sum == budget
+    total_len : 布局**自然长度** = round_up(Σ实段, PACK_Q)（budget 只是 FFD 装箱
+        容量上限，语义同 Anima Layout）
+    seg_lens  : combined 段长（实段降序；取整余量的纯填充段恒在末尾、无 text 槽），
+        sum == total_len
     txt_segs  : 各**实**段的 text 槽长（与 seg_lens 前 len(txt_segs) 项一一对应）
     img_segs  : 各**实**段的 image 槽长（seg = txt + img）
+    t_slots / t_gather : RNG 兼容信息（compare=False，语义同 Anima Layout）
     """
-    budget: int
+    total_len: int
     seg_lens: Tuple[int, ...]
     txt_segs: Tuple[int, ...]
     img_segs: Tuple[int, ...]
+    t_slots: int = field(default=0, compare=False)
+    t_gather: Tuple[int, ...] = field(default=(), compare=False)
 
     def __post_init__(self):
-        if sum(self.seg_lens) != self.budget:
-            raise ValueError(f"段长和 {sum(self.seg_lens)} != budget {self.budget}")
+        if sum(self.seg_lens) != self.total_len:
+            raise ValueError(f"段长和 {sum(self.seg_lens)} != total_len {self.total_len}")
         bad = [n for n in self.seg_lens if n % BLOCK]
         if bad:
             raise ValueError(f"段长必须是 {BLOCK} 的倍数（splash 块粒度），越界 {bad[:4]}")
         if not (len(self.txt_segs) == len(self.img_segs) <= len(self.seg_lens)):
             raise ValueError(f"txt/img 槽数 ({len(self.txt_segs)}/{len(self.img_segs)}) "
                              f"与段数 {len(self.seg_lens)} 对不上")
+        if len(self.seg_lens) - len(self.txt_segs) > 1:
+            raise ValueError("至多一个纯填充段（取整余量，恒在末尾）")
         for i, (tq, iq) in enumerate(zip(self.txt_segs, self.img_segs)):
             if tq % BLOCK or iq % BLOCK:
                 raise ValueError(f"第 {i} 段槽长未对齐 {BLOCK}：txt={tq} img={iq}")
@@ -295,6 +362,11 @@ class K2Layout:
     @property
     def n_seg(self) -> int:
         return len(self.seg_lens)
+
+    @property
+    def real_seg_lens(self) -> Tuple[int, ...]:
+        """实段（combined）段长——反向块上限（seg_cap）只统计它们（同 Anima Layout）。"""
+        return self.seg_lens[:len(self.txt_segs)]
 
     @property
     def n_img_tokens(self) -> int:
@@ -343,7 +415,7 @@ class K2Pack:
             由 make_grad_fn 闭包持有，不走运行时数组）
         """
         L = self.layout
-        B = L.budget
+        B = L.total_len
         rows = np.zeros(B, np.int32)
         cols = np.zeros(B, np.int32)
         mod_index = np.empty(B, np.int32)
@@ -389,9 +461,9 @@ class K2Pack:
 
     @property
     def fill(self) -> float:
-        """有效填充率 = （真实 image + 真实 text）/ budget。它**直接等于**线性层
+        """有效填充率 = （真实 image + 真实 text）/ 自然总长。它**直接等于**线性层
         的算力利用率（填充 token 一样要过 MLP）。"""
-        return (sum(self.real_img_lens) + sum(self.real_txt_lens)) / self.layout.budget
+        return (sum(self.real_img_lens) + sum(self.real_txt_lens)) / self.layout.total_len
 
 
 class K2Packer:
@@ -404,6 +476,10 @@ class K2Packer:
                              f"得到 {quantum}/{txt_quantum}")
         if budget % quantum:
             raise ValueError(f"budget {budget} 必须能被 quantum {quantum} 整除")
+        if budget % PACK_Q:
+            raise ValueError(f"budget {budget} 必须是 {PACK_Q} 的倍数：pack 总长向上"
+                             f"取整到 {PACK_Q}（自然长度），budget 作为容量上限必须"
+                             f"装得下取整结果")
         self.budget, self.quantum, self.txt_quantum = budget, quantum, txt_quantum
         self.devices = devices
         self._carry: List[K2Pack] = []
@@ -437,7 +513,6 @@ class K2Packer:
                 real_t.append(txt_lens[i])
                 gr.append(grids[i])
                 it.append(items[i])
-            rest = self.budget - sum(seg)
             # 段序规范化：**实段**降序、纯填充段恒在末尾。段在 pack 里的先后是
             # 自由的（调制走 mod_index、RoPE 走 rows/cols），但它进编译身份；
             # 规范化是免费的去重（同一段长 multiset 只编译一次），且填充段恒
@@ -450,10 +525,22 @@ class K2Packer:
             real_t = [real_t[i] for i in order]
             gr = [gr[i] for i in order]
             it = [it[i] for i in order]
+            # 自然长度：只补齐到 Σ实段 向上取整 PACK_Q，不再补齐到 budget
+            # （combined 段含 128 量化文本槽，余量段 < PACK_Q 是常态）。
+            total = quantize_len(sum(seg), PACK_Q)
+            # RNG 兼容（见 Layout.t_slots）：旧版填充段恒在末尾，实段槽位不变，
+            # 只需记得旧槽数（含旧填充段），新填充位复用旧填充槽。
+            rest_old = self.budget - sum(seg)
+            t_slots = len(seg) + (1 if rest_old else 0)
+            pad_old = len(seg) if rest_old else -1
+            rest = total - sum(seg)
+            t_gather = list(range(len(seg)))
             if rest:
                 seg.append(rest)                # 纯填充段（无 text 槽，恒在末尾）
+                t_gather.append(pad_old)
             packs.append(K2Pack(
-                K2Layout(self.budget, tuple(seg), tuple(tseg), tuple(iseg)),
+                K2Layout(total, tuple(seg), tuple(tseg), tuple(iseg),
+                         t_slots, tuple(t_gather)),
                 it, real_i, real_t, gr))
         return packs
 
@@ -472,8 +559,12 @@ class K2Packer:
         return steps, carry
 
 
-def report_k2(packs: Sequence[K2Pack], devices: int = 8) -> str:
-    """Krea2 打包质量报告（口径同 report()，填充率含 text 流）。"""
+def report_k2(packs: Sequence[K2Pack], devices: int = 8, capacity: int = 0) -> str:
+    """Krea2 打包质量报告（口径同 report()，填充率含 text 流）。
+
+    有效填充率的分母是**自然总长**（= 线性层算力利用率）；`capacity`（全局 budget
+    /卡）给定时额外打印容量利用率 = Σ自然总长 / (pack 数 × capacity)。
+    """
     if not packs:
         return "（无 pack）"
     layouts = {p.layout for p in packs}
@@ -482,9 +573,12 @@ def report_k2(packs: Sequence[K2Pack], devices: int = 8) -> str:
         by[p.layout] += 1
     full = sum(c // devices * devices for c in by.values())
     fill = sum(sum(p.real_img_lens) + sum(p.real_txt_lens) for p in packs) \
-        / sum(p.layout.budget for p in packs)
+        / sum(p.layout.total_len for p in packs)
+    cap = (f" | 容量利用率 "
+           f"{sum(p.layout.total_len for p in packs) / (len(packs) * capacity):.1%}"
+           if capacity else "")
     lines = [f"pack {len(packs)} 个 | 布局 {len(layouts)} 种 "
-             f"(≈{len(layouts)}次全模型编译) | 有效填充率 {fill:.1%} | "
+             f"(≈{len(layouts)}次全模型编译) | 有效填充率 {fill:.1%}{cap} | "
              f"可成步 {full}/{len(packs)} 个 pack = {full // devices} 步"]
     for layout, c in sorted(by.items(), key=lambda kv: -kv[1]):
         lines.append(f"  seg{str(layout.seg_lens):<40} txt{str(layout.txt_segs):<20} "
@@ -644,9 +738,14 @@ def report_buckets(steps: Sequence[BucketStep], carry_n: int = 0) -> str:
 
 
 # ── 诊断 ──────────────────────────────────────────────────────────────────────
-def report(packs: Sequence[Pack], devices: int = 8) -> str:
+def report(packs: Sequence[Pack], devices: int = 8, capacity: int = 0) -> str:
     """打包质量报告。**上真机前先看这个**：布局数决定编译成本，填充率决定
-    线性层算力利用率，成步率决定有多少样本会被顺延。"""
+    线性层算力利用率，成步率决定有多少样本会被顺延。
+
+    有效填充率的分母是**自然总长**（round_up(Σ实段, PACK_Q)）；`capacity`
+    （budget/卡）给定时额外打印容量利用率 = Σ自然总长 / (pack 数 × capacity)，
+    用于对照"装箱容量被吃掉多少"。
+    """
     if not packs:
         return "（无 pack）"
     layouts = {p.layout for p in packs}
@@ -654,9 +753,12 @@ def report(packs: Sequence[Pack], devices: int = 8) -> str:
     for p in packs:
         by[p.layout] += 1
     full = sum(c // devices * devices for c in by.values())
-    fill = sum(sum(p.real_lens) for p in packs) / sum(p.layout.budget for p in packs)
+    fill = sum(sum(p.real_lens) for p in packs) / sum(p.layout.total_len for p in packs)
+    cap = (f" | 容量利用率 "
+           f"{sum(p.layout.total_len for p in packs) / (len(packs) * capacity):.1%}"
+           if capacity else "")
     lines = [f"pack {len(packs)} 个 | 布局 {len(layouts)} 种 "
-             f"(≈{len(layouts)}次全模型编译) | 有效填充率 {fill:.1%} | "
+             f"(≈{len(layouts)}次全模型编译) | 有效填充率 {fill:.1%}{cap} | "
              f"可成步 {full}/{len(packs)} 个 pack = {full // devices} 步"]
     for layout, c in sorted(by.items(), key=lambda kv: -kv[1]):
         lines.append(f"  {str(layout.seg_lens):<44} x{c:<4} "

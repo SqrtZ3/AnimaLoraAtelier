@@ -2,7 +2,9 @@
 
 回答"上 TPU 前必须先知道"的两件事：
   * 布局种类有多少（决定 splash 的 MaskInfo 预热成本会不会爆炸）
-  * 填充率多少（padding 也要过 MLP，填充率**直接等于**线性层的算力利用率）
+  * 填充率多少（padding 也要过 MLP；**算力填充率**（分母 = 自然总长
+    round_up(Σ实段,1024)）直接等于线性层的算力利用率，**容量利用率**
+    （分母 = budget）看装箱容量被吃掉多少）
 
 **当前是 Krea2 口径**（段 = [512 文本 ; 图像 token]，见 krea2_modeling.py:971）。
 Anima 的文本走 cross-attn、不进主序列，段 = 纯图像 token —— 换算时把 TXT 设为 0。
@@ -74,21 +76,27 @@ def main():
           f"{len(copies)} multiscale 副本 = {len(pool)} 条（TXT={TXT}）")
     print(f"段长 {min(pool)}..{max(pool)}，不同段长 {len(set(pool))} 种\n")
 
-    print(f"{'budget':>7} {'packs':>6} {'填充率':>8} {'图/pack':>9} {'布局数':>7}")
+    print(f"{'budget':>7} {'packs':>6} {'算力填充':>8} {'容量利用':>8} "
+          f"{'图/pack':>9} {'布局数':>7}")
     for b in budgets:
         if b < max(pool):
             print(f"{b:>7}  单段 {max(pool)} 放不下，跳过")
             continue
         packs = ffd(pool, b)
         used = sum(sum(p) for p in packs)
+        # 算力填充率的分母是**自然总长**（packing.Packer 的自然长度口径）；
+        # 容量利用率 = Σ自然总长 / (pack 数 × budget)，看装箱容量被吃掉多少。
+        natural = sum(-(-sum(p) // 1024) * 1024 for p in packs)
         layouts = {tuple(sorted(p)) for p in packs}
-        print(f"{b:>7} {len(packs):>6} {used / (len(packs) * b):>7.1%} "
+        print(f"{b:>7} {len(packs):>6} {used / natural:>7.1%} "
+              f"{natural / (len(packs) * b):>7.1%} "
               f"{len(pool) / len(packs):>9.2f} {len(layouts):>7}")
 
     b0 = budgets[0]
     print(f"\n—— budget={b0} 的 pack 组成（前 8 种）——")
     for comp, c in Counter(tuple(sorted(p)) for p in ffd(pool, b0)).most_common(8):
-        print(f"  {str(comp):<36} x{c:<4} 填充 {sum(comp) / b0:.1%} 段数={len(comp)}")
+        nat = -(-sum(comp) // 1024) * 1024
+        print(f"  {str(comp):<36} x{c:<4} 填充 {sum(comp) / nat:.1%} 段数={len(comp)}")
 
     al = sum(1 for s in pool if s % 128 == 0)
     pad = sum((-s) % 128 for s in pool)

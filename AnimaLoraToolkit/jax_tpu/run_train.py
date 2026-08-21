@@ -136,6 +136,23 @@ def _valid_mask(packs) -> np.ndarray:
     return np.asarray(out, np.float32)
 
 
+def _sample_t(sampler, rng, packs, layout, fcfg, gstep) -> np.ndarray:
+    """采本步的 t，**RNG 消费与「补齐到 budget」旧版逐 bit 一致**。
+
+    旧版每 pack 按含纯填充段的段数采 t（填充段的 t 采了被丢）。自然长度布局的
+    段数可能更少（Σ实段恰好 PACK_Q 对齐时填充段整个不存在），这里仍按旧槽数
+    `layout.t_slots` 采样，再按 `layout.t_gather`（新段序第 p 段 -> 旧槽位）
+    重排 —— 实段拿到与旧版完全相同的 t，新旧两条代码路径的 loss 曲线可逐点
+    对比。直接构造的 Layout（t_slots=0）退化为按 n_seg 采样、不重排。
+    """
+    n_slots = layout.t_slots or layout.n_seg
+    t = sampler.sample(rng, len(packs) * n_slots, fcfg, gstep)
+    if layout.t_gather:
+        t = np.asarray(t).reshape(len(packs), n_slots)[:,
+              np.asarray(layout.t_gather, np.int64)].reshape(-1)
+    return np.asarray(t, np.float32)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="与 GPU 侧同一份训练 yaml")
@@ -207,7 +224,7 @@ def main(argv=None) -> int:
 
     packer = Packer(rc.budget, rc.quantum, rc.txt_len, rc.devices)
     steps, carry = ds.plan_packed(packer)
-    print(report([p for st in steps for p in st] + carry, rc.devices))
+    print(report([p for st in steps for p in st] + carry, rc.devices, rc.budget))
     _advise_steps(steps, carry, rc)
     if rc.tcfg.aux.spectral_enabled:
         h, w = rc.tcfg.aux.canvas_hw
@@ -305,12 +322,11 @@ def main(argv=None) -> int:
             lats, ctxs = pref.take(ds.materialize_packed, packs)
             if i_step + 1 < len(steps):
                 pref.start(ds.materialize_packed, steps[i_step + 1])
-            n_img = len(packs) * layout.n_seg
             # 路由概率的线性退火只作用在 host 侧的 t 采样上，**不进编译产物**
             # （device 侧的 FlowConfig 只被 huber/加权读，不读 mix 概率）。
             # 退火关着时 at_step 返回原对象，逐位等价。
             fcfg = F.at_step(rc.tcfg.flow, gstep)
-            t_vec = sampler.sample(rng, n_img, fcfg, gstep)
+            t_vec = _sample_t(sampler, rng, packs, layout, fcfg, gstep)
             batch = T.assemble_batch(packs, lats, ctxs, t_vec, mcfg, rc.tcfg.dtype,
                                      _ms_weights(packs, rc.ms_loss_weight))
             k_step, key = jax.random.split(key)
@@ -342,7 +358,8 @@ def main(argv=None) -> int:
                 print(f"e{epoch} s{gstep} loss {float(loss):.5f} "
                       f"gnorm {float(diag['gnorm']):.4f} lr {float(diag['lr']):.2e} "
                       f"| 图 {int(v.sum())} 填充率 "
-                      f"{sum(sum(p.real_lens) for p in packs) / (len(packs)*layout.budget):.1%}"
+                      f"{sum(sum(p.real_lens) for p in packs) / (len(packs)*layout.total_len):.1%}"
+                      f" 容量 {layout.total_len / rc.budget:.1%}"
                       f" | {time.time()-t_epoch:.1f}s")
             if rc.eval_every and gstep % rc.eval_every == 0 and evalset:
                 _run_eval(state, consts, params, mcfg, rc, evalset)
@@ -510,7 +527,7 @@ def main_k2(a, raw) -> int:
 
     packer = K2Packer(rc.budget, rc.quantum, devices=rc.devices)
     steps, carry = ds.plan_packed(packer)
-    print(report_k2([p for st in steps for p in st] + carry, rc.devices))
+    print(report_k2([p for st in steps for p in st] + carry, rc.devices, rc.budget))
     _advise_steps(steps, carry, rc)
     if rc.tcfg.aux.spectral_enabled:
         h, w = rc.tcfg.aux.canvas_hw
@@ -608,9 +625,10 @@ def main_k2(a, raw) -> int:
             lats, ctxs = pref.take(ds.materialize_packed, packs)
             if i_step + 1 < len(steps):
                 pref.start(ds.materialize_packed, steps[i_step + 1])
-            n_img = len(packs) * layout.n_seg
             fcfg = F.at_step(rc.tcfg.flow, gstep)
-            t_vec = sampler.sample(rng, n_img, fcfg, gstep)
+            # RNG 消费与旧版逐 bit 一致（含旧填充段槽位，见 _sample_t）；
+            # res_shift 作用在**重排后**的新段序 t 上（逐段独立，实段与旧版同值）。
+            t_vec = _sample_t(sampler, rng, packs, layout, fcfg, gstep)
             if rc.krea2_res_shift:
                 t_vec = F.krea2_res_shift_np(
                     t_vec, _img_tokens_of(packs),
@@ -649,7 +667,8 @@ def main_k2(a, raw) -> int:
                 print(f"e{epoch} s{gstep} loss {float(loss):.5f} "
                       f"gnorm {float(diag['gnorm']):.4f} lr {float(diag['lr']):.2e} "
                       f"| 图 {int(v.sum())} 填充率 "
-                      f"{sum(sum(p.real_img_lens) + sum(p.real_txt_lens) for p in packs) / (len(packs)*layout.budget):.1%}"
+                      f"{sum(sum(p.real_img_lens) + sum(p.real_txt_lens) for p in packs) / (len(packs)*layout.total_len):.1%}"
+                      f" 容量 {layout.total_len / rc.budget:.1%}"
                       f" | {time.time()-t_epoch:.1f}s")
             if rc.eval_every and gstep % rc.eval_every == 0 and evalset:
                 _run_eval(state, consts, params, mcfg, rc, evalset)

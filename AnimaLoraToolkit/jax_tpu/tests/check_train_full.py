@@ -18,7 +18,7 @@ r"""闸门⑪：**全功能**训练步（LoKr+DoRA + 三峰/自适应 t + Huber(
   T3 rank 掩码      被 reg_dims 掩掉的那些 rank 通道，梯度必须**恒 0**。
   T4 跨卡           改一张卡的数据，loss 必须变（否则 shard_map 没接对）。
   T5 填充不参与     改填充区的 latent，loss 必须**逐 bit 不变**。
-  T6 逐图等权       两张 token 数差 4 倍的图，loss 对它们的权重必须相同
+  T6 逐图等权       pack 的 loss 精确 == 两张图各自单跑的算术平均（8:1 token 差）
                     （全局 token 加权的话大图会顶 4 张小图）。
   T7 aux 都在动     逐个关掉 eisbach/ΔFM/spectral，loss 必须变 —— 防"开关接了但
                     数值恒等于 0"。
@@ -309,12 +309,41 @@ def replace_adapter_off(tcfg):
 
 
 def _check_equal_weight(mcfg, tcfg, plans, lora, consts, params, mesh):
-    """两段 token 数 4:1，把两段的误差各自放大同样倍数，loss 增量必须相同。
+    """逐图等权：一个 pack 的 loss 必须**精确**等于两张图各自单跑的算术平均。
 
-    逐图等权时增量相同；若归约是"全局 token 加权"，大图那次的增量会是小图的 4 倍。
+    ## 为什么不是"扰动两段看 Δloss 是否相等"
+
+    旧版给两段各加同一个常数扰动、比 Δloss。那个判据有两个毛病，seed=1 上就
+    是红的（Δ 4.0% > 2% 阈值），但它红的原因不是归约错了：
+
+      * **阈值低于自己的噪声底。** 把两段做成**同样大**（128 vs 128 token，此时
+        两种归约口径预测完全一致、不存在尺寸效应），8 个 seed 的 Δ 比值仍在
+        [0.955, 1.037]，最大偏离 4.55% —— 比让它判失败的 4.02% 还大。红的是
+        内容噪声，不是权重。（本仓库自己的方法论第一条：没有噪声基线的阈值
+        不是判据。）
+      * **前提本身不成立。** "给 latent 加常数 = 把两段误差放大同样倍数"是假的：
+        扰动要过一遍网络，响应与该图的 token 数、内容都有关。实测 8:1 时比值
+        系统性地是 1.16（8 个 seed 全部 > 1.08，远出噪声底），bump 0.05 时更是
+        2.18 —— 这些都是真实的、与归约口径无关的非线性。
+
+    两个口径的差距本来有 4~8 倍（4:1 时全局 token 加权预测 Δ 比值 = 4.0），
+    所以旧判据**方向上**其实一直是对的（实测 ≈1.0，离 4.0 差得远），只是把
+    容差调到了噪声以下。
+
+    ## 现在这个判据是精确的
+
+    块对角注意力下两段互不影响：把一段的 `loss_mask` 清零就等于"只有另一张图"
+    （`train.py:195` 的 `valid = den > 0` 会把它排除），而留下那段的每 token 误差
+    逐 bit 不变。于是有恒等式
+
+        L(A+B) == (L(A) + L(B)) / 2          ← 逐图等权
+        L(A+B) == (N_A·L(A) + N_B·L(B)) / (N_A+N_B)   ← 全局 token 加权（错的那个）
+
+    实测（128 vs 16 token）：对前者 rel ≤ 5e-08（fp32 噪声），对后者 rel 4.1e-02
+    —— 判别余量 ~10^6 倍，不再依赖任何拍脑袋的阈值。
     """
     import dataclasses
-    packs, layout = make_packs(len(jax.devices()), grids=((8, 16), (4, 8)))
+    packs, layout = make_packs(len(jax.devices()), grids=((8, 16), (4, 4)))
     c = dataclasses.replace(tcfg, aux=X.AuxConfig(), flow=dataclasses.replace(
         tcfg.flow, immiscible_k=1, loss_type="mse"),
         adapter=dataclasses.replace(tcfg.adapter, rank_dropout=0.0,
@@ -323,20 +352,32 @@ def _check_equal_weight(mcfg, tcfg, plans, lora, consts, params, mesh):
     key = jax.random.PRNGKey(3)
     t = np.full(len(packs) * layout.n_seg, 0.5, np.float32)
     b0, lats, ctxs = toy_batch(packs, layout, mcfg, t, seed=1)
-    l0 = float(gf(lora, consts, params, b0, key)[0])
 
-    outs = []
-    for seg_i in (0, 1):
-        lat = np.asarray(b0["latent"]).copy()
-        off = sum(layout.seg_lens[:seg_i])
-        n = packs[0].real_lens[seg_i]
-        lat[:, off:off + n] += 1.0
+    m_ab = np.asarray(b0["loss_mask"]).copy()
+    n_a, n_b = packs[0].real_lens[0], packs[0].real_lens[1]
+    off_b = sum(layout.seg_lens[:1])
+
+    def run(mask):
         b = dict(b0)
-        b["latent"] = jnp.asarray(lat)
-        outs.append(float(gf(lora, consts, params, b, key)[0]) - l0)
-    check("大图/小图对 loss 的权重相同",
-          abs(outs[0] - outs[1]) < 0.02 * max(abs(outs[0]), 1e-9),
-          f"Δ大 {outs[0]:.5f} vs Δ小 {outs[1]:.5f}")
+        b["loss_mask"] = jnp.asarray(mask)
+        return float(gf(lora, consts, params, b, key)[0])
+
+    m_a = m_ab.copy(); m_a[:, off_b:off_b + n_b] = 0        # 只留大图
+    m_b = m_ab.copy(); m_b[:, 0:n_a] = 0                    # 只留小图
+    l_a, l_b, l_ab = run(m_a), run(m_b), run(m_ab)
+
+    # 两张图的 loss 必须真的不一样，否则两个假设重合、这条断言是空的
+    check("两图 loss 可区分（判据非空）", abs(l_a - l_b) > 1e-3 * max(abs(l_a), 1e-9),
+          f"L_大 {l_a:.6f} vs L_小 {l_b:.6f}")
+
+    eq = (l_a + l_b) / 2                                    # 逐图等权
+    tok = (n_a * l_a + n_b * l_b) / (n_a + n_b)             # 全局 token 加权（错的）
+    r_eq = abs(l_ab - eq) / max(abs(eq), 1e-9)
+    r_tok = abs(l_ab - tok) / max(abs(tok), 1e-9)
+    check("pack loss == 两图单跑的算术平均", r_eq < 1e-6,
+          f"L(A+B) {l_ab:.8f} vs (L_A+L_B)/2 {eq:.8f}  rel={r_eq:.2e}")
+    check("与'全局 token 加权'口径可区分", r_tok > 100 * max(r_eq, 1e-8),
+          f"离 token 加权 {tok:.8f} 有 rel={r_tok:.2e}（判别余量 {r_tok / max(r_eq, 1e-8):.0e}x）")
 
 
 def _mesh(devices):

@@ -564,18 +564,22 @@ class WanVAE_(nn.Module):
         ## cache
         t = x.shape[2]
         iter_ = 1 + (t - 1) // 4
+        ## T=1（纯图）时 feat_cache 写完全程不会被读（没有第二段帧可衔接），却把
+        ## 每层全分辨率特征图 clone 一份留着 -- 8GB 卡上 1024^2 整图 OOM 的元凶。
+        ## 传 None 跳过，输出逐 bit 不变（缓存只在 i>=1 的迭代里被读）。
+        feat_map = self._enc_feat_map if t > 1 else None
         ## 对encode输入的x，按时间拆分为1、4、4、4....
         for i in range(iter_):
             self._enc_conv_idx = [0]
             if i == 0:
                 out = self.encoder(
                     x[:, :, :1, :, :],
-                    feat_cache=self._enc_feat_map,
+                    feat_cache=feat_map,
                     feat_idx=self._enc_conv_idx)
             else:
                 out_ = self.encoder(
                     x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
-                    feat_cache=self._enc_feat_map,
+                    feat_cache=feat_map,
                     feat_idx=self._enc_conv_idx)
                 out = torch.cat([out, out_], 2)
         mu, log_var = self.conv1(out).chunk(2, dim=1)

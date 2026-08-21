@@ -32,10 +32,24 @@ TPU 后端（`jax_tpu/`）只跑 DiT，**不做任何编码**（`jax_tpu/data.py
 
 ## 显存
 
-整图 encode 的峰值 ∝ 像素数（conv encoder 的全分辨率特征图）。超 `--tiled-threshold`
-的图走 `tiled_vae_encode` 分块 + 羽化拼接（data.py:2055，与 cache_encode_tiled 同一条
-路径，**分块缝处是近似**）。默认 1.5M 像素是 8GB 笔记本卡的稳妥值；大显存机器可抬到
-训练侧内置默认 4M（能整图就整图，分块只是显存兜底）。
+整图 encode 的峰值有三处 ∝ 像素数：conv encoder 的全分辨率特征图、mid block 单头
+全局注意力的 O(N²) SDPA、以及 cuDNN conv3d 的 im2col 工作区（96ch×27×px×2B，
+**这个是整图直编的硬边界**）。三条杠杆/实测（RTX 5070 Laptop 8GB，与桌面共享显存，
+见 tools/vae_tiled_verify.py）：
+
+  * feat_cache：T=1 时 vae2_1.encode 已自动跳过（逐 bit 等价，已验证），不再把
+    每层全分辨率特征图 clone 一份留给出不存在的"下一帧"。
+  * `--vae-attn-chunk`：mid block 全局注意力的 query 分块（数学恒等，已验证逐 bit
+    等价），把 O(N²) 峰值降到 O(chunk·N)。
+  * 即便两个都开，整图直编也在 ~1.05Mpx 触顶（1.01Mpx 实测峰值 6.2GB、0.5s，
+    旧配置同尺寸直接 OOM；1.57Mpx/2.09Mpx 因 conv3d im2col ~5.2KB/px 仍 OOM）。
+
+超 `--tiled-threshold` 的图走 `tiled_vae_encode` 分块 + 羽化拼接（data.py:2055，
+与 cache_encode_tiled 同一条路径）。注意 encoder 的 mid block 是**全局注意力**
+（vae2_1.py:300），感受野=整块：实测分块误差是**全域的**而非只在缝附近（整图 vs
+分块 mean|Δ|≈0.002，且不随离缝距离衰减），overlap 只能压低、不能消除。默认
+tile 832/overlap 256：比旧 640/128 误差低约 40%（mean 0.0024→0.0014）、峰值
+4.4GB，代价是约 +20% 耗时；≤1.05Mpx 的图整图直编零误差且更快（2.8x）。
 
 用法：
     <torch-python> cache_latents.py --data-dir <图片目录> \
@@ -112,14 +126,20 @@ def main() -> int:
                     help="fit_max_tokens，超了直接报错（与 trainer 的 fail 策略一致）")
     ap.add_argument("--no-flip", action="store_true",
                     help="不编码 latent_flipped（yaml flip_augment: false 时用）")
-    ap.add_argument("--tiled-threshold", type=int, default=500_000,
-                    help="像素数超阈值走分块 encode。本机 8GB 卡实测：整图 768^2 峰值 4.5G、"
-                         "1024^2 超 8G OOM（WanVAE feat_cache 把每层全分辨率特征图都留着），"
-                         "所以默认 0.5M 几乎全部走分块；大显存机器可抬到 4M（训练侧默认），"
-                         "分块缝处是近似，能整图就整图")
-    ap.add_argument("--tile-px", type=int, default=640,
-                    help="分块边长。1024 在 8GB 卡上自身就 OOM，640 实测峰值 ~3G")
-    ap.add_argument("--tile-overlap", type=int, default=128)
+    ap.add_argument("--tiled-threshold", type=int, default=1_050_000,
+                    help="像素数超阈值走分块 encode。feat_cache 跳过 + attn 分块后，"
+                         "8GB 卡实测整图直编上限 ~1.05Mpx（1.01Mpx 峰值 6.2GB/0.5s；"
+                         "1.57Mpx 起 conv3d im2col 工作区 OOM）--整图零接缝且更快，"
+                         "能整图就整图")
+    ap.add_argument("--tile-px", type=int, default=832,
+                    help="分块边长。832/ov256 实测峰值 4.4GB（8GB 卡安全值），"
+                         "比旧 640/128 的接缝误差低约 40%")
+    ap.add_argument("--tile-overlap", type=int, default=256,
+                    help="重叠像素。encoder mid block 是全局注意力，分块误差是全域的，"
+                         "overlap 只能压低不能消除；256 实测比 128 低约 40%")
+    ap.add_argument("--vae-attn-chunk", type=int, default=2048,
+                    help="VAE mid block 全局注意力的 query 分块 token 数（数学恒等，"
+                         "已验证逐 bit 等价），0=关闭。整图/分块路径都生效")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--overwrite", action="store_true")
     a = ap.parse_args()
@@ -139,7 +159,8 @@ def main() -> int:
         return 1
 
     dev = torch.device(a.device)
-    vae = load_vae(a.vae, dev, torch.bfloat16, find_diffusion_pipe_root())
+    vae = load_vae(a.vae, dev, torch.bfloat16, find_diffusion_pipe_root(),
+                   attn_chunk_tokens=a.vae_attn_chunk)
     print(f"{len(imgs)} 张图，ms 档 {ladder or '关'}，flip {'关' if a.no_flip else '开'}")
 
     n_ok = n_skip = n_ms = 0

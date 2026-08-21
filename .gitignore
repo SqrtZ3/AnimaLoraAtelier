@@ -19,6 +19,7 @@ AnimaLoraToolkit/config/private/
 AnimaLoraToolkit/config/train_my_1024.yaml
 AnimaLoraToolkit/config/train_my_1536.yaml
 AnimaLoraToolkit/config/train_my_soap_sf.yaml
+AnimaLoraToolkit/config/train_krea2_tpu_jan.yaml
 
 # Local MCP server (not shared — contains machine-specific paths)
 mcp_server/

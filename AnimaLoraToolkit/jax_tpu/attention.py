@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from typing import Callable, Optional, Sequence, Tuple
 
 import numpy as np
@@ -51,6 +52,38 @@ BLOCK = 128          # splash 的 TPU 块粒度；段长必须是它的倍数
 #   dkv=2048 fused OOM
 # -> 取 1024 + use_fused_bwd_kernel，比默认快 2.03x。整除不了时逐级退让。
 BWD_BLOCK_PREF = (1024, 512, 256, 128)
+
+#: **反向块的额外硬上限**，来自环境变量 `ANIMA_BWD_BLOCK_MAX`。0/未设 = 关闭
+#: （完全保持既有行为，逐 bit 中立）。
+#:
+#: 为什么需要它：splash 的 fused dkv kernel 会按 `block_q_dkv x block_kv_dkv`
+#: 在 **scoped vmem（栈）** 上开临时缓冲，而 XLA 给 scoped vmem 的默认额度是
+#: 16MB。K2 12B + LoKr 的某些布局会顶穿 —— 2026-08-21 Kaggle v5e-8 真机实测：
+#:
+#:     布局 seg(4480, 4480, 256) txt(384, 384)（ΣL=9216，实段最短 4480 -> 块 1024）
+#:     RESOURCE_EXHAUSTED: E1001: CompileTimeScopedVmemOom
+#:     splash_mha_dkv_segmented_no_residuals ... block_q_dkv=1024, block_kv_dkv=1024
+#:     Scoped allocation with size 18.08M and limit 16.00M exceeded by 2.08M
+#:
+#: 同一轮里 seg(8576, 640) 与 seg(6528, 640) 两个**两段**布局都跑过了（5 步出
+#: loss），顶穿的是三段布局 —— 它的 mask_ref 是 s32[10,1024,1024]，比两段的大。
+#: 注意这是**编译期**判定（CompileTime...Oom），不是训练跑热了才炸，所以同一个
+#: 布局要么每次都炸要么每次都过。
+#:
+#: 两条可选修法，本变量走的是第二条：
+#:   ① 抬高 XLA 的 scoped vmem 额度（`--xla_tpu_scoped_vmem_limit_kib`）。
+#:      数值与调度完全不变，但**这个 flag 在 CPU jaxlib 上不注册**（本地实测
+#:      `Unknown flag in XLA_FLAGS` 直接 F 级 abort），真机是否接受没法本地验，
+#:      押错一次就是白烧一轮。
+#:   ② 把反向块从 1024 降到 512：scoped vmem 里 block_q x block_kv 那一项
+#:      直接降到 1/4，一定够。代价是 attention 反向变慢 —— arch_probe H1 在
+#:      L=16384 的真机数：dkv=1024 fused 142ms、dkv=512 fused 157ms（约 1.1x），
+#:      只作用在 attention 反向这一段，整步的相对代价更小。
+#:      **数值上不是逐 bit 相同**（分块累加次序变了），但数学等价。
+BWD_BLOCK_MAX = int(os.environ.get("ANIMA_BWD_BLOCK_MAX", "0") or 0)
+if BWD_BLOCK_MAX and BWD_BLOCK_MAX not in BWD_BLOCK_PREF:
+    raise ValueError(f"ANIMA_BWD_BLOCK_MAX 只能取 {BWD_BLOCK_PREF} 之一，"
+                     f"收到 {BWD_BLOCK_MAX}")
 
 
 # ── 段几何 ────────────────────────────────────────────────────────────────────
@@ -162,8 +195,11 @@ def _block_sizes(q_len: int, kv_len: int, seg_cap: Optional[int] = None):
     if q_len % BLOCK or kv_len % BLOCK:
         raise ValueError(f"序列长必须被 {BLOCK} 整除，得到 q={q_len} kv={kv_len}"
                          f"（splash_attention_mask_info.py 对此硬 raise）")
-    pref = BWD_BLOCK_PREF if seg_cap is None else \
-        tuple(b for b in BWD_BLOCK_PREF if b <= seg_cap) or (BLOCK,)
+    cap = seg_cap if seg_cap is not None else None
+    if BWD_BLOCK_MAX:                       # 环境变量硬上限，默认关（见定义处）
+        cap = BWD_BLOCK_MAX if cap is None else min(cap, BWD_BLOCK_MAX)
+    pref = BWD_BLOCK_PREF if cap is None else \
+        tuple(b for b in BWD_BLOCK_PREF if b <= cap) or (BLOCK,)
     bwd_q = next(b for b in pref if q_len % b == 0)
     bwd_kv = next(b for b in pref if kv_len % b == 0)
     return sk.BlockSizes(

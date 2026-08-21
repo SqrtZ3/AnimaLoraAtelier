@@ -298,7 +298,14 @@ def txtfusion_block(x: jnp.ndarray, p: Dict[str, Any], heads: int, head_dim: int
 
 
 def _resolve_remat(remat):
-    """(fn, layer_idx)->fn 的包装。档位语义见 anima_jax.resolve_remat。"""
+    """(fn, layer_idx)->fn 的包装。档位语义见 anima_jax.resolve_remat。
+
+    **K2 路径禁 `dots`**：`dots_saveable` 把 matmul 的输入存给反向，而 FSDP 下
+    dense 的输入正是 `gather_sharded` 当层 gather 出的**全量**权重（见
+    gather_sharded 的"必须被 jax.checkpoint 包住"）—— 于是 28 层全量权重同时
+    活着，正是探针第四跑 OOM 37.62G 的形态。语法上它曾被放行（只有 none 在
+    forward_packed / run_train 被拦），真机上是一条静默的死路，这里 fail-fast。
+    """
     if remat is True:
         remat = "full"
     elif remat is False:
@@ -308,8 +315,10 @@ def _resolve_remat(remat):
     if remat == "every2":
         return lambda fn, i: fn if i % 2 == 0 else jax.checkpoint(fn)
     if remat == "dots":
-        pol = jax.checkpoint_policies.dots_saveable
-        return lambda fn, i: jax.checkpoint(fn, policy=pol)
+        raise ValueError(
+            "Krea2 路径不支持 remat='dots'：FSDP 下 dots_saveable 会把每层 "
+            "all_gather 出的全量权重存给反向（28 层同时活着 = 探针实测 37.62G "
+            "OOM）。用 'full'（唯一在真机验证过的档）。")
     return lambda fn, i: jax.checkpoint(fn)
 
 

@@ -69,10 +69,15 @@ cd ..
 同一条流水线，yaml 换 `model_family: krea2` 即可（run_train 自动分派到 FSDP
 路线）。三处与 Anima 不同的操作：
 
-- **底模**：`--hf-model krea/Krea-2-Raw:<文件名>[:<rev>]` —— **gated repo**，
-  先在 HF 网页接受 Krea 2 Community License，并把 token 配成 Kaggle Secrets
-  的 `HF_TOKEN`（job 启动时自动读，不落盘）。12.16B bf16 ~24GB，Kaggle→HF
-  直下，job 内 FSDP 分片加载（每卡 ~3GB）。
+- **底模**：已传成 Kaggle Dataset `ilovebg/krea2-raw-bf16`
+  （`krea2_raw_bf16.safetensors`，26,283,332,608 字节 = 24.5GiB），
+  `dataset_sources` 挂上后直接
+  `--env ANIMA_TRANSFORMER=/kaggle/input/krea2-raw-bf16/krea2_raw_bf16.safetensors`，
+  **不再需要** `--hf-model/--hf-stream`，也不再需要 HF token 与 gated 协议。
+  与 HF `krea/Krea-2-Raw@6b0ece7f` 的 raw.safetensors 逐字节同源
+  （全文件 sha256 `f99bb0ff8e36…03d7`，与 HF 那份的 git-lfs oid 逐位一致）。
+  回退路径（HF gated 直下/流式）见 `GUIDE_new_training.md` 的 Krea2 ④(b)。
+  12.16B bf16 ~24GB，job 内 FSDP 分片加载（每卡 ~3GB）。
 - **文本缓存**：`tools/cache_text_features.py --model-family krea2`
   （Qwen3-VL-4B 编码，键 `txt` [L,12,2560]，变长；约为 anima 格式 60 倍/token，
   注意 dataset 体积）。latent 缓存与 Anima 完全同一份（同一个 VAE）。
@@ -80,12 +85,14 @@ cd ..
   （FSDP 训练闭环），全绿再推。详见 `AnimaLoraToolkit/docs/krea2-family.md`
   的「TPU 后端」节与 `config/train_krea2_tpu_template.yaml`。
 
-### 权重与数据从哪来（2026-08-19 首秀定案的形态）
+### 权重与数据从哪来（2026-08-21 更新：底模已传 Kaggle Dataset）
 
-- **底模走 job 内 HF 直下**（`--hf-model <repo>:<文件>[:<revision>]`），不走 Kaggle
-  Models：本机上传 4.2GB 太慢，而 Kaggle → HF 实测 **10~13 秒**拉完。revision 钉死，
-  且 HF 文件的 X-Linked-ETag 已与本地那份的 sha256 核对一致（bd43b7cf…），
-  对拍环境与真机权重逐字节相同。repo 是 public 非 gated，不需要 token。
+- **底模**：`krea2` 底模已传成 Kaggle Dataset `ilovebg/krea2-raw-bf16`
+  （`krea2_raw_bf16.safetensors`，与 HF `krea/Krea-2-Raw@6b0ece7f` 逐字节同源，
+  全文件 sha256 `f99bb0ff8e36…03d7`），`dataset_sources` 挂上后直接
+  `--env ANIMA_TRANSFORMER=/kaggle/input/krea2-raw-bf16/krea2_raw_bf16.safetensors`
+  读本地挂载，不再需要 HF 交互。`anima` 底模仍走 job 内 HF 直下
+  （`--hf-model <repo>:<文件>[:<revision>]`，~4.2GB，10~13 秒）。
 - **数据缓存走 Kaggle Dataset**（私有），`dataset_sources` 挂进 metadata。
   latent / textfeat 两份缓存都由 PyTorch 侧离线产出：`tools/cache_latents.py`
   （图像侧，本仓库新增）+ `tools/cache_text_features.py`（文本侧，含

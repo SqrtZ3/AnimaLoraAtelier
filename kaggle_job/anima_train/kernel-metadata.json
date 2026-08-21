@@ -9,7 +9,8 @@
   "enable_tpu": "true",
   "enable_internet": "true",
   "dataset_sources": [
-    "ilovebg/modare-krea2-tpu-cache"
+    "ilovebg/modare-krea2-tpu-cache",
+    "ilovebg/krea2-raw-bf16"
   ],
   "competition_sources": [],
   "kernel_sources": [],

@@ -1,0 +1,199 @@
+# ══════════════════════════════════════════════════════════════════
+# JAN · Krea2 TPU 真训练（jax_tpu 后端，Kaggle TPU v5e-8 / FSDP）
+#
+# 来源：D:/models/LoRA/krea/jacknife-krea2-tpu-v1.yaml（PyTorch 侧键名）逐键搬到
+# TPU 后端的键名空间。**噪声/loss/aux/timestep/适配器结构一律照抄，没动一个数**。
+# 只改了三类：①键名（TPU 侧命名）②硬件适配 ③用户当次指定。
+#
+# ★ 改动清单（只有这些，别的都是原值）
+#
+#   ① 键名映射（同一个东西，两个后端叫法不同）
+#      transformer -> transformer_path / vae -> vae_path
+#      krea2_text_encoder -> krea2_text_encoder_path / lr -> learning_rate
+#
+#   ② 硬件适配
+#      navit_token_budget: 65536 -> 81920
+#        TPU 侧 budget 是**全局**（8 卡各跑一个 pack），单卡拿 1/8。
+#        65536 -> 8192/卡装不下本数据集：最大图 1088x1920 = 8160 token，
+#        quantum=1024 量化后 8192，再加 128 量化的 caption 槽就超了 ——
+#        打包器会 fail-fast「单段 N > budget」。81920 -> 10240/卡，
+#        最大段 8192+384 = 8576 放得下。81920 也正是 Krea2 首跑跑通的工作点
+#        （commit e307539）。
+#      navit_pack_strategy: next_fit -> ffd
+#        TPU 打包器只实现了 FFD（jax_tpu/packing.py:ffd）。装箱策略不改训练
+#        数学，只改哪几张图凑一个 pack。
+#      lokr_compute_dtype / base_quant* / torch_compile / num_workers 等
+#        纯 PyTorch 运行时项，TPU 侧无对应概念，直接不写（写了会 fail-fast）。
+#
+#   ③ 用户当次指定
+#      learning_rate: 0.00025 -> 0.0003（+20%，"稍微抬高一点点"）
+#      epochs: 200 -> 20（本次跑到第 20 个 epoch 取模型）
+#      data_dir / output_dir / output_name -> 本次的数据集与产物名
+#
+# ★ 数据缓存口径（与本文件配套，换数据集要重跑）
+#   源图 96 张（D:/Datasets/帮/1_data），cache_latents.py + cache_text_features.py
+#   --model-family krea2 产出，落在 D:/Datasets/_staging/jan-krea2-tpu-cache/。
+#   **latent 是分块编码的**：本地 8GB 卡放不下整图 encode（1024x1536 单个 conv3d
+#   要 7.59GiB），走 tiled_vae_encode，tile 640 / overlap 128。分块缝处是近似 ——
+#   与参考 config 的 cache_encode_max_pixels: 16777216（整图口径）不同，
+#   换大显存机器重缓存可消除。ms 档 4096，55 个 sidecar，合计 151 条样本。
+#
+# ★ 上真机前跑一遍 quantum 补正
+#   jax_tpu/tests/enum_quantum_advisor.py --config <本文件> --data-dir <缓存目录>
+# ══════════════════════════════════════════════════════════════════
+
+model_family: "krea2"
+transformer_path: "/kaggle/input/krea2-raw-bf16/krea2_raw_bf16.safetensors"
+vae_path: ""                    # TPU 侧不编码，留空
+krea2_text_encoder_path: ""     # 同上（缓存阶段用的是本地 Qwen3-VL-4B-Instruct-heretic）
+krea2_text_max_length: 0        # 不截断（cache-side 口径，TPU 侧 no-op）
+
+# ── 数据集 ─────────────────────────────────────────────────────
+data_dir: "/kaggle/input/jan-krea2-tpu-cache"
+resolution: 1024
+repeats: 1
+seed: 42
+
+# ── ARB 分桶（TPU 侧为 cache-side no-op，语义已烘焙进 npz）────────
+bucket_base_resos: [1024]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 2048
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.7
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+max_img_h: 0
+max_img_w: 0
+
+# ── NaViT 打包 ─────────────────────────────────────────────────
+navit_packing: true
+navit_native_resolution: true
+navit_token_budget: 81920       # ★改：全局 = 8 卡 x 10240
+fit_max_tokens: 32768000
+fit_warn_tokens: 32768000
+navit_max_images_per_pack: 0
+navit_multiscale: true
+navit_multiscale_token_ladder: "4096"
+navit_multiscale_loss_weight: 1.0
+navit_pack_strategy: ffd        # ★改：TPU 只有 FFD
+cache_latents: true
+cache_encode_tiled: true
+cache_encode_max_pixels: 16777216
+
+# ── 数据增强 / 打标 ─────────────────────────────────────────────
+shuffle_caption: false
+keep_tokens: 1
+flip_augment: true
+tag_dropout: 0.0
+caption_dropout_rate: 0.0
+freq_balanced_dropout_strength: 0.0
+prefer_json: false
+
+# ── LoRA 结构（照抄）────────────────────────────────────────────
+lora_type: "lokr"
+lora_rank: 32
+lora_alpha: 32.0
+lora_dropout: 0.0
+lokr_factor: 4
+lora_variant: "base"
+dora_export_mode: "native"
+rank_dropout: 0.05
+module_dropout: 0.03
+loraplus_lr_ratio: 1.0
+lora_reg_dims:
+  '.*attn\.(wq|wk|wv|wo|gate)$': 48
+  '.*mlp\.(gate|up)$': 32
+lora_reg_alphas:
+  '.*attn\.(wq|wk|wv|wo|gate)$': 48
+  '.*mlp\.(gate|up)$': 32
+
+# ── 优化器（照抄，只抬 lr）──────────────────────────────────────
+optimizer_type: "adamw_snr"
+learning_rate: 0.0003           # ★改：0.00025 -> 0.0003
+optimizer_args:
+  betas: [0.98, 0.999]
+  weight_decay: 1.0e-05
+  snr_power: 1.5
+  cautious: false
+epochs: 20                      # ★改：200 -> 20
+max_steps: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0
+mixed_precision: "bf16"
+grad_checkpoint: true
+
+# ── timestep（照抄）────────────────────────────────────────────
+flow_shift: 3.0
+timestep_sampling: mixed_logsnr_three
+timestep_stratified: true
+timestep_t_min: 0.0
+timestep_t_max: 1.0
+schedule_shift: 1.0
+timestep_mix_low_prob: 0.5
+timestep_mix_high_prob: 0.25
+timestep_logsnr_mu: -6.0
+timestep_logsnr_sigma: 2.4
+timestep_mix_anneal_start: 0
+timestep_mix_anneal_end: 0
+timestep_mix_low_prob_end: -1.0
+timestep_mix_high_prob_end: -1.0
+timestep_laplace_mu: 0.0
+timestep_laplace_b: 0.5
+krea2_res_shift: true
+krea2_shift_min_res: 256
+krea2_shift_max_res: 1280
+krea2_shift_y1: 0.5
+krea2_shift_y2: 1.15
+
+# ── loss / 噪声 / aux（照抄）───────────────────────────────────
+loss_type: "huber"
+huber_c: 0.2
+huber_schedule: "snr"
+huber_snr_clamp_max: 2.0
+loss_weighting_scheme: "none"
+min_snr_gamma: 0
+detail_inv_t_min: 1.0
+detail_inv_t_max: 5.0
+immiscible_enabled: false
+immiscible_k: 4
+eisbach_lambda: 0.15
+dfm_lambda: 0.05
+dfm_mode: "vecor"
+aux_spectral_enabled: true
+aux_spectral_lambda: 0.065
+aux_spectral_use_wavelet: true
+aux_spectral_wavelet_lambda: 0.2
+aux_spectral_t_gate: 0.55
+
+# ── 自适应 timestep（照抄）──────────────────────────────────────
+adaptive_timestep: true
+adaptive_timestep_metric: "slope"
+adaptive_timestep_bins: 8
+adaptive_timestep_ema_decay: 0.97
+adaptive_timestep_slope_slow_decay: 0.995
+adaptive_timestep_burn_in: 200
+adaptive_timestep_min_factor: 0.5
+adaptive_timestep_max_factor: 2.2
+adaptive_timestep_base_mix: 0.5
+adaptive_timestep_candidate_mult: 4
+adaptive_timestep_low_noise_gate: true
+adaptive_timestep_gate_n: 3.0
+adaptive_timestep_gate_c: 0.04
+adaptive_timestep_highfreq_weight: 0.14
+
+# ── eval / 存档 ────────────────────────────────────────────────
+eval_every: 0
+eval_count: 0
+eval_t_grid: ""
+eval_seed: 1234
+output_dir: "/kaggle/working/output"
+output_name: "JAN-krea2-tpu"
+save_every: 1
+save_every_steps: 0
+save_state_every: 0
+resume_state: ""
+log_every: 1

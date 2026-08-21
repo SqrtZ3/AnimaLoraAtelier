@@ -64,9 +64,12 @@ def main() -> int:
                          "之后、run_train 之前下载，并把 ANIMA_TRANSFORMER 指到产物")
     ap.add_argument("--hf-stream", action="store_true",
                     help="不落盘：把 ANIMA_TRANSFORMER 写成 HF resolve URL，由 "
-                         "krea2_jax 的 HTTP Range 加载边下边训（Krea-2-Raw 26GB > "
-                         "/kaggle/working 的 ~20GB 上限时唯一可行路）。**仅 krea2**——"
-                         "anima 加载器不支持 URL。token 照走 --env HF_TOKEN=...")
+                         "krea2_jax 的 HTTP Range 加载边下边训。**仅 krea2**——"
+                         "anima 加载器不支持 URL。token 照走 --env HF_TOKEN=...。"
+                         "注意：底模已传成 Kaggle Dataset 时更推荐直接 "
+                         "--env ANIMA_TRANSFORMER=/kaggle/input/<slug>/<文件> "
+                         "读本地挂载（无网络依赖、不占 /kaggle/working 配额），"
+                         "本参数留作回退")
     a = ap.parse_args()
 
     blobs, digest = {}, hashlib.sha256()
@@ -193,6 +196,26 @@ if _HF:
               f"（{{__import__('time').time() - _t0:.0f}}s）", flush=True)
 
 
+def _resolve_input(v):
+    """校正 /kaggle/input 下的挂载路径。dataset 的挂载布局有两种并存
+    （`/kaggle/input/<slug>/` 与 `/kaggle/input/datasets/<owner>/<slug>/`），
+    写错的代价是一轮白烧配额 —— 所以路径不存在时按 basename 在 /kaggle/input
+    下搜一次；恰好一个候选就用它，否则 fail-fast 并把实际内容打出来（而不是
+    让底模加载器抛一个看不懂的 FileNotFoundError）。URL 与本地干跑原样放过。"""
+    if v.startswith(("http://", "https://")) or os.path.exists(v):
+        return v
+    root = Path("/kaggle/input")
+    if not root.exists():
+        return v
+    hits = sorted(root.glob("**/" + os.path.basename(v)))
+    if len(hits) == 1:
+        print(f"[ WARN ] {{v}} 不存在 -> 改用实际挂载 {{hits[0]}}", flush=True)
+        return str(hits[0])
+    listing = "\\n".join("  " + str(p) for p in sorted(root.glob("*/*"))[:40])
+    raise SystemExit(f"[ FATAL ] {{v}} 不存在，/kaggle/input 下同名候选 {{len(hits)}} 个。\\n"
+                     f"/kaggle/input 实际内容（前 40 项）：\\n{{listing}}")
+
+
 def _override_paths(path):
     """用环境变量覆盖 yaml 里的本地路径。yaml 本身不动 —— 两个后端共用同一份，
     改了就不是同一个实验了。"""
@@ -203,6 +226,8 @@ def _override_paths(path):
                      ("ANIMA_OUTPUT_DIR", "output_dir")):
         v = os.environ.get(env)
         if v:
+            if env != "ANIMA_OUTPUT_DIR":      # 输出目录是待创建的，不该校验存在
+                v = _resolve_input(v)
             print(f"[ INFO ] {{key}}: {{d.get(key)!r}} -> {{v!r}}（来自 {{env}}）")
             d[key] = v
     path.write_text(yaml.safe_dump(d, allow_unicode=True), encoding="utf-8")

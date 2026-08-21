@@ -199,7 +199,33 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$PWD/kaggle_run.ps1" \
   `schedule_shift` 必须 1.0，构造期 fail-fast）。模板
   `AnimaLoraToolkit/config/train_krea2_tpu_template.yaml`。预算语义不变
   （全局 = 8×单卡），但 K2 的段含 text 槽 —— **单图 image+text 合计 ≤ 16384/卡**。
-- **④ 底模**：`--hf-model krea/Krea-2-Raw:<文件>[:<rev>] --hf-stream
+- **④ 底模**：两条路，**优先挂 dataset**（下面 a），流式（b）留作回退。
+
+  **(a) 挂 Kaggle Dataset（推荐）**：权重预先传成 dataset，训练时直接从
+  `/kaggle/input` 读本地文件 —— 无网络依赖、无 HF gated/token、无 302 CDN 抖动，
+  且 26GB 只读挂载不占 `/kaggle/working` 的 ~20GB 配额。
+  本仓库已传好 `ilovebg/krea2-raw-bf16`（`krea2_raw_bf16.safetensors`，
+  26,283,332,608 字节，与 HF `krea/Krea-2-Raw@6b0ece7f` 的 raw.safetensors
+  **逐字节同源**：本地文件全文件 sha256 =
+  `f99bb0ff8e362b77342bc4994e0c50906fe7ef7074864b181b7d48d2fa6d03d7`，与 HF 那份的
+  git-lfs 指针 oid（lfs oid 就是全文件 sha256）逐位一致 —— 不是抽样，是整文件算过。
+  上传前的 `D:/Datasets/_staging/` 那份与 ComfyUI 那份是同一 inode 的硬链接，
+  本地不存在拷贝损坏的可能。**Kaggle 侧那份没有独立校验**，靠加载器的
+  尺寸闸门兜底（见下）。用法：kernel-metadata 的 `dataset_sources`
+  挂上它，然后
+
+  ```bash
+  --env ANIMA_TRANSFORMER=/kaggle/input/krea2-raw-bf16/krea2_raw_bf16.safetensors
+  ```
+
+  **不要**再传 `--hf-model/--hf-stream`（传了会覆盖成 URL 又走回流式）。
+  `_read_safetensors_map` 的非 URL 分支逐 tensor 读本地文件 + 即刻分片，
+  host 同样不持全量，数值与流式完全等价。挂载路径两种布局并存的老问题由
+  job 里的 `_resolve_input` 兜底：路径不存在时按 basename 在 `/kaggle/input`
+  下搜，唯一命中就自动改用并打 WARN，否则 fail-fast 并列出实际树（不再是
+  加载器抛一个看不懂的 FileNotFoundError）。
+
+  **(b) HF 流式（回退）**：`--hf-model krea/Krea-2-Raw:<文件>[:<rev>] --hf-stream
   --env HF_TOKEN=<只读token>`。**gated** —— 先在 HF 网页接受协议。
   raw.safetensors 26.3GB > /kaggle/working 的 ~20GB 上限，直下装不下；
   `--hf-stream` 让 krea2_jax 走 HTTP Range 流式加载（8 线程预取，真机

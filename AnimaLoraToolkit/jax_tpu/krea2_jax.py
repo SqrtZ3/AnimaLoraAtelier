@@ -644,6 +644,18 @@ def _read_safetensors_map(path: str, token: Optional[str] = None):
         hdr = json.loads(f.read(hlen))
         meta = hdr.pop("__metadata__", None) or {}
         base = 8 + hlen
+    # 完整性闸门：safetensors 是纯字节寻址格式，文件长度**恒等于**头部末尾加上
+    # 最大 data_offset。底模现在从 Kaggle Dataset 挂载读（26GB 上传过一次网络，
+    # 本地那份的 sha256 核过、Kaggle 那份没有），截断的话不加这条会等到读到某个
+    # tensor 才炸在 reshape 上 —— 已经烧掉几分钟 TPU 配额，报错还看不懂。
+    # 代价是一次 getsize，读零字节数据。
+    end = max((m["data_offsets"][1] for m in hdr.values()), default=0)
+    size = os.path.getsize(path)
+    if base + end != size:
+        raise ValueError(
+            f"{path} 不是完整的 safetensors：头部声明数据区到 {base + end} 字节，"
+            f"实际文件 {size} 字节（差 {size - base - end:+d}）。\n"
+            f"  下载/上传被截断，或写盘没写完。别继续加载 —— 重新传一份。")
 
     def make_reader(m):
         s0, e0 = m["data_offsets"]

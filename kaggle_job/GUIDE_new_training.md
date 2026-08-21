@@ -88,23 +88,40 @@ cd AnimaLoraToolkit
 
 ## ③ 上传数据集
 
+**只传 npz**。原图与 `.txt` 一个都不要带上去 —— `jax_tpu/data.py:CacheDataset`
+自 commit a473957 起「无图时按 npz 推 stem」，缓存目录里根本不需要图片文件
+（本仓库 2026-08-21 实测：一个纯 npz 的目录 plan-only 照常认出 151 条样本）。
+
 ```bash
-mkdir /d/Datasets/_staging && cp -r "/d/Datasets/<名字>" /d/Datasets/_staging/<slug>
-cd /d/Datasets/_staging/<slug>
-# 写 dataset-metadata.json：{"title":"<slug>","id":"<用户名>/<slug>","licenses":[{"name":"other"}]}
-PYTHONUTF8=1 python -m kaggle datasets create -p .
+# 只挑 npz 进上传目录（原图/标签留在本地缓存目录里）
+mkdir -p /d/Datasets/_staging/<slug>
+cp /d/Datasets/_staging/<本地缓存>/*.npz /d/Datasets/_staging/<slug>/
+# 写 dataset-metadata.json：{"title":"<slug>","id":"<用户名>/<slug>","licenses":[{"name":"CC0-1.0"}]}
+
+# 用并行上传器（官方 CLI 是串行的，几百个小 npz 会把带宽跑成锯齿，见工具 docstring）
+PYTHONUTF8=1 python AnimaLoraToolkit/tools/kaggle_fast_upload.py \
+  /d/Datasets/_staging/<slug> --mode create --workers 8
 ```
 
+`kaggle_fast_upload.py` 相对 `python -m kaggle datasets create -p .`：
+
+- **并行 + 连接复用**，把「token 往返时网卡空转」这段填掉；跑完会打印
+  `空闲秒占比 / 变异系数`，可直接判断带宽有没有用满（判据定义见工具 docstring）。
+- **两道数据外泄闸门默认开**：目录里有 png/jpg/txt 之类直接 fail-fast；
+  `.npz` 内部藏 `caption` 明文（`cache_text_features.py` 会塞）也 fail-fast。
+  `--dry-run` 只扫描不发字节。要放行得显式 `--allow-ext` / `--allow-npz-caption`。
+- 传新版本：`--mode version -m "说明"`。
+
 注意：
-- 上传的是**私有** dataset（默认）。**两种挂载布局并存（2026-08-20 实测）**：
+- 上传的是**私有** dataset（默认；`--public` 才公开）。**两种挂载布局并存（2026-08-20 实测）**：
   早先传的 ashima 缓存在 `/kaggle/input/datasets/<用户名>/<slug>/`，
   新传的 krea2-tiny-* 却在 `/kaggle/input/<slug>/` —— 同一个 kernel 里两种都在。
   推之前拿不准就用 `kaggle_job/input_probe/` 零配额探一下（把 dataset_sources
   挂上后跑一遍，它会打印 /kaggle/input 的实际树）。
 - `datasets status <用户名>/<slug>` 显示 **ready 之后**才能 push kernel，
   否则挂载不到（白烧约 1 分钟 TPU）。
-- PNG 必须一起传：TPU 扫描靠图片文件发现 stem（像素从不被读）。若在意隐私，
-  用 `tools/dataset_encrypt.py`（像素洗牌 + 剥 caption 明文）。
+- 已经缓存好、但 npz 里带了 caption 明文的，用 `tools/dataset_encrypt.py`
+  剥掉（训练路径只读 `txt`，剥掉逐 bit 无影响）。
 
 ## ④ 打包 job
 

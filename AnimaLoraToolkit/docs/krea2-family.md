@@ -178,3 +178,62 @@ Krea2 已接线到 Kaggle TPU v5e-8 训练链路（`run_train.py` 自动按 `mod
 - 与官方 mmdit.py：state dict key 双向 strict 相同；同权重 bf16 前向
   max_abs_diff 1.6e-02（跨 kernel + 官方 256-pad，量级正常）。
 - 12B 真权重加载、云端端到端训练、画质效果：**未验证**——首跑请先小步数冒烟。
+
+## TPU 后端一轮全面审查的修复（2026-08-22）
+
+审的是 `jax_tpu/` 全包 + 6 份 TPU yaml + 3 份真机训练日志。**影响已跑过的四轮
+（JAN / ASK / modare / ashima）的有三条**，都不报错、都只在特定条件下显形：
+
+1. **`auxloss.eisbach_weight` 会产 NaN 并污染整步**（四轮全部开着
+   `eisbach_lambda: 0.15`）。掩码乘在 `exp` 之后，而"无有效 token 的段"的段内最大值
+   被兜底成 0，于是填充位能量 > 88（幅度 ≳9.5）时 `exp` 溢出成 `inf`、`inf*0 = NaN`。
+   `valid=0` **拦不住** —— `weighted_mean` 用 `jnp.sum`，NaN 直接传染成标量 loss，
+   一步污染 fp32 master 全部参数。本地复现：填充位幅度 12 即触发。
+   而 FFD 取整余量的纯填充段**每个 pack 都有**（`packing.py:301`）。
+   修法：掩码进指数（`exp(where(m>0, e, -inf) - mx)`），与 PyTorch 侧
+   `masked_fill(-inf)` 再 softmax 同口径；无填充位时逐 bit 不变。
+   历史上没炸过大概是因为填充位能量还没到那个量级 —— 属于**未爆的雷**，不是已发生的错。
+
+2. **krea2 `txtfusion.projector` 的等效学习率是 PyTorch 侧的 32 倍**（K2 三轮都不写
+   `lora_targets`，默认 264 层含它）。它是 `Linear(12→1)`，rank 被夹到 1 而 alpha
+   仍是 32，于是 `scale = alpha/rank = 32`，其余 263 层都是 1。PyTorch 侧标准 LoRA
+   **不夹 rank**（`LoRALayer.__init__`），那边这层恒是 1。
+   修法：`adapters.cap_rank_alpha` —— 夹 rank 时 alpha 同比例夹，scale 不变；
+   导出侧写的是夹后的 alpha，推理端按 `alpha/rank` 算出的 scale 与训练时逐位相同。
+   Anima 侧六个 target 最小维 1024，`scale` 全是 1，**不受影响**。
+
+3. **DoRA 的 `dora_scale` 被降 bf16，step-0 中立性失效**（`ashima` 那轮
+   `lora_variant: dora`）。前向 cast 整树 `astype(bf16)`，而 `base_row_sq` 在 consts
+   里是 fp32，比值不再精确为 1：实测 step-0 输出 rel **1.659e-03**（改后 0）。
+   更要紧的是 bf16 在 ‖W‖ 量级上 ulp 约 0.62%，lr=1e-4 下要 312~1250 步才在前向
+   可见 —— master 上学到的幅度增量在越过半个 ulp 之前对前向完全不可见。
+   `export.py` 与 `trainer/lora.py` 的 state_dict 都坚持把它存 fp32，理由正是这个。
+   修法：`train._fwd_cast` / `optim.update` 按叶子路径跳过 `dora`。
+
+其余修的（不影响已跑轮次，但都是"开关开着却什么都没发生"或休眠雷）：
+`--packed-barrier` 不带 `--unrolled` 时被静默忽略（scan 分支根本不读它）；
+`entropy_rate` 的 `/w(t)` 因为没人传 `loss_weight_fn` 而被静默跳过（采样权重差 4~9 倍）；
+`sched.sample()` 候选分桶多套一层 `t_range` clip（`timestep_t_min/t_max` 收窄时
+让部分桶的权重永远索引不到）；`sample_steps`/`lr_scheduler`/顶层 `weight_decay`/
+`lora_include_patterns` 等 GPU 侧真实生效的键在 TPU 上静默无效；
+`navit_max_images_per_pack` 解析了但从未被消费；`krea2_jax._resolve_remat` 对未知
+档位静默退化成 `full`；`gather_sharded` 的分片判据在 `ndev != 8` 时错位（休眠）；
+`anima_jax.eps_rms` 抄了 `RMSNorm` 的默认 1e-5 而实例化处是 1e-6。
+
+闸门覆盖的盲区分析见 `jax_tpu/tests/README.md` 的「闸门的已知盲区」一节 ——
+上面 5 条正确性问题里有 4 条是现有闸门**结构上**抓不到的。
+
+### 效率侧：`LIBTPU_INIT_ARGS` 是可用通道（此前被误判为无法验证）
+
+commit `3c1696c` 认定"抬 `--xla_tpu_scoped_vmem_limit_kib` 这条路走不通，因为
+CPU jaxlib 不注册这个 flag、真机是否接受没法本地验"。**前半句对，结论下早了**：
+`XLA_FLAGS` 确实会 F 级 abort（本地复现），但 `LIBTPU_INIT_ARGS` 由 libtpu 自己
+解析、**在无 TPU 的 CPU 上完全无副作用**（本地实测照常 import jax 并跑通），
+而这正是 Google 官方教程的用法（MaxDiffusion on v6e 那篇逐字写着
+`LIBTPU_INIT_ARGS="... --xla_tpu_scoped_vmem_limit_kib=65536"`）。
+
+JAN 那次 `CompileTimeScopedVmemOom` 报的 `limit 16.00M` 正是这个 flag 的默认值
+（16384 KiB）。当时选的 `ANIMA_BWD_BLOCK_MAX=512` 代价约 **1.1×** attention 反向；
+抬额度则数值与调度完全不变。用法与两条注意事项（v5e vmem 上限有官方口径冲突、
+首次上机建议 flag 与 `BWD_BLOCK_MAX` 同时带）见 `kaggle_job/README.md` 的
+「XLA 调优 flag」一节。**未在 Kaggle 真机验证过。**

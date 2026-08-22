@@ -40,14 +40,22 @@ max_img_w: 0
 # ── NaViT 打包（单流：预算 = text+image 合计）────────────────────
 navit_packing: true
 navit_native_resolution: true
-# TPU 全局预算 = 8 卡 × 16384。K2 的段含 text 槽（量化到 128），16384/卡里
+# TPU 全局预算 = 8 卡 × 10240。K2 的段含 text 槽（量化到 128），10240/卡里
 # 约有 1-3k 花在 text 上 —— 单图最大 image token 必须 <= 预算减去自己的 text 槽，
 # 否则打包器 fail-fast（"单段 N > budget"）。RAW 训练分布只到 ~1k，
 # 超过 ~4096 token（1024²）属于底模分布外，谨慎（docs/krea2-family.md 口径）。
-navit_token_budget: 131072
+#
+# **81920 是 K2 真机已验工作点，别往上调**（单卡上限 15.7GiB）：
+#   131072 (8×16384) -> 运行期 HLO temporaries 18.15G，OOM
+#    98304 (8×12288) -> executable reserve 11.94G vs free 11.74G，OOM
+#    81920 (8×10240) -> 跑通（JAN 20 epoch/254 步、ASK 18 epoch/176 步）
+# 账见 docs/krea2-family.md；开训前用 jax_tpu/tests/enum_quantum_advisor.py
+# 对着自己的数据集再算一遍。
+navit_token_budget: 81920
 fit_max_tokens: 32768000
 fit_warn_tokens: 32768000
-navit_max_images_per_pack: 0
+# navit_max_images_per_pack：TPU 侧未移植（packing.ffd 只按 token budget 装箱），
+# 写非 0 会 fail-fast。要限图数请调小 navit_token_budget。
 navit_multiscale: true
 navit_multiscale_token_ladder: "2304,4096"   # 贴合 RAW 分布（768²~1024²）
 navit_pack_strategy: ffd

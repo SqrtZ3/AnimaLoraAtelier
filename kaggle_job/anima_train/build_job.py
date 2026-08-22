@@ -127,7 +127,7 @@ from pathlib import Path
 _BLOBS = {blobs}
 _CFG = {cfg}
 _EXTRA = {extra}
-_ENV = {env}            # build_job --env 烘焙的路径覆盖（ANIMA_* ）
+_ENV = {env}            # build_job --env 烘焙的路径覆盖（ANIMA_* / LIBTPU_INIT_ARGS）
 _HF = {hf}              # build_job --hf-model 烘焙的 (repo, 文件名[, revision])
 _STREAM = {stream}      # build_job --hf-stream：底模不落盘，走 HTTP Range 流式
 
@@ -148,6 +148,18 @@ for _k, _v in _ENV.items():
     _show = "***" if any(s in _k.upper() for s in ("TOKEN", "SECRET", "KEY")) \\
             else os.environ[_k]
     print(f"[ INFO ] env {{_k}} = {{_show}}", flush=True)
+# **这一步在 `import run_train`（进而 import jax）之前**，所以除了 ANIMA_* 之外，
+# `LIBTPU_INIT_ARGS` 也能从这里生效 —— libtpu 在初始化时读它。这是 TPU 侧 XLA
+# 调优 flag 的可用通道：`XLA_FLAGS` 走的是 XLA 的 flag 注册表，`--xla_tpu_*` 这类
+# TPU 专属 flag 不在其中，本地 CPU jaxlib 上直接 F 级 abort
+#（实测 `Unknown flag in XLA_FLAGS: --xla_tpu_scoped_vmem_limit_kib`）；而
+# `LIBTPU_INIT_ARGS` 由 libtpu 自己解析，在无 TPU 的 CPU 上完全无副作用（实测），
+# 所以可以安全携带。Google 官方教程用的就是这个通道，例如 MaxDiffusion on v6e：
+#     LIBTPU_INIT_ARGS="--xla_tpu_rwb_fusion=false
+#                       --xla_tpu_dot_dot_fusion_duplicated=true
+#                       --xla_tpu_scoped_vmem_limit_kib=65536"
+# 用法见 kaggle_job/README.md 的「XLA 调优 flag」一节。
+
 
 if _HF:
     # gated repo（如 krea/Krea-2-Raw）需要 token —— 优先环境变量（build_job

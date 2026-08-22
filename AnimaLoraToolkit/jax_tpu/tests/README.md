@@ -23,6 +23,8 @@
 | **preflight** | `enum_quantum_advisor.py --config <yaml>` | 用这次的 yaml+数据集扫出该传的 `--quantum` | numpy + pyyaml |
 | **K1** Krea2 前向对拍 | `dump_krea2_ref.py` → `check_krea2_parity.py` | `krea2_jax` ≡ `models/krea2_modeling.py`（逐 tap + LoRA 四区域） | torch + jax |
 | **K2** Krea2 端到端 | `check_train_loop_k2.py` | FSDP 分片训练闭环能学 + 分片≡全量 + 导出键名 | jax |
+| **K3** 文本塔前向对拍 | `dump_qwen3vl_ref.py` → `check_qwen3vl_parity.py` | `qwen3vl_te` ≡ HF `Qwen3VLTextModel`（逐层 + tap 语义 + padding 口径） | torch + jax |
+| **K3-B** 文本塔真权重 | `check_qwen3vl_real.py` | 真权重重算的 `textfeat` ≡ 本地已缓存的那一份（残差全在 bf16 噪声内） | jax + 真 TE |
 
 K1/K2 是 **Krea2 模型族**（`model_family: krea2`，单流 MMDiT 12B + FSDP 权重分片）
 引入的。K1 用小构型随机权重（结构 parity 不需要 24GB 真权重），逐 tap 比对
@@ -34,6 +36,29 @@ txtfusion/txtmlp/first/t_vec/逐块/最终输出，再挂合成 LoRA 比对四�
 （K2 文本是变长的，填充全靠精细 segment_ids 隔离）、T2 真的在学、
 T5 存取往返 + 导出键名（`lora_unet_blocks_0_attn_wq` / `lora_unet_tproj_1`
 等 torch 模块路径）。
+
+K3 是把 **Qwen3-VL 文本塔搬上 TPU** 引入的（`jax_tpu/qwen3vl_te.py` +
+`text_cache.py`）：krea2 的 `.textfeat.npz` 是 12 层 hidden 堆叠、61.4KB/token，
+96 张就 1.7GB，而信息源只有 96 条 caption（0.14MB）。移植后本地只 tokenize
+（`tools/dump_caption_ids.py`，实测 **39.8KB**，压缩比 48658×），textfeat 在真机现算。
+
+K3 用小构型随机权重判**结构**（fp32 rel ≤ 5.3e-7），顺带把三条"猜错就静默全错"的
+口径**测**成断言而不是留在注释里：
+  * `hidden_states[k]`（k<层数）**= 第 k 层的输入**、`hidden_states[层数]` 才是
+    final norm 输出 —— 于是 `KREA2_SELECT_LAYERS` 最大 tap 35 意味着
+    **只跑 0~34 层**，`layers.35.*` 与 `norm.weight` 一个字节都不用加载；
+    tap 等于层数时 fail-fast（T7）。
+  * mrope 在纯文本输入下三路 position 相同，退化为标准 RoPE（T1 逐元素比 cos/sin）。
+  * **padding 摆法**：`position_ids` 用 `arange`、**不看 attention_mask**，所以
+    `_encode_krea2_batch` 在 `max_length<=0` 下把 suffix 拼在 padding 之后的那种
+    "中段 padding"会改条件 —— torch 侧探针实测 max|Δ| = **6.7e-1**；右侧 padding
+    才是逐 bit 等价的摆法（探针 0.0）。已落盘的缓存是 B=1 无 padding 口径，
+    jax 侧一律按右侧 padding 摆。
+
+K3-B 判**口径**：拿本地已有的 96 份 `.textfeat.npz`（torch CUDA bf16 产出）当参考，
+不需要再跑一次 torch。判据不设绝对阈值，而是同时量 A=JAX(bf16) vs 缓存、
+B=JAX(fp32 计算) vs 缓存、C=JAX(bf16) vs JAX(fp32)，**A 不该比 B+C 大一个数量级**
+（实测 A/(B+C)=0.43，‖Δ‖/‖ref‖≈1.1e-2 = bf16 本身的噪声，逐层平坦无离群层）。
 
 ⑮ 守的是一条**外部平台**约束：TPU 侧从不读像素（`_stems` 只取文件名），
 所以缓存 dataset 里放原图是纯多余的暴露 —— 2026-08-21 真实吃过一次，
@@ -105,6 +130,26 @@ DFT 就是同一 DTFT 的更细采样，幅度谱与平移无关），差的只�
 顺序不同，不是数学差异。再经 AdamW 的 `m/√v`（对近零梯度近似取符号）放大，
 几步之内参数就有 O(lr) 分歧。**所以切换这些开关不能复现同一条轨迹**，
 做 A/B 时别把这种分歧读成"算法变了"。
+
+## 闸门的已知盲区（2026-08-22 一轮全面审查暴露的）
+
+那一轮修的 5 条正确性问题里，**有 4 条是现有闸门结构上抓不到的**。记在这里，
+是因为"闸门全绿"不等于"没问题"，下次审查别把绿灯当结论：
+
+| 修的问题 | 为什么闸门抓不到 | 补了什么 |
+|---|---|---|
+| `auxloss.eisbach_weight` 掩码乘在 `exp` 之后 → 填充位能量 >88 时 `inf*0=NaN`，且 `valid=0` 拦不住（`weighted_mean` 用 `jnp.sum`），一步污染 fp32 master | ⑬ 的 Eisbach 用例是**全有效 mask**，永远走不到填充位那条路 | ⑬ 该加一个"含填充位、填充位 pred 幅度 12"的用例 |
+| DoRA 的 `dora_scale` 被 `train._fwd_cast` 前身整树降 bf16 → step-0 中立性失效（输出 rel 1.7e-3）、幅度增量被量化到 0.62% 格子 | ⑦/K2 的 T1 比的是 **loss**（偏差仅 2e-7，远在阈值内），问题在**输出域** | T1 宜改成比输出/比 per-image 向量 |
+| krea2 `txtfusion.projector`（`Linear(12→1)`）rank 被 cap 到 1 而 alpha 不跟着 → 该层 scale=32、其余 264 层 =1，等效 LR 差 32× | 没有任何闸门比较**逐层 scale** 与 PyTorch 侧 | ⑫ 宜加一条"全 target 的 scale 与 torch `LoRALayer.scaling` 逐层相等" |
+| `anima_jax.AnimaConfig.eps_rms` 抄了 `RMSNorm.__init__` 的默认 1e-5，而实例化处是 1e-6 | ① 的 `t_emb` 分项 tol=1e-4，而偏差只有 9e-6；bf16 下又小于 1 个 ULP | ① 的 `t_emb` 阈值宜收到 1e-6 |
+| `sched.sample()` 候选分桶多套了一层 `t_range` clip（PyTorch 只施加 schedule_shift） | **`sched.py` 完全没有对拍闸门** —— `AdaptiveTimestepSampler` 只在 ⑪ T9 被构造过，没有与 PyTorch 的数值对拍 | 缺一个 sched 对拍闸门 |
+
+共性：**闸门比的量与 bug 所在的域不一致**（比 loss 而 bug 在输出域、比 fp32 而
+bug 只在 bf16 显形、阈值宽于偏差量级），以及**没有闸门的模块**（`sched.py`）。
+
+同一轮还修了几处"开关开着但什么都没发生"（`--packed-barrier` 不带 `--unrolled` 时被
+静默忽略、`entropy_rate` 的 `/w(t)` 因为没人传 `loss_weight_fn` 而被跳过、
+`navit_max_images_per_pack` 解析了但从未被消费）—— 这一类现在都是构造期 raise。
 
 ## 环境
 

@@ -137,6 +137,44 @@ yaml 的 `navit_token_budget` 在 GPU 上是一步一个 pack 的预算；TPU �
 每个布局本来就独立编译，统一长度买不到任何东西。填充率日志的分母也是自然总长，
 另打了"容量"（Σ自然总长/budget）供对照。
 
+### XLA 调优 flag：走 `LIBTPU_INIT_ARGS`，不要走 `XLA_FLAGS`
+
+`--xla_tpu_*` 这类 TPU 专属 flag **不在 XLA 的 flag 注册表里**，塞进 `XLA_FLAGS`
+会在本地 CPU jaxlib 上直接 F 级 abort（实测
+`F parse_flags_from_env.cc:234] Unknown flag in XLA_FLAGS: --xla_tpu_scoped_vmem_limit_kib`）。
+而 `LIBTPU_INIT_ARGS` 由 libtpu 在初始化时自己解析，**在无 TPU 的 CPU 上完全无副作用**
+（本地实测：设了它照常 `import jax` 并跑通 CPU 计算），所以可以安全携带、也能本地干跑。
+Google 官方教程用的就是这个通道（MaxDiffusion on v6e：
+`LIBTPU_INIT_ARGS="--xla_tpu_rwb_fusion=false --xla_tpu_dot_dot_fusion_duplicated=true --xla_tpu_scoped_vmem_limit_kib=65536"`）。
+
+`build_job.py` 的 `--env` 在 `import run_train`（进而 import jax）**之前**注入 environ，
+所以直接这样传：
+
+```bash
+python build_job.py --config <yaml> \
+  --env LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=65536 \
+  --env ANIMA_BWD_BLOCK_MAX=512 ...
+```
+
+**这条为什么值得试**：JAN 第一轮撞的 `CompileTimeScopedVmemOom` 是
+`Scoped allocation with size 18.08M and limit 16.00M exceeded by 2.08M` ——
+那个 `16.00M` 正是 `xla_tpu_scoped_vmem_limit_kib` 的默认值 16384 KiB
+（OpenXLA flag 指南）。当时选的是另一条路（`ANIMA_BWD_BLOCK_MAX=512` 把反向块降到
+1/4，已验证 254 步跑满），代价按 arch_probe H1 约 **1.1×** attention 反向
+（dkv=1024 fused 142ms vs dkv=512 fused 157ms）。抬 vmem 额度则**数值与调度完全不变**，
+能把那 1.1× 拿回来。
+
+MaxText 生产用值：dense 模型 `98304`（96 MiB）、MoE `81920`，官方注释
+"experimentally recommended values for compute bound models"。
+
+⚠️ 两点要盯住：
+- **v5e 的 vmem 上限有官方口径冲突** —— JAX Pallas 硬件表说 v5e = 128 MiB，
+  MaxText 调优文档说 "64M for v5e"。两个都是官方来源，我没有第三方证据裁决，
+  所以**从 65536 起试**（两个口径下都安全），别一步跳到 98304。
+- **首次上机建议两个都带**（flag + `BWD_BLOCK_MAX=512`），flag 是新变量、
+  `BWD_BLOCK_MAX` 作保底；确认没问题后再单独摘掉 `BWD_BLOCK_MAX`，看能否回到
+  反向块 1024。一次只动一个变量。
+
 ## 架构裁决（2026-08-14，`arch_probe` 第二跑，v5e-8 真机）
 
 块对角内核可行之后，这一轮问的是**整条路能不能走**：静态图（E）、显存（F）、

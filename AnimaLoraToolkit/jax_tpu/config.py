@@ -60,14 +60,20 @@ _HANDLED = {
     "krea2_shift_y1", "krea2_shift_y2",
     "navit_packing", "navit_native_resolution", "navit_token_budget",
     "navit_multiscale", "navit_pack_strategy", "navit_text_trim_padding",
-    "navit_max_images_per_pack", "navit_multiscale_loss_weight",
+    # navit_max_images_per_pack 已挪到 _UNPORTED —— 它以前在这里，但全仓从未被
+    # 消费（packing.Packer 的签名里没有这个量），属于"在表里却是 no-op"。
+    "navit_multiscale_loss_weight",
     "flip_augment", "caption_dropout_rate",
     "lora_type", "lora_rank", "lora_alpha", "lokr_factor", "lora_variant",
     "lora_targets", "lora_exclude_patterns", "lora_reg_dims", "lora_reg_alphas",
     "rank_dropout", "module_dropout", "loraplus_lr_ratio", "lokr_w1_init_std",
     "lokr_compute_dtype",
     "optimizer_type", "learning_rate", "optimizer_args",
-    "epochs", "max_steps", "grad_accum", "grad_clip_max_norm", "warmup_steps",
+    "epochs", "max_steps", "grad_accum", "grad_clip_max_norm",
+    # `warmup_steps` 是 **TPU 独有的 yaml 键**（GPU 侧 trainer/config.py 的
+    # YAML_TO_ARGS 里没有它，那边用 lr_scheduler 那一套）。写进 GPU yaml 会被
+    # 它的 warn_unrecognized_keys 报未知。
+    "warmup_steps",
     "mixed_precision", "grad_checkpoint",
     "flow_shift", "schedule_shift", "timestep_sampling",
     "timestep_mix_low_prob", "timestep_mix_high_prob",
@@ -130,6 +136,47 @@ _UNPORTED: Dict[str, Tuple[Any, str]] = {
     "sample_every": (lambda v: int(v or 0) > 0,
                      "训练期采样出图未移植（要在 TPU 上跑完整 ODE 采样器 + VAE 解码）。"
                      "设 sample_every: 0，改用导出的 LoRA 在本地出图。"),
+    # GPU 侧采样有**三个**独立触发器（anima_train.py：sample_every 每 N epoch、
+    # sample_steps 每 N step、sample_reference_steps）。以前只判 sample_every，而
+    # `_check_coverage` 里 `startswith("sample_")` 那条豁免把后两个当"未移植子参数"
+    # 一并跳过了 —— 于是 `sample_every: 0` + `sample_steps: 100` 静默通过，TPU 一张
+    # 图都不出、无提示。这正是本文件 docstring 要防的那类。
+    "sample_steps": (lambda v: int(v or 0) > 0,
+                     "同 sample_every（按 step 触发的那个）。TPU 侧不出图，设 0。"),
+    "sample_reference_steps": (lambda v: int(v or 0) > 0,
+                               "同 sample_every（参考图那路）。TPU 侧不出图，设 0。"),
+    # ── LR 调度：GPU 有 cosine / cosine_with_restart，TPU 只有 warmup + 常数 lr ──
+    # `optim._lr_at` 的 docstring 解释了为什么有意不做衰减（用户范式是极大 epoch
+    # 一直训、随时手停、从任意 step 挑 checkpoint，带衰减会让"第 N 步的 checkpoint"
+    # 的含义依赖总步数）。但"有意不做"必须显式告知，不能静默忽略。
+    "lr_scheduler": (lambda v: str(v or "constant").lower()
+                     not in ("", "constant", "none"),
+                     "LR 调度未移植：TPU 侧只有线性 warmup + 之后恒定"
+                     "（optim._lr_at，有意如此 —— 见那里的 docstring）。"
+                     "要衰减请在 GPU 侧跑，或接受常 LR。"),
+    "lr_scheduler_t0": (lambda v: int(v or 0) > 0, "同 lr_scheduler。"),
+    "lr_scheduler_t_mult": (lambda v: float(v or 1) != 1.0, "同 lr_scheduler。"),
+    "lr_scheduler_eta_min": (lambda v: float(v or 0) > 0, "同 lr_scheduler。"),
+    # ── 顶层 weight_decay：TPU 只读 optimizer_args.weight_decay ──────────────
+    # GPU 侧有 `_resolve_weight_decay`（trainer/config.py）处理顶层 vs optimizer_args
+    # 的权威性。TPU 侧顶层写法完全接不上 —— 用户以为设了 wd 其实是 0，最危险的一类。
+    "weight_decay": (lambda v: float(v or 0) > 0,
+                     "顶层 weight_decay 未接线：TPU 侧只读 "
+                     "`optimizer_args.weight_decay`。请把它移进 optimizer_args。"),
+    "lora_include_patterns": (lambda v: bool(v),
+                              "include（exclude 的豁免通道）未移植：TPU 侧只有 "
+                              "lora_targets + lora_exclude_patterns 两级。"
+                              "请把要保留的目标直接写进 lora_targets。"),
+    # ── 正则化数据集 ────────────────────────────────────────────────────────
+    "reg_data_dir": (lambda v: bool(str(v or "").strip()),
+                     "正则化数据集未移植（TPU 侧 CacheDataset 只吃一个 latent 缓存目录）。"),
+    "reg_repeats": (lambda v: int(v or 0) > 0, "同 reg_data_dir。"),
+    "reg_caption": (lambda v: bool(str(v or "").strip()), "同 reg_data_dir。"),
+    "navit_max_images_per_pack": (
+        lambda v: int(v or 0) > 0,
+        "逐 pack 图数上限未移植：TPU 侧 packing.ffd 只按 token budget 装箱"
+        "（Packer 的签名里没有这个量）。以前它被解析进 RunConfig 但**从未被消费** —— "
+        "属于'在表里却是 no-op'，比报错更坏。要限图数请调小 navit_token_budget。"),
     "tread_enabled": (bool, "TREAD 未移植。"),
     "dispersive_enabled": (bool, "Dispersive loss 未移植（要额外一次截断前向）。"),
     "aux_self_perceptual_enabled": (bool, "self-perceptual 未移植（要额外模型前向）。"),
@@ -147,7 +194,18 @@ _UNPORTED: Dict[str, Tuple[Any, str]] = {
     "lora_dropout": (lambda v: float(v or 0) > 0,
                      "适配器输入侧 dropout 未移植（rank_dropout / module_dropout 已移植）。"),
     "lora_one_init_steps": (lambda v: int(v or 0) > 0, "LoRA-One 初始化未移植。"),
-    "weight_cap_ratio": (lambda v: float(v or 0) > 0, "loss 权重上限比未移植。"),
+    # GPU 侧默认值是 5.0 且**默认生效**（trainer/config.py 的 DEFAULTS +
+    # objective.py 的 compute_loss_weight 尾部按 weight_cap_ratio 夹权重）。
+    # 谓词的语义是"这个键在 GPU 上会真的改变权重吗"：
+    #   * 0（或负）= 显式关掉 cap -> GPU 也不 cap -> 与 TPU 一致，**不该拦**
+    #     （train_tpu_ashima.yaml 就是显式写 0 的）；
+    #   * 缺省 / 5.0 = GPU 会按 5.0 夹，TPU 不夹 -> 是真差异，但 5.0 是 GPU 默认，
+    #     从 GPU 拷来的 yaml 都带着它，拦了等于逼所有人加 --allow-unported ->
+    #     所以只提示"非默认正值"这种明确是刻意调过的情况。
+    "weight_cap_ratio": (
+        lambda v: float(v or 0) > 0 and abs(float(v) - 5.0) > 1e-9,
+        "loss 权重上限比未移植（TPU 侧 flow.loss_weight 不做 cap）。"
+        "写 0 = 显式关掉（两边一致）；GPU 默认 5.0；调成别的正值不会在 TPU 上生效。"),
     "fit_packed_training": (bool, "FiT 打包训练与 NaViT 打包是两条路，TPU 侧只走 NaViT。"),
     "token_bucket": (bool, "token_bucket 是 PyTorch DataLoader 侧的调度，TPU 侧走 packing.py。"),
     "dora_export_mode": (lambda v: str(v or "native").lower() != "native",
@@ -193,8 +251,9 @@ class RunConfig:
     #: **单卡** token 预算（= yaml 的 navit_token_budget / devices）
     budget: int = 16384
     quantum: int = 1024
+    #: anima 路径的定长 cross-attn 文本槽（data.CacheDataset 用它断言缓存 shape）。
+    #: K2 路径不用它（K2Packer 走 txt_quantum，文本槽是变长的），那边这个字段是死的。
     txt_len: int = 512
-    max_images_per_pack: int = 0
     repeats: int = 1
     multiscale: bool = False
     ms_loss_weight: float = 1.0
@@ -268,11 +327,19 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
     targets = _expand_targets(d.get("lora_targets") or [],
                               d.get("lora_exclude_patterns") or [], family)
     acfg = AD.AdapterConfig(
-        kind=str(d.get("lora_type", "lora")).lower(),
+        # 下面四个默认值与 GPU 侧逐一对齐（trainer/config.py 的 DEFAULTS +
+        # anima_train.py 的 argparse）。以前 lora_type 默认 "lora"、lora_alpha 默认
+        # None(=rank)，于是一份"只写关心的开关"的 yaml（本仓库推荐用法）在两个后端上
+        # 解出**不同的适配器结构**与**差 2× 的 scale**，且没有任何提示。
+        kind=str(d.get("lora_type", "lokr")).lower(),            # GPU: DEFAULTS=lokr
         variant=str(d.get("lora_variant", "base") or "base").lower(),
-        rank=_i(d, "lora_rank", 32),
-        alpha=(None if d.get("lora_alpha") is None else _f(d, "lora_alpha")),
-        factor=_i(d, "lokr_factor", 8),
+        rank=_i(d, "lora_rank", 32),                             # GPU: 32（一致）
+        # GPU 缺省是 32.0（不是 "=rank"）。显式写 null 才是"取 rank"（scale=1）。
+        # 差别在 rank≠32 时显形：rank=64 + 不写 alpha -> GPU scale=0.5、旧 TPU
+        # scale=1.0，等效学习率差 2×。
+        alpha=(None if "lora_alpha" in d and d.get("lora_alpha") is None
+               else _f(d, "lora_alpha", 32.0)),
+        factor=_i(d, "lokr_factor", 8),                          # GPU: 8（一致）
         rank_dropout=_f(d, "rank_dropout"),
         module_dropout=_f(d, "module_dropout"),
         w1_init_std=_f(d, "lokr_w1_init_std", 0.1),
@@ -289,7 +356,28 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
             f"（后者含 SNR 锐化与 cautious 掩码）。别指望它悄悄退回 adamw —— 那会让"
             f"同一份 yaml 在两个后端上是两个优化器。")
     oa = d.get("optimizer_args") or {}
-    betas = oa.get("betas") or [0.9, 0.999]
+    # `optimizer_args` 的**内部**以前是一片没有覆盖检查的盲区：只读这 5 个子键，
+    # 其余静默丢弃（实测 `decouple` / `d0` / `weight_decouple` / `amsgrad` /
+    # `unknown_knob` 全部无声消失）。这与本文件 docstring"每一个会改变训练数学的
+    # yaml 键都必须在表里出现"直接矛盾 —— `optimizer_type` 那条 fail-fast 做得很好，
+    # 它的参数却没有。所以这里也做覆盖检查。
+    _OA_KNOWN = ("betas", "eps", "weight_decay", "snr_power", "cautious")
+    unknown_oa = [k for k in oa if k not in _OA_KNOWN]
+    if unknown_oa:
+        raise ValueError(
+            f"optimizer_args 里有 TPU 后端不认识的子键 {sorted(unknown_oa)}；"
+            f"已实现 {list(_OA_KNOWN)}。它们不会被悄悄忽略 —— 若是别的优化器的参数"
+            f"（Prodigy 的 d0/decouple、AdamW 变体的 amsgrad 等），那个优化器本身"
+            f"就没移植（见 optimizer_type 的 fail-fast）；若确实无用请从 yaml 删掉。")
+    betas = oa.get("betas")
+    if betas is None:
+        betas = [0.9, 0.999]
+    # 显式判空而不是 `or 默认值`：`betas: []` 会被 `or` 静默换成默认值。
+    if len(betas) != 2:
+        raise ValueError(
+            f"optimizer_args.betas 必须恰好 2 个（b1, b2），得到 {list(betas)}。"
+            f"以前这里直接取前两个下标：3 个会静默丢掉第三个、1 个会报一个看不出"
+            f"根因的 IndexError、空列表会被兜底成默认值。")
     adamw = O.AdamWConfig(
         lr=_f(d, "learning_rate", 1e-4),
         b1=float(betas[0]), b2=float(betas[1]),
@@ -309,7 +397,10 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
         schedule_shift=_f(d, "schedule_shift", 1.0),
         logsnr_mu=_f(d, "timestep_logsnr_mu", -6.0),
         logsnr_sigma=_f(d, "timestep_logsnr_sigma", 2.0),
-        mix_low_prob=_f(d, "timestep_mix_low_prob", 0.5),
+        # GPU 侧 `--timestep-mix-low-prob` / `--timestep-mix-high-prob` 默认都是 0.25
+        # （anima_train.py 的 argparse；DEFAULTS 同值）。以前 low 默认 0.5，三峰路由
+        # 的低噪份额比 GPU 多一倍 —— 同一份 yaml 两个后端的 t 分布不同。
+        mix_low_prob=_f(d, "timestep_mix_low_prob", 0.25),
         mix_high_prob=_f(d, "timestep_mix_high_prob", 0.25),
         laplace_mu=_f(d, "timestep_laplace_mu", 0.0),
         laplace_b=_f(d, "timestep_laplace_b", 0.5),
@@ -325,19 +416,28 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
         huber_schedule=str(d.get("huber_schedule", "constant")).lower(),
         huber_snr_clamp_max=_f(d, "huber_snr_clamp_max", 10.0),
         weighting=str(d.get("loss_weighting_scheme", "none")).lower(),
-        min_snr_gamma=_f(d, "min_snr_gamma", 5.0),
+        # 与 GPU 侧默认对齐（trainer/config.py 的 DEFAULTS["min_snr_gamma"]=0.0、
+        # argparse `--min-snr-gamma` default=0.0）。以前这里默认 5.0：只写
+        # `loss_weighting_scheme: min_snr` 不写 gamma 时 GPU 不加权、TPU 加
+        # min(5/snr,1) —— 同一份 yaml 在两个后端上不是同一个实验。
+        min_snr_gamma=_f(d, "min_snr_gamma", 0.0),
         detail_inv_t_min=_f(d, "detail_inv_t_min", 1.0),
         detail_inv_t_max=_f(d, "detail_inv_t_max", 5.0),
         immiscible_k=(_i(d, "immiscible_k", 4) if _b(d, "immiscible_enabled") else 1),
     )
 
-    # min_snr_gamma<=0 只在 weighting=min_snr 时是错配置（权重恒 0，loss 恒 0，
-    # 不报错）；其它 scheme 不读它，留着无影响。
-    if (fcfg.weighting == "min_snr" and fcfg.min_snr_gamma <= 0):
+    # `min_snr_gamma <= 0` **不是**错配置：PyTorch 侧 `compute_loss_weight` 的
+    # min_snr / max_snr_inv 两个分支都在 `min_snr_gamma <= 0` 时 `return ones_like(t)`
+    # （trainer/objective.py 的 `compute_loss_weight`，:1112-1121 附近，行号可能漂移，
+    # 以符号名为准），即"退化成不加权"，而不是权重恒 0。
+    # 以前这里 raise，反而拦掉了 GPU 上完全合法的 `min_snr + 默认 gamma(0.0)` 组合
+    # —— 从 GPU 侧拷 yaml 过来必撞。TPU 侧 `flow.loss_weight` 已同口径退化成 ones，
+    # 所以这里不再拦，只在真的会静默失效时提示（gamma<0 是笔误的强信号）。
+    if fcfg.weighting == "min_snr" and fcfg.min_snr_gamma < 0:
         raise ValueError(
-            f"loss_weighting_scheme=min_snr 但 min_snr_gamma={fcfg.min_snr_gamma}："
-            f"权重 = min(gamma/snr, 1) 会恒为 0，loss 恒 0 且看起来一切正常。"
-            f"PyTorch 侧默认 5.0。")
+            f"min_snr_gamma={fcfg.min_snr_gamma} < 0 无意义（权重 = min(gamma/snr, 1)）。"
+            f"想要不加权就设 0（与 PyTorch 侧默认一致，两边都退化成 ones）；"
+            f"想要真的加权请给正值（论文常用 5.0）。")
 
     aux = X.AuxConfig(
         eisbach_lambda=_f(d, "eisbach_lambda"),
@@ -372,11 +472,21 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
         adapter=acfg, targets=targets,
         remat=("full" if _b(d, "grad_checkpoint", True) else "none"),
         grad_accum=max(_i(d, "grad_accum", 1), 1),
-        seed=_i(d, "seed", 0),
+        seed=_i(d, "seed", 42),         # GPU: DEFAULTS/argparse 都是 42
         flow=fcfg, aux=aux, adamw=adamw,
     )
 
-    total_budget = _i(d, "navit_token_budget", 16384)
+    # navit_token_budget 不给默认值：它是**全局** token 预算，直接决定单卡显存能否
+    # 装下（K2 真机账：131072 撞 HLO temporaries 18.15G、98304 撞 executable reserve
+    # 11.94G、81920 才跑通）。以前默认 16384 -> 单卡 2048，恰好整除、不报错，于是漏写
+    # 这个键的 yaml 会静默跑一个极小预算的实验。
+    if d.get("navit_token_budget") in (None, 0, ""):
+        raise ValueError(
+            "必须显式设 navit_token_budget（**全局** token 预算，8 卡各拿 1/8）："
+            "它直接决定显存能否装下，没有一个安全的默认值。K2 真机已验工作点 "
+            "81920（= 8 x 10240）；Anima 纯 DP 路线 131072（= 8 x 16384）。"
+            "开训前请跑 tests/enum_quantum_advisor.py 看这个数据集的账。")
+    total_budget = _i(d, "navit_token_budget", 0)
     if total_budget % devices:
         raise ValueError(
             f"navit_token_budget={total_budget} 不能被 {devices} 卡整除。"
@@ -391,7 +501,6 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
         output_name=str(d.get("output_name", "anima-tpu")),
         family=family,
         devices=devices, budget=total_budget // devices,
-        max_images_per_pack=_i(d, "navit_max_images_per_pack", 0),
         repeats=max(_i(d, "repeats", 1), 1),
         multiscale=_b(d, "navit_multiscale"),
         ms_loss_weight=_f(d, "navit_multiscale_loss_weight", 1.0),
@@ -422,29 +531,49 @@ def _check_coverage(d: Dict[str, Any], allow: bool) -> List[str]:
     for k, v in d.items():
         if k in _UNPORTED:
             pred, why = _UNPORTED[k]
-            if pred(v):
-                on.append(f"  {k} = {v!r}\n      {why}")
+            try:
+                hit = pred(v)
+            except (TypeError, ValueError) as e:
+                # 谓词大多是 `int(v or 0)` / `float(v or 0)` 这类，值写错类型会抛裸的
+                # TypeError/ValueError（`sample_every: [1]` -> "int() argument must be
+                # a string..."），不带键名，用户看不出是哪个字段。补上键名。
+                raise ValueError(
+                    f"yaml 键 {k!r} 的值 {v!r} 类型不对，无法判定该功能是否开启："
+                    f"{type(e).__name__}: {e}") from e
+            if hit:
+                on.append((k, v, why))
             continue
         if k in _HANDLED or k in _CACHE_SIDE or k in _IGNORED:
             continue
-        if k.startswith("sample_"):          # 采样出图的一整族，由 sample_every 统管
+        if k.startswith("sample_"):
+            # 采样出图的一整族。**三个触发器（sample_every / sample_steps /
+            # sample_reference_steps）已各自在 _UNPORTED 里**，上面那个分支先命中，
+            # 所以这条豁免只兜住 sample_prompt / sample_steps_count 之类的纯参数。
             continue
         if any(k.startswith(pre) for pre, _ in _FAMILY):
-            continue                         # 未移植功能的子参数，主开关那条已经管了
+            # 未移植功能的子参数，主开关那条已经管了。
+            # **已知盲区**：这是前缀匹配，所以也会吞掉拼写错误（任何 `tread_` /
+            # `lwd_` / `dispersive_` 开头的错拼键都不会被报出来）。GPU 侧对此有
+            # difflib.get_close_matches 的拼写提示，TPU 这条豁免把那个能力关掉了。
+            # 换成显式白名单能恢复，代价是要维护那 30 来个子参数名。
+            continue
         unknown.append(k)
     if unknown:
         raise ValueError(
             "yaml 里有 TPU 后端不认识的键：\n  " + ", ".join(sorted(unknown))
             + "\n它们可能是新加的功能。这里不静默忽略 —— 请把它们归到 config.py 的"
               " _HANDLED / _CACHE_SIDE / _IGNORED / _UNPORTED 之一，"
-              "顺便确认它是不是真的不影响训练数学。")
+              "顺便确认它是不是真的不影响训练数学。\n"
+              "**若它是 GPU 侧真实生效的功能而 TPU 未移植，请补进 _UNPORTED"
+              "（带判定谓词与替代路径），不要塞进 _IGNORED 或从 yaml 删掉** —— "
+              "那样下一个人就看不出这份 yaml 在两个后端上不是同一个实验了。")
     if on and not allow:
         raise ValueError(
             "以下功能在 yaml 里是开着的，但 TPU 后端没有移植：\n"
-            + "\n".join(on)
+            + "\n".join(f"  {k} = {v!r}\n      {why}" for k, v, why in on)
             + "\n\n要么在 yaml 里关掉它们（那样两个后端才是同一个实验），"
               "要么传 --allow-unported 明确接受这份差异。")
-    return [x.strip().split(" =")[0] for x in on]
+    return [k for k, _, _ in on]
 
 
 def _check_navit(d: Dict[str, Any], family: str = "anima") -> None:

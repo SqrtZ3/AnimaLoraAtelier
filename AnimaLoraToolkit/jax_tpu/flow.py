@@ -191,11 +191,37 @@ def t_range_clip(t, cfg: FlowConfig, xp=jnp):
     return xp.clip(t, lo, hi)
 
 
-def finish_t(t, cfg: FlowConfig, xp=jnp):
-    """≡ `apply_timestep_schedule_shift` + `apply_t_range`（objective.py:307/329）。"""
+def _sched_shifted(t, cfg: FlowConfig):
+    """只做 shift 变换本身（无任何 clamp）—— schedule_shift 公式的**唯一**出处。
+
+    `schedule_shift_only` 与 `finish_t` 都从这里取公式，避免两份平行实现漂移
+    （漂了不报错，只是两条 t 路径悄悄不同）。
+    """
     if abs(cfg.schedule_shift - 1.0) > 1e-6 and cfg.schedule_shift > 0:
-        t = _shift(t, cfg.schedule_shift)
-    return t_range_clip(t, cfg, xp)
+        return _shift(t, cfg.schedule_shift)
+    return t
+
+
+def schedule_shift_only(t, cfg: FlowConfig, xp=jnp):
+    """≡ `apply_timestep_schedule_shift`（objective.py:307，行号可能漂移，以函数名为准）
+    **单独一步**：schedule_shift + 恒定 [EPS, 1-EPS] clamp，**不含** t_range。
+
+    为什么要单独暴露：PyTorch 侧自适应采样器给候选分桶用的正是这一步
+    （`AdaptiveTimestepSampler.sample` 里的 `candidates_final`），**没有** t_range。
+    用 `finish_t` 分桶会在 t_min/t_max 收窄时把候选挤进边界桶（实测数字见
+    sched.py 的 `sample()` 注释），且 factors 的一部分桶永远索引不到。
+    两个口径必须能分开调用。
+    """
+    return xp.clip(_sched_shifted(t, cfg), EPS, 1.0 - EPS)
+
+
+def finish_t(t, cfg: FlowConfig, xp=jnp):
+    """≡ `apply_timestep_schedule_shift` + `apply_t_range`（objective.py:307/329）。
+
+    中间那道 [EPS, 1-EPS] clamp 省掉了：t_range_clip 的窗口本就落在它里面
+    （t_min<=t_max 时），套两次是 no-op。
+    """
+    return t_range_clip(_sched_shifted(t, cfg), cfg, xp)
 
 
 def _finish(t, cfg: FlowConfig, xp):
@@ -419,6 +445,14 @@ def loss_weight(t: jnp.ndarray, cfg: FlowConfig) -> jnp.ndarray:
     if s == "cosmap":
         return 2.0 / (jnp.pi * (1 - 2 * tc + 2 * tc ** 2))
     if s == "min_snr":
+        # gamma <= 0 退化成**不加权**（返回 ones），与 PyTorch 侧
+        # `compute_loss_weight` 的 min_snr 分支逐字一致（`if min_snr_gamma <= 0:
+        # return torch.ones_like(t)`，trainer/objective.py，行号可能漂移，以符号名
+        # 为准）。GPU 侧 `min_snr_gamma` 默认就是 0.0，所以这条分支是常走的 ——
+        # 少了它，只写 `loss_weighting_scheme: min_snr` 的 yaml 在两个后端上是两个
+        # 实验（这边会算出 min(0/snr,1) ≡ 0，loss 恒 0 且不报错）。
+        if float(cfg.min_snr_gamma) <= 0.0:
+            return jnp.ones_like(tc)
         snr = ((1 - tc) / tc) ** 2
         return jnp.minimum(float(cfg.min_snr_gamma) / snr, 1.0)
     # logit_normal：按采样密度的倒数去偏

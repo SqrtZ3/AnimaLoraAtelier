@@ -136,6 +136,25 @@ def _valid_mask(packs) -> np.ndarray:
     return np.asarray(out, np.float32)
 
 
+def _make_sampler(rc) -> "S.AdaptiveTimestepSampler":
+    """构造自适应采样器，**并把 `loss_weight_fn` 接上**。
+
+    `metric=entropy_rate` 的定义是 `π(σ) ∝ ρ(σ)/w(σ)`（论文 Eq.16），那个 `/w(t)`
+    不是可选项 —— PyTorch 侧 `anima_train.py` 构造闭包后必传。以前这里只传 cfg，
+    于是 `sched.factors()` 里那一除被静默跳过：实测（loss ∝ t³、weighting=min_snr
+    gamma=5）最低 t 桶的采样权重差 4.1×、其余桶约 9×，即"同一份 yaml 在两个后端上
+    不是同一个实验"，且没有任何迹象。现在 `AdaptiveTimestepSampler.__init__` 对
+    这个组合 fail-fast，所以漏接会立刻报错而不是悄悄跑偏。
+
+    `w(t)` 取 `flow.loss_weight`（与 device 侧主 loss 加权用的是**同一个函数**，
+    口径不会漂）。`metric != entropy_rate` 时它不被调用，传了也无副作用。
+    """
+    return S.AdaptiveTimestepSampler(
+        rc.adaptive,
+        loss_weight_fn=lambda c: np.asarray(
+            F.loss_weight(jnp.asarray(c, jnp.float32), rc.tcfg.flow), np.float32))
+
+
 def _sample_t(sampler, rng, packs, layout, fcfg, gstep) -> np.ndarray:
     """采本步的 t，**RNG 消费与「补齐到 budget」旧版逐 bit 一致**。
 
@@ -205,6 +224,9 @@ def main(argv=None) -> int:
     rc = C.build(raw, a.devices, a.allow_unported, canvas_hw=ds.canvas_hw)
     rc = replace(rc, quantum=a.quantum,
                  max_steps=(a.max_steps or rc.max_steps))
+    # aux 画布容得下数据集最大网格（`AuxConfig.canvas_hw` 的注记：填小了不报错，
+    # 只让 scatter 越界被丢弃、gather 越界被 clamp -> loss 有限但方向错）。
+    rc.tcfg.aux.verify_canvas(*ds.canvas_hw)
     if rc.eval_every and not rc.eval_t_grid:
         # 以前这里静默不跑 eval（evalset 永远取不到）——开关开着却什么都没发生，
         # 正是本仓库要防的那类。PyTorch 侧 eval 走自己的默认网格。
@@ -270,7 +292,7 @@ def main(argv=None) -> int:
     print(AD.summary(plans, rc.tcfg.adapter))
 
     state = O.init_state(lora)
-    sampler = S.AdaptiveTimestepSampler(rc.adaptive)
+    sampler = _make_sampler(rc)          # 含 loss_weight_fn 接线
     start_step = 0
     if rc.resume_state:
         state = T.load_state(rc.resume_state)
@@ -493,11 +515,13 @@ def _img_tokens_of(packs) -> np.ndarray:
 
 
 def main_k2(a, raw) -> int:
-    from jax.sharding import NamedSharding, PartitionSpec as P
+    from jax.sharding import NamedSharding
 
+    #: 加载时逐张的分片规则 = krea2_jax.fsdp_spec（唯一一份实现；这里曾经是
+    #: 复制粘贴的第三份等价代码 —— 另两份是 train.py 的 fsdp_pspec 回退与
+    #: krea2_jax 自己）。"代理判据够不够用"由下面 check_gather_proxy_safe 单独审计。
     def shard_rule(x):
-        return (P(*([None] * (x.ndim - 1) + ["d"]))
-                if K2.fsdp_shard_pred(x.shape, a.devices) else P())
+        return K2.fsdp_spec(x.shape, "d", a.devices)
 
     # ── 数据先扫（画布尺寸 + fail-fast 清单，与 anima 同一顺序）────────────────
     tmp = C.build(raw, a.devices, a.allow_unported, canvas_hw=(1, 1))
@@ -508,6 +532,9 @@ def main_k2(a, raw) -> int:
     rc = C.build(raw, a.devices, a.allow_unported, canvas_hw=ds.canvas_hw)
     rc = replace(rc, quantum=a.quantum,
                  max_steps=(a.max_steps or rc.max_steps))
+    # aux 画布容得下数据集最大网格（`AuxConfig.canvas_hw` 的注记：填小了不报错，
+    # 只让 scatter 越界被丢弃、gather 越界被 clamp -> loss 有限但方向错）。
+    rc.tcfg.aux.verify_canvas(*ds.canvas_hw)
     if rc.eval_every and not rc.eval_t_grid:
         raise ValueError(
             f"eval_every={rc.eval_every} 但 eval_t_grid 为空：TPU 侧 eval 只在"
@@ -551,11 +578,24 @@ def main_k2(a, raw) -> int:
     # ── 模型与适配器（分片加载：逐张读出即刻 device_put，host 不持全量）────────
     t0 = time.time()
     row_norms: Dict[str, np.ndarray] = {}
+    #: 加载时顺手记下每张的全局形状 —— 分片之后 host 侧就只看得到 spec 了，
+    #: 而下面那条 gather 代理判据的审计要的是**全局**形状。
+    global_shapes: Dict[str, Tuple[int, ...]] = {}
+
+    def _shard_put(name, arr):
+        global_shapes[name] = tuple(arr.shape)
+        return NamedSharding(mesh, shard_rule(arr))
+
     params, mcfg = K2.load_safetensors_krea2(
         str(rc.transformer_path), dtype=rc.tcfg.dtype,
-        shard_put=lambda name, arr: NamedSharding(mesh, shard_rule(arr)),
-        row_norms_out=row_norms)
+        shard_put=_shard_put, row_norms_out=row_norms)
     params = K2.stack_blocks(params, mesh)
+    # K2 的训练路径不传 fsdp_sharded 布尔树，靠 shard_map 体内的**局部形状代理**
+    # 判断该不该 all_gather。代理只在"全局末维能被 devices² 整除"时与真相等价
+    # （ndev=8 + 发布构型满足；16 卡就漏，gather 被静默跳过 = dense 拿 1/16 的
+    # 权重乘全宽激活）。在这里一次性审计，别等真机跑出个"看起来不太对"的 loss。
+    K2.check_gather_proxy_safe(global_shapes, rc.devices,
+                               where=f"krea2 FSDP 加载（{rc.devices} 卡）")
     print(f"底模载入 {time.time()-t0:.1f}s，{mcfg.layers} 块 + txtfusion（scan 路径，"
           f"FSDP 每卡 ~1/{rc.devices}）")
 
@@ -567,7 +607,7 @@ def main_k2(a, raw) -> int:
     print(AD.summary(plans, rc.tcfg.adapter))
 
     state = O.init_state(lora)
-    sampler = S.AdaptiveTimestepSampler(rc.adaptive)
+    sampler = _make_sampler(rc)          # 含 loss_weight_fn 接线
     start_step = 0
     if rc.resume_state:
         state = T.load_state(rc.resume_state)

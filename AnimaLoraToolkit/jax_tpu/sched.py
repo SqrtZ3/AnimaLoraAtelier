@@ -1,12 +1,13 @@
-"""自适应 timestep 重采样（host 侧），对齐 `trainer/objective.py:358`
-`AdaptiveTimestepSampler`。
+"""自适应 timestep 重采样（host 侧），对齐 `trainer/objective.py`
+`AdaptiveTimestepSampler`（:358，**行号可能漂移，以符号名为准**）。
 
 ## 为什么在 host 上
 
 它是一个**反馈闭环**：上一步各图的裸 loss -> 按 t 分桶的 EMA -> 逐桶重采样权重
--> 这一步的 t。状态只有 `bins`(=8) 个标量，但每步要读上一步的结果 —— 放进 jit
-就得把它做成 carry 并让 t 采样也进图，得不偿失。逐图 loss 回 host 是 [G] 个
-float32（G≈6），一步几十字节。
+-> 这一步的 t。状态只有 `bins` 个标量（`AdaptiveConfig.bins` 默认 16，与 PyTorch
+侧 argparse 的 `adaptive_timestep_bins` 同值；本仓库的 TPU yaml 多用 8），但每步
+要读上一步的结果 —— 放进 jit 就得把它做成 carry 并让 t 采样也进图，得不偿失。
+逐图 loss 回 host 是 [G] 个 float32（G≈6），一步几十字节。
 
 ## metric=slope（本配方用的这个）
 
@@ -66,10 +67,16 @@ class AdaptiveConfig:
     highfreq_weight: float = 0.25       # 只在 highfreq/mixed 下有意义（未移植）
 
     def __post_init__(self):
+        # metric 只在**开着的时候**校验：`adaptive_timestep: false` +
+        # `metric: highfreq` 在 GPU 侧是合法的死配置（PyTorch 侧 metric 的白名单
+        # 校验在 `AdaptiveTimestepSampler.__init__` 里，但 enabled=False 时那条路
+        # 上的值根本不被读），TPU 侧要是照样 raise，就变成"关着的功能也拦人"。
+        if not self.enabled:
+            return
         if self.metric in _NOT_PORTED:
             raise ValueError(
                 f"adaptive_timestep_metric={self.metric!r} 需要逐图高频 loss 信号"
-                f"（trainer/objective.py:per_sample_highfreq_loss），TPU 后端尚未移植。"
+                f"（trainer/objective.py `per_sample_highfreq_loss`），TPU 后端尚未移植。"
                 f"可选 {METRICS}；想要它就先移植那个信号，别让它悄悄退回 raw。")
         if self.metric not in METRICS:
             raise ValueError(f"adaptive_timestep_metric 只支持 {METRICS}，"
@@ -77,7 +84,8 @@ class AdaptiveConfig:
 
 
 class AdaptiveTimestepSampler:
-    """objective.py:358 的 numpy 复刻。`enabled=False` 时是纯透传。"""
+    """`objective.py` `AdaptiveTimestepSampler` 的 numpy 复刻（:358，行号可能漂移，
+    以符号名为准）。`enabled=False` 时是纯透传。"""
 
     def __init__(self, cfg: AdaptiveConfig,
                  loss_weight_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None):
@@ -94,10 +102,31 @@ class AdaptiveTimestepSampler:
         self.max_factor = max(float(cfg.max_factor), self.min_factor)
         self.base_mix = min(max(float(cfg.base_mix), 0.0), 1.0)
         self.candidate_mult = max(int(cfg.candidate_mult), 1)
+        # 闸门参数的下界与 PyTorch 侧同（`AdaptiveTimestepSampler.__init__`：
+        # `gate_n = max(float(gate_n or 0), 1e-3)` / `gate_c = max(..., 1e-6)`）。
+        # 少了这两个 clamp 会静默坏掉而不报错：gate_c=0 -> c^n=0 -> gate ≡ 1（闸门
+        # 等于没开）；gate_n<0 -> t^n 单调**递减** -> 闸门方向反过来（本该压低噪端，
+        # 变成压高噪端）。
+        self.gate_n = max(float(cfg.gate_n or 0.0), 1e-3)
+        self.gate_c = max(float(cfg.gate_c or 0.0), 1e-6)
         self.loss_ema = np.zeros(self.bins, np.float32)
         self.loss_ema_slow = np.zeros(self.bins, np.float32)
         self.counts = np.zeros(self.bins, np.int64)
         self.loss_weight_fn = loss_weight_fn
+        # entropy_rate 的公式是 π(σ) ∝ ρ(σ)/w(σ)（论文 Eq.16），那个 /w(t) 不是
+        # 可选项。PyTorch 侧 anima_train.py 构造 `_loss_weight_fn` 闭包后**必传**；
+        # 这里若为 None，那一除会被静默跳过 —— 实测（loss ∝ t³、weighting=min_snr
+        # gamma=5）最低 t 桶采样权重差 4.1×、其余桶 ~9×，也就是"同一份 yaml 在两个
+        # 后端上不是同一个实验"，而且没有任何迹象。所以宁可构造期就报错。
+        if cfg.enabled and cfg.metric == "entropy_rate" and loss_weight_fn is None:
+            raise ValueError(
+                "adaptive_timestep_metric=entropy_rate 必须传 loss_weight_fn："
+                "该 metric 的定义是 π(σ) ∝ ρ(σ)/w(σ)（objective.py `factors()` 的 "
+                "entropy_rate 分支除以 `self.loss_weight_fn(bin_centers)`），"
+                "少了 /w(t) 那一除，t 的分布与 GPU 侧同 yaml **不是同一个实验**"
+                "（实测最低 t 桶权重差 4.1×，其余桶约 9×），且不会有任何报错。"
+                "接线见 run_train.py："
+                "loss_weight_fn=lambda c: np.asarray(F.loss_weight(jnp.asarray(c), rc.tcfg.flow))。")
 
     # ── 反馈 ──────────────────────────────────────────────────────────────────
     @property
@@ -109,7 +138,8 @@ class AdaptiveTimestepSampler:
                        0, self.bins - 1)
 
     def update(self, t: np.ndarray, per_image_loss: np.ndarray) -> None:
-        """喂**裸**逐图 loss（objective.py:1071：slope/raw/entropy_rate 都透传裸值）。
+        """喂**裸**逐图 loss（objective.py `adaptive_timestep_metric_signal`：
+        slope/raw/entropy_rate 都透传裸值；:1059 附近，行号可能漂移，以符号名为准）。
 
         注意"裸"的含义：eisbach 权重、ΔFM 负项、multiscale 权重都**不能**乘进来
         —— 那些是"要不要让这张图影响参数"的旋钮，不是"这个 t 学得怎么样"的度量。
@@ -158,11 +188,12 @@ class AdaptiveTimestepSampler:
         if self.cfg.metric == "entropy_rate":
             centers = (np.arange(self.bins, dtype=np.float32) + 0.5) / float(self.bins)
             rate = losses / np.maximum(centers ** 3, 1e-6)
-            if self.loss_weight_fn is not None:
-                rate = rate / np.maximum(self.loss_weight_fn(centers), 1e-6)
+            # /w(t)：构造期已保证 loss_weight_fn 不是 None（见 __init__ 的 fail-fast），
+            # 这里不再有"静默跳过"的分支。
+            rate = rate / np.maximum(self.loss_weight_fn(centers), 1e-6)
             if self.cfg.low_noise_gate:
-                tn = centers ** self.cfg.gate_n
-                rate = rate * (tn / (tn + float(self.cfg.gate_c) ** self.cfg.gate_n))
+                tn = centers ** self.gate_n
+                rate = rate * (tn / (tn + self.gate_c ** self.gate_n))
             rel = rate / max(float(rate.mean()), 1e-8)
         else:
             rel = losses / max(float(losses.mean()), 1e-8)
@@ -188,10 +219,26 @@ class AdaptiveTimestepSampler:
         m = max(cnt * self.candidate_mult, cnt)
         cand = F.base_t_np(rng, m, fcfg, stratified=False)
         # **分桶用 schedule_shift 之后的值、被选中的却是之前的值**——照抄
-        # objective.py:520-525。理由：分桶要与 update() 里的 t 同一口径（那边拿到的
-        # 是训练用的最终 t），而返回值随后还会被统一施加一次 shift。
-        w = self.factors()[self._bin(F.finish_t(cand, fcfg, np))]
-        p = w / max(float(w.sum()), 1e-8)
+        # objective.py `AdaptiveTimestepSampler.sample` 的 `candidates_final`
+        # （:520 附近，行号可能漂移，以符号名为准）。理由：分桶要与 update() 里的 t
+        # 同一口径（那边拿到的是训练用的最终 t），而返回值随后还会被统一施加一次 shift。
+        #
+        # 这里必须是 `schedule_shift_only` 而**不是** `finish_t`：PyTorch 侧只施加
+        # schedule_shift，t_range 是在 `adaptive_ts.sample()` 返回**之后**才作用的
+        # （anima_train.py 里 sample -> apply_timestep_schedule_shift -> (res_shift)
+        # -> apply_t_range 这条链）。多套一层 t_range clip 会把候选挤进边界桶：
+        # 实测 t_min=0.3/t_max=0.7、bins=8、20000 候选时
+        #     TPU（clip 过）: [   0    0 7440 2530 2480 7550    0    0]
+        #     PyTorch      : [2486 2495 2459 2530 2480 2506 2502 2542]
+        # 于是桶 0/1/6/7 的 factors 永远索引不到、桶 2/5 拿到 3× 质量；而 update()
+        # 那侧喂的是被 clip 的最终 t，counts 必有空桶 -> `ready` 恒 False -> 整个
+        # 自适应静默退回 base。两种失效模式二选一，都不报错。
+        w = self.factors()[self._bin(F.schedule_shift_only(cand, fcfg, np))]
+        # p 升到 float64 再归一化：rng.choice 会校验 |sum(p)-1| <= atol(1.49e-8)，
+        # 而 float32 下 m=数千时实测 |sum(p)-1| 最大 1.3e-7 —— 现在没炸只是因为
+        # numpy 内部用了 Kahan 求和，属于贴着容差跑。float64 把余量拉开 ~1e9 倍。
+        w64 = np.asarray(w, np.float64)
+        p = w64 / max(float(w64.sum()), 1e-8)
         chosen = rng.choice(m, size=cnt, replace=True, p=p)
         adapted = cand[chosen]
 

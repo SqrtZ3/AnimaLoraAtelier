@@ -131,6 +131,18 @@ class TrainConfig:
                 "1.01 MB/token，anima-mem-probe V4），必须开 packed_chunk 或 "
                 "packed_barrier 之一才压得住。**full 档也不例外** —— 朴素展开在 "
                 "budget 16384 的 full 档实测就要 20.60G（anima-layout-probe 第一棒）。")
+        if self.packed_barrier and not self.unrolled:
+            # barrier 只在展开分支里插（anima_jax._forward_core 的
+            # `isinstance(params["blocks"], (list, tuple))` 分支）；scan 路径下这个
+            # 参数一路传到底、落进用不到它的 else 分支，**一个 bit 都不变也不提示**。
+            # 而 packed_chunk 单开是真生效的（chunk 分支与 params 布局无关，
+            # 真机实测 scan 下慢 1~5%）—— 两个"正交开关"在这一点上并不对称，
+            # 所以这里明说，不让它静默无效（run_train.py 的 eval 那处同一教训）。
+            raise ValueError(
+                "packed_barrier 只在展开路径（unrolled）下生效 —— scan 路径的块边界"
+                "由 lax.scan 自己隔开，barrier 参数会被静默忽略（不报错、不改数值、"
+                "也没有任何提示）。请同时给 --unrolled，或去掉 --packed-barrier。"
+                "注意 packed_chunk 不同：它单开是真生效的（scan 下实测慢 1~5%）。")
 
 
 # ── 初始化 ────────────────────────────────────────────────────────────────────
@@ -319,6 +331,19 @@ def make_grad_fn(model_cfg: A.AnimaConfig, tcfg: TrainConfig, plans, layout: Lay
     g = layout.n_seg
     # chunk 化调制：段长的 gcd 是能用的最大 chunk（更大就会跨图 -> 调制静默用错 t）。
     chunk = layout.max_chunk if tcfg.packed_chunk else None
+    if chunk is not None:
+        # `forward_packed` 只校验总长能被 chunk 整除，段长整除性它查不了（收的是
+        # mod_index 而不是 seg_lens）。但这里 seg_lens 是编译期已知的 python 元组，
+        # 所以这个 host 侧断言是免费的 —— 而漏掉它的后果是"某个 chunk 跨两张图、
+        # 调制静默用错图的 t，不报错、训练照跑、结果全错"（见 anima_jax.forward_packed
+        # 的 chunk 一节）。max_chunk 按定义是 gcd，正常永远成立；这条拦的是将来有人
+        # 手改 chunk 来源的情况。
+        bad = [s for s in layout.seg_lens if s % chunk]
+        if bad:
+            raise ValueError(
+                f"chunk={chunk} 不整除段长 {bad[:4]}：某个 chunk 会跨两张图，AdaLN "
+                f"调制会静默用错图的 t（不报错，结果全错）。chunk 必须取段长的 gcd "
+                f"（Layout.max_chunk）。")
 
     # **kernel 在 trace 外构造**：它的 MaskInfo 是 jax 数组，在 trace 内构造会变成
     # tracer 并被 _splash_kernel 的 lru_cache 缓存下来，泄漏到下一次 trace
@@ -384,6 +409,40 @@ def make_grad_fn_ragged(model_cfg: A.AnimaConfig, tcfg: TrainConfig, plans, buck
     return _finish_grad_fn(per_shard, mesh, dspec, tcfg, grad)
 
 
+def _fwd_cast(lora, dtype):
+    """把适配器参数降到前向 dtype，**但 `dora` 叶子保 fp32**。
+
+    为什么单独放它：`dora_scale` 是整个适配器里唯一"初值恰为 ‖W‖_row、之后只叠很小
+    增量"的参数，DoRA 的 step-0 中立性正是靠 `dora / merged_row_norm == 1` 精确成立
+    （adapters.py 的 init 从同一个 `base_row_sq` 算两边）。整棵树无差别 astype 会破坏
+    这一条，本地实测（in=out=256, r=16）：
+
+        dora 全 fp32      step-0 输出相对偏差 = 0.000e+00   逐 bit 中立
+        dora 降 bf16      step-0 输出相对偏差 = 1.659e-03   不中立
+
+    而且 T1 闸门比的是 loss（偏差仅 2e-7），放过了它 —— 问题在输出域。
+
+    第二重后果更要紧：bf16 在 ‖W‖ 量级上的 ulp 约 0.62%，
+
+        ‖W‖=5.0  -> ulp 0.0312，lr=1e-4 要约  312 步才在前向可见
+        ‖W‖=20.0 -> ulp 0.1250，lr=1e-4 要约 1250 步
+
+    即 master 上学到的幅度增量在越过半个 ulp 之前对前向完全不可见，典型 run
+    （数百~千步）下 DoRA 的幅度分量近似冻死。
+
+    这不是新口径：`export.py` 与 `trainer/lora.py` 的 state_dict 都坚持把 dora_scale
+    存 fp32，理由就是"降 bf16 会让幅度增量的最大相对误差 ~50%"。PyTorch 侧前向也是
+    fp32（`LoRALinear.forward` 里的 `.float()`）。存盘认了这个理，前向不该再 round 掉。
+
+    代价：`dora` 是 [L, out] 的小张量（r32 全目标下几 MB），可忽略。
+    """
+    def cast(path, x):
+        last = path[-1]
+        name = getattr(last, "key", None) or getattr(last, "name", None)
+        return x if name == "dora" else x.astype(dtype)
+    return jax.tree_util.tree_map_with_path(cast, lora)
+
+
 def _finish_grad_fn(per_shard, mesh, dspec, tcfg: TrainConfig, grad: bool = True):
     from jax.sharding import PartitionSpec as P
 
@@ -397,7 +456,7 @@ def _finish_grad_fn(per_shard, mesh, dspec, tcfg: TrainConfig, grad: bool = True
     if not grad:
         @jax.jit
         def eval_fn(lora, consts, params, b, key):
-            fwd = jax.tree.map(lambda x: x.astype(tcfg.dtype), lora)
+            fwd = _fwd_cast(lora, tcfg.dtype)
             loss, per = loss_fn(fwd, consts, params, b, key)
             return loss, per, None
         return eval_fn
@@ -406,7 +465,7 @@ def _finish_grad_fn(per_shard, mesh, dspec, tcfg: TrainConfig, grad: bool = True
     def grad_fn(lora, consts, params, b, key):
         # lora/params 在 in_spec P() 上是复制的 -> 它们的余切在 shard_map 转置时
         # 自动 psum，即适配器梯度的 8 卡 all-reduce 已含在这一步里。
-        fwd = jax.tree.map(lambda x: x.astype(tcfg.dtype), lora)
+        fwd = _fwd_cast(lora, tcfg.dtype)
         (loss, per), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             fwd, consts, params, b, key)
         return loss, per, grads
@@ -693,12 +752,17 @@ def make_grad_fn_k2(model_cfg: K2.Krea2Config, tcfg: TrainConfig, plans,
     rf_attn = AT.make_splash_attn(txtc, txtc, model_cfg.txtheads,
                                   model_cfg.txt_head_dim, interpret=interpret)
     # GQA：splash 只认等头数，KV 头在内核外 repeat_interleave 展开（krea2_jax
-    # 的 wrap_attn_gqa；与 torch 侧 repeat_interleave 逐 bit 相同）
+    # 的 wrap_attn_gqa；与 torch 侧 repeat_interleave 逐 bit 相同）。
+    # refiner 也要套：发布构型 txtheads == txtkvheads == 20 时 expand_gqa 是恒等
+    # return（krea2_jax.py:230-231），零代价；但 _infer_config 推得出
+    # txtkvheads != txtheads 的构型，那时 20 头 q / N 头 kv 直接喂给只认等头数的
+    # splash 就错了。套上就永远对。
     main_gqa = K2.wrap_attn_gqa(main_attn, model_cfg.heads)
+    rf_gqa = K2.wrap_attn_gqa(rf_attn, model_cfg.txtheads)
 
     def per_shard(lora, consts, params, b, key):
         self_fn = AT.bind_segments(main_gqa, b["seg_self"][0], b["seg_self"][0])
-        rf_fn = AT.bind_segments(rf_attn, b["txt_fine"][0], b["txt_fine"][0])
+        rf_fn = AT.bind_segments(rf_gqa, b["txt_fine"][0], b["txt_fine"][0])
         one = {k: v[0] for k, v in b.items()}
         kk = jax.random.fold_in(key, jax.lax.axis_index(mesh_axis))
         loss, per = local_loss_k2(lora, consts, params, one, model_cfg, tcfg,
@@ -717,7 +781,8 @@ def make_grad_fn_k2(model_cfg: K2.Krea2Config, tcfg: TrainConfig, plans,
 def _finish_grad_fn_k2(per_shard, mesh, pspec, dspec, tcfg: TrainConfig,
                        grad: bool = True):
     """k2 版 _finish_grad_fn：唯一差别是 params 的 in_spec 是分片树（pspec），
-    其余（lora/consts 复制、梯度转置自动 psum、eval 降 dtype）与 Anima 相同。"""
+    其余（lora/consts 复制、梯度转置自动 psum、前向降 dtype 但 dora 保 fp32）
+    与 Anima 相同。"""
     from jax.sharding import PartitionSpec as P
 
     smapped = _shard_map(per_shard, mesh,
@@ -730,14 +795,14 @@ def _finish_grad_fn_k2(per_shard, mesh, pspec, dspec, tcfg: TrainConfig,
     if not grad:
         @jax.jit
         def eval_fn(lora, consts, params, b, key):
-            fwd = jax.tree.map(lambda x: x.astype(tcfg.dtype), lora)
+            fwd = _fwd_cast(lora, tcfg.dtype)          # dora 保 fp32，见 _fwd_cast
             loss, per = loss_fn(fwd, consts, params, b, key)
             return loss, per, None
         return eval_fn
 
     @jax.jit
     def grad_fn(lora, consts, params, b, key):
-        fwd = jax.tree.map(lambda x: x.astype(tcfg.dtype), lora)
+        fwd = _fwd_cast(lora, tcfg.dtype)              # dora 保 fp32，见 _fwd_cast
         (loss, per), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             fwd, consts, params, b, key)
         return loss, per, grads

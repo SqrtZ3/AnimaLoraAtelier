@@ -33,8 +33,18 @@ scan 要求每块的参数**形状相同**。
   * 它们收到的梯度**恒为 0**（乘 0 的链式法则），不会偷偷学到东西；
   * 导出时按各块自己的 `rank_l` 切片，产物与 PyTorch 侧逐块 rank 的文件完全同形。
 
-代价是显存/带宽按 rmax 记（r=16 的块也占 64 列）。r32 全目标下多出来的这部分
-约 20MB fp32 master，相对 552MB 的优化器状态可以忽略。
+代价是显存/带宽按 rmax 记（r=16 的块也占 64 列）。**这笔账取决于 rank 倾斜程度，
+不能一句"可忽略"了事** —— 本地按仓库里真实 yaml 配方实测：
+
+    train_char.yaml（blocks 14-20 → r16、其余 r32，标准 LoRA）
+        有效 40.14M / 实分配 45.88M   多 23MB fp32 master（含 m+v 69MB）
+    train_fdy_csflow.yaml（lokr f4，r64/48/16 三档）
+        有效 14.63M / 实分配 20.65M   **+41%**（多 72MB）
+    同一套 reg_dims 换标准 LoRA
+        有效 58.49M / 实分配 82.58M   多 289MB
+
+统一 rank 时两者相等。`summary()` 会把这两个数并排打出来（有效参数 = 导出件体积、
+实分配 = 显存），上真机前看那一行。
 
 ## 掩码乘在哪一侧要紧
 
@@ -96,6 +106,24 @@ class AdapterConfig:
             raise ValueError(f"rank_dropout 必须在 [0,1)，得到 {self.rank_dropout}")
         if not (0.0 <= self.module_dropout < 1.0):
             raise ValueError(f"module_dropout 必须在 [0,1)，得到 {self.module_dropout}")
+        if self.alpha is not None and not (self.alpha > 0.0):
+            # scaling = alpha/rank，alpha=0 让适配器输出恒 0 —— loss 照降（底模本身
+            # 有能力）、gnorm 恒 0、导出件 ΔW≡0，跑完几千步才发现。yaml 写
+            # `lora_alpha: 0` 会走到这里（`_f` 对显式 0 返回 0.0，不是 None）。
+            raise ValueError(
+                f"lora_alpha={self.alpha} 必须 > 0：scaling = alpha/rank，alpha=0 时"
+                f"适配器输出恒 0，整轮训练什么都学不到且不报错。想要 scaling=1 请"
+                f"不写 lora_alpha（或写 null），那样 alpha 取 rank。")
+        if self.kind == "lokr" and not (self.w1_init_std > 0.0):
+            # kron 对 w2 的梯度正比于 w1（∂/∂w2 kron(w1,w2) 含 w1 因子），w1 全零
+            # 时三个因子的梯度**全部**恒 0，适配器永久死亡。本地实测：
+            #   w1 全零 -> |grad w1| = |grad w2a| = |grad w2b| = 0.0
+            # PyTorch 侧在 LoKrLayer.__init__ 与 LoRAInjector 两处都硬拦
+            # （trainer/lora.py，搜 `w1_init_std`）。
+            raise ValueError(
+                f"lokr_w1_init_std={self.w1_init_std} 必须 > 0：kron 对 w2 的梯度"
+                f"正比于 w1，w1 全零则三个因子梯度全为 0 —— 适配器永久空转，"
+                f"loss 曲线看起来正常但 gnorm 恒 0、导出件是个空 LoRA。")
 
     @property
     def uses_dropout(self) -> bool:
@@ -159,6 +187,33 @@ class TargetPlan:
         return tuple(a / r for a, r in zip(self.alphas, self.ranks))
 
 
+def cap_rank_alpha(r: int, a: float, cap: int) -> Tuple[int, float]:
+    """把 rank 夹到结构上限 `cap`，**alpha 同比例夹**，于是 `scale = alpha/rank` 不变。
+
+    为什么 alpha 必须跟着夹：`TargetPlan.scales` 是 `alpha / cap 后的 rank`，只夹
+    rank 会让缩放被放大 `r/cap` 倍。真实命中过 —— krea2 的 `txtfusion.projector`
+    是 `Linear(12→1)`，cap=1，而 rank=32/alpha=32：
+
+        修前  rank_eff=1  alpha=32  scale=32     <- 其它层都是 1
+        修后  rank_eff=1  alpha=1   scale=1
+
+    PyTorch 侧标准 LoRA **不夹 rank**（`trainer/lora.py` 的 `LoRALayer.__init__`：
+    `self.rank = rank` / `self.scaling = alpha / rank`，退化层只回退 SVD 类 init 并
+    warning），所以那边这一层的 scale 恒是 `alpha/rank`。夹了 rank 又不夹 alpha =
+    同一份 yaml 在这一层上等效学习率差 `r/cap` 倍（projector 上是 32×），
+    不报错、不体现在导出文件里，只体现在"这一层收敛快 32 倍"——A/B 不可比。
+
+    夹 alpha 而不是"不夹 rank"，是因为 TPU 侧的 scan 布局按 `rmax` 分配
+    `[L, out_dim, rmax]`，rank > min(in,out) 的退化层白占显存且低秩分解已无意义；
+    夹住并保住 scale 是代价最小的一致化。导出侧 `unstack_named` 写的是 `pl.alphas[i]`
+    （即夹后的 alpha），推理端按 `alpha/rank` 算出的 scale 与训练时逐位相同。
+    """
+    r_new = max(1, min(int(r), int(cap)))
+    if r_new == r:
+        return r_new, float(a)
+    return r_new, float(a) * r_new / float(r)
+
+
 def plan_targets(model_cfg, cfg: AdapterConfig,
                  targets: Sequence[str]) -> Dict[str, TargetPlan]:
     """按 reg_dims / reg_alphas 解析出每个 target 在每块上的 rank/alpha/factor。
@@ -186,7 +241,7 @@ def plan_targets(model_cfg, cfg: AdapterConfig,
             r = int(resolve_reg(cfg.reg_dims, name, cfg.rank))
             a = float(resolve_reg(cfg.reg_alphas, name,
                                   cfg.alpha if cfg.alpha is not None else cfg.rank))
-            r = max(1, min(r, cap))
+            r, a = cap_rank_alpha(r, a, cap)
             ranks.append(r)
             alphas.append(a)
         out[t] = TargetPlan(t, i_f, o_f, tuple(ranks), tuple(alphas), f, in_dim, out_dim)
@@ -496,21 +551,40 @@ def summary(plans: Dict[str, TargetPlan], cfg: AdapterConfig) -> str:
              + f" variant={cfg.variant} rank_dropout={cfg.rank_dropout}"
              f" module_dropout={cfg.module_dropout}"]
     total = 0
+    alloc = 0                    # 按 rmax 的**实分配**（scan 布局的真实显存口径）
     for t, pl in sorted(plans.items()):
         uniq = sorted(set(pl.ranks))
+        cap_note = ""
         if cfg.kind == "lokr":
-            per = [pl.factor ** 2 + pl.out_dim * r + r * pl.in_dim for r in pl.ranks]
+            mk = lambda r: pl.factor ** 2 + pl.out_dim * r + r * pl.in_dim
             note = (f"f={pl.factor}" + ("" if pl.factor == cfg.factor
                                         else f"(请求 {cfg.factor}，已下调)")
                     + f" {pl.out_dim}x{pl.in_dim}")
+            struct_cap = min(pl.in_dim, pl.out_dim)
         else:
-            per = [(pl.in_features + pl.out_features) * r for r in pl.ranks]
+            mk = lambda r: (pl.in_features + pl.out_features) * r
             note = f"{pl.out_features}x{pl.in_features}"
+            struct_cap = min(pl.in_features, pl.out_features)
+        per = [mk(r) for r in pl.ranks]
+        per_alloc = [mk(pl.rmax)] * len(pl.ranks)
         if cfg.variant == "dora":
             per = [x + pl.out_features for x in per]
+            per_alloc = [x + pl.out_features for x in per_alloc]
+        if pl.rmax >= struct_cap and cfg.rank > struct_cap:
+            # rank 被结构上限夹过 -> alpha 已同比例夹（cap_rank_alpha），scale 不变
+            cap_note = f" [rank 被 min(in,out)={struct_cap} 夹，alpha 已同比例夹]"
         total += sum(per)
+        alloc += sum(per_alloc)
         lines.append(f"  {t:<24} rank {uniq} rmax={pl.rmax:<3} {note} "
-                     f"参数 {sum(per) / 1e6:.2f}M")
-    lines.append(f"  合计可训练参数 {total / 1e6:.2f}M "
-                 f"(fp32 master+m+v ≈ {total * 12 / 1e9:.2f}GB)")
+                     f"参数 {sum(per) / 1e6:.2f}M{cap_note}")
+    # 两个数都要报：**有效参数**是导出件体积，**实分配**是显存。scan 布局按
+    # `[L, out_dim, rmax]` 分配（init_from_plans），rank 倾斜的配方下两者差得不小
+    # —— 本地实测 train_fdy_csflow.yaml 的 lokr 三档配方差 +41%（14.63M vs
+    # 20.65M）、标准 LoRA 同配方差 289MB。v5e 单 chip 15.7GiB、K2 executable
+    # 常驻 ~12G 的情况下，这个口径误差不是可忽略的。
+    lines.append(f"  合计可训练参数 {total / 1e6:.2f}M（导出件口径）")
+    lines.append(f"  实分配（scan 按 rmax） {alloc / 1e6:.2f}M "
+                 f"= fp32 master+m+v ≈ {alloc * 12 / 1e9:.2f}GB"
+                 + ("" if alloc == total
+                    else f"（比有效参数多 {(alloc / total - 1):.0%}，rank 倾斜所致）"))
     return "\n".join(lines)

@@ -11,19 +11,25 @@
     （Krea2 12.16B/22.6GB 必须分片，那套 FSDP 方案在这里是多余的通信。）
   * 文本**不进主序列**，走 cross-attn（q=图像段 / kv=caption 段，块对角是**矩形**的）。
 
-对齐依据（逐条指向 PyTorch 源）：
-  models/anima_modeling_core.py:299  RMSNorm（fp32 归一后乘 weight）
-  models/anima_modeling_core.py:324  GPT2FeedForward（nn.GELU 默认 = erf 精确式，非 tanh）
-  models/anima_modeling_core.py:436  Attention（q/k_norm 是**逐 head_dim** RMSNorm eps=1e-6）
-  models/anima_modeling_core.py:277  RoPE（rotate_half 式，cos/sin 转成 t.dtype 后相乘）
-  models/anima_modeling_core.py:719  Timesteps（cat[cos, sin]，注意 cos 在前）
-  models/anima_modeling_core.py:742  TimestepEmbedding（use_adaln_lora 时 emb=**原始正弦**，
-                                     MLP 输出走 adaln_lora 这条支路）
-  models/anima_modeling_core.py:967  Block（LayerNorm elementwise_affine=False eps=1e-6）
-  models/anima_modeling_core.py:1174 Block.forward_tokens（三组 AdaLN + mod_index gather）
-  models/anima_modeling_core.py:926  FinalLayer.forward_tokens（2 chunk，取 adaln_lora 前 2D）
-  models/anima_modeling_core.py:1663 _packed_rope_from_grid（cat[t,h,w]*2，t 段恒 0）
-  models/anima_modeling_core.py:1774 forward_packed_navit（整体装配）
+对齐依据（逐条指向 PyTorch 源，全部在 `models/anima_modeling_core.py` 里）。
+
+**锚点是函数名/类名，行号只是辅助**：本文件上一版这一批引用写的是纯行号，PyTorch
+侧插了一段代码后**十余处集体漂了 +83 行**（例如 `:1174` 实际已经是 `:1257`），逐条
+修行号只会再漂一次。所以下表以符号名为准，行号带 `~` 表示"写这行注释时的位置"；
+对不上就用 `grep -n "def forward_tokens" models/anima_modeling_core.py` 重新定位。
+
+  RMSNorm._norm / RMSNorm.forward       fp32 归一、type_as(x) 回原 dtype、再乘 weight  ~:391
+  GPT2FeedForward.__init__              nn.GELU() 默认 = erf 精确式，**不是** tanh 近似 ~:410
+  Attention.__init__                    q_norm/k_norm 是**逐 head_dim** RMSNorm eps=1e-6 ~:576
+  _apply_rotary_pos_emb_base            RoPE（rotate_half 式，cos/sin 转成 t.dtype 再乘）~:365
+  Timesteps.forward                     cat[cos, sin]，注意 cos 在前                  ~:807
+  TimestepEmbedding.forward             use_adaln_lora 时 emb=**原始正弦**，
+                                        MLP 输出走 adaln_lora 这条支路                ~:847
+  Block.__init__                        LayerNorm elementwise_affine=False eps=1e-6   ~:1084
+  Block.forward_tokens                  三组 AdaLN + mod_index gather                 ~:1257
+  FinalLayer.forward_tokens             2 chunk，取 adaln_lora 前 2D                  ~:1009
+  MiniTrainDIT._packed_rope_from_grid   cat[t,h,w]*2，t 段恒 0                        ~:1746
+  MiniTrainDIT.forward_packed_navit     整体装配                                      ~:1857
 
 本文件只做**前向**，不含优化器/数据/采样——那些留在 PyTorch 侧离线完成。
 """
@@ -62,8 +68,20 @@ class AnimaConfig:
     patch: int = 2
     eps_ln: float = 1e-6            # Block 的 LayerNorm
     eps_qk: float = 1e-6            # q_norm / k_norm
-    eps_rms: float = 1e-5           # t_embedding_norm
-    # RoPE 的 NTK 外推系数。trainer/models.py:156 对 in_channels==16 用 4.0，
+    # t_embedding_norm 的 eps。**1e-6，不是 RMSNorm 的类默认值 1e-5**：
+    # `MiniTrainDIT.__init__` 里写的是 `RMSNorm(model_channels, eps=1e-6)`
+    # （anima_modeling_core.py 的 MiniTrainDIT.__init__，~:1498），实例化时显式传参
+    # 覆盖了 `RMSNorm.__init__(dim, eps=1e-5)` 的默认值。抄默认值就是抄错。
+    #
+    # 写错会怎样：t_embedding_norm 吃的是 timestep_sincos 的输出，而
+    # mean(cat[cos,sin]²) 对任意 t 恒 ≈ 0.5（cos²+sin² 逐通道配对），所以 eps 差值
+    # 不随 t 变化 —— emb 被一个**与 t 无关的常数因子**整体缩放，本地实测相对量
+    # -9.13e-6（理论 -Δeps/(2·0.5) = -9e-6）。这个量级两侧闸门都抓不到：
+    # fp32 对拍闸门 tol=1e-4 差 11 倍，bf16 下小于 1 个 ULP（2⁻⁸ = 3.9e-3）。
+    # 也就是说错了不会被任何现有测试发现，只会让 TPU 与 GPU 的 emb 系统性差一点。
+    eps_rms: float = 1e-6
+    # RoPE 的 NTK 外推系数。trainer/models.py 的 load_anima_model 对 in_channels==16
+    # 用 4.0（`rope_h_extrapolation_ratio=4.0 if in_channels == 16 else 3.0`，~:224），
     # 模型内换算成 ntk_factor = ratio**(dim/(dim-2))，再乘进 theta。
     # 漏掉它不会报错，只会静默改变位置编码频率 —— 必须跟着 checkpoint 走。
     rope_h_ratio: float = 4.0
@@ -84,7 +102,8 @@ def layer_norm(x: jnp.ndarray, eps: float) -> jnp.ndarray:
 
 
 def rms_norm(x: jnp.ndarray, w: jnp.ndarray, eps: float) -> jnp.ndarray:
-    """models/anima_modeling_core.py:308 —— fp32 归一、type_as(x) 回原 dtype、再乘 weight。
+    """`RMSNorm.forward`（models/anima_modeling_core.py，~:394；行号可能漂移，
+    以函数名为准）—— fp32 归一、type_as(x) 回原 dtype、再乘 weight。
 
     注意乘 weight 的顺序：PyTorch 是 `self._norm(x.float()).type_as(x) * self.weight`，
     即**先降回 x.dtype 再乘**。bf16 下这与"fp32 乘完再降"有舍入差异，故照抄顺序。
@@ -122,10 +141,22 @@ def apply_rope(t: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarra
 
 
 def timestep_sincos(t: jnp.ndarray, num_channels: int) -> jnp.ndarray:
-    """models/anima_modeling_core.py:724。**cos 在前、sin 在后**（与 diffusers 相反）。
+    """`Timesteps.forward`（models/anima_modeling_core.py，~:807；行号可能漂移，
+    以函数名为准）。**cos 在前、sin 在后**（与 diffusers 相反）。
 
     exponent = -log(10000) * arange(half) / half —— 分母是 half_dim 本身（不减 1）。
+
+    `t` 必须是 1-D `[G]`（每图一个 timestep）。这条**不是可选的**：下面
+    `t[:, None]` 在 2-D 输入上不会报错，只会广播成 `[G, T, half]` 再 concat 成
+    `[G, T, D]`，后续 dense/rms_norm 全都能算，只有 emb 的 rank 悄悄多了一维，
+    最后靠 mod_bcast 的广播把错误吃掉 —— 结果是错的但没有任何异常。
+    PyTorch 侧同样有硬断言（`assert timesteps_B_T.ndim == 2`，那边是 [B, T] 布局，
+    这里的打包/分桶布局都是逐图一个标量 t，故要求 1-D）。
     """
+    if t.ndim != 1:
+        raise ValueError(f"timestep_sincos 要求 1-D 的 [G] timesteps，得到 shape "
+                         f"{t.shape}（rank {t.ndim}）；2-D 输入会被广播成 [G, T, D] "
+                         f"而不报错，结果静默错误")
     half = num_channels // 2
     exponent = -math.log(10000.0) * jnp.arange(half, dtype=jnp.float32) / float(half)
     emb = t.astype(jnp.float32)[:, None] * jnp.exp(exponent)[None, :]
@@ -135,7 +166,9 @@ def timestep_sincos(t: jnp.ndarray, num_channels: int) -> jnp.ndarray:
 def packed_rope_cos_sin(rows: jnp.ndarray, cols: jnp.ndarray, head_dim: int,
                         h_ratio: float = 4.0, w_ratio: float = 4.0
                         ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """models/anima_modeling_core.py:1663 + :605。
+    """`MiniTrainDIT._packed_rope_from_grid`（models/anima_modeling_core.py，~:1746）
+    + `VideoRopePosition3DEmb.__init__` 的 dim_h/dim_t 切分（~:710）。
+    行号可能漂移，以函数名为准。
 
     head_dim=128 -> dim_h = dim_w = 128//6*2 = 42，dim_t = 128 - 84 = 44。
     emb = cat([t_half(22 个 0), h_half(21), w_half(21)] * 2) -> 128 维。
@@ -148,7 +181,8 @@ def packed_rope_cos_sin(rows: jnp.ndarray, cols: jnp.ndarray, head_dim: int,
     dim_h = head_dim // 6 * 2
     dim_t = head_dim - 2 * dim_h
     spatial_range = jnp.arange(0, dim_h, 2, dtype=jnp.float32)[: dim_h // 2] / dim_h
-    # models/anima_modeling_core.py:644 —— ntk_factor = ratio**(dim/(dim-2))，theta 再乘它
+    # `VideoRopePosition3DEmb.__init__`（~:727）—— ntk_factor = ratio**(dim/(dim-2))，
+    # theta 再乘它（行号可能漂移，以函数名为准）
     h_theta = 10000.0 * (h_ratio ** (dim_h / (dim_h - 2)))
     w_theta = 10000.0 * (w_ratio ** (dim_h / (dim_h - 2)))
     h_freqs = 1.0 / (h_theta ** spatial_range)
@@ -213,27 +247,80 @@ def _lora(ctx, key: str):
 # ── 注意力后端 ────────────────────────────────────────────────────────────────
 def attention_dense(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray,
                     bias: Optional[jnp.ndarray] = None) -> jnp.ndarray:
-    """q: [S, H, D]，k/v: [T, H, D]，bias: [S, T] 加性（0 / -inf）。返回 [S, H, D]。
+    """q: [S, H, D]，k/v: [T, H, D]，bias: [S, T] 加性（可见 0 / 屏蔽 -1e4）。
+    返回 [S, H, D]。
 
     参考实现（本地对拍 + 小规模用）。softmax 在 fp32 上做，与 SDPA 一致。
     O(S·T) 显存，只适合 S·T 不大的场合；大 pack 走 splash（TPU）。
+
+    **`preferred_element_type=jnp.float32` 不是可选的**：`einsum(bf16, bf16)` 的输出
+    dtype 就是 bf16，把 `.astype(fp32)` 放在 einsum **之后**只是把已经截断过的数搬到
+    fp32 —— softmax 本身在 fp32 上算，但喂给它的 logits 已经掉了精度。本地实测
+    （S=T=8, H=2, D=128, 标准正态输入）：对 fp32 参考的相对误差
+    旧写法 2.06e-03 -> 新写法 1.33e-07，**分辨力差 1.5e4 倍**。
+    这个函数是块对角语义的**参考实现**（tests/check_splash_blockdiag.py 拿它当判据，
+    TOL=2e-2 的 bf16 口径），参考实现自己带 2e-3 的噪声会直接吃掉判据分辨力。
+
+    加 `preferred_element_type` 只是把 TPU MXU 本就 fp32 累加的行为写实，不是"多要
+    精度"：JAX Pallas matmul 官方文档明确写 "The native MXU bf16 matmul routine ...
+    accumulates it in f32"。
     """
     d = q.shape[-1]
-    logits = jnp.einsum("shd,thd->hst", q, k).astype(jnp.float32) / math.sqrt(d)
+    logits = jnp.einsum("shd,thd->hst", q, k,
+                        preferred_element_type=jnp.float32) / math.sqrt(d)
     if bias is not None:
         logits = logits + bias[None, :, :]
     w = jax.nn.softmax(logits, axis=-1).astype(v.dtype)
     return jnp.einsum("hst,thd->shd", w, v)
 
 
+#: 块对角 bias 的屏蔽值。**有限负值，不是 -inf** —— 口径同 PyTorch 侧
+#: `MiniTrainDIT._build_packed_masks` 的 `attn_mask.masked_fill(~key_valid, -1.0e4)`
+#: （models/anima_modeling_core.py，~:1807；行号可能漂移，以函数名为准）。
+_MASK_NEG = -1.0e4
+
+
 def block_diag_bias(q_lens: Sequence[int], kv_lens: Optional[Sequence[int]] = None,
                     dtype=jnp.float32) -> jnp.ndarray:
-    """块对角加性 mask：同一图的 q 只看得见同一图的 kv。kv_lens=None 时为自注意力。"""
+    """块对角加性 mask：同一图的 q 只看得见同一图的 kv。kv_lens=None 时为自注意力。
+
+    返回 [ΣQ, ΣKV]，可见位 0.0、屏蔽位 `_MASK_NEG`(-1e4)。
+
+    **为什么屏蔽值是 -1e4 而不是 -inf**：整行全屏蔽时 -inf 会让 softmax 分母为 0 ->
+    输出 NaN -> 反向把 NaN 灌进**全部**适配器梯度（本地实测：段数不匹配的例子里
+    out_has_nan=True / grad_has_nan=True；换成 -1e4 后两者都 False）。有限值下那一行
+    退化成均匀分布 —— 数值是"没意义"，但不会污染整棵梯度树，错能被 loss 看见而不是
+    把训练变成 NaN 空转。段数匹配（正常情形）下两者**逐 bit 相同**（本地对拍
+    max|diff|=0.0），所以这不改任何正常路径的数值。
+    下游 `attention.make_dense_attn`（attention.py:666）用 `== 0.0` 判"可见"，
+    只依赖可见位仍是 0.0，与屏蔽值取什么无关。
+
+    **fp32 而不是 fp64**：`np.where(bool, 0.0, -1.0e4)` 里两个分支是 Python float，
+    numpy 按 float64 出结果，尾巴上的 `dtype` 只作用于之后的 `jnp.asarray` —— 也就是
+    host 上先物化一份 8 字节/元素的中间数组。budget 32768 时那是 8.00 GiB host RAM
+    （fp32 4.00 / bool 1.00）。
+
+    **两个分支传 `np.float32` 标量，而不是在 `np.where(...)` 外面套 `.astype`**：
+    `.astype` 是先算出 fp64 再拷一份 fp32，两份**同时活着**，实测反而更差
+    （n=4096 时 tracemalloc 峰值：fp64 直出 128.00 MiB / 套 astype 192.00 MiB /
+    传 fp32 标量 64.00 MiB）。三者结果逐 bit 相同，所以这里取峰值最低的那个写法。
+    """
     kv_lens = q_lens if kv_lens is None else kv_lens
+    if len(q_lens) != len(kv_lens):
+        # 段数不匹配 = 调用方把 q/kv 的段几何接错了。以前这里不拦：多出来的 q 段
+        # 找不到对应 kv 段 -> 整行屏蔽 -> （-inf 时）NaN 顺着反向灌满全部适配器梯度，
+        # 而 loss 只显示 nan，查不出是段几何错的。fail-fast 在这里就说清楚。
+        raise ValueError(
+            f"q/kv 段数必须一致：len(q_lens)={len(q_lens)} vs "
+            f"len(kv_lens)={len(kv_lens)}。块对角要求第 i 个 q 段对第 i 个 kv 段"
+            f"（自注意力传 kv_lens=None，cross-attn 传每图的文本段长）；"
+            f"段数不等会让多出来的段整行被屏蔽，softmax 退化成均匀分布，"
+            f"训练照跑但结果全错。口径同 PyTorch 侧 _SegLens.__init__ 的同名校验。")
     qi = np.repeat(np.arange(len(q_lens)), np.asarray(q_lens))
     ki = np.repeat(np.arange(len(kv_lens)), np.asarray(kv_lens))
     allow = qi[:, None] == ki[None, :]
-    return jnp.asarray(np.where(allow, 0.0, -np.inf), dtype=dtype)
+    return jnp.asarray(np.where(allow, np.float32(0.0), np.float32(_MASK_NEG)),
+                       dtype=dtype)
 
 
 # ── 单块前向 ──────────────────────────────────────────────────────────────────
@@ -264,7 +351,8 @@ def block_forward(x: jnp.ndarray, p: Dict[str, Any], cfg: AnimaConfig,
                   ctx: jnp.ndarray, cos, sin,
                   self_attn_fn, cross_attn_fn,
                   loras=None, layer: Optional[int] = 0) -> jnp.ndarray:
-    """models/anima_modeling_core.py:1174 的逐算子复刻。
+    """`Block.forward_tokens`（models/anima_modeling_core.py，~:1257；行号可能漂移，
+    以函数名为准）的逐算子复刻。
 
     emb: [G, D] 逐图 timestep 向量；adaln_lora: [G, 3D]。
 
@@ -285,6 +373,15 @@ def block_forward(x: jnp.ndarray, p: Dict[str, Any], cfg: AnimaConfig,
 
     def modulation(name: str):
         h = silu(emb)
+        # **这两个 `_lora(...)` 当前恒为 None，是刻意保留的钩子，不要删**：
+        # TPU 侧 config 层已经把 adaln 挡在门外 —— `adapters.target_shapes`
+        # （adapters.py:132-138）与 `config._expand_targets`（config.py:489-492）的
+        # 全名表里都**没有** adaln 条目，所以 `plan_targets` 见到 "adaln_*" 会直接
+        # fail-fast（adapters.py:174 `未知 target`），键根本进不了 LoraCtx.params。
+        # 保留的理由：PyTorch 侧按模块名子串匹配注入，adaln_modulation 的两个 Linear
+        # 是能被命中的；哪天要把这条打开，必须**同时**在
+        # `adapters.target_shapes`（给 (in, out) 形状）与 `config._expand_targets`
+        # （给全名表）加条目，只加一处会在另一处 fail-fast。
         h = dense(h, p[f"adaln_{name}_1"], _lora(loras, f"{lp}adaln_{name}.1"))
         h = dense(h, p[f"adaln_{name}_2"], _lora(loras, f"{lp}adaln_{name}.2"))
         h = h + adaln_lora                                             # [G, 3D]
@@ -355,6 +452,14 @@ def stack_loras(loras: Optional[Dict[str, Any]], num_blocks: int
 
     要求每个 target 在所有块上都存在且形状一致（本仓库的 LoRA 注入满足这点：
     每块结构相同）。缺块会在这里 fail-fast，而不是在 scan 里变成形状怪错。
+
+    **契约：只支持标准 LoRA 的 `{a, b}` 两个因子**（下面的 `for s in ("a", "b")`
+    是写死的）。LoKr（`{w1, w2a, w2b}`）/ DoRA（多一个 `dora`）进来会 KeyError。
+    这不是遗漏而是分工：训练路径的适配器由 `adapters.init` **直接**产出 scan 布局
+    （每个 target 一份 `[L, ...]`，见 adapters.init_from_plans），根本不需要"先扁平
+    再堆叠"这一步；导出走 `adapters.unstack`（认全部三种因子）。本函数与
+    `unstack_loras` 只服务 `init_lora` 的扁平产物 —— 也就是对拍脚本
+    （tests/check_scan_equiv.py 的 C4 往返、tests/check_export.py）。
     """
     if loras is None:
         return None
@@ -377,7 +482,12 @@ def _slice_ctx(ctx: "LoraCtx", i: int) -> "LoraCtx":
 
 
 def unstack_loras(stacked: Dict[str, Any], num_blocks: int) -> Dict[str, Any]:
-    """stack_loras 的逆运算，导出/取证时用（export.py 吃的是扁平键）。"""
+    """`stack_loras` 的逆运算，对拍/取证时用。
+
+    **同样只认标准 LoRA 的 `{a, b}`**（见 `stack_loras` 的契约说明）。
+    LoKr/DoRA 的导出走 `adapters.unstack` -> `export.adapter_state_dict`
+    （export.py:112 按有没有 `lokr_w1` 自动分流），不要往这里传。
+    """
     return {f"blocks.{i}.{t}": {s: v[s][i] for s in ("a", "b")}
             for t, v in stacked.items() for i in range(num_blocks)}
 
@@ -389,16 +499,25 @@ def unstack_loras(stacked: Dict[str, Any], num_blocks: int) -> Dict[str, Any]:
 REMAT_CHOICES = ("full", "dots", "every2", "none")
 
 
-def resolve_remat(remat):
-    """把 remat 设定翻成 (policy, wrap(fn, layer_idx)->fn)。
+def resolve_remat(remat, unrolled: bool = True):
+    """把 remat 设定翻成 `(mode, wrap(fn, layer_idx) -> fn)`。
+
+    第一个返回值是**规范化后的档位字符串**（不是 checkpoint policy）：
+    `True -> "full"`、`False -> "none"`，其余原样。调用方必须用它而不是原始参数
+    去做分档判断 —— 见 `_forward_core` 里 `mode == "every2"` 那处。
 
       full   每块整个重算——激活最省、算力最贵（原实现，且是当前唯一真机验证过的档）
       dots   保留所有矩阵乘的输出，只重算 norm/激活函数等便宜算子
              （jax.checkpoint_policies.dots_saveable）——省掉绝大部分重算，
-             但要存 q/k/v/attn/mlp 隐藏层，显存涨得最多
+             但要存 q/k/v/attn/mlp 隐藏层，显存涨得最多。
+             **仅展开路径可用**（`unrolled=True`）：scan 下未被 remat 掉的激活会按
+             28 次迭代堆叠（≈1MB/token），budget 16384 必 OOM，故那边 fail-fast。
       every2 隔块 remat：偶数块存、奇数块重算——粗粒度的折中
       none   完全不 remat：最快，但按结构估算需要约 2.2MB/token 的激活
              （**估算值，未实测**），11.8GiB 余量只够约 5k token/chip
+
+    `unrolled`：调用方是不是展开路径。默认 True = 老行为（放行全部档位），
+    scan 路径必须显式传 False 才能拦住 `dots`。
 
     兼容旧签名：True -> "full"，False -> "none"。
     """
@@ -415,6 +534,14 @@ def resolve_remat(remat):
         return remat, (lambda fn, i: jax.checkpoint(fn))
     if remat == "every2":
         return remat, (lambda fn, i: fn if i % 2 == 0 else jax.checkpoint(fn))
+    if not unrolled:
+        # 同 krea2_jax._resolve_remat 对 dots 的处理（那边是 FSDP 全量权重的账，
+        # 这里是 scan 迭代堆叠的账）：语法上曾被放行，真机上是一条静默的死路。
+        raise ValueError(
+            "scan 路径不支持 remat='dots'：dots_saveable 会把 q/k/v/attn/mlp 隐藏层"
+            "留给反向，而 scan 的语义是「未被 remat 掉的激活按 28 次迭代堆叠」"
+            "（≈1MB/token），budget 16384 直接 OOM。"
+            "dots 只在展开路径可用；scan 下请用 'full' 或 'every2'。")
     pol = jax.checkpoint_policies.dots_saveable
     return remat, (lambda fn, i: jax.checkpoint(fn, policy=pol))
 
@@ -530,7 +657,8 @@ def _forward_core(params: PyTree, cfg: AnimaConfig,
                   rows: jnp.ndarray, cols: jnp.ndarray, mod_bcast,
                   self_attn_fn, cross_attn_fn,
                   loras=None, remat="full", barrier: bool = False) -> jnp.ndarray:
-    """models/anima_modeling_core.py:1774 的复刻，**布局无关**。
+    """`MiniTrainDIT.forward_packed_navit`（models/anima_modeling_core.py，~:1857；
+    行号可能漂移，以函数名为准）的复刻，**布局无关**。
 
     `self_attn_fn(q,k,v)` / `cross_attn_fn(q,k,v)` 由调用方注入（稠密 / splash /
     分桶 vmap），段几何被闭包在里面 —— 这样"换布局"只换函数、不动模型代码。
@@ -559,8 +687,16 @@ def _forward_core(params: PyTree, cfg: AnimaConfig,
     # LoRA 键全部匹配不上 -> LoRA 静默失效、梯度恒 0（本地冒烟实测 sum|grad_b|=0）。
     # 这种错不报异常，只会让"训练"变成空转，且 XLA 可能把反向整个 DCE 掉、
     # 使步时假性变快 —— 属于必须靠断言拦住的一类。
-    policy, wrap = resolve_remat(remat)
-    if isinstance(params["blocks"], (list, tuple)):
+    # **返回值第一个是规范化后的档位字符串（mode），不是 checkpoint policy**：
+    # `True -> "full"`、`False -> "none"`。下面 scan 分支的 `mode == "every2"` 必须
+    # 用它，不能用原始的 `remat` 参数 —— 现在两者恰好等价（True/False 都不等于
+    # "every2"），但只要 resolve_remat 将来加任何别名映射（如 "every_two"），
+    # 用原始参数就会静默走错分支（走进普通 scan、悄悄改掉重算策略，不报错）。
+    #
+    # `unrolled` 决定 `dots` 放不放行：scan 下 dots_saveable 必 OOM，见 resolve_remat。
+    unrolled = isinstance(params["blocks"], (list, tuple))
+    mode, wrap = resolve_remat(remat, unrolled=unrolled)
+    if unrolled:
         # 展开路径：逐块单独编译。对拍脚本按块比对需要它，**训练也用得上** ——
         # 但必须配 chunk 或 barrier（见下），否则就是 stack_blocks 注释里那个
         # 1.01 MB/token 的朴素展开（budget 16384 即 OOM）。压住之后它是真机
@@ -606,13 +742,14 @@ def _forward_core(params: PyTree, cfg: AnimaConfig,
             rebuild = lambda lo: lo
         _run = run_block
         run_block = lambda carry, p, lo: _run(carry, p, rebuild(lo))
-        if remat == "every2":
+        if mode == "every2":
             # 隔块 remat 在 scan 下要**成对**做：把 [L,...] 重排成 [L/2, 2, ...]，
             # 一次循环走两块，第一块不 remat、第二块 remat。
             # （wrap 的 `i % 2` 判据在 scan 里用不了 —— 循环变量是 tracer。）
             if cfg.num_blocks % 2:
                 raise ValueError(f"remat='every2' 在 scan 路径下需要偶数块，"
-                                 f"当前 {cfg.num_blocks}；改用 full/dots/none")
+                                 f"当前 {cfg.num_blocks}；改用 full/none"
+                                 f"（dots 在 scan 下不可用，见 resolve_remat）")
             pair = lambda z: z.reshape(cfg.num_blocks // 2, 2, *z.shape[1:])
             xs = jax.tree.map(pair, xs)
 
@@ -630,7 +767,8 @@ def _forward_core(params: PyTree, cfg: AnimaConfig,
                 return run_block(carry, p, lo), None
             x, _ = jax.lax.scan(wrap(body, 0), x, xs, length=cfg.num_blocks)
 
-    # FinalLayer：2 chunk，且只取 adaln_lora 的前 2D（models/...:950）
+    # FinalLayer：2 chunk，且只取 adaln_lora 的前 2D
+    # （`FinalLayer.forward_tokens`，models/anima_modeling_core.py ~:1033）
     h = silu(emb)
     h = dense(h, net["final_adaln_1"])
     h = dense(h, net["final_adaln_2"]) + adaln_lora[:, : 2 * cfg.model_channels]
@@ -641,7 +779,8 @@ def _forward_core(params: PyTree, cfg: AnimaConfig,
 
 
 def output_tokens_to_patch_tokens(tokens: jnp.ndarray, cfg: AnimaConfig) -> jnp.ndarray:
-    """models/anima_modeling_core.py:1638 —— `(ph pw pt c) -> (c pt ph pw)`。
+    """`MiniTrainDIT._output_tokens_to_patch_tokens`（models/anima_modeling_core.py，
+    ~:1721；行号可能漂移，以函数名为准）—— `(ph pw pt c) -> (c pt ph pw)`。
 
     **不是恒等重排**（Krea2 那边才是）。final_layer 吐的是 unpatchify 折叠用的
     (ph pw pt c) 序，而训练目标来自 patchify_latents_to_tokens 的 (c pt ph pw) 序。
@@ -722,10 +861,12 @@ def load_safetensors_anima(path: str, dtype=jnp.bfloat16) -> Tuple[PyTree, Anima
 
 
 def lora_scaling(rank: int, alpha: Optional[float]) -> float:
-    """ΔW 的缩放系数，口径同 trainer/lora.py:287 `self.scaling = alpha / rank`。
+    """ΔW 的缩放系数，口径同 `LoRALayer.__init__` 的 `self.scaling = alpha / rank`
+    （trainer/lora.py:287）。
 
     alpha=None 时取 alpha=rank（scaling=1），这也是本仓库落地 adapter 的默认口径
-    （lora.py:92 注明 PiSSA 等要求 alpha=rank 才能保证 step-0 净增量为 0）。
+    （`_pissa_init` 的 docstring 注明 PiSSA 等要求 alpha=rank 才能保证 step-0
+    净增量为 0，trainer/lora.py:92）。
     导出 safetensors 时必须把这个 alpha 一起写进去，否则 ComfyUI 侧会按自己的
     默认值重算 scaling —— 权重对、强度错。
     """
@@ -741,23 +882,21 @@ def init_lora(key, cfg: AnimaConfig, rank: int = 32,
               dtype=jnp.bfloat16) -> Dict[str, Dict[str, jnp.ndarray]]:
     """B 恒为 0 -> step-0 净增量为 0（本仓库落地新 adapter 的硬约束，见 skill 2.2）。
 
-    A 的初始化对齐 PyTorch 侧 trainer/lora.py:367 的
-    `kaiming_uniform_(lora_down.weight, a=sqrt(5))`：该调用等价于
-    U(-b, b)，b = sqrt(6 / ((1+5) * fan_in)) = 1/sqrt(fan_in)，fan_in = in_features。
+    A 的初始化对齐 PyTorch 侧 `LoRALayer.__init__` 里的
+    `kaiming_uniform_(self.lora_down.weight, a=5**0.5)`（trainer/lora.py:367）：
+    该调用等价于 U(-b, b)，b = sqrt(6 / ((1+5) * fan_in)) = 1/sqrt(fan_in)，
+    fan_in = in_features。
 
     （原实现用的是 N(0, 1/sqrt(in))，std 比这里大约 sqrt(3) 倍。B=0 时 step-0
       仍然中立，但 A 的量级会改变有效学习率与早期动力学 —— 两侧口径不一致会让
       "同一份 yaml 在 GPU 与 TPU 上训出不同结果"，且查不出原因。）
+
+    形状表**直接取 `adapters.target_shapes(cfg)`**，不再在这里抄一份：两处以前是同一
+    张表硬编码两遍（本地实测键集与逐键值完全相同，mlp_ratio=2.5/3.0/4.0 都一致），
+    改一处漏一处就是"init 出的 A 形状与 plan_targets 算的 rank cap 对不上"，
+    而两边都不报错。
     """
-    D, C = cfg.model_channels, cfg.crossattn_dim
-    shape = {
-        "self_attn.q_proj": (D, D), "self_attn.k_proj": (D, D),
-        "self_attn.v_proj": (D, D), "self_attn.output_proj": (D, D),
-        "cross_attn.q_proj": (D, D), "cross_attn.k_proj": (C, D),
-        "cross_attn.v_proj": (C, D), "cross_attn.output_proj": (D, D),
-        "mlp.layer1": (D, int(D * cfg.mlp_ratio)),
-        "mlp.layer2": (int(D * cfg.mlp_ratio), D),
-    }
+    shape = AD.target_shapes(cfg)
     out = {}
     keys = jax.random.split(key, cfg.num_blocks * len(targets))
     n = 0

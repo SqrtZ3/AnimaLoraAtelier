@@ -193,5 +193,13 @@ def update(state: Dict[str, Any], grads: PyTree, cfg: AdamWConfig,
     v_new = jax.tree.unflatten(treedef, [o[2] for o in outs])
 
     new_state = {"master": master, "m": m_new, "v": v_new, "step": step}
-    fwd = jax.tree.map(lambda x: x.astype(dtype), master)
+    # 降到前向 dtype，**但 `dora` 叶子保 fp32**（与 train._fwd_cast 同一条理由：
+    # dora_scale 初值恰为 ‖W‖_row，bf16 的 0.62% ulp 会让 step-0 中立性失效、
+    # 并把幅度增量量化到几百步才可见。export.py 与 trainer/lora.py 的 state_dict
+    # 同样把它存 fp32）。
+    def _cast(path, x):
+        last = path[-1]
+        name = getattr(last, "key", None) or getattr(last, "name", None)
+        return x if name == "dora" else x.astype(dtype)
+    fwd = jax.tree_util.tree_map_with_path(_cast, master)
     return new_state, fwd, {"gnorm": gnorm, "lr": lr, "step": step}

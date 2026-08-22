@@ -75,7 +75,15 @@ class AuxConfig:
     spectral_wavelet_lambda: float = 0.05
     spectral_t_gate: float = 0.7
     #: FFT 画布（token 网格单位）。必须 >= 数据集里最大的 (h, w)，由
-    #: `data.CacheDataset` 在建计划时算出来填进去；填小了会 fail-fast。
+    #: `data.CacheDataset` 在建计划时算出来填进去（`run_train.py` 的两阶段 build）。
+    #:
+    #: **填小了不会报错**，只会静默劣化：`to_canvas` 的 scatter 越界被 JAX 丢弃
+    #: （本地实测 4x4 网格塞 2x2 画布 -> 16 个 token 只落进 4 个），读回时
+    #: gather 越界被静默 clamp（负样本读到别的 token）。spectral 那支于是在一个
+    #: 缺了大半内容的画布上算谱、ΔFM 那支的负样本退化成同一格重复 —— 两者都有
+    #: 有限的 loss 与梯度，方向却是错的。所以 `verify_canvas` 提供了 host 侧的
+    #: 显式校验，由 `packing`/数据侧在建计划时调用（trace 内查不了：rows/cols
+    #: 是运行时数组）。
     canvas_hw: Tuple[int, int] = (0, 0)
 
     def __post_init__(self):
@@ -97,6 +105,23 @@ class AuxConfig:
     def any_enabled(self) -> bool:
         return (self.eisbach_lambda > 0 or self.dfm_lambda > 0
                 or self.spectral_enabled)
+
+    def verify_canvas(self, max_h: int, max_w: int) -> None:
+        """host 侧闸门：画布必须容得下数据集最大网格（见 `canvas_hw` 的注记）。
+
+        `max_h/max_w` 是**token 网格**单位（= latent 像素 / PATCH），与
+        `data.CacheDataset.canvas_hw` 同口径。画布用不到时（三项 aux 全关）不查。
+        """
+        if not self.any_enabled or min(self.canvas_hw) <= 0:
+            return
+        h, w = self.canvas_hw
+        if max_h > h or max_w > w:
+            raise ValueError(
+                f"aux 画布 canvas_hw={self.canvas_hw} 容不下数据集最大网格 "
+                f"({max_h}, {max_w})。这不会自己报错 —— to_canvas 的 scatter 越界"
+                f"被静默丢弃、gather 越界被静默 clamp，spectral/ΔFM 会在缺内容的"
+                f"画布上算出有限但方向错的 loss。canvas_hw 应由 data.CacheDataset "
+                f"按数据集逐轴 max 填入（run_train.py 的两阶段 build）。")
 
 
 # ── 逐段归约的小工具 ──────────────────────────────────────────────────────────
@@ -134,13 +159,26 @@ def eisbach_weight(pred: jnp.ndarray, mask: jnp.ndarray, seg: jnp.ndarray,
     逐段 softmax 用"减段内最大值"稳定化。填充位置被 `mask` 排除在分子分母之外
     —— 若不排除，填充多的 pack 会因为一大片相同的值把熵抬到接近 1，权重被系统性
     压到地板（不报错，只是训练悄悄变慢）。
+
+    **掩码必须进指数之内**（`exp(where(...))` 而不是 `exp(...) * m`）：填充位的
+    `e` 是无监督的模型输出能量，`mx` 对无有效 token 的段被兜底成 0（见下），于是
+    `exp(e - 0)` 在 e > 88 时溢出成 inf，`inf * 0 = NaN`。而 NaN 逃不掉 ——
+    `weighted_mean` 用 `jnp.sum`，`valid=0` 只让权重为 0、**乘不掉 NaN**，一步就
+    把 fp32 master 全部污染。本地实测（填充位幅度 12 即触发）：
+
+        幅度 1.0 / 5.0 -> [0.8715, 1.0]      无 NaN
+        幅度 12.0      -> [0.8715, nan]      -> 标量 loss = nan
+
+    而"无有效 token 的段"每个 pack 都有（FFD 取整余量的纯填充段，packing.py:301）。
+    `exp(-inf)=0` 精确，所以搬进去之后既不溢出也不再需要后乘 `m`。
+    PyTorch 侧本就是这个口径（objective.py:847 `masked_fill(m<=0, -inf)` 再 softmax）。
     """
     e = pixel_energy(pred)                                   # [N, 4]
     m = mask.astype(jnp.float32)[:, None]                    # [N, 1]
     big = jnp.where(m > 0, e, -jnp.inf)
     mx = seg_max(jnp.max(big, axis=-1), seg, g)              # [G]
     mx = jnp.where(jnp.isfinite(mx), mx, 0.0)
-    ex = jnp.exp(e - mx[seg][:, None]) * m
+    ex = jnp.exp(big - mx[seg][:, None])                     # 填充位恒 0（exp(-inf)）
     den = seg_sum(jnp.sum(ex, axis=-1), seg, g)              # [G]
     den = jnp.maximum(den, eps)
     p = ex / den[seg][:, None]
@@ -223,9 +261,15 @@ def vecor_crop_resize(key, target, seg, rows, cols, mask, g, hw) -> jnp.ndarray:
     由它们在 jnp 里现算，全部静态形状，不进编译身份。网格从段内 max(rows/cols)
     现推（打包与分桶两条布局共用；分桶路线的 seg/rows/cols 由 local_loss_ragged
     摊平后传入，语义相同）。返回与 target 同形的 token 域负样本。
+
+    `gh/gw` 必须 clamp 到 >= 1：`segment_max` 对**空段**返回 `INT32_MIN`
+    （每个 pack 都有一个纯填充段，packing.py:301），+1 后是 -2147483647，
+    `gh * PATCH` 在 int32 下补码回绕成 2 —— 当前恰好落在合法区间所以不炸，
+    但那是侥幸（改 PATCH、改 rows 的 dtype、或 crop_resize_canvas 里
+    `min(y0+1, H-1)` 拿到负 H 都会翻脸）。空段的输出反正被 valid=0 丢掉。
     """
-    gh = (seg_max(rows, seg, g) + 1).astype(jnp.int32)    # [G] 每图 patch 网格
-    gw = (seg_max(cols, seg, g) + 1).astype(jnp.int32)
+    gh = jnp.maximum(seg_max(rows, seg, g) + 1, 1).astype(jnp.int32)   # [G] patch 网格
+    gw = jnp.maximum(seg_max(cols, seg, g) + 1, 1).astype(jnp.int32)
     k_r, k_t, k_l = jax.random.split(key, 3)
     ratio = 0.6 + 0.3 * jax.random.uniform(k_r, (g,))     # objective.py:964
     H, W = gh * PATCH, gw * PATCH
@@ -313,6 +357,10 @@ def spectral_per_image(x0_pred: jnp.ndarray, x0_target: jnp.ndarray,
     amp = lambda z: jnp.sqrt(jnp.real(z) ** 2 + jnp.imag(z) ** 2 + 1e-12)
     diff = jnp.abs(amp(fp) - amp(ft))
     n_canvas = float(x0_pred.shape[-1] * x0_pred.shape[-2])
+    # `maximum(·, 1.0)` 只是防 0/0：空段的 cover 恒 0 -> diff 也恒 0（画布全零），
+    # 所以分子先归零、这个 floor 永远不改真实图的值。**它依赖"分子在空段恒 0"
+    # 这个外部性质**（cover 由 to_canvas 散射同一份 mask 得到），谁把 cover 换成
+    # 含填充的粗粒度掩码，这里就会把该图的 spectral 放大 sqrt(n_canvas) 倍且不报错。
     n_img = jnp.maximum(jnp.sum(cover, axis=(-2, -1)), 1.0)         # [G]
     # 零填充补偿：|A_padded| = sqrt(N_img/N_canvas)·|A_native|
     total = jnp.mean(diff, axis=(1, 2, 3)) * jnp.sqrt(n_canvas / n_img)

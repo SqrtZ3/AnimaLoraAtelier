@@ -11,7 +11,8 @@ scan 路径是为了修显存引入的（真机归因：展开时 NaViT 路径�
 
   C1 前向：scan vs 展开，逐元素
   C2 LoRA 梯度：scan vs 展开，逐元素（训练真正用的是它）
-  C3 四档 remat 在 scan 下彼此一致
+  C3 scan 下 full/every2/none 三档彼此一致，且 dots 被 fail-fast 拦住
+     （dots 在 scan 下是 CLI 可达的 OOM 死路，见 anima_jax.resolve_remat）
   C4 stack/unstack 往返：unstack_loras(stack_loras(x)) == x（导出链路靠它）
 
 用法（jax 解释器）：python check_scan_equiv.py
@@ -108,14 +109,23 @@ def main() -> int:
                 for n in gu for s in ("a", "b"))
     ok("逐层梯度", worst[0] < 1e-4, f"最差 {worst[1]} rel={worst[0]:.3e}")
 
-    print("\nC3 scan 下四档 remat 一致")
+    print("\nC3 scan 下三档 remat 一致 + dots fail-fast")
     base = fwd_scan(stacked_l, "full")
     gb = jax.grad(lambda lo: jnp.sum(fwd_scan(lo, "full") ** 2))(stacked_l)
-    for rm in ("dots", "every2", "none"):
+    for rm in ("every2", "none"):
         r1 = rel(fwd_scan(stacked_l, rm), base)
         g2 = jax.grad(lambda lo: jnp.sum(fwd_scan(lo, rm) ** 2))(stacked_l)
         r2 = max(rel(g2[t_][s], gb[t_][s]) for t_ in gb for s in ("a", "b"))
         ok(f"remat={rm}", r1 < 1e-6 and r2 < 1e-4, f"前向 rel={r1:.1e} 梯度 rel={r2:.1e}")
+    # `dots` 在 scan 下**必须报错**而不是"跑得出同一个数"：dots_saveable 保留的激活
+    # 会按 num_blocks 次迭代堆叠（≈1MB/token），budget 16384 必 OOM。这里段长很小所以
+    # 数值上跑得通，正是这条 CLI 可达死路以前藏得住的原因（run_train.py --remat dots
+    # 默认就走 scan），所以判据从"数值一致"改成"拦住了"。见 anima_jax.resolve_remat。
+    try:
+        fwd_scan(stacked_l, "dots")
+        ok("remat=dots 被拦住", False, "未抛异常")
+    except ValueError as e:
+        ok("remat=dots 被拦住", "dots" in str(e), f"{str(e)[:34]}...")
 
     print("\nC4 stack/unstack 往返")
     back = A.unstack_loras(stacked_l, NB)

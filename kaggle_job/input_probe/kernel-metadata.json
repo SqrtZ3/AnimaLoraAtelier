@@ -1,5 +1,5 @@
 {
-  "id": "ilovebg/anima-input-probe",
+  "id": "KAGGLE_USERNAME/anima-input-probe",
   "title": "anima-input-probe",
   "code_file": "probe_input.py",
   "language": "python",
@@ -8,9 +8,7 @@
   "enable_gpu": "false",
   "enable_tpu": "false",
   "enable_internet": "true",
-  "dataset_sources": [
-    "ilovebg/modare-krea2-tpu-cache"
-  ],
+  "dataset_sources": [],
   "competition_sources": [],
   "kernel_sources": [],
   "model_sources": []

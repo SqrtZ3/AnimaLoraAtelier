@@ -1,3 +1,15 @@
 # 从 Kaggle 拉回来的运行产物（含 jax 编译缓存，几十个文件）——不进仓库
 output/
 __pycache__/
+
+# `anima_train/anima_train_job.py` 是 build_job.py 的生成物，不进仓库
+# （规则在 anima_train/.gitignore 里，那里有更详细的理由）。
+#
+# 探针目录的 `*_job.py`（anima_dp/anima_layout/... ）是**历史已跟踪**的，
+# 这里不动它们 —— 它们内嵌的是探针代码而非训练 yaml，没有本地信息泄漏问题，
+# 而把已跟踪文件改成 ignore 需要 `git rm --cached`，属于另一件事。
+_unpacked/
+
+# 本地 venv（SETUP.md 建议的名字）
+.venv-torch/
+.venv-jax/

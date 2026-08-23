@@ -40,12 +40,13 @@ AnimaLoraToolkit/            训练器内核与主要增量开发
 ├── trainer/                 目标/loss、LoRA 注入、数据集、分桶、采样、telemetry、checkpoint…
 ├── utils/                   优化器实现 + 硬件兼容层（dcu_compat / npu_compat / dist_utils）
 ├── models/                  Anima / Cosmos-Predict2 / Krea 2 建模
-├── jax_tpu/                 TPU 侧全套 JAX 移植（独立于 PyTorch 栈，13 个模块）
+├── jax_tpu/                 TPU 侧全套 JAX 移植（16 个模块；**副本**，主拷贝在 kaggle_job/）
 ├── config/                  训练 YAML（train_all_args_annotated.yaml 为带注释全参考）
 ├── docs/                    技术文档（每项技术一篇）+ probe_results 真机探针日志
 ├── tests/                   40+ 回归测试与 diag_* 诊断取证脚本
 ├── tools/                   探针 / 镜像装配 / 压缩导出 / 取证工具
-kaggle_job/                  Kaggle TPU v5e-8 CLI 工作台（免 notebook 全流程）
+kaggle_job/                  **可独立发布的 TPU 训练仓库**（jax_tpu 主拷贝 + 数据缓存
+                             工具自包含 + Kaggle CLI 全流程；对本仓库零运行时依赖）
 tools/                       LoRA/LoKr 分析小工具（块能量、delta 测量、ckpt 平均…）
 run.sh / run_dcu.sh / run_npu.sh    各硬件训练入口（含显存守卫接力）
 Dockerfile.dcu               海光 DCU 训练镜像（DAS 预编译轮子 + 构建期自检）
@@ -172,7 +173,7 @@ python anima_train.py --config ./config/my_training.yaml
 | [`AnimaLoraToolkit/docs/hygon-dcu.md`](AnimaLoraToolkit/docs/hygon-dcu.md) / [`dcu-image-release.md`](AnimaLoraToolkit/docs/dcu-image-release.md) / [`scnet-image-build.md`](AnimaLoraToolkit/docs/scnet-image-build.md) | 海光 DCU 适配、训练镜像发布、scnet 镜像构建规范 |
 | [`AnimaLoraToolkit/docs/regularization-analysis.md`](AnimaLoraToolkit/docs/regularization-analysis.md) / [`trainer-optimization-analysis.md`](AnimaLoraToolkit/docs/trainer-optimization-analysis.md) | 正则化方案与训练器架构分析 |
 | [`AnimaLoraToolkit/docs/training-tips.md`](AnimaLoraToolkit/docs/training-tips.md) / [`tagging-guide.md`](AnimaLoraToolkit/docs/tagging-guide.md) / [`json-caption-format.md`](AnimaLoraToolkit/docs/json-caption-format.md) | 训练经验、打标与 caption 规范 |
-| [`kaggle_job/README.md`](kaggle_job/README.md) | Kaggle TPU CLI 工作台全流程 |
+| [`kaggle_job/README.md`](kaggle_job/README.md) | Kaggle TPU 训练全流程（**该目录可整体独立发布**：`jax_tpu` 主拷贝 + 自包含的数据缓存工具，对本仓库零运行时依赖；两边一致性由它的 `tools/check_sync.py` 与逐 bit 缓存对拍守） |
 | [`docs/superpowers/`](docs/superpowers/) | 设计文档（plans / specs） |
 
 ## 上游与许可

@@ -1,5 +1,5 @@
 {
-  "id": "ilovebg/anima-tpu-spmd-probe",
+  "id": "KAGGLE_USERNAME/anima-tpu-spmd-probe",
   "title": "anima tpu spmd probe",
   "code_file": "probe_tpu_spmd.py",
   "language": "python",

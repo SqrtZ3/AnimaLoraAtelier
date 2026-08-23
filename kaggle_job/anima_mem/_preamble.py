@@ -7,7 +7,7 @@ Kaggle 默认镜像是 jax 0.10.2 + libtpu 构建于 2025-06-12，比 Pallas 的
 
 与上一版的区别：**钉死版本**而不是 `-U`。
   * 上一轮 `-U` 实际装到了 0.11.0（见 anima-tpu-dp-probe 日志），钉死同一版
-    使真机结果可复现，也与本地对拍环境（jaxenv: Python 3.12 + jax 0.11.0）一致；
+    使真机结果可复现，也与本地对拍环境（本地 jax 侧环境：Python 3.12 + jax 0.11.0，见 SETUP.md）一致；
   * 本地/真机版本一旦漂移，"本地过了真机挂"会变成查不动的问题。
 Kaggle 允许自由装依赖（docs/notebooks#modifying-a-notebook-specific-environment），
 所以这里就是一次正常的 pip install，不是什么绕过手段。
@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 
-JAX_VERSION = "0.11.0"          # 与本地 jaxenv 对齐；改这里要同步改 tests/README.md
+JAX_VERSION = "0.11.0"          # 与本地 jax 侧环境对齐（见 SETUP.md）；改这里要同步改那边
 
 _BOOT = "未开启"
 if os.environ.get("ANIMA_TPU_UPGRADE", "1") == "1":

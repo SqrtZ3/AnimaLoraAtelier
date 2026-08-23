@@ -1,0 +1,276 @@
+# ══════════════════════════════════════════════════════════════════
+# Anima LoRA/LoKr · Kaggle TPU v5e-8 模板（jax_tpu 后端，8 卡纯 DP）
+#
+# 这份是**真机跑过的配方**（C12：LoKr+DoRA / adamw_snr / 三峰+自适应 t /
+# Huber(snr) / eisbach+ΔFM+spectral / immiscible），实测账目见
+# docs/ARCH_FINDINGS.md 的「首秀实测」。拿它当起点，别从空文件开始 ——
+# jax_tpu/config.py 对未移植的键 **fail-fast**，从零写很容易撞一堆错。
+#
+# ★ 必改三处（下面标了 ★）：transformer_path / data_dir / output_name
+#   路径写**本地值**即可 —— 上云时由 build_job 的 --env 覆盖（yaml 本身不动，
+#   同一份 yaml 就能同时驱动本地 plan-only 与真机训练）。
+#
+# 从 GPU 侧 yaml 迁过来时要删掉的后端专属键（留着会 fail-fast）：
+#   device_backend / navit_attn_backend / fast_model_init / base_quant /
+#   wandb_* / sample_*（TPU 无训练期采样）/ save_state_every_epochs
+#
+# navit_token_budget 在 TPU 上是**全局**预算（8 卡纯 DP、每卡一个 pack），
+# 必须被 8 整除；131072 = 8 × 16384，而 16384 是 v5e 单 chip(15.7GiB) 在
+# scan+full 档装得下的量级（32768 实测 OOM）。
+# ══════════════════════════════════════════════════════════════════
+
+# ── 模型路径（本地值；Kaggle 上由 ANIMA_TRANSFORMER 覆盖）────────
+# ★ anima 底模。也可以不放本地文件，用 build_job --hf-model 从 HF 直下。
+transformer_path: "/path/to/anima-base-v1.0.safetensors"
+# 下面三个只在**数据缓存阶段**（tools/cache_*.py）用到，TPU 侧从不读它们。
+vae_path: "/path/to/qwen_image_vae.safetensors"
+text_encoder_path: "/path/to/Qwen3-0.6B-Base"
+t5_tokenizer_path: "/path/to/t5_tokenizer"
+
+# ── 数据集（本地值；Kaggle 上由 ANIMA_DATA_DIR 覆盖）─────────────
+# ★ 先跑 tools/cache_latents.py + tools/cache_text_features.py 产缓存，
+#   再用 tools/verify_cache.py 验一遍 —— 缺文件的代价是白烧一轮 TPU 配额。
+data_dir: "/path/to/your-dataset-cache"
+resolution: 1024
+repeats: 1
+
+# ── ARB 分桶（TPU 侧为 cache-side no-op，语义已烘焙进 npz）────────
+bucket_base_resos: [1536]
+bucket_min_base_reso: 0
+bucket_max_base_reso: 0
+bucket_base_reso_steps: 256
+min_bucket_reso: 512
+max_bucket_reso: 3072
+bucket_reso_steps: 64
+bucket_max_aspect_ratio: 2.7
+bucket_no_upscale: true
+bucket_max_upscale: 0.0
+bucket_report: true
+max_img_h: 0
+max_img_w: 0
+
+# ── NaViT 块对角打包 ────────────────────────────────────────────
+navit_packing: true
+navit_native_resolution: true
+navit_token_budget: 131072      # TPU 全局预算 = 8 × 16384（单 chip 实测上限量级）
+fit_max_tokens: 204800
+fit_warn_tokens: 204800
+navit_max_images_per_pack: 0
+navit_multiscale: true
+navit_multiscale_token_ladder: "4096"
+navit_pack_strategy: ffd
+navit_text_trim_padding: false
+cache_latents: true
+cache_encode_tiled: true
+cache_encode_max_pixels: 16777216
+fit_packed_training: false
+token_bucket: false
+bucket_drop_last: false
+torch_compile: false
+attn_force_autocast_dtype: true
+
+# ── 数据增强 / 打标 ─────────────────────────────────────────────
+shuffle_caption: false
+keep_tokens: 1
+flip_augment: true              # 缓存含 latent_flipped（像素域翻转后再 encode）
+caption_dropout_rate: 0.01      # 需要 _empty.textfeat.npz（已随缓存产出）
+freq_balanced_dropout_strength: 0.0
+prefer_json: false
+
+# ── LoRA / LoKr / DoRA 结构（与 DCU 版逐字段一致）────────────────
+lora_type: "lokr"
+lora_rank: 32
+lora_alpha: 32.0
+lora_dropout: 0.0
+lokr_factor: 4
+lora_variant: "dora"
+dora_export_mode: "native"
+
+lora_targets:
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "output_proj"
+  - "mlp.layer1"
+  - "mlp.layer2"
+
+lora_exclude_patterns:
+  - ".*llm_adapter.*"
+
+lora_reg_dims:
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.(self_attn|cross_attn).*': 64
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.mlp.*': 48
+  '.*blocks\.2[1-7]\..*': 16
+  ".*self_attn.*": 32
+  ".*cross_attn.*": 32
+  ".*mlp.*": 32
+lora_reg_alphas:
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.(self_attn|cross_attn).*': 64
+  '.*blocks\.(0?[7-9]|1[0-9]|20)\.mlp.*': 48
+  '.*blocks\.2[1-7]\..*': 16
+  ".*self_attn.*": 32
+  ".*cross_attn.*": 32
+  ".*mlp.*": 32
+
+rank_dropout: 0.05
+module_dropout: 0.03
+loraplus_lr_ratio: 1.0
+lora_one_init_steps: 0
+lora_one_init_scale: 0.01
+
+# ── 优化器 ──────────────────────────────────────────────────────
+optimizer_type: "adamw_snr"
+learning_rate: 5e-4
+optimizer_args:
+  betas: [0.98, 0.999]
+  snr_power: 1.5
+  cautious: false
+  weight_decay: 0.00001
+
+# ── 训练循环 ────────────────────────────────────────────────────
+epochs: 20                      # 用户拍板：这个数据集 20 epoch 足够（每 epoch 存档，随时挑 checkpoint）
+max_steps: 0
+batch_size: 4                   # NaViT 下被忽略
+effective_batch_size: 0
+grad_accum: 1
+grad_clip_max_norm: 1.0
+grad_norm_log_every: 40
+mixed_precision: "bf16"
+grad_checkpoint: true
+num_workers: 4
+
+# ── Timestep 采样（三峰）────────────────────────────────────────
+flow_shift: 3.0
+timestep_sampling: mixed_logsnr_three
+timestep_mix_low_prob: 0.12
+timestep_mix_high_prob: 0.48
+timestep_logsnr_mu: -6.0
+timestep_logsnr_sigma: 2.4
+timestep_t_min: 0.05
+timestep_t_max: 1.0
+timestep_stratified: true
+timestep_mix_anneal_start: 0
+timestep_mix_anneal_end: 0
+timestep_mix_low_prob_end: -1.0
+timestep_mix_high_prob_end: -1.0
+timestep_laplace_mu: -1
+timestep_laplace_b: 0.75
+schedule_shift: 1
+
+# ── 自适应 timestep ─────────────────────────────────────────────
+adaptive_timestep: true
+adaptive_timestep_metric: "slope"
+adaptive_timestep_slope_slow_decay: 0.995
+adaptive_timestep_low_noise_gate: true
+adaptive_timestep_gate_n: 3.0
+adaptive_timestep_gate_c: 0.04
+adaptive_timestep_highfreq_weight: 0.14
+adaptive_timestep_bins: 8
+adaptive_timestep_ema_decay: 0.97
+adaptive_timestep_burn_in: 200
+adaptive_timestep_min_factor: 0.5
+adaptive_timestep_max_factor: 2.2
+adaptive_timestep_base_mix: 0.50
+adaptive_timestep_candidate_mult: 4
+
+# ── 主 loss ─────────────────────────────────────────────────────
+loss_type: "huber"
+huber_c: 0.2
+huber_schedule: "snr"
+huber_snr_clamp_max: 2.0
+loss_weighting_scheme: "none"
+weight_cap_ratio: 0
+min_snr_gamma: 0
+detail_inv_t_min: 1.0
+detail_inv_t_max: 8.0
+
+# ── 噪声 ────────────────────────────────────────────────────────
+noise_offset: 0
+noise_offset_min: 0
+noise_offset_random_strength: false
+pyramid_noise_iterations: 0
+pyramid_noise_discount: 0.3
+
+# ── 逐图正则 / 辅助 loss ────────────────────────────────────────
+eisbach_lambda: 0.15
+
+dfm_lambda: 0.05
+dfm_mode: "vecor"               # 两支增强（通道乱序 / 裁剪+resize）都已移植，
+                                # 核内逐图 50/50（auxloss.py，对拍闸门 13/13）
+
+aux_spectral_enabled: true
+aux_spectral_lambda: 0.065
+aux_spectral_use_wavelet: true
+aux_spectral_wavelet_lambda: 0.20
+aux_spectral_t_gate: 0.55
+
+dispersive_enabled: false
+dispersive_lambda: 0.05
+dispersive_tau: 0.5
+dispersive_tap_block: 7
+dispersive_variant: infonce_l2
+
+aux_self_perceptual_enabled: false
+aux_self_perceptual_lambda: 0.05
+aux_self_perceptual_t_gate: 0.5
+aux_self_perceptual_tap_block: -1
+aux_self_perceptual_encode_t: 0.05
+
+aux_perceptual_enabled: false
+aux_perceptual_lambda_lpips: 0.10
+aux_perceptual_lambda_dino: 0.01
+aux_perceptual_t_gate: 0.4
+aux_perceptual_lpips_net: "vgg"
+aux_perceptual_dino_local_path: ""
+aux_perceptual_cache_dir: ""     # aux_perceptual TPU 未移植（开了会 fail-fast）
+aux_perceptual_use_checkpoint: true
+aux_perceptual_lpips_size: 512
+
+lwd_mask_enabled: false
+lwd_mask_floor: 0.3
+
+# ── 其它训练开关 ────────────────────────────────────────────────
+disable_tlora_hooks: false
+use_precommit_lora_forward: false
+use_per_block_checkpoint: true
+
+tread_enabled: false
+tread_ratio: 0.25
+tread_start_layer: 3
+tread_end_layer: -4
+
+immiscible_enabled: true
+immiscible_k: 4
+
+# ── eval（首秀关）──────────────────────────────────────────────
+eval_every: 0
+eval_count: 16
+eval_t_grid: "0.1,0.5,0.9,0.97"
+eval_seed: 1234
+
+# ── 遥测（TPU 侧为展示层 no-op）─────────────────────────────────
+telemetry_enabled: true
+telemetry_freq_bands: 3
+telemetry_slope_window: 6
+telemetry_optimizer_every: 0
+telemetry_capacity_every: 0
+
+# ── 输出 / 保存（output_dir 由 ANIMA_OUTPUT_DIR 覆盖）────────────
+output_dir: "./output"
+output_name: "anima-lokr-tpu"    # ★ 改成你的 LoRA 名（存档文件名前缀）
+save_every: 1
+save_every_steps: 0             # >0 时按步存；两者都开就都生效
+save_state_every: 0             # 长训建议 50-100：存完整优化器状态给 resume_state
+seed: 42
+resume_lora: ""
+stage_timing_every: 0
+stage_timing_warmup: 10
+
+# ── 日志 / 监控 ─────────────────────────────────────────────────
+loss_curve_steps: 1
+no_progress: false
+log_every: 1
+no_monitor: false
+monitor_host: "0.0.0.0"
+monitor_port: 6006
+no_browser: true

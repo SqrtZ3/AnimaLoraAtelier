@@ -1,0 +1,400 @@
+r"""逐图辅助项：Eisbach 障碍权重 / ΔFM(VeCoR) 负样本 / spectral(FFT+小波)。
+
+（文件名不叫 `aux.py`：AUX 是 Windows 的保留设备名，git 在 Windows 上
+ 直接打不开这个文件 —— `error: open("aux.py"): No such file or directory`，
+ 而 ls/python 都看得见它。踩过一次，别改回去。）
+
+对齐依据：
+  trainer/objective.py:814   `eisbach_barrier_weight`（空间能量熵 -> 逐样本 detached 权重）
+  trainer/objective.py:934   `vecor_contrastive_neg`（对 target 做破坏性增强当负样本）
+  trainer/aux_losses.py:170  `recover_x0_from_velocity`：x0 = x_t - t·v
+  trainer/aux_losses.py:194  `_haar_wavelet_coefs`（单层 Haar，2x2 滤波器 ×0.5，stride 2）
+  trainer/aux_losses.py:251  `spectral_loss_per_sample`（FFT 振幅 L1 + 可选小波 L1，t-gate）
+  anima_train.py:4258        navit 逐图 aux 的组装：λ × **命中 gate 的图的均值**
+
+## 三项在 TPU 上的可移植性各不相同，逐条说清
+
+**Eisbach —— 可精确移植。** 它是"位置能量分布的熵"，对位置的**排列不变**：
+只要拿到同一张图的那一组位置能量，摆成网格还是摆成一条 token 序列，softmax
+与熵完全相同。所以打包布局下不需要还原网格，逐段做 masked softmax 即可。
+唯一要注意的是**位置的粒度**：PyTorch 在 latent 像素上算（每个位置 16 通道），
+而一个 token 是 2x2 个 latent 像素。这里把 token 的 64 维拆回 `(c=16, ph, pw)`
+再对 c 取均值，得到每 token 4 个位置 —— 与 PyTorch 逐像素完全同粒度。
+（若图省事直接对 64 维取均值，就变成 4 个像素先平均再算熵，熵会系统性偏低，
+且不报错。）
+
+**ΔFM(VeCoR) —— 两支增强都已移植。**
+PyTorch 每次调用在"通道乱序"与"随机裁剪后 resize 回原尺寸"之间各 50% 二选一。
+通道乱序是逐 token 的置换，直接精确移植。裁剪+resize 曾被判为不可移植（"图的
+真实网格是运行时量"）——后来意识到**运行时标量 ≠ 运行时形状**：裁剪参数
+(ratio/top/left) 只是数值，采样坐标可以在 jnp 里由它们算出、gather 取四角做
+双线性，全部静态形状。网格本身从每段的 `max(rows)+1` 现推，散射进固定画布用
+`to_canvas`（spectral 同款原语）。两条支路都由核内随机数逐图二选一，与
+objective.py:955 同粒度。另一个曾考虑过的方案是 host 侧预生成负样本，**不成立**：
+增强作用在 velocity target 上（v = noise − x0，objective.py:963-969 的 `_tg`），
+而噪声是核内 immiscible 采样（依赖 latent 的 KNN），host 拿不到 —— 只能核内做。
+好在裁剪与双线性都是线性算子，crop(v) = crop(noise) − crop(x0)，对象无歧义。
+
+**spectral —— 移植了，但 FFT 走"零填充到静态画布"。**
+打包布局下每图的 (h, w) 是运行时量，而 FFT 需要静态形状。这里把每图散射进一个
+固定大小的画布再做 FFT。零填充**不是近似**：补零后的 DFT 就是同一信号 DTFT 的
+更细采样（幅度谱与平移无关，所以图放在画布左上角不影响幅度）。差别只有两处，
+都已补偿：
+  ① `norm="ortho"` 的归一化分母从"图面积"变成"画布面积" -> 乘 sqrt(N_画布/N_图)；
+  ② 频点数变多（更细采样）-> 求均值时自然抵消。
+小波那一支不需要补偿：Haar 是 2x2/stride 2，图的高宽都是偶数，块与图边界严格
+对齐，所以**只统计完全落在图内的系数**就与原实现逐元素相同。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import jax
+import jax.numpy as jnp
+
+try:
+    from . import flow as F
+except ImportError:
+    import flow as F
+
+LATENT_CH = 16          # Anima/Qwen VAE 的 latent 通道数
+PATCH = 2
+
+
+@dataclass(frozen=True)
+class AuxConfig:
+    """与 yaml 的 `eisbach_* / dfm_* / aux_spectral_*` 同名同义。"""
+    eisbach_lambda: float = 0.0
+    dfm_lambda: float = 0.0
+    dfm_mode: str = "vecor"
+    spectral_enabled: bool = False
+    spectral_lambda: float = 0.05
+    spectral_use_wavelet: bool = False
+    spectral_wavelet_lambda: float = 0.05
+    spectral_t_gate: float = 0.7
+    #: FFT 画布（token 网格单位）。必须 >= 数据集里最大的 (h, w)，由
+    #: `data.CacheDataset` 在建计划时算出来填进去（`run_train.py` 的两阶段 build）。
+    #:
+    #: **填小了不会报错**，只会静默劣化：`to_canvas` 的 scatter 越界被 JAX 丢弃
+    #: （本地实测 4x4 网格塞 2x2 画布 -> 16 个 token 只落进 4 个），读回时
+    #: gather 越界被静默 clamp（负样本读到别的 token）。spectral 那支于是在一个
+    #: 缺了大半内容的画布上算谱、ΔFM 那支的负样本退化成同一格重复 —— 两者都有
+    #: 有限的 loss 与梯度，方向却是错的。所以 `verify_canvas` 提供了 host 侧的
+    #: 显式校验，由 `packing`/数据侧在建计划时调用（trace 内查不了：rows/cols
+    #: 是运行时数组）。
+    canvas_hw: Tuple[int, int] = (0, 0)
+
+    def __post_init__(self):
+        if self.dfm_lambda > 0 and self.dfm_mode != "vecor":
+            raise ValueError(
+                f"dfm_mode={self.dfm_mode!r}：batch 模式要在同形 batch 内配对负样本，"
+                f"NaViT 逐图异形打包下对不上（PyTorch 侧 anima_train.py:1509 同样"
+                f"fail-fast）。请用 dfm_mode: vecor。")
+        if self.spectral_enabled and min(self.canvas_hw) <= 0:
+            raise ValueError("aux_spectral 需要 canvas_hw（FFT 画布尺寸），"
+                             "由数据侧按数据集最大网格填入")
+        if self.dfm_lambda > 0 and min(self.canvas_hw) <= 0:
+            # ΔFM 的裁剪+resize 支路与 spectral 共用同一个画布原语（to_canvas），
+            # 没画布会在 trace 里报一个看不出根因的 gather 越界
+            raise ValueError("dfm_lambda>0 需要 canvas_hw（裁剪支路的画布尺寸），"
+                             "由数据侧按数据集最大网格填入")
+
+    @property
+    def any_enabled(self) -> bool:
+        return (self.eisbach_lambda > 0 or self.dfm_lambda > 0
+                or self.spectral_enabled)
+
+    def verify_canvas(self, max_h: int, max_w: int) -> None:
+        """host 侧闸门：画布必须容得下数据集最大网格（见 `canvas_hw` 的注记）。
+
+        `max_h/max_w` 是**token 网格**单位（= latent 像素 / PATCH），与
+        `data.CacheDataset.canvas_hw` 同口径。画布用不到时（三项 aux 全关）不查。
+        """
+        if not self.any_enabled or min(self.canvas_hw) <= 0:
+            return
+        h, w = self.canvas_hw
+        if max_h > h or max_w > w:
+            raise ValueError(
+                f"aux 画布 canvas_hw={self.canvas_hw} 容不下数据集最大网格 "
+                f"({max_h}, {max_w})。这不会自己报错 —— to_canvas 的 scatter 越界"
+                f"被静默丢弃、gather 越界被静默 clamp，spectral/ΔFM 会在缺内容的"
+                f"画布上算出有限但方向错的 loss。canvas_hw 应由 data.CacheDataset "
+                f"按数据集逐轴 max 填入（run_train.py 的两阶段 build）。")
+
+
+# ── 逐段归约的小工具 ──────────────────────────────────────────────────────────
+def seg_sum(x: jnp.ndarray, seg: jnp.ndarray, g: int) -> jnp.ndarray:
+    return jax.ops.segment_sum(x, seg, num_segments=g, indices_are_sorted=True)
+
+
+def seg_max(x: jnp.ndarray, seg: jnp.ndarray, g: int) -> jnp.ndarray:
+    return jax.ops.segment_max(x, seg, num_segments=g, indices_are_sorted=True)
+
+
+def pixel_energy(pred: jnp.ndarray) -> jnp.ndarray:
+    """token [N, 64] -> 每 token 的 4 个 latent 像素的能量 [N, 4]。
+
+    通道序是 `(c pt ph pw)`（c 在最外，pt=1），所以 reshape 成 (16, 4) 后对第一维
+    取均值就是"逐像素、跨 16 通道的均方"，与 PyTorch 的 `o.pow(2).mean(dim=1)` 同义。
+    """
+    o = pred.astype(jnp.float32).reshape(*pred.shape[:-1], LATENT_CH, PATCH * PATCH)
+    return jnp.mean(o ** 2, axis=-2)
+
+
+def eisbach_weight(pred: jnp.ndarray, mask: jnp.ndarray, seg: jnp.ndarray,
+                   g: int, lam: float, eps: float = 1e-6) -> jnp.ndarray:
+    """逐图的 Eisbach log-barrier 权重 [G]（objective.py:814，**整体 detach**）。
+
+      e   = 逐位置能量
+      p   = softmax(e)               # 只在该图的真实位置上
+      H   = -Σ p log p / log(M)      # 归一化熵 ∈ [0,1]
+      w   = 1/(1 + (-log(1-H)))      # 障碍 -> 权重 ∈ (0,1]
+      out = (1-λ) + λ·w              # 论文的插值地板，保证平坦样本也有保底监督
+
+    H→0（有结构）→ w→1；H→1（弥散/均值化）→ w→0。detach 是有意的：它只缩 step
+    size、不改梯度方向（监督扩散的方向锁死在真值上，所以安全）。
+
+    逐段 softmax 用"减段内最大值"稳定化。填充位置被 `mask` 排除在分子分母之外
+    —— 若不排除，填充多的 pack 会因为一大片相同的值把熵抬到接近 1，权重被系统性
+    压到地板（不报错，只是训练悄悄变慢）。
+
+    **掩码必须进指数之内**（`exp(where(...))` 而不是 `exp(...) * m`）：填充位的
+    `e` 是无监督的模型输出能量，`mx` 对无有效 token 的段被兜底成 0（见下），于是
+    `exp(e - 0)` 在 e > 88 时溢出成 inf，`inf * 0 = NaN`。而 NaN 逃不掉 ——
+    `weighted_mean` 用 `jnp.sum`，`valid=0` 只让权重为 0、**乘不掉 NaN**，一步就
+    把 fp32 master 全部污染。本地实测（填充位幅度 12 即触发）：
+
+        幅度 1.0 / 5.0 -> [0.8715, 1.0]      无 NaN
+        幅度 12.0      -> [0.8715, nan]      -> 标量 loss = nan
+
+    而"无有效 token 的段"每个 pack 都有（FFD 取整余量的纯填充段，packing.py:301）。
+    `exp(-inf)=0` 精确，所以搬进去之后既不溢出也不再需要后乘 `m`。
+    PyTorch 侧本就是这个口径（objective.py:847 `masked_fill(m<=0, -inf)` 再 softmax）。
+    """
+    e = pixel_energy(pred)                                   # [N, 4]
+    m = mask.astype(jnp.float32)[:, None]                    # [N, 1]
+    big = jnp.where(m > 0, e, -jnp.inf)
+    mx = seg_max(jnp.max(big, axis=-1), seg, g)              # [G]
+    mx = jnp.where(jnp.isfinite(mx), mx, 0.0)
+    ex = jnp.exp(big - mx[seg][:, None])                     # 填充位恒 0（exp(-inf)）
+    den = seg_sum(jnp.sum(ex, axis=-1), seg, g)              # [G]
+    den = jnp.maximum(den, eps)
+    p = ex / den[seg][:, None]
+    ent = -seg_sum(jnp.sum(p * jnp.log(jnp.maximum(p, eps)) * m, axis=-1), seg, g)
+    cnt = jnp.maximum(seg_sum(jnp.sum(m * jnp.ones_like(e), axis=-1), seg, g), 2.0)
+    h = jnp.clip(ent / jnp.log(cnt), 0.0, 1.0)
+    w = 1.0 / (1.0 + (-jnp.log(jnp.maximum(1.0 - h, eps))))
+    return jax.lax.stop_gradient((1.0 - lam) + lam * w)
+
+
+def vecor_negative(key, target: jnp.ndarray, seg: jnp.ndarray, g: int) -> jnp.ndarray:
+    """VeCoR 负目标：对每张图独立地把 16 个 latent 通道乱序（objective.py:955-961）。
+
+    保证非恒等（撞上恒等置换就 roll 一位），与原实现一致。返回与 target 同形。
+    """
+    perms = jax.random.permutation(key, jnp.tile(jnp.arange(LATENT_CH), (g, 1)),
+                                   axis=1, independent=True)          # [G, 16]
+    ident = jnp.all(perms == jnp.arange(LATENT_CH), axis=1, keepdims=True)
+    perms = jnp.where(ident, jnp.roll(perms, 1, axis=1), perms)
+    t = target.astype(jnp.float32).reshape(*target.shape[:-1], LATENT_CH, PATCH * PATCH)
+    return jnp.take_along_axis(t, perms[seg][:, :, None], axis=-2).reshape(target.shape)
+
+
+def crop_resize_canvas(canvas, ratio, top, left, gh, gw, hw):
+    """逐图"随机裁剪 + align_corners=False 双线性拉回原尺寸"（纯函数，便于对拍）。
+
+    canvas [G, 16, Hc, Wc]（to_canvas 的产物）；ratio/top/left [G] 是运行时
+    参数（标量数组，不是形状）；gh/gw [G] 是每图真实的 patch 网格高宽。
+    返回同形画布，图外位置恒 0。
+
+    坐标口径与 torch F.interpolate(mode='bilinear', align_corners=False) 一致：
+    src = (dst+0.5)·(in/out) − 0.5，越界取边框。**clamp 必须在裁剪框相对坐标里做**
+    （clip 到 [0, ch−1]）再平移 top/left —— 先平移再 clamp 到图边会让"出界回落到
+    裁剪框边行"错成"插值到框外一行"（本地对拍抓到过，图 A 首行全错）。
+    """
+    g = canvas.shape[0]
+    hc, wc = hw
+    Hc, Wc = hc * PATCH, wc * PATCH                       # 画布（latent 像素）
+    H = (gh * PATCH).astype(jnp.float32)                  # 每图真实高宽（latent 像素）
+    W = (gw * PATCH).astype(jnp.float32)
+    ch = jnp.maximum((H * ratio).astype(jnp.int32), 2)    # objective.py:964-965
+    cw = jnp.maximum((W * ratio).astype(jnp.int32), 2)
+
+    ys = jnp.arange(Hc, dtype=jnp.float32)[None, :]
+    xs = jnp.arange(Wc, dtype=jnp.float32)[None, :]
+    # 先 clamp 裁剪框相对坐标（[0, ch−1] / [0, cw−1]），再平移 —— 见 docstring
+    sy = jnp.clip((ys + 0.5) * (ch / H)[:, None] - 0.5,
+                  0.0, (ch - 1)[:, None].astype(jnp.float32)) \
+        + top.astype(jnp.float32)[:, None]                # [G, Hc]
+    sx = jnp.clip((xs + 0.5) * (cw / W)[:, None] - 0.5,
+                  0.0, (cw - 1)[:, None].astype(jnp.float32)) \
+        + left.astype(jnp.float32)[:, None]               # [G, Wc]
+    y0 = jnp.floor(sy).astype(jnp.int32)
+    wy = sy - y0
+    x0 = jnp.floor(sx).astype(jnp.int32)
+    wx = sx - x0
+    y1 = jnp.minimum(y0 + 1, (H.astype(jnp.int32) - 1)[:, None])
+    x1 = jnp.minimum(x0 + 1, (W.astype(jnp.int32) - 1)[:, None])
+
+    ct = canvas.transpose(0, 2, 3, 1)                     # [G, Hc, Wc, 16]
+    GI = jnp.broadcast_to(jnp.arange(g)[:, None, None], (g, Hc, Wc))
+    Y0 = jnp.broadcast_to(y0[:, :, None], (g, Hc, Wc))
+    Y1 = jnp.broadcast_to(y1[:, :, None], (g, Hc, Wc))
+    X0 = jnp.broadcast_to(x0[:, None, :], (g, Hc, Wc))
+    X1 = jnp.broadcast_to(x1[:, None, :], (g, Hc, Wc))
+    WY = jnp.broadcast_to(wy[:, :, None], (g, Hc, Wc))[..., None]
+    WX = jnp.broadcast_to(wx[:, None, :], (g, Hc, Wc))[..., None]
+    out = (ct[GI, Y0, X0] * (1 - WY) * (1 - WX) + ct[GI, Y0, X1] * (1 - WY) * WX
+           + ct[GI, Y1, X0] * WY * (1 - WX) + ct[GI, Y1, X1] * WY * WX)
+
+    inside = ((ys < H[:, None])[:, :, None] & (xs < W[:, None])[:, None, :])
+    out = jnp.where(inside[..., None], out, 0.0)
+    return out.transpose(0, 3, 1, 2)                      # 回到 [G, 16, Hc, Wc]
+
+
+def vecor_crop_resize(key, target, seg, rows, cols, mask, g, hw) -> jnp.ndarray:
+    """VeCoR 负目标的另一支：随机裁 60-90% 区域再双线性拉回（objective.py:962-969）。
+
+    每图的 (ratio, top, left) 由 key 在核内抽出 —— 都是运行时**数值**，采样坐标
+    由它们在 jnp 里现算，全部静态形状，不进编译身份。网格从段内 max(rows/cols)
+    现推（打包与分桶两条布局共用；分桶路线的 seg/rows/cols 由 local_loss_ragged
+    摊平后传入，语义相同）。返回与 target 同形的 token 域负样本。
+
+    `gh/gw` 必须 clamp 到 >= 1：`segment_max` 对**空段**返回 `INT32_MIN`
+    （每个 pack 都有一个纯填充段，packing.py:301），+1 后是 -2147483647，
+    `gh * PATCH` 在 int32 下补码回绕成 2 —— 当前恰好落在合法区间所以不炸，
+    但那是侥幸（改 PATCH、改 rows 的 dtype、或 crop_resize_canvas 里
+    `min(y0+1, H-1)` 拿到负 H 都会翻脸）。空段的输出反正被 valid=0 丢掉。
+    """
+    gh = jnp.maximum(seg_max(rows, seg, g) + 1, 1).astype(jnp.int32)   # [G] patch 网格
+    gw = jnp.maximum(seg_max(cols, seg, g) + 1, 1).astype(jnp.int32)
+    k_r, k_t, k_l = jax.random.split(key, 3)
+    ratio = 0.6 + 0.3 * jax.random.uniform(k_r, (g,))     # objective.py:964
+    H, W = gh * PATCH, gw * PATCH
+    ch = jnp.maximum((H * ratio).astype(jnp.int32), 2)
+    cw = jnp.maximum((W * ratio).astype(jnp.int32), 2)
+    top = jax.random.randint(k_t, (g,), 0, H - ch + 1)    # objective.py:966-967
+    left = jax.random.randint(k_l, (g,), 0, W - cw + 1)
+    return _vecor_crop_resize_params(target, seg, rows, cols, mask, g, hw,
+                                     ratio, top, left)
+
+
+def _vecor_crop_resize_params(target, seg, rows, cols, mask, g, hw,
+                              ratio, top, left) -> jnp.ndarray:
+    """参数显式给定的版本 —— 对拍闸门（tests/check_objective_parity.py ⑦）直接调它。
+
+    ratio/top/left 的语义与 objective.py:963-968 一致：ratio ∈ [0.6, 0.9]，
+    裁剪框 (top, left, max(int(H·ratio),2), max(int(W·ratio),2))，双线性拉回
+    (H, W)（H/W = 各图自己的 latent 像素高宽）。"""
+    gh = (seg_max(rows, seg, g) + 1).astype(jnp.int32)
+    gw = (seg_max(cols, seg, g) + 1).astype(jnp.int32)
+    canvas = to_canvas(target, seg, rows, cols, mask, g, hw)      # [G,16,Hc,Wc]
+    out = crop_resize_canvas(canvas, ratio, top, left, gh, gw, hw)
+
+    # 读回 token：token (r, c) 在画布网格里的扁平下标是 r*wc + c（与 data.patchify
+    # 的 r*gw + c 同序，wc 是画布网格宽）；64 维通道序 (ch, ph, pw) 与之一致。
+    hc, wc = hw
+    o = out.transpose(0, 2, 3, 1)                         # [G, Hc, Wc, 16]
+    o = o.reshape(g, hc, PATCH, wc, PATCH, LATENT_CH)
+    o = o.transpose(0, 1, 3, 5, 2, 4).reshape(g, hc * wc,
+                                              LATENT_CH * PATCH * PATCH)
+    return o[seg, rows * wc + cols]
+
+
+# ── spectral ─────────────────────────────────────────────────────────────────
+def to_canvas(tokens: jnp.ndarray, seg: jnp.ndarray, rows: jnp.ndarray,
+              cols: jnp.ndarray, mask: jnp.ndarray, g: int,
+              hw: Tuple[int, int]) -> jnp.ndarray:
+    """token [N, 64] -> 逐图的 latent 网格画布 [G, 16, 2*H, 2*W]（图在左上角，其余补 0）。
+
+    **必须用 `.add` 而不是 `.set`**：填充 token 的 (row, col) 都是 0，与该段真
+    token 的 (0,0) 撞在同一个格子上；`.set` 下谁最后写谁赢（XLA 不保证顺序），
+    真 token 可能被 0 覆盖 —— 不报错，只是那一格数据没了。`.add` 下填充写的是
+    0（已乘 mask），加多少次都不改结果。
+    """
+    h, w = hw
+    tok = (tokens.astype(jnp.float32) * mask.astype(jnp.float32)[:, None]).reshape(
+        -1, LATENT_CH, PATCH, PATCH)
+    canvas = jnp.zeros((g, h, w, LATENT_CH, PATCH, PATCH), jnp.float32)
+    canvas = canvas.at[seg, rows, cols].add(tok)
+    # [G, h, w, c, ph, pw] -> [G, c, h*ph, w*pw]
+    return canvas.transpose(0, 3, 1, 4, 2, 5).reshape(g, LATENT_CH, h * PATCH,
+                                                      w * PATCH)
+
+
+def _haar(x: jnp.ndarray) -> jnp.ndarray:
+    """单层 Haar 分解，返回 [B, 4*C, H/2, W/2]（aux_losses.py:194 的等价写法）。
+
+    原实现用 grouped conv2d + 4 个 2x2 核 ×0.5；这里直接按 stride-2 切片组合，
+    数值上是同一个线性变换（同样的 ±1 组合乘 0.5），少一次卷积调用。
+    """
+    a = x[..., 0::2, 0::2]
+    b = x[..., 0::2, 1::2]
+    c = x[..., 1::2, 0::2]
+    d = x[..., 1::2, 1::2]
+    ll = (a + b + c + d) * 0.5
+    lh = (a + b - c - d) * 0.5
+    hl = (a - b + c - d) * 0.5
+    hh = (a - b - c + d) * 0.5
+    return jnp.concatenate([ll, lh, hl, hh], axis=1)
+
+
+def spectral_per_image(x0_pred: jnp.ndarray, x0_target: jnp.ndarray,
+                       cover: jnp.ndarray, cfg: AuxConfig) -> jnp.ndarray:
+    """逐图 spectral loss [G]。输入是 `to_canvas` 的产物 [G, 16, H, W]。
+
+    `cover` [G, H, W] 是画布上"这一格属于真实图像"的 0/1 掩码，用来
+      ① 把 FFT 的 ortho 归一化补偿回图自己的面积（见模块 docstring）；
+      ② 给小波系数做 masked mean（只统计完全落在图内的块）。
+    """
+    fp = jnp.fft.fft2(x0_pred.astype(jnp.float32), axes=(-2, -1), norm="ortho")
+    ft = jax.lax.stop_gradient(
+        jnp.fft.fft2(x0_target.astype(jnp.float32), axes=(-2, -1), norm="ortho"))
+    # 稳定的复模：sqrt(re²+im²+eps) —— 在 0 处的梯度会 NaN，加 eps 后对非零幅度
+    # 实质无影响（aux_losses.py:44 同款处理）
+    amp = lambda z: jnp.sqrt(jnp.real(z) ** 2 + jnp.imag(z) ** 2 + 1e-12)
+    diff = jnp.abs(amp(fp) - amp(ft))
+    n_canvas = float(x0_pred.shape[-1] * x0_pred.shape[-2])
+    # `maximum(·, 1.0)` 只是防 0/0：空段的 cover 恒 0 -> diff 也恒 0（画布全零），
+    # 所以分子先归零、这个 floor 永远不改真实图的值。**它依赖"分子在空段恒 0"
+    # 这个外部性质**（cover 由 to_canvas 散射同一份 mask 得到），谁把 cover 换成
+    # 含填充的粗粒度掩码，这里就会把该图的 spectral 放大 sqrt(n_canvas) 倍且不报错。
+    n_img = jnp.maximum(jnp.sum(cover, axis=(-2, -1)), 1.0)         # [G]
+    # 零填充补偿：|A_padded| = sqrt(N_img/N_canvas)·|A_native|
+    total = jnp.mean(diff, axis=(1, 2, 3)) * jnp.sqrt(n_canvas / n_img)
+
+    if cfg.spectral_use_wavelet:
+        cp = _haar(x0_pred.astype(jnp.float32))
+        ct = jax.lax.stop_gradient(_haar(x0_target.astype(jnp.float32)))
+        # 系数掩码：2x2 块四角都在图内才算数（图的高宽是偶数、块与边界对齐，
+        # 所以这等价于"块完全落在图内"）
+        cm = (cover[:, 0::2, 0::2] * cover[:, 0::2, 1::2]
+              * cover[:, 1::2, 0::2] * cover[:, 1::2, 1::2])[:, None]
+        num = jnp.sum(jnp.abs(cp - ct) * cm, axis=(1, 2, 3))
+        den = jnp.maximum(jnp.sum(cm, axis=(1, 2, 3)) * cp.shape[1], 1.0)
+        total = total + float(cfg.spectral_wavelet_lambda) * (num / den)
+    return total
+
+
+def spectral_term(x0_pred, x0_target, cover, t, cfg: AuxConfig,
+                  valid: jnp.ndarray) -> jnp.ndarray:
+    """λ × **命中 t-gate 的图的均值**（anima_train.py:4290-4295 的口径）。
+
+    那一行的注释值得照抄进来：navit 侧是对命中的图**求和**再除以命中数，
+    因为非 navit 路径的 `spectral_loss` 返回的是 batch 均值。少除这一下，
+    aux 相对主 loss 会被放大 G 倍（G≈6 时就压死主损失了）。
+    没有图命中 gate 时返回 0。
+    """
+    gate = ((t < float(cfg.spectral_t_gate)).astype(jnp.float32)
+            * valid.astype(jnp.float32))
+    per = spectral_per_image(x0_pred, x0_target, cover, cfg)
+    return (float(cfg.spectral_lambda) * jnp.sum(per * gate)
+            / jnp.maximum(jnp.sum(gate), 1.0))
+
+
+def recover_x0(noisy: jnp.ndarray, t_tok: jnp.ndarray,
+               pred: jnp.ndarray) -> jnp.ndarray:
+    """aux_losses.py:170 —— 线性 FM 下 `x0 = x_t - t·v`。fp32。"""
+    return noisy.astype(jnp.float32) - t_tok * pred.astype(jnp.float32)

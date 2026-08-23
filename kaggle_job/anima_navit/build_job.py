@@ -14,7 +14,7 @@ Kaggle 的 script kernel 只跑 metadata 里的**单个** code_file，没有模�
 from pathlib import Path
 
 HERE = Path(__file__).parent
-SRC = HERE.parents[1] / "AnimaLoraToolkit" / "jax_tpu"
+SRC = HERE.parent / "jax_tpu"
 PARTS = [
     ("① bootstrap（_preamble.py）—— 必须在 import jax 之前", HERE / "_preamble.py"),
     ("② 模型（jax_tpu/anima_jax.py）", SRC / "anima_jax.py"),

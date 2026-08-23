@@ -1,0 +1,27 @@
+__pycache__/
+
+# `_ref/` 是对拍参考量。规则的意思是：**默认全挡，只放行小的那几份**。
+#
+# 挡的原因：大的几份体积离谱（export_ref.npz 503MB / anima_ref.npz 37MB /
+# optim_ref.npz 9MB / tiny.safetensors 11MB），而且要真权重 + torch 才能产。
+#
+# 放行的原因：有了那几份小的（合计约 1MB），⑫⑬④ 与 K1 的 check 侧在本仓库
+# 独立可跑 —— 不需要 clone upstream、不需要 torch、不需要底模。这是
+# 「拿到本仓库的人能验证多少」的关键差别。
+#
+# 写法要点：git 的 `!` 反否定对**目录**生效时会连目录里的一切一起放行，
+# 所以不能写 `!_ref/`。这里先放行目录本身（让 git 愿意往里走），
+# 再用 `_ref/**` 把内容全挡掉，最后逐个点名放行。
+#
+# krea2 的 K1 参考量**不放行**：`krea2_ref.npz` 虽然只有 339KB，但它与
+# `tiny.safetensors`（11MB 随机权重）是同一次 `dump_krea2_ref.py` 的配套产物，
+# 少了权重那两份 npz 用不上。要跑 K1 就设 ANIMA_UPSTREAM 重新 dump 一遍。
+# K3（qwen3vl）的配套只有 1.4MB，所以连权重一起放行 —— 它能独立跑。
+!_ref/
+_ref/**
+!_ref/adapter_ref.npz
+!_ref/flow_ref.npz
+!_ref/objective_ref.npz
+!_ref/qwen3vl/
+!_ref/qwen3vl/qwen3vl_ref.npz
+!_ref/qwen3vl/tiny_te.safetensors

@@ -171,6 +171,67 @@ Krea2 已接线到 Kaggle TPU v5e-8 训练链路（`run_train.py` 自动按 `mod
   真机；动 HTTP Range 加载路径加跑 `check_http_range.py`。
 - 训练配置模板：`config/train_krea2_tpu_template.yaml`。
 
+## 文本缓存在 TPU 上现算（opt-in，2026-08-21）
+
+krea2 的 `<stem>.textfeat.npz` 是 12 层 hidden 堆叠，bf16 下 **61.4KB/token**：
+JAN 那轮 96 张图实测 **1699MB**，占整个上传 dataset 的 **90.3%**（latent 侧只有
+127MB）。而这 1.7GB 的信息源只是 96 条 caption，合计 **0.14MB**。
+
+`jax_tpu/qwen3vl_te.py` 把 Qwen3-VL 的**文本塔**移植成纯 JAX 前向，
+`jax_tpu/text_cache.py` 在真机上把 textfeat 现算出来。本地这一侧只剩 tokenize。
+
+**默认关闭**：不给 `--caption-ids` 时 build_job 与之前逐字节等价。
+
+```bash
+# ① 本地：只 tokenize，不加载权重（torch 解释器，只用它的 tokenizer）
+<py> tools/dump_caption_ids.py --data-dir D:/Datasets/帮/1_data \
+    --tokenizer models/text_encoders/Qwen3-VL-4B-Instruct-heretic \
+    -o caption_ids.npz [--empty-caption]     # 实测 96 条 -> 39.8KB
+
+# ② 打包：ids 直接内嵌进 script kernel（不建 dataset，caption 明文不出本地）
+<py> build_job.py --config <yaml> --caption-ids caption_ids.npz \
+    --env ANIMA_DATA_DIR=/kaggle/input/<只含 latent 的 dataset> \
+    --env ANIMA_TE_PATH=/kaggle/input/<Qwen3-VL 文本塔 dataset> ...
+```
+
+真机上的顺序：解包 → **子进程**跑 `text_cache.py`（加载文本塔 → 现算 textfeat →
+写 `/kaggle/temp/data` → 把只读挂载里的 latent **软链**进同一目录）→ 子进程退出 →
+父进程 `import run_train` 加载 12B 底模。
+
+- **为什么是子进程而不是 import**：底模是 FSDP 单布局驻留 ~11.9G/卡，文本塔是
+  7.1GB。同进程内靠 `Array.delete()` 还内存要赌 TPU 分配器不留碎片；子进程退出
+  则必然把 HBM 全部交回。代价只是一次解释器启动。**父进程在此之前不能碰 jax**
+  —— TPU 同一时刻只能被一个进程持有。
+- **staging 落 `/kaggle/temp`**（回退 `/tmp`）：那里是 1GB+ 的 textfeat 加一堆
+  指向 `/kaggle/input` 的软链，进 kernel output 既没用又拖慢拉回。
+  真机实测磁盘：`/kaggle/working` **21.0GB**（这是唯一受限的那块，也是 kernel
+  output 的来源），而 `/` 与 `/root` 都是 8656.9GB / 可用 1096.9GB —— 所以
+  HF 缓存放默认的 `/root/.cache` 不占 working 配额，大临时文件也该往 `/tmp` 放。
+- `ANIMA_TE_PATH` 支持 `hf://<repo>[@<rev>]` 现拉（用完删快照腾磁盘）、
+  Kaggle 挂载目录、单 safetensors。**带 scheme 的值不要过 `_resolve_input`**
+  —— 它只放行 `http(s)://`，`hf://` 会被当成挂载路径然后 fail-fast（真机踩过一次）。
+
+- **只加载 35/36 层**：`KREA2_SELECT_LAYERS` 最大 tap 是 35，而闸门实测
+  `hidden_states[k]` = **第 k 层的输入**，所以 `layers.35.*` 与 `norm.weight`
+  永远用不到。加上按数据集 token 集裁剪 embedding（151936 行 → 实测 278 行），
+  实载 **3.53B / 7.1GB bf16**，单 chip（16GB）放得下。
+- **padding 必须摆在右侧**。`position_ids` 是 `arange`、不看 attention_mask，
+  所以 `_encode_krea2_batch` 在 `max_length<=0` 下"先 pad 再拼 suffix"的中段
+  padding 会把 suffix 推到别的位置上 —— torch 侧探针实测 max|Δ| = **6.7e-1**。
+  已落盘的缓存是 `cache_text_features.py` 的 B=1 无 padding 口径，TPU 侧按
+  [prefix; caption; suffix; PAD…] 摆，与之逐 bit 等价（探针 0.0）。
+  （**顺带的发现**：GPU 侧动态 caption 训练在 `krea2_text_max_length<=0` 且
+  同批 caption 不等长时，条件会随 batch 组成而变。TPU 走缓存不受影响，
+  GPU 侧要不要改是另一件事。）
+- **TE 权重从哪来**：推荐传成 Kaggle Dataset 挂 `/kaggle/input`（只读挂载走
+  惰性读，用不上的张量一个字节都不读，也不占 `/kaggle/working` 的 20GB）。
+  `ANIMA_TE_PATH` 也认单文件与 HF resolve URL，但 **URL 只能指单文件
+  checkpoint**（官方是 2 分片），且 HTTP Range 路径会把整个文件预取下来。
+  另外：JAN 那轮用的是本地 `Qwen3-VL-4B-Instruct-**heretic**` 变体，
+  要复现同一条件就得传那一份，不能拿官方 Instruct 顶替。
+- 闸门：`jax_tpu/tests/` 的 **K3**（结构，fp32 rel ≤ 5.3e-7）与 **K3-B**
+  （真权重 vs 本地已有缓存，残差全落在 bf16 噪声内，A/(B+C)=0.43）。
+
 ## 验证状态（本地 RTX GPU，tests/test_krea2_modeling.py）
 
 - packed navit ≡ 逐图 dense 前向：fp32 max_abs_diff **1.4e-06**（SDPA 回退）/

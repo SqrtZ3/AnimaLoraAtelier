@@ -7,7 +7,7 @@ Kaggle 的 script kernel 只跑 metadata 里的**单个** code_file，没有模�
 from pathlib import Path
 
 HERE = Path(__file__).parent
-MODEL = HERE.parents[1] / "AnimaLoraToolkit" / "jax_tpu" / "anima_jax.py"
+MODEL = HERE.parent / "jax_tpu" / "anima_jax.py"
 PRE = HERE / "_preamble.py"
 BODY = HERE / "_job_body.py"
 OUT = HERE / "anima_tpu_job.py"
@@ -32,7 +32,7 @@ OUT.write_text(
     "from __future__ import annotations\n"
     + sep("① bootstrap（_preamble.py）—— 必须在 import jax 之前")
     + strip_future(pre_src)
-    + sep("② 模型（AnimaLoraToolkit/jax_tpu/anima_jax.py）")
+    + sep("② 模型（jax_tpu/anima_jax.py）")
     + strip_future(model_src)
     + sep("③ job 主体（_job_body.py）")
     + strip_future(body_src),

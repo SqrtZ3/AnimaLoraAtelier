@@ -27,7 +27,7 @@ sha256 自检），也就不存在"拼接版和本地版行为不一样"这种�
 
 ## 用法
 
-    python build_job.py --config ../../AnimaLoraToolkit/config/train_anima.yaml
+    python build_job.py --config ../config/train_anima_tpu_template.yaml
 """
 
 from __future__ import annotations
@@ -38,14 +38,14 @@ import hashlib
 from pathlib import Path
 
 HERE = Path(__file__).parent
-SRC = HERE.parents[1] / "AnimaLoraToolkit" / "jax_tpu"
+SRC = HERE.parent / "jax_tpu"
 OUT = HERE / "anima_train_job.py"
 
 #: 打包哪些模块。顺序无所谓（运行时是正常 import），但列表要全 ——
 #: 漏一个会在真机上报 ModuleNotFoundError，白烧一轮配额。
 MODULES = ("adapters.py", "anima_jax.py", "attention.py", "auxloss.py", "config.py",
            "data.py", "export.py", "flow.py", "krea2_jax.py", "optim.py", "packing.py",
-           "sched.py", "train.py", "run_train.py")
+           "qwen3vl_te.py", "sched.py", "text_cache.py", "train.py", "run_train.py")
 
 
 def main() -> int:
@@ -62,6 +62,13 @@ def main() -> int:
                          "circlestone-labs/Anima:split_files/diffusion_models/"
                          "anima-base-v1.0.safetensors:f7382c4...。脚本会在 import jax "
                          "之后、run_train 之前下载，并把 ANIMA_TRANSFORMER 指到产物")
+    ap.add_argument("--caption-ids", default="",
+                    help="`tools/dump_caption_ids.py` 产出的 caption_ids.npz。给了它就"
+                         "**在 TPU 上现算文本缓存**（jax_tpu/text_cache.py）：ANIMA_DATA_DIR "
+                         "只需要 latent 侧的 npz，textfeat 由真机算出来写进 "
+                         "/kaggle/working/data 并接管 data_dir。文件几十 KB，直接"
+                         "**内嵌进脚本**（不建 dataset，caption 明文也不出本地）。"
+                         "配套需要 --env ANIMA_TE_PATH=<Qwen3-VL 文本塔路径/URL>")
     ap.add_argument("--hf-stream", action="store_true",
                     help="不落盘：把 ANIMA_TRANSFORMER 写成 HF resolve URL，由 "
                          "krea2_jax 的 HTTP Range 加载边下边训。**仅 krea2**——"
@@ -93,6 +100,20 @@ def main() -> int:
             raise SystemExit("--hf-model 需要 <repo>:<文件名>[:<revision>]")
         hf = tuple(parts)
 
+    ids_b64 = ""
+    if a.caption_ids:
+        ids_raw = Path(a.caption_ids).read_bytes()
+        if len(ids_raw) > 4 << 20:
+            raise SystemExit(
+                f"{a.caption_ids} 有 {len(ids_raw) / 1e6:.1f}MB —— caption ids 该是几十 KB "
+                f"量级。内嵌这么大的东西进 script kernel 不合适，确认传对文件了吗？")
+        digest.update(ids_raw)
+        ids_b64 = base64.b64encode(ids_raw).decode()
+        if "ANIMA_TE_PATH" not in env_kv:
+            raise SystemExit(
+                "--caption-ids 需要同时给 --env ANIMA_TE_PATH=<Qwen3-VL 文本塔>\n"
+                "  （Kaggle Dataset 挂载路径，或 HF resolve URL；见 jax_tpu/text_cache.py）")
+
     body = _TEMPLATE.format(
         preamble=(HERE / "_preamble.py").read_text(encoding="utf-8"),
         blobs=repr(blobs),
@@ -102,13 +123,16 @@ def main() -> int:
         env=repr(env_kv),
         hf=repr(hf),
         stream=repr(bool(a.hf_stream)),
+        ids=repr(ids_b64),
     )
     OUT.write_text(body, encoding="utf-8")
     compile(body, str(OUT), "exec")          # 语法自检，别推上去才炸
     print(f"已生成 {OUT}（{len(body.splitlines())} 行，源码 sha {digest.hexdigest()[:16]}）")
     print(f"内嵌模块 {len(MODULES)} 个 + 配置 {Path(a.config).name}"
           + (f"，env {sorted(env_kv)}" if env_kv else "")
-          + (f"，HF 直下 {hf[0]}:{hf[1]}" if hf else ""))
+          + (f"，HF 直下 {hf[0]}:{hf[1]}" if hf else "")
+          + (f"，caption ids {len(ids_b64) * 3 // 4 / 1024:.0f}KB（TPU 侧现算 textfeat）"
+             if ids_b64 else ""))
     return 0
 
 
@@ -130,6 +154,7 @@ _EXTRA = {extra}
 _ENV = {env}            # build_job --env 烘焙的路径覆盖（ANIMA_* / LIBTPU_INIT_ARGS）
 _HF = {hf}              # build_job --hf-model 烘焙的 (repo, 文件名[, revision])
 _STREAM = {stream}      # build_job --hf-stream：底模不落盘，走 HTTP Range 流式
+_IDS = {ids}            # build_job --caption-ids：caption 的 token ids（几十 KB）
 
 _PKG = Path("/kaggle/working/jax_tpu")
 if not _PKG.parent.exists():                 # 本地干跑
@@ -159,7 +184,6 @@ for _k, _v in _ENV.items():
 #                       --xla_tpu_dot_dot_fusion_duplicated=true
 #                       --xla_tpu_scoped_vmem_limit_kib=65536"
 # 用法见 kaggle_job/README.md 的「XLA 调优 flag」一节。
-
 
 if _HF:
     # gated repo（如 krea/Krea-2-Raw）需要 token —— 优先环境变量（build_job
@@ -245,7 +269,57 @@ def _override_paths(path):
     path.write_text(yaml.safe_dump(d, allow_unicode=True), encoding="utf-8")
 
 
+def _build_text_cache():
+    """在 TPU 上现算 krea2 的 `<stem>.textfeat.npz`，返回接管后的 data_dir。
+
+    只有 `--caption-ids` 烘焙过才走这里。做三件事：
+      ① 把内嵌的 ids 写回磁盘（几十 KB）；
+      ② 跑 `jax_tpu/text_cache.py`：加载 Qwen3-VL 文本塔（35/36 层 + 裁剪词表
+         ≈ 7.1GB bf16，单卡）现算 textfeat；
+      ③ 把只读挂载里的 latent 软链进同一目录（`jax_tpu/data.py` 要求同目录同 stem）。
+
+    **跑在子进程里**，不是 import 进来跑：后面还要在同一台机器上加载 12B 底模
+    （FSDP，单布局驻留 ~11.9G/卡）。同进程内靠 `Array.delete()` 还内存要赌 TPU
+    分配器不留碎片；子进程退出则必然把 HBM 全部交回。代价只是一次解释器启动。
+    父进程在此之前**不能碰 jax** —— TPU 同一时刻只能被一个进程持有，所以本函数
+    必须在 `import run_train` 之前调用。
+    """
+    import subprocess
+    ids_path = _PKG / "caption_ids.npz"
+    ids_path.write_bytes(base64.b64decode(_IDS))
+    te = os.environ.get("ANIMA_TE_PATH", "")
+    if not te:
+        raise SystemExit("[ FATAL ] 烘焙了 caption ids 但没给 ANIMA_TE_PATH")
+    if "://" not in te:
+        # 带 scheme 的（hf:// / http(s)://）不是挂载路径，别拿去 _resolve_input
+        # —— 那样会被当成 /kaggle/input 下的目录名找不到然后 fail-fast。
+        te = _resolve_input(te)
+    latent = _resolve_input(os.environ["ANIMA_DATA_DIR"])
+    # staging 落 **/kaggle/temp**（不进 kernel output）：里面是 1GB+ 的 textfeat
+    # 与指向 /kaggle/input 的软链，committing 进产物既没用又拖慢拉回。
+    stage = ("/kaggle/temp/data" if Path("/kaggle/temp").exists()
+             else "/tmp/anima_stage" if Path("/tmp").exists()
+             else str(_PKG / "data"))
+    cmd = [sys.executable, str(_PKG / "text_cache.py"),
+           "--ids", str(ids_path), "--te", te, "--out", stage,
+           "--latent-dir", latent,
+           "--quantum", os.environ.get("ANIMA_TE_QUANTUM", "128"),
+           "--batch", os.environ.get("ANIMA_TE_BATCH", "1")]
+    if Path("/kaggle/working").exists():
+        cmd += ["--jax-cache", "/kaggle/working/jax_cache"]
+    print(f"[ INFO ] 文本缓存子进程: {{' '.join(cmd[1:])}}", flush=True)
+    r = subprocess.run(cmd, cwd=str(_PKG))
+    if r.returncode != 0:
+        raise SystemExit(f"[ FATAL ] 文本缓存子进程退出码 {{r.returncode}} —— "
+                         f"上面是它的完整输出")
+    n = len(list(Path(stage).glob("*.textfeat.npz")))
+    print(f"[ INFO ] 文本缓存完成，{{stage}} 下 {{n}} 个 textfeat", flush=True)
+    return stage
+
+
 def main() -> int:
+    if _IDS:
+        os.environ["ANIMA_DATA_DIR"] = _build_text_cache()
     _override_paths(_CFG_PATH)
     argv = ["--config", str(_CFG_PATH), "--devices",
             os.environ.get("ANIMA_DEVICES", "8"),

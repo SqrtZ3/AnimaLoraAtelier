@@ -49,13 +49,13 @@ num_workers: 0
 # ============================================================================
 output_dir: "./output"
 output_name: "anima_lora"
-save_every: 5             # 每 5 个 epoch 保存
+save_every_epochs: 5             # 每 5 个 epoch 保存
 seed: 42
 
 # ============================================================================
 # 采样
 # ============================================================================
-sample_every: 1           # 每 5 个 epoch 采样
+sample_every_epochs: 1           # 每 5 个 epoch 采样
 sample_prompt: "@your-trigger,masterpiece, best quality, newest, safe, 1girl"
 
 # ============================================================================

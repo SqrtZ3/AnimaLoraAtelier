@@ -96,10 +96,10 @@ _HANDLED = {
     "eisbach_lambda", "dfm_lambda", "dfm_mode",
     "aux_spectral_enabled", "aux_spectral_lambda", "aux_spectral_use_wavelet",
     "aux_spectral_wavelet_lambda", "aux_spectral_t_gate",
-    "eval_every", "eval_count", "eval_t_grid", "eval_seed",
-    "output_dir", "output_name", "save_every", "save_every_steps",
-    "save_state_every", "resume_state",
-    "log_every",
+    "eval_every", "eval_every_steps", "eval_count", "eval_t_grid", "eval_seed",
+    "output_dir", "output_name", "save_every", "save_every_epochs", "save_every_steps",
+    "save_state_every", "save_state_every_steps", "resume_state",
+    "log_every", "log_every_steps",
 }
 
 #: 由 **PyTorch 侧的离线缓存**负责，TPU 训练时不再需要（读的是缓存产物）。
@@ -121,14 +121,21 @@ _IGNORED = {
     "batch_size", "num_workers", "torch_compile", "attn_force_autocast_dtype",
     "keep_vae_on_gpu", "empty_cache_after_sample", "no_progress", "no_monitor",
     "monitor_host", "monitor_port", "no_browser", "loss_curve_steps",
-    "stage_timing_every", "stage_timing_warmup",
+    "stage_timing_every", "stage_timing_every_steps", "stage_timing_warmup",
     "disable_tlora_hooks", "use_precommit_lora_forward",
     "use_per_block_checkpoint", "telemetry_freq_bands", "telemetry_slope_window",
-    "telemetry_optimizer_every", "telemetry_capacity_every",
+    "telemetry_optimizer_every", "telemetry_optimizer_every_steps",
+    "telemetry_capacity_every", "telemetry_capacity_every_steps",
     "bucket_drop_last", "effective_batch_size", "lora_one_init_scale",
     # 纯展示/日志：TPU 侧每 log_every 步就打一次 gnorm，没有独立的遥测通道。
     # 归在这里而不是 _HANDLED —— 它们不改训练数学，但也确实没被读。
-    "grad_norm_log_every", "telemetry_enabled",
+    "grad_norm_log_every", "grad_norm_log_every_steps", "telemetry_enabled",
+    # 节奏参数统一为 *_every_<单位>；下列 cadence 在 TPU 侧本就不消费（GPU 专属 / 无
+    # 独立通道），旧名 + 新名一并归 _IGNORED，避免被当未知键 raise。无 TPU yaml 设它们。
+    "wandb_log_every", "wandb_log_every_steps",
+    "gaf_every", "gaf_every_steps",
+    "dpo_regen_every", "dpo_regen_every_steps",
+    "aclora_restart_every", "aclora_restart_every_steps",
 }
 
 #: 没移植。值 = (判定"是否被打开"的函数, 原因与替代路径)。
@@ -145,6 +152,15 @@ _UNPORTED: Dict[str, Tuple[Any, str]] = {
                      "同 sample_every（按 step 触发的那个）。TPU 侧不出图，设 0。"),
     "sample_reference_steps": (lambda v: int(v or 0) > 0,
                                "同 sample_every（参考图那路）。TPU 侧不出图，设 0。"),
+    # ── 同上三键的 *_every_<单位> 新名（节奏参数统一）。必须显式列在 _UNPORTED：
+    # _check_coverage 的 startswith("sample_") 豁免会把这些 sample_* 前缀的新名静默吞掉，
+    # 否则从"开则 raise"退化为"静默忽略"——正是本文件 docstring 要防的那类。旧名仍在上面。
+    "sample_every_epochs": (lambda v: int(v or 0) > 0,
+                            "同 sample_every（按 epoch 触发的那个）。TPU 侧不出图，设 0。"),
+    "sample_every_steps": (lambda v: int(v or 0) > 0,
+                           "同 sample_every（按 step 触发的那个）。TPU 侧不出图，设 0。"),
+    "sample_every_reference_steps": (lambda v: int(v or 0) > 0,
+                                      "同 sample_every（参考图那路）。TPU 侧不出图，设 0。"),
     # ── LR 调度：GPU 有 cosine / cosine_with_restart，TPU 只有 warmup + 常数 lr ──
     # `optim._lr_at` 的 docstring 解释了为什么有意不做衰减（用户范式是极大 epoch
     # 一直训、随时手停、从任意 step 挑 checkpoint，带衰减会让"第 N 步的 checkpoint"
@@ -507,13 +523,16 @@ def build(d: Dict[str, Any], devices: int = 8, allow_unported: bool = False,
         flip_prob=(0.5 if _b(d, "flip_augment") else 0.0),
         caption_dropout=_f(d, "caption_dropout_rate"),
         epochs=_i(d, "epochs", 200), max_steps=_i(d, "max_steps", 0),
-        save_every=_i(d, "save_every", 1),
+        # 节奏参数已统一为 *_every_<单位>（见 trainer/config.py 的 ALIASES）。
+        # build() 优先读新键、回退旧键（旧 yaml 仍可用，行为不变）。RunConfig 字段名
+        # 保持旧名不变 → run_train.py 的 rc.save_every / rc.eval_every 等读取点不用动。
+        save_every=_i(d, "save_every_epochs", _i(d, "save_every", 1)),
         save_every_steps=_i(d, "save_every_steps", 0),
-        save_state_every=_i(d, "save_state_every", 0),
-        eval_every=_i(d, "eval_every", 0), eval_count=_i(d, "eval_count", 0),
+        save_state_every=_i(d, "save_state_every_steps", _i(d, "save_state_every", 0)),
+        eval_every=_i(d, "eval_every_steps", _i(d, "eval_every", 0)), eval_count=_i(d, "eval_count", 0),
         eval_t_grid=_parse_grid(d.get("eval_t_grid", "")),
         eval_seed=_i(d, "eval_seed", 1234),
-        log_every=max(_i(d, "log_every", 1), 1),
+        log_every=max(_i(d, "log_every_steps", _i(d, "log_every", 1)), 1),
         resume_state=str(d.get("resume_state", "") or ""),
         waived=tuple(waived),
         krea2_res_shift=_b(d, "krea2_res_shift", True),

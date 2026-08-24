@@ -50,7 +50,7 @@ def init(args, extra_config: Mapping[str, Any] | None = None) -> bool:
     if mode == "disabled":
         return False
 
-    _LOG_EVERY = max(1, int(getattr(args, "wandb_log_every", 1) or 1))
+    _LOG_EVERY = max(1, int(getattr(args, "wandb_log_every_steps", 1) or 1))
     _LOG_IMAGES = bool(getattr(args, "wandb_log_images", True))
 
     try:
@@ -117,7 +117,7 @@ def log_step(
     samples_seen: int | None = None,
     ref_step: float | None = None,
 ) -> None:
-    """逐步指标。按 wandb_log_every 抽稀（默认每步；长跑可设 10/50 降低请求量）。"""
+    """逐步指标。按 wandb_log_every_steps 抽稀（默认每步；长跑可设 10/50 降低请求量）。"""
     if _RUN is None or _FAILED:
         return
     if _LOG_EVERY > 1 and int(step) % _LOG_EVERY != 0:

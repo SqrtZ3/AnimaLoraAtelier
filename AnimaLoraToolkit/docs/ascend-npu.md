@@ -45,7 +45,7 @@ ANIMA_NPU=1 python anima_train.py --config config/xxx.yaml
 | `aux_perceptual_enabled`（LPIPS / DINOv2） | 硬依赖 torchvision，装它会换掉 torch（见 §6） | `false`；确需则用 `npu_setup_image.sh --with-perceptual`（带 constraints）自行验证 |
 
 未拦但**需要探针确认**的：`torch.fft`（spectral aux loss 依赖）、稠密 mask 下的 SDPA 后端与显存、
-`torch.npu.Event`（`stage_timing_every > 0` 才用到，默认关）。
+`torch.npu.Event`（`stage_timing_every_steps > 0` 才用到，默认关）。
 
 ### 2.2 广播 attn_mask 要展开（`expand_attn_mask`）
 

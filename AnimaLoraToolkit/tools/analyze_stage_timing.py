@@ -4,7 +4,7 @@
 用法：
     python tools/analyze_stage_timing.py --csv <output_dir>/stage_timing.csv
 
-CSV 由 anima_train.py 的 stage_timing_every>0 写出（见 trainer/stage_timer.py）。
+CSV 由 anima_train.py 的 stage_timing_every_steps>0 写出（见 trainer/stage_timer.py）。
 按 mode（navit / arb / fit …）分组，对每个阶段列输出 count / mean / median / p90，
 以及占 whole_step 的均值份额——用来回答"一步时间花在哪、两条路径差在哪个阶段"。
 
@@ -49,7 +49,7 @@ def main() -> int:
     with path.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     if not rows:
-        print("CSV 为空（没有采样行）。确认 stage_timing_every>0 且训练已跑过 warmup。")
+        print("CSV 为空（没有采样行）。确认 stage_timing_every_steps>0 且训练已跑过 warmup。")
         return 0
     if args.last > 0:
         rows = rows[-args.last:]

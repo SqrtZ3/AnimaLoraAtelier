@@ -371,7 +371,7 @@ bf16+xformers）：** 旧实现把 t_emb/adaln_lora `repeat_interleave` 成逐 t
 新路径较旧路径**前向 −13.3%**。同基准下注意力形状（dense `[4,4096]` 无掩码 vs 块对角
 `[1,16384]`）前向等速（±1.4%）、fwd+bwd 仅 +6% —— attention 不是瓶颈。
 **诚实标注：** −13% 前向不足以解释云端全部差距（navit budget=16384 ≈ 0.25 it/s vs
-ARB bs=4 ≈ 0.33 it/s，步时 +32%）；剩余部分的归因需要云端 `stage_timing_every` A/B 数据
+ARB bs=4 ≈ 0.33 it/s，步时 +32%）；剩余部分的归因需要云端 `stage_timing_every_steps` A/B 数据
 （本地卡与云端卡的带宽/算力比不同，各开销占比会移动）。
 
 **改法：** `forward_packed_navit` 改传 per-image `[1, G, *]` 的 emb/adaln_lora + `mod_index`

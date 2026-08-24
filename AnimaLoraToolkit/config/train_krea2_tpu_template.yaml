@@ -164,14 +164,14 @@ adaptive_timestep_gate_c: 0.05
 adaptive_timestep_highfreq_weight: 0.25
 
 # ── eval / 存档 / 断点接棒 ─────────────────────────────────────
-eval_every: 0                  # >0 时必须有 eval_t_grid（否则构造期报错）
+eval_every_steps: 0                  # >0 时必须有 eval_t_grid（否则构造期报错）
 eval_count: 0
 eval_t_grid: ""
 eval_seed: 1234
 output_dir: "./output"
 output_name: "krea2-tpu"
-save_every: 1
+save_every_epochs: 1
 save_every_steps: 0
-save_state_every: 0            # 长训建议 50-100：存完整优化器状态 + 自适应 EMA
+save_state_every_steps: 0            # 长训建议 50-100：存完整优化器状态 + 自适应 EMA
 resume_state: ""
-log_every: 1
+log_every_steps: 1

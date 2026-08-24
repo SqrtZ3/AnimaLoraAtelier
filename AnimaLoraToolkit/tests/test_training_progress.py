@@ -55,7 +55,7 @@ class TrainingProgressConfigTests(unittest.TestCase):
         apply_yaml_config(args, {
             "reference_batch_size": 4,
             "reference_grad_accum": 1,
-            "sample_reference_steps": 40,
+            "sample_every_reference_steps": 40,
             "save_every_reference_steps": 80,
             "keep_vae_on_gpu": True,
             "empty_cache_after_sample": False,
@@ -63,10 +63,35 @@ class TrainingProgressConfigTests(unittest.TestCase):
 
         self.assertEqual(args.reference_batch_size, 4)
         self.assertEqual(args.reference_grad_accum, 1)
-        self.assertEqual(args.sample_reference_steps, 40)
+        self.assertEqual(args.sample_every_reference_steps, 40)
         self.assertEqual(args.save_every_reference_steps, 80)
         self.assertTrue(args.keep_vae_on_gpu)
         self.assertFalse(args.empty_cache_after_sample)
+
+    def test_renamed_cadence_keys_alias_old_yaml_names(self):
+        """节奏参数统一为 *_every_<单位> 后，旧 yaml 键经 ALIASES 落到新属性，值不变。"""
+        args = SimpleNamespace(**DEFAULTS)
+        apply_yaml_config(args, {
+            "save_every": 3,            # → save_every_epochs
+            "sample_steps": 50,         # → sample_every_steps
+            "log_every": 9,             # → log_every_steps
+            "eval_every": 30,           # → eval_every_steps
+            "grad_norm_log_every": 15,  # → grad_norm_log_every_steps
+            "aclora_restart_every": 99, # → aclora_restart_every_steps
+        })
+        self.assertEqual(args.save_every_epochs, 3)
+        self.assertEqual(args.sample_every_steps, 50)
+        self.assertEqual(args.log_every_steps, 9)
+        self.assertEqual(args.eval_every_steps, 30)
+        self.assertEqual(args.grad_norm_log_every_steps, 15)
+        self.assertEqual(args.aclora_restart_every_steps, 99)
+
+    def test_renamed_cadence_new_key_wins_over_old(self):
+        """新旧键同在时新键优先，旧键忽略（且旧 attr 不被设）。"""
+        args = SimpleNamespace(**DEFAULTS)
+        apply_yaml_config(args, {"save_every": 1, "save_every_epochs": 8})
+        self.assertEqual(args.save_every_epochs, 8)
+        self.assertFalse(hasattr(args, "save_every"))
 
 
 class MonitorReferenceProgressTests(unittest.TestCase):

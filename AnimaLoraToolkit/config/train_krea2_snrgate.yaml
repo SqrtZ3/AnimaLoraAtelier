@@ -254,7 +254,7 @@ batch_size: 4
 effective_batch_size: 0
 grad_accum: 1
 grad_clip_max_norm: 1.0
-grad_norm_log_every: 20
+grad_norm_log_every_steps: 20
 mixed_precision: "bf16"
 grad_checkpoint: true
 num_workers: 4
@@ -313,7 +313,7 @@ immiscible_enabled: false       # Krea2+navit 未验证，首版收窄变量面
 
 # ── eval ────────────────────────────────────────────────────
 # ★ 判读 B：本配方下 t=0.1 曲线应开始下降（低 t 有监督了）。
-eval_every: 40
+eval_every_steps: 40
 eval_count: 16
 eval_t_grid: "0.1,0.5,0.9,0.97"
 eval_seed: 1234
@@ -322,21 +322,21 @@ eval_seed: 1234
 telemetry_enabled: true
 telemetry_freq_bands: 3
 telemetry_slope_window: 6
-telemetry_optimizer_every: 0
-telemetry_capacity_every: 0
+telemetry_optimizer_every_steps: 0
+telemetry_capacity_every_steps: 0
 
 # ── 输出 / 保存 ─────────────────────────────────────────────
 output_dir: "./output/krea2-snrgate"   # ★必改
 output_name: "krea2-snrgate"           # ★必改（★上次 automagic 忘改名，务必改）
-save_every: 1
+save_every_epochs: 1
 save_every_steps: 0
-save_state_every: 100
+save_state_every_steps: 100
 keep_vae_on_gpu: true
 empty_cache_after_sample: false
 seed: 42
 resume_lora: ""
 resume_state: ""
-stage_timing_every: 20
+stage_timing_every_steps: 20
 stage_timing_warmup: 0
 
 # ── 采样出图（进度条用；checkpoint 选点在 Turbo 工作流做）─────
@@ -349,8 +349,8 @@ stage_timing_warmup: 0
 #  #2 元素记忆探针：白背景+简单裙，画面里凭空多出的道具/背景=病灶 B 信号
 #  #3 分布外迁移：训练集不会有的场景，画风应带过去；只出"训练集式构图"=记忆
 #  #4 服从性：多主体绑定，LoRA 不应损伤底模的 prompt 追从（官方关注点）
-sample_every: 1
-sample_steps: 0
+sample_every_epochs: 1
+sample_every_steps: 0
 sample_infer_steps: 30
 sample_cfg_scale: 4.5
 sample_sampler_name: "er_sde"
@@ -369,7 +369,7 @@ sample_prompts:                                 # ★必改 trigger 前缀，与
 # ── 日志 / 监控 ─────────────────────────────────────────────
 loss_curve_steps: 1
 no_progress: false
-log_every: 1
+log_every_steps: 1
 no_monitor: false
 monitor_port: 8765
 monitor_host: "0.0.0.0"

@@ -489,13 +489,14 @@ def parse_args():
                    help="缓存阶段单次 VAE encode 的总像素预算（含 flip 份）。0=内置保守默认 4M。"
                         "大显存卡上调可让同尺寸小图批量更深（纯提速，不改变单图结果）；"
                         "同时是 cache_encode_tiled 的分块触发阈值（超预算的图才分块）。")
-    p.add_argument("--stage-timing-every", type=int, default=0,
+    p.add_argument("--stage-timing-every-steps", "--stage-timing-every",
+                   dest="stage_timing_every_steps", type=int, default=0,
                    help="训练步分阶段计时 cadence（步）；0=关（默认，零开销/行为中立）。开启后每 N 步"
                         "用 CUDA event 计时 text_encode/forward/loss/aux/backward 等阶段、末尾一次 sync "
                         "写 stage_timing.csv，定位 NaViT vs ARB 速度根因。仅被采样步 sync，稳态 it/s 在"
                         "非采样步测量不受影响。")
     p.add_argument("--stage-timing-warmup", type=int, default=10,
-                   help="分阶段计时跳过前 N 步（cudnn autotune / cache 冷），默认 10。仅 stage_timing_every>0 时生效。")
+                   help="分阶段计时跳过前 N 步（cudnn autotune / cache 冷），默认 10。仅 stage_timing_every_steps>0 时生效。")
     p.add_argument("--stage-profile-step", type=int, default=0,
                    help="在第 N 个 micro-step 用 torch.profiler 采样完整一步（含 optimizer），"
                         "下一步开始时把 kernel 汇总表 + GPU 忙碌占比打进日志。0=关（默认，"
@@ -625,9 +626,12 @@ def parse_args():
     p.add_argument("--resume-lora", default="", help="从已有 LoRA 继续训练（safetensors 路径）")
 
     # 采样参数
-    p.add_argument("--sample-every", type=int, default=0, help="每 N 个 epoch 采样一次 (0=禁用)")
-    p.add_argument("--sample-steps", type=int, default=0, help="每 N 个 step 采样一次 (0=禁用)")
-    p.add_argument("--sample-reference-steps", type=int, default=0,
+    p.add_argument("--sample-every-epochs", "--sample-every", dest="sample_every_epochs",
+                   type=int, default=0, help="每 N 个 epoch 采样一次 (0=禁用)")
+    p.add_argument("--sample-every-steps", "--sample-steps", dest="sample_every_steps",
+                   type=int, default=0, help="每 N 个 step 采样一次 (0=禁用)")
+    p.add_argument("--sample-every-reference-steps", "--sample-reference-steps",
+                   dest="sample_every_reference_steps", type=int, default=0,
                    help="每 N 个 reference step 采样一次。reference step 按旧 batch/grad_accum 分桶模拟。0=禁用")
     p.add_argument("--sample-prompt", default="1girl, masterpiece", help="采样提示词")
     p.add_argument("--sample-cfg-scale", type=float, default=4.0, help="采样 CFG（设为 1 表示不做 CFG，仅用正面条件）")
@@ -652,14 +656,16 @@ def parse_args():
                    help="追加到训练集 caption 末尾的固定后缀（如 ',a'）。留空=不追加")
 
     # 保存参数
-    p.add_argument("--save-every", type=int, default=0, help="每 N 个 epoch 保存 (0=仅结束时)")
+    p.add_argument("--save-every-epochs", "--save-every", dest="save_every_epochs",
+                   type=int, default=0, help="每 N 个 epoch 保存 (0=仅结束时)")
     p.add_argument("--save-every-steps", type=int, default=0, help="每 N 个 optimizer step 保存 LoRA (0=禁用)")
     p.add_argument("--save-every-reference-steps", type=int, default=0,
                    help="每 N 个 reference step 保存 LoRA。reference step 按旧 batch/grad_accum 分桶模拟。0=禁用")
-    p.add_argument("--save-state-every", type=int, default=0, help="每 N 步保存完整训练状态（可断点续训）")
+    p.add_argument("--save-state-every-steps", "--save-state-every", dest="save_state_every_steps",
+                   type=int, default=0, help="每 N 步保存完整训练状态（可断点续训）")
     p.add_argument("--save-state-every-epochs", type=int, default=0,
                    help="每 N 个 epoch 保存完整训练状态（可断点续训）。0=禁用。"
-                        "与 --save-state-every（按 step）独立，可同时开")
+                        "与 --save-state-every-steps（按 step）独立，可同时开")
     p.add_argument("--resume-state", default="", help="从训练状态恢复（.pt 文件路径）")
     p.add_argument("--no-resume-skip-consumed-batches", dest="resume_skip_consumed_batches",
                    action="store_false", default=True,
@@ -675,7 +681,8 @@ def parse_args():
     p.add_argument("--monitor-host", default="0.0.0.0", help="监控面板绑定地址（默认 0.0.0.0 以支持远程访问）")
     p.add_argument("--monitor-port", type=int, default=8765, help="监控面板端口")
     p.add_argument("--no-browser", action="store_true", help="不自动打开监控面板浏览器")
-    p.add_argument("--log-every", type=int, default=10, help="日志输出间隔")
+    p.add_argument("--log-every-steps", "--log-every", dest="log_every_steps",
+                   type=int, default=10, help="日志输出间隔")
     p.add_argument("--debug-first-batches", type=int, default=0, help="记录前 N 个优化步的张量统计，用于对齐 loss 标尺")
     p.add_argument("--debug-nan-hooks", action="store_true",
                    help="逐 module 探测 NaN/Inf 诞生点（诊断用，显著拖慢每步）。"
@@ -683,7 +690,9 @@ def parse_args():
     p.add_argument("--no-debug-nan-hooks-abort", dest="debug_nan_hooks_abort",
                    action="store_false", default=True,
                    help="配合 --debug-nan-hooks：抓到诞生点只记录不中止（默认抓到即中止，防现场被冲掉）。")
-    p.add_argument("--grad-norm-log-every", type=int, default=0, help="每 N 个优化步记录梯度范数和裁切状态 (0=禁用)")
+    p.add_argument("--grad-norm-log-every-steps", "--grad-norm-log-every",
+                   dest="grad_norm_log_every_steps", type=int, default=0,
+                   help="每 N 个优化步记录梯度范数和裁切状态 (0=禁用)")
     p.add_argument("--keep-vae-on-gpu", action="store_true",
                    help="cache_latents=True 后仍让 VAE 留在 GPU，适合频繁采样，避免反复搬运。")
     p.add_argument("--empty-cache-after-sample", action="store_true", default=True,
@@ -734,7 +743,8 @@ def parse_args():
     p.add_argument("--dfm-mode", choices=["batch", "vecor"], default="batch",
                    help="ΔFM 负样本来源：batch=同批其它样本（原版）；vecor=对 target 做通道乱序/裁剪缩放"
                         "构造（arXiv 2511.18942 部分移植，不依赖 batch 大小，bs=1 也生效；实验性）。")
-    p.add_argument("--eval-every", type=int, default=0,
+    p.add_argument("--eval-every-steps", "--eval-every", dest="eval_every_steps",
+                   type=int, default=0,
                    help="每 N 步跑一次固定网格 eval loss（0=关）。固定样本+固定噪声+固定 t 网格 → "
                         "跨 run 可比的确定性曲线，写入 output_dir/eval_loss.csv。")
     p.add_argument("--eval-count", type=int, default=4,
@@ -770,15 +780,17 @@ def parse_args():
     # 训练内遥测总线（trainer/telemetry.py）：图盲、复用现有 forward/优化器 state、默认全关。
     p.add_argument("--telemetry-enabled", action="store_true",
                    help="开启训练内遥测总线（图盲）。各探针仍需各自 cadence 开关；L1/L2 频带探针随 "
-                        "eval（eval_every>0）一起跑，写 eval_freq_loss.csv / eval_slope.csv。")
+                        "eval（eval_every_steps>0）一起跑，写 eval_freq_loss.csv / eval_slope.csv。")
     p.add_argument("--telemetry-freq-bands", type=int, default=3,
                    help="L1 径向频带数（残差 FFT 按径向分带），默认 3=低/中/高。")
     p.add_argument("--telemetry-slope-window", type=int, default=6,
                    help="L2 逐 t-bin 饱和斜率的滑窗 eval 点数（最小二乘 Δloss/step）。")
-    p.add_argument("--telemetry-optimizer-every", type=int, default=0,
+    p.add_argument("--telemetry-optimizer-every-steps", "--telemetry-optimizer-every",
+                   dest="telemetry_optimizer_every_steps", type=int, default=0,
                    help="O1/O2/O3 优化器探针 cadence（步）：SF-lag/预条件 κ/逐block trust ratio → "
                         "telemetry_optimizer.csv。0=关；建议 50-100。soap_sf 时自动开 update-norm stash。")
-    p.add_argument("--telemetry-capacity-every", type=int, default=0,
+    p.add_argument("--telemetry-capacity-every-steps", "--telemetry-capacity-every",
+                   dest="telemetry_capacity_every_steps", type=int, default=0,
                    help="C1 逐 block 容量探针 cadence（步）：LoKr ‖ΔW‖+有效秩 → telemetry_capacity.csv。"
                         "0=关；带小 SVD，建议稀疏（200-400）。")
     p.add_argument("--lora-one-init-steps", type=int, default=0,
@@ -996,14 +1008,14 @@ def prompt_for_args(args):
     args.lora_alpha = _ask_float("LoRA alpha", args.lora_alpha)
     args.loss_curve_steps = _ask_int("Loss 曲线步数 (0=禁用)", args.loss_curve_steps)
     args.auto_install = _ask_bool("自动安装缺失依赖?", args.auto_install)
-    # ★ 旧实现 `args.save_every_epoch` 这个属性根本不存在（argparse 里只有 save_every: int）
-    # 任何用户跑 --interactive 都会 AttributeError 崩溃。把它映射到 save_every（0=禁用, 1=每 epoch）。
-    _save_each_epoch_default = bool(getattr(args, "save_every", 0))
+    # ★ 旧实现 `args.save_every_epoch` 这个属性根本不存在（argparse 里只有 save_every_epochs: int）
+    # 任何用户跑 --interactive 都会 AttributeError 崩溃。把它映射到 save_every_epochs（0=禁用, 1=每 epoch）。
+    _save_each_epoch_default = bool(getattr(args, "save_every_epochs", 0))
     if _ask_bool("每个 epoch 保存?", _save_each_epoch_default):
-        if not args.save_every:
-            args.save_every = 1
+        if not args.save_every_epochs:
+            args.save_every_epochs = 1
     else:
-        args.save_every = 0
+        args.save_every_epochs = 0
     args.mixed_precision = _ask_str("混合精度 (bf16/fp32)", args.mixed_precision)
     return args
 
@@ -1180,8 +1192,8 @@ def main():
                 "effective_batch_size": getattr(args, "effective_batch_size", 0),
                 "reference_batch_size": getattr(args, "reference_batch_size", 0),
                 "reference_grad_accum": getattr(args, "reference_grad_accum", 1),
-                "sample_steps": getattr(args, "sample_steps", 0),
-                "sample_reference_steps": getattr(args, "sample_reference_steps", 0),
+                "sample_every_steps": getattr(args, "sample_every_steps", 0),
+                "sample_every_reference_steps": getattr(args, "sample_every_reference_steps", 0),
                 "save_every_steps": getattr(args, "save_every_steps", 0),
                 "save_every_reference_steps": getattr(args, "save_every_reference_steps", 0),
                 "keep_vae_on_gpu": getattr(args, "keep_vae_on_gpu", False),
@@ -1377,14 +1389,14 @@ def main():
         injector_kwargs["include_patterns"] = list(raw_include_patterns)
 
     # lora_compress_replace_main 只写压缩件、不写满 rank 主件 → 满 rank 权重此后
-    # 只有 training_state(.pt) 一个副本。若 save_state_every<=0 就一份都不存，
+    # 只有 training_state(.pt) 一个副本。若 save_state_every_steps<=0 就一份都不存，
     # 续训能力会被永久丢弃且用户不会察觉，故构造期 fail-fast。
     if bool(getattr(args, "lora_compress_replace_main", False)):
-        _sse = int(getattr(args, "save_state_every", 0) or 0)
+        _sse = int(getattr(args, "save_state_every_steps", 0) or 0)
         _sse_ep = int(getattr(args, "save_state_every_epochs", 0) or 0)
         if _sse <= 0 and _sse_ep <= 0:
             raise ValueError(
-                "lora_compress_replace_main=true 要求 save_state_every>0 或 "
+                "lora_compress_replace_main=true 要求 save_state_every_steps>0 或 "
                 "save_state_every_epochs>0。\n"
                 "  该模式下 epoch 成品是逐层截断的压缩件（不能续训），满 rank 权重"
                 "只存在于 training_state(.pt)；若不定期存 .pt，一旦中断就无法续训。\n"
@@ -1452,7 +1464,7 @@ def main():
         lora_compress_replace_main=bool(getattr(args, "lora_compress_replace_main", False)),
         # Layer B：AC-LoRA 训练期 RESTART
         aclora_enabled=bool(getattr(args, "aclora_enabled", False)),
-        aclora_restart_every=int(getattr(args, "aclora_restart_every", 200) or 0),
+        aclora_restart_every=int(getattr(args, "aclora_restart_every_steps", 200) or 0),
         aclora_warmup_steps=int(getattr(args, "aclora_warmup_steps", 200) or 0),
         aclora_p_mode=str(getattr(args, "aclora_p_mode", "schedule") or "schedule"),
         aclora_p_start=float(getattr(args, "aclora_p_start", 0.7)),
@@ -2867,7 +2879,7 @@ def main():
         """保存完整训练状态 → `training_state_{tag}.pt`（含 LoRA/优化器/scheduler/RNG/监控）。
 
         `lora_stem` 非空时另写一份 LoRA 成品 `{output_name}_{lora_stem}.safetensors`
-        （None = 不写，用于"本 epoch 的成品已由 save_every 写过"的情形，避免同内容存两份）。
+        （None = 不写，用于"本 epoch 的成品已由 save_every_epochs 写过"的情形，避免同内容存两份）。
 
         epoch 号一律用 `ckpt_epoch` 而不是当前 epoch 变量：它与 `_epoch_position()` 记录的
         batch 位置成对，都是"最后一次完成 optimizer step"时的锚点 —— 两者必须同源，
@@ -2909,9 +2921,9 @@ def main():
     # Step 0 初始采样（基线效果，测试所有提示词）
     # 只在新训练时执行（global_step == 0），resume 时跳过
     sampling_enabled = (
-        args.sample_steps > 0
-        or args.sample_every > 0
-        or int(getattr(args, "sample_reference_steps", 0) or 0) > 0
+        args.sample_every_steps > 0
+        or args.sample_every_epochs > 0
+        or int(getattr(args, "sample_every_reference_steps", 0) or 0) > 0
     )
     if global_step == 0 and sampling_enabled:
         emit("采样中 (step 0, 基线)...")
@@ -3063,7 +3075,7 @@ def main():
             batch_size=int(getattr(args, "batch_size", 1) or 1),
             proj_dim=int(getattr(args, "gaf_proj_dim", 16) or 16),
             enabled=True,
-            every=int(getattr(args, "gaf_every", 4) or 4),
+            every=int(getattr(args, "gaf_every_steps", 4) or 4),
             warmup=int(getattr(args, "gaf_warmup", 100) or 100),
             mode=str(getattr(args, "gaf_mode", "soft") or "soft"),
             threshold=float(getattr(args, "gaf_threshold", 0.0) or 0.0),
@@ -3103,7 +3115,7 @@ def main():
             beta=float(getattr(args, "dpo_beta", 0.1) or 0.1),
             eta=float(getattr(args, "dpo_eta", 0.01) or 0.01),
             ref_ema=float(getattr(args, "dpo_ref_ema", 1.0) or 1.0),
-            regen_every=int(getattr(args, "dpo_regen_every", 1000) or 1000),
+            regen_every=int(getattr(args, "dpo_regen_every_steps", 1000) or 1000),
             loser_steps=int(getattr(args, "dpo_loser_steps", 14) or 14),
             loser_cfg=float(getattr(args, "dpo_loser_cfg", 1.0) or 1.0),
             loser_subset=float(getattr(args, "dpo_loser_subset", 1.0) or 1.0),
@@ -3329,7 +3341,7 @@ def main():
         )
 
     # ── 固定网格 eval loss（确定性曲线，跨 run 可比）───────────────────────────
-    _eval_every = int(getattr(args, "eval_every", 0) or 0)
+    _eval_every = int(getattr(args, "eval_every_steps", 0) or 0)
     _eval_set = []          # [(latents_1xC1HW_gpu, cross_1xLxD_gpu)]
     _eval_t_grid = []
     if _eval_every > 0:
@@ -3383,8 +3395,8 @@ def main():
     # L1/L2 频带+斜率探针随 eval 跑；O1/O2/O3 优化器探针 + C1 容量探针挂在 optimizer.step
     # 之后（见 run_step_telemetry）。所有探针只碰 latent 残差 / 权重 / 优化器 state。
     _telemetry_on = bool(getattr(args, "telemetry_enabled", False))
-    _telem_opt_every = int(getattr(args, "telemetry_optimizer_every", 0) or 0)
-    _telem_cap_every = int(getattr(args, "telemetry_capacity_every", 0) or 0)
+    _telem_opt_every = int(getattr(args, "telemetry_optimizer_every_steps", 0) or 0)
+    _telem_cap_every = int(getattr(args, "telemetry_capacity_every_steps", 0) or 0)
     _telem = None
     _freq_probe = None
     if _telemetry_on:
@@ -3405,7 +3417,7 @@ def main():
     # ARB 速度根因（flash varlen 已实测与 xformers 等速，attention 非瓶颈）。关闭时计时器
     # 是 _NOOP_TIMER，零开销、行为中立。
     from trainer.stage_timer import make_stage_timer, _NOOP_TIMER as _stage_noop_ref
-    _stage_timing_every = int(getattr(args, "stage_timing_every", 0) or 0)
+    _stage_timing_every = int(getattr(args, "stage_timing_every_steps", 0) or 0)
     _stage_timing_warmup = int(getattr(args, "stage_timing_warmup", 10) or 0)
     _stage_micro_step = 0
     _stage_sampling = False
@@ -3735,7 +3747,7 @@ def main():
         # 本 epoch 切分 batch 时用的 offset —— 存进 state，resume 才能复现同一切分序列
         _accum_offset_this_epoch = sample_accum_pending
         if _skip_until:
-            # 保存点恰好是该 epoch 的最后一个 batch（save_state_every 正好等于每 epoch
+            # 保存点恰好是该 epoch 的最后一个 batch（save_state_every_steps 正好等于每 epoch
             # 步数时很常见）——整个 epoch 已经训完了，直接进下一个 epoch，不必空转一遍
             # dataloader。sampler 此时已 set_epoch/set_accumulation_offset，len() 就是
             # 本 epoch 的真实 batch 数。
@@ -3792,7 +3804,7 @@ def main():
                 if hasattr(optimizer, "train"):
                     optimizer.train()
 
-            # ── 分阶段计时：per-micro-batch 选 real/noop 计时器（仅 stage_timing_every>0 时）。
+            # ── 分阶段计时：per-micro-batch 选 real/noop 计时器（仅 stage_timing_every_steps>0 时）。
             # 被采样步用真实 StageTimer（记录 CUDA event + 末尾一次 sync），非采样步用 noop（零开销）。
             # warmup 内一律 noop。whole_step 跨整个 micro-batch，交叉校验 dt_step。
             # flush 在 micro-batch 末尾（不要求撞上优化器边界步——按 micro-batch 计数的采样
@@ -4166,7 +4178,7 @@ def main():
 
                 # GAF（B1）：GAF 步抽每样本梯度→方向信任，更新逐图 EMA。用 ΔFM 之前的干净主
                 # 重建 per_sample；autograd.grad 不污染 .grad、retain_graph 保后续主 backward。
-                # 仅每 gaf_every 步触发（周期摊销）；warmup 内不介入。
+                # 仅每 gaf_every_steps 步触发（周期摊销）；warmup 内不介入。
                 if gaf_ctrl is not None and not _skip_main_extras:
                     gaf_ctrl.update_autograd(per_sample, batch.get("images"), global_step)
 
@@ -4729,7 +4741,7 @@ def main():
                 # ProdigyPlus 官方建议：use_stableadamw=True 时其内部已处理梯度归一化，
                 # 外部裁剪会干扰 d 估计。AdamW 系优化器若想用裁剪，再把这个值设为 1.0。
                 grad_norm_before = None
-                grad_norm_log_every = int(getattr(args, "grad_norm_log_every", 0) or 0)
+                grad_norm_log_every = int(getattr(args, "grad_norm_log_every_steps", 0) or 0)
                 should_log_grad_norm = grad_norm_log_every > 0 and (global_step + 1) % grad_norm_log_every == 0
                 if should_log_grad_norm:
                     grad_norm_before = compute_grad_norm(trainable_params)
@@ -4826,7 +4838,7 @@ def main():
                 ckpt_accum_pending = sample_accum_pending
                 ckpt_accum_offset_at_epoch_start = _accum_offset_this_epoch
 
-                # AC-LoRA 训练期 RESTART（arXiv:2504.02231）：每 aclora_restart_every 步
+                # AC-LoRA 训练期 RESTART（arXiv:2504.02231）：每 aclora_restart_every_steps 步
                 # 对每层 A/B 做信号-噪声重置。默认关（aclora_active()=False → 直接短路）。
                 # 放在 optimizer.step + zero_grad 之后：grad 已清、参数刚更新，就地改 .data 安全。
                 if injector.aclora_active():
@@ -4841,7 +4853,7 @@ def main():
 
                 previous_ref_step, ref_step = reference_tracker.commit_batches(pending_reference_batches)
                 pending_reference_batches = 0
-                sample_reference_steps = int(getattr(args, "sample_reference_steps", 0) or 0)
+                sample_reference_steps = int(getattr(args, "sample_every_reference_steps", 0) or 0)
                 save_reference_steps = int(getattr(args, "save_every_reference_steps", 0) or 0)
                 sample_by_ref = reference_interval_crossed(
                     previous_ref_step,
@@ -4908,11 +4920,11 @@ def main():
                             live.update(Group(progress, panel))
                 elif use_plain:
                     print(f"epoch {epoch+1}/{args.epochs} step {global_step}{ref_desc} loss={loss_val:.6f} lr={lr:.2e} speed={speed_ema:.2f} it/s", end="\r", flush=True)
-                elif args.log_every and global_step % args.log_every == 0:
+                elif args.log_every_steps and global_step % args.log_every_steps == 0:
                     print(f"epoch={epoch} step={global_step}{ref_desc} loss={loss_val:.6f} lr={lr:.2e} speed={steps_per_sec:.2f} it/s")
 
                 # Sample/checkpoint by optimizer step or by old-batch-equivalent reference step.
-                if args.sample_steps > 0 and global_step % args.sample_steps == 0:
+                if args.sample_every_steps > 0 and global_step % args.sample_every_steps == 0:
                     run_sample_checkpoint(f"step {global_step}", f"step_{global_step}")
                 elif sample_by_ref:
                     ref_tag = int(ref_step)
@@ -4928,12 +4940,12 @@ def main():
                     ref_tag = int(ref_step)
                     save_lora_checkpoint(f"refstep{ref_tag}_step{global_step}")
 
-                # 固定网格 eval loss（确定性曲线；eval_every=0 时 no-op）
+                # 固定网格 eval loss（确定性曲线；eval_every_steps=0 时 no-op）
                 if _eval_every > 0 and global_step % _eval_every == 0:
                     run_eval_loss(global_step)
 
                 # 定期保存训练状态（断点续训）
-                save_state_every = getattr(args, "save_state_every", 0)
+                save_state_every = getattr(args, "save_state_every_steps", 0)
                 if save_state_every > 0 and global_step % save_state_every == 0:
                     # 同时保存 LoRA 权重（文件名与旧版一致）
                     save_state_checkpoint(f"step{global_step}",
@@ -4993,11 +5005,11 @@ def main():
         current_epoch = epoch + 1
         if not args.max_steps or global_step < args.max_steps:
             # 保存 checkpoint
-            _lora_saved_this_epoch = args.save_every > 0 and current_epoch % args.save_every == 0
+            _lora_saved_this_epoch = args.save_every_epochs > 0 and current_epoch % args.save_every_epochs == 0
             if _lora_saved_this_epoch:
                 save_lora_checkpoint(f"epoch{current_epoch}")
 
-            # 每 N 个 epoch 保存完整训练状态（断点续训）。与按 step 的 save_state_every
+            # 每 N 个 epoch 保存完整训练状态（断点续训）。与按 step 的 save_state_every_steps
             # 独立：两者都开就各存各的（文件名不同，互不覆盖）。
             # 此刻 ckpt_* 记的仍是"最后一次完成 optimizer step"的位置（不是 epoch 末尾），
             # 两种落点都正确：末尾 batch 恰好完成 step → resume 走"该 epoch 已训完、直接进
@@ -5005,13 +5017,13 @@ def main():
             # → resume 快进到那一处、把它重跑一遍（它的梯度本就还没进权重）。
             _sse_epochs = int(getattr(args, "save_state_every_epochs", 0) or 0)
             if _sse_epochs > 0 and current_epoch % _sse_epochs == 0:
-                # LoRA 成品若已由 save_every 在本 epoch 写过，就不再重复写一份同内容的
+                # LoRA 成品若已由 save_every_epochs 在本 epoch 写过，就不再重复写一份同内容的
                 _stem = None if _lora_saved_this_epoch else f"epoch{current_epoch}"
                 save_state_checkpoint(f"epoch{current_epoch}_step{global_step}",
                                       lora_stem=_stem)
 
             # 采样（轮换提示词）
-            if args.sample_every > 0 and current_epoch % args.sample_every == 0:
+            if args.sample_every_epochs > 0 and current_epoch % args.sample_every_epochs == 0:
                 run_sample_checkpoint(f"epoch {current_epoch}", f"epoch_{current_epoch}")
 
         # 检查 max_steps

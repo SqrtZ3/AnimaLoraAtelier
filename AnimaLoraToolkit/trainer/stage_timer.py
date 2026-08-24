@@ -12,7 +12,7 @@
   ``elapsed_time``。逐图 Python 循环里的 kernel launch 开销会被计入该阶段（正是要抓的）。
 * **perf_counter 计时 CPU/IO 阶段**（``data_fetch``）：CUDA event 测纯 CPU 区间会得 ~0，
   故 CPU/IO 用 ``start_cpu``/``stop_cpu`` 走 wall-clock。
-* **行为中立**：默认 ``stage_timing_every=0`` 时 ``make_stage_timer(False)`` 返回
+* **行为中立**：默认 ``stage_timing_every_steps=0`` 时 ``make_stage_timer(False)`` 返回
   ``_NOOP_TIMER``，start/stop 全是空操作，不记录 event、不 sync、不分配。开启时仅被采样
   步用真实 ``StageTimer``，非采样步用 noop——稳态 it/s 在非采样步测量，不受 sync 影响。
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """`save_state_every_epochs`（按 epoch 存训练状态）的回归测试。
 
-背景：原来只有按 step 的 `save_state_every`。每个 epoch 的 step 数在 ARB / navit 打包 /
+背景：原来只有按 step 的 `save_state_every`（现名 `save_state_every_steps`）。每个 epoch 的 step 数在 ARB / navit 打包 /
 sample-window accumulation 下都不是固定值（`len(dataloader)` 随分桶变化），按 step 的
 cadence 很难正好落在 epoch 边界上，于是"每个 epoch 末尾一定有一个可续训的点"这件事
 无法保证。新开关在 epoch 末尾直接触发一次 `save_training_state`。

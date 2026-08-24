@@ -161,7 +161,7 @@ YAML_TO_ARGS = {
     "lora_compress_replace_main": "lora_compress_replace_main",
     # Layer B：AC-LoRA 训练期 RESTART（arXiv:2504.02231）
     "aclora_enabled": "aclora_enabled",
-    "aclora_restart_every": "aclora_restart_every",
+    "aclora_restart_every_steps": "aclora_restart_every_steps",
     "aclora_warmup_steps": "aclora_warmup_steps",
     "aclora_p_mode": "aclora_p_mode",
     "aclora_p_start": "aclora_p_start",
@@ -202,10 +202,10 @@ YAML_TO_ARGS = {
     # 输出与保存
     "output_dir": "output_dir",
     "output_name": "output_name",
-    "save_every": "save_every",
+    "save_every_epochs": "save_every_epochs",
     "save_every_steps": "save_every_steps",
     "save_every_reference_steps": "save_every_reference_steps",
-    "save_state_every": "save_state_every",
+    "save_state_every_steps": "save_state_every_steps",
     # 每 N 个 epoch 存一次完整训练状态（与按 step 的 save_state_every 独立，可同开）。
     # 0=禁用；两者都>0 时各存各的，文件名不同（step{N}.pt vs epoch{E}_step{N}.pt）。
     "save_state_every_epochs": "save_state_every_epochs",
@@ -215,8 +215,8 @@ YAML_TO_ARGS = {
     "resume_skip_consumed_batches": "resume_skip_consumed_batches",
     "seed": "seed",
     # 采样
-    "sample_every": "sample_every",
-    "sample_steps": "sample_steps",
+    "sample_every_epochs": "sample_every_epochs",
+    "sample_every_steps": "sample_every_steps",
     "sample_prompt": "sample_prompt",
     "sample_prompts": "sample_prompts",
     # 预览提示词从训练集 caption 随机取（opt-in）。off=只用 sample_prompts（默认，
@@ -234,7 +234,7 @@ YAML_TO_ARGS = {
     "sample_infer_steps": "sample_infer_steps",
     "sample_sampler_name": "sample_sampler_name",
     "sample_scheduler": "sample_scheduler",
-    "sample_reference_steps": "sample_reference_steps",
+    "sample_every_reference_steps": "sample_every_reference_steps",
     "reference_batch_size": "reference_batch_size",
     "reference_grad_accum": "reference_grad_accum",
     "keep_vae_on_gpu": "keep_vae_on_gpu",
@@ -242,7 +242,7 @@ YAML_TO_ARGS = {
     # 进度显示与监控
     "loss_curve_steps": "loss_curve_steps",
     "no_progress": "no_progress",
-    "log_every": "log_every",
+    "log_every_steps": "log_every_steps",
     "no_monitor": "no_monitor",
     "monitor_host": "monitor_host",
     "monitor_port": "monitor_port",
@@ -284,16 +284,16 @@ YAML_TO_ARGS = {
     "wandb_run_name": "wandb_run_name",
     "wandb_mode": "wandb_mode",
     "wandb_dir": "wandb_dir",
-    "wandb_log_every": "wandb_log_every",
+    "wandb_log_every_steps": "wandb_log_every_steps",
     "wandb_log_images": "wandb_log_images",
     "telemetry_enabled": "telemetry_enabled",
     "telemetry_freq_bands": "telemetry_freq_bands",
     "telemetry_slope_window": "telemetry_slope_window",
-    "telemetry_optimizer_every": "telemetry_optimizer_every",
-    "telemetry_capacity_every": "telemetry_capacity_every",
+    "telemetry_optimizer_every_steps": "telemetry_optimizer_every_steps",
+    "telemetry_capacity_every_steps": "telemetry_capacity_every_steps",
     # 训练步分阶段计时（trainer/stage_timer.py，opt-in default-off）—定位 NaViT vs
     # ARB 速度根因。CUDA event 计时 GPU 阶段、perf_counter 计时 CPU/IO；仅被采样步 sync。
-    "stage_timing_every": "stage_timing_every",
+    "stage_timing_every_steps": "stage_timing_every_steps",
     "stage_timing_warmup": "stage_timing_warmup",
     "stage_profile_step": "stage_profile_step",
     "stage_profile_trace": "stage_profile_trace",
@@ -321,7 +321,7 @@ YAML_TO_ARGS = {
     "timestep_mix_low_prob_end": "timestep_mix_low_prob_end",
     "timestep_mix_high_prob_end": "timestep_mix_high_prob_end",
     "dfm_mode": "dfm_mode",
-    "eval_every": "eval_every",
+    "eval_every_steps": "eval_every_steps",
     "eval_count": "eval_count",
     "eval_t_grid": "eval_t_grid",
     "eval_seed": "eval_seed",
@@ -358,7 +358,7 @@ YAML_TO_ARGS = {
     "immiscible_enabled": "immiscible_enabled",
     "immiscible_k": "immiscible_k",
     "caption_dropout_rate": "caption_dropout_rate",
-    "grad_norm_log_every": "grad_norm_log_every",
+    "grad_norm_log_every_steps": "grad_norm_log_every_steps",
     # Regex 模块选择（kohya 风格）
     "lora_exclude_patterns": "lora_exclude_patterns",
     "lora_include_patterns": "lora_include_patterns",
@@ -413,7 +413,7 @@ YAML_TO_ARGS = {
     "aux_lpl_max_decode_px": "aux_lpl_max_decode_px",
     # ── GAF 梯度一致性过滤（脏数据鲁棒性 B1；默认关）──
     "gaf_enabled": "gaf_enabled",
-    "gaf_every": "gaf_every",
+    "gaf_every_steps": "gaf_every_steps",
     "gaf_warmup": "gaf_warmup",
     "gaf_mode": "gaf_mode",
     "gaf_threshold": "gaf_threshold",
@@ -429,7 +429,7 @@ YAML_TO_ARGS = {
     "dpo_beta": "dpo_beta",
     "dpo_eta": "dpo_eta",
     "dpo_ref_ema": "dpo_ref_ema",
-    "dpo_regen_every": "dpo_regen_every",
+    "dpo_regen_every_steps": "dpo_regen_every_steps",
     "dpo_loser_steps": "dpo_loser_steps",
     "dpo_loser_cfg": "dpo_loser_cfg",
     "dpo_loser_subset": "dpo_loser_subset",
@@ -753,7 +753,7 @@ DEFAULTS = {
     "lora_compress_replace_main": False,
     # Layer B：AC-LoRA 训练期 RESTART。默认关。仅 lora_type=lora + variant=base + init=default。
     "aclora_enabled": False,
-    "aclora_restart_every": 200,     # 每多少 optimizer step 做一次 RESTART（论文 E=10 epoch 的 step 类比）
+    "aclora_restart_every_steps": 200,     # 每多少 optimizer step 做一次 RESTART（论文 E=10 epoch 的 step 类比）
     "aclora_warmup_steps": 200,      # 此前不 RESTART（保 step-0 中立 + 让信号先形成）
     "aclora_p_mode": "schedule",     # "schedule"=FM 稳健(p_start→p_end 线性)；"loss"=论文 p=1-l^α（假设 loss<1）
     "aclora_p_start": 0.7,           # schedule 模式起始保留能量占比
@@ -807,16 +807,16 @@ DEFAULTS = {
     "num_workers": 0,
     "output_dir": "./output",
     "output_name": "anima_lora",
-    "save_every": 0,
+    "save_every_epochs": 0,
     "save_every_steps": 0,
     "save_every_reference_steps": 0,
-    "save_state_every": 0,
+    "save_state_every_steps": 0,
     "save_state_every_epochs": 0,
     "resume_state": "",
     "resume_skip_consumed_batches": True,
     "seed": 42,
-    "sample_every": 0,
-    "sample_steps": 0,
+    "sample_every_epochs": 0,
+    "sample_every_steps": 0,
     "sample_prompt": "1girl, masterpiece",
     "sample_prompts": [],
     "sample_dataset_prompts": "off",
@@ -832,14 +832,14 @@ DEFAULTS = {
     "sample_infer_steps": 25,
     "sample_sampler_name": "er_sde",
     "sample_scheduler": "simple",
-    "sample_reference_steps": 0,
+    "sample_every_reference_steps": 0,
     "reference_batch_size": 0,
     "reference_grad_accum": 1,
     "keep_vae_on_gpu": False,
     "empty_cache_after_sample": True,
     "loss_curve_steps": 100,
     "no_progress": False,
-    "log_every": 10,
+    "log_every_steps": 10,
     "no_monitor": False,
     "monitor_host": "0.0.0.0",
     "monitor_port": 8765,
@@ -874,16 +874,16 @@ DEFAULTS = {
     "wandb_run_name": "",         # 空=取 output_name，便于与磁盘上的权重对号
     "wandb_mode": "online",       # online / offline（先落盘，事后 wandb sync）/ disabled
     "wandb_dir": "",              # 空=output_dir
-    "wandb_log_every": 1,         # >1 时逐步指标抽稀
+    "wandb_log_every_steps": 1,         # >1 时逐步指标抽稀
     "wandb_log_images": True,     # 采样预览图是否上传
     "telemetry_enabled": False,
     "telemetry_freq_bands": 3,
     "telemetry_slope_window": 6,
-    "telemetry_optimizer_every": 0,
-    "telemetry_capacity_every": 0,
+    "telemetry_optimizer_every_steps": 0,
+    "telemetry_capacity_every_steps": 0,
     # 训练步分阶段计时 cadence（步）；0=关（noop 计时器，零开销/行为中立）。开启后每 N 步
     # 用 CUDA event 计时各阶段、末尾一次 sync 写 stage_timing.csv，定位 NaViT vs ARB 速度根因。
-    "stage_timing_every": 0,
+    "stage_timing_every_steps": 0,
     # 跳过前 warmup 步不计时（cudnn autotune / cache 冷），避免冷启动污染统计；仅 every>0 时生效。
     "stage_timing_warmup": 10,
     # 在第 N 个 micro-step 用 torch.profiler 采样完整一步，区分「kernel 慢」vs
@@ -911,7 +911,7 @@ DEFAULTS = {
     "tread_ratio": 0.3,
     "tread_start_layer": 3,
     "tread_end_layer": -4,
-    "eval_every": 0,
+    "eval_every_steps": 0,
     "eval_count": 4,
     "eval_t_grid": "0.1,0.3,0.5,0.7,0.9",
     "eval_seed": 1234,
@@ -948,7 +948,7 @@ DEFAULTS = {
     "immiscible_enabled": False,
     "immiscible_k": 4,
     "caption_dropout_rate": 0.0,
-    "grad_norm_log_every": 0,
+    "grad_norm_log_every_steps": 0,
     "lora_exclude_patterns": None,
     "lora_include_patterns": None,
     "lora_reg_dims": None,
@@ -1004,7 +1004,7 @@ DEFAULTS = {
     "aux_self_perceptual_encode_t": 0.05,
     # GAF 梯度一致性过滤（默认关 → 完全 no-op）
     "gaf_enabled": False,
-    "gaf_every": 4,
+    "gaf_every_steps": 4,
     "gaf_warmup": 100,
     "gaf_mode": "soft",
     "gaf_threshold": 0.0,
@@ -1021,7 +1021,7 @@ DEFAULTS = {
     "dpo_beta": 0.1,
     "dpo_eta": 0.01,
     "dpo_ref_ema": 1.0,
-    "dpo_regen_every": 1000,
+    "dpo_regen_every_steps": 1000,
     "dpo_loser_steps": 14,
     "dpo_loser_cfg": 1.0,
     "dpo_loser_subset": 1.0,
@@ -1163,6 +1163,32 @@ INERT_KEYS = {
 }
 
 
+#: 已重命名的 YAML 键别名（旧 → 新 args 属性）。
+#:
+#: 节奏参数统一为 ``<动作>_every_<单位>``（单位 ∈ {epochs, steps, reference_steps}），
+#: 解决两个隐患：bare ``_every`` 在 ``save_every``(epoch) 与 ``save_state_every``(step)
+#: 间单位相反；``sample_steps``（每 N 训练步采样）与 ``sample_infer_steps``（采样器去噪
+#: 步数）撞名。旧键仍可用（经此表映射到新属性，值不变），但启动时会告警提示迁移；
+#: 新键优先，两者同在则忽略旧名并告警冲突。详见 ``apply_yaml_config``。
+ALIASES = {
+    "save_every": "save_every_epochs",
+    "save_state_every": "save_state_every_steps",
+    "sample_every": "sample_every_epochs",
+    "sample_steps": "sample_every_steps",
+    "sample_reference_steps": "sample_every_reference_steps",
+    "eval_every": "eval_every_steps",
+    "log_every": "log_every_steps",
+    "gaf_every": "gaf_every_steps",
+    "dpo_regen_every": "dpo_regen_every_steps",
+    "telemetry_optimizer_every": "telemetry_optimizer_every_steps",
+    "telemetry_capacity_every": "telemetry_capacity_every_steps",
+    "wandb_log_every": "wandb_log_every_steps",
+    "stage_timing_every": "stage_timing_every_steps",
+    "grad_norm_log_every": "grad_norm_log_every_steps",
+    "aclora_restart_every": "aclora_restart_every_steps",
+}
+
+
 def _is_active_deprecated_value(value):
     if value is None:
         return False
@@ -1180,14 +1206,14 @@ def _is_active_deprecated_value(value):
 def unrecognized_keys(config):
     """返回 ``(未知键, 已失效键)`` 两个有序列表。纯函数，不打日志，便于单测。
 
-    "未知"= 不在 ``YAML_TO_ARGS``、也不在 ``DEPRECATED_V5_KEYS`` / ``INERT_KEYS`` 里。
-    已失效键只在**值看起来是在开启它**时才计入（``disable_tlora_hooks: false`` 与
-    不写它完全等价，为这种情况刷警告纯属噪声）；未知键则一律计入 —— 拼错的键无论
+    "未知"= 不在 ``YAML_TO_ARGS``、也不在 ``DEPRECATED_V5_KEYS`` / ``INERT_KEYS`` /
+    ``ALIASES`` 里。已失效键只在**值看起来是在开启它**时才计入（``disable_tlora_hooks: false``
+    与不写它完全等价，为这种情况刷警告纯属噪声）；未知键则一律计入 —— 拼错的键无论
     值是什么都是问题。
     """
     if not config:
         return [], []
-    known = set(YAML_TO_ARGS) | set(DEPRECATED_V5_KEYS) | set(INERT_KEYS)
+    known = set(YAML_TO_ARGS) | set(DEPRECATED_V5_KEYS) | set(INERT_KEYS) | set(ALIASES)
     unknown = sorted(k for k in config if k not in known)
     inert = sorted(k for k in config
                    if k in INERT_KEYS and _is_active_deprecated_value(config.get(k)))
@@ -1260,6 +1286,30 @@ def apply_yaml_config(args, config):
         # 列表类型的默认值用 [] 表示，但 argparse 未定义时返回 None
         if current_value == default_value or current_value is None:
             setattr(args, arg_attr, yaml_value)
+
+    # ── 已重命名键的旧名别名 ────────────────────────────────────────────────
+    # ALIASES：旧 yaml 键 → 新 args 属性。旧键仍生效（值原样落到新属性，行为不变），
+    # 但告警提示迁移；新键优先，两者同在则忽略旧名并告警冲突。值 0 也照常应用
+    # （0 对 cadence 是"禁用"，必须落到新属性，否则会用默认值静默打开）。
+    for old_key, new_attr in ALIASES.items():
+        if old_key not in config:
+            continue
+        old_value = config[old_key]
+        if old_value is None:
+            continue
+        if new_attr in config and config[new_attr] is not None:
+            logger.warning(
+                "YAML 键 %r 已重命名为 %r，但两者都在配置中出现；忽略旧名，采用新名。"
+                "请删除旧名 %r 以保持一致。",
+                old_key, new_attr, old_key,
+            )
+            continue
+        logger.warning(
+            "YAML 键 %r 已重命名为 %r（节奏参数统一为 *_every_<单位>）。"
+            "旧名仍可用，请改用新名以便将来移除。",
+            old_key, new_attr,
+        )
+        setattr(args, new_attr, old_value)
 
     # style_profile 在 wd 解析前应用 —— 它可能覆盖 timestep/loss 字段，但不动 wd
     _apply_style_profile(args, config)

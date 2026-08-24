@@ -180,7 +180,7 @@ http://localhost:8080
 
 3. ✅ 小批量测试
    ```bash
-   python anima_train.py --config config.yaml --epochs 3 --save_every 1
+   python anima_train.py --config config.yaml --epochs 3 --save-every-epochs 1
    ```
 
 ### 训练中

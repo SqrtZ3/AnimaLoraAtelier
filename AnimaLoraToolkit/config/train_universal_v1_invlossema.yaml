@@ -171,7 +171,7 @@ batch_size: 4
 effective_batch_size: 0
 grad_accum: 1
 grad_clip_max_norm: 1.0
-grad_norm_log_every: 40
+grad_norm_log_every_steps: 40
 mixed_precision: "bf16"
 grad_checkpoint: true
 num_workers: 4
@@ -264,7 +264,7 @@ aux_perceptual_use_checkpoint: true
 aux_perceptual_lpips_size: 512
 
 # ── eval（固定网格，跨 run 跨数据集可比）──────────────────────────────────
-eval_every: 40
+eval_every_steps: 40
 eval_count: 4
 eval_t_grid: "0.1,0.3,0.5,0.7,0.9"
 eval_seed: 1234
@@ -274,14 +274,14 @@ output_dir: "./output/CHANGE_ME"    # ★必改
 output_name: "CHANGE_ME"            # ★必改
 
 save_every_steps: 40
-save_state_every: 200
+save_state_every_steps: 200
 keep_vae_on_gpu: true
 empty_cache_after_sample: false
 seed: 42
 resume_lora: ""
 
-sample_every: 0
-sample_steps: 40
+sample_every_epochs: 0
+sample_every_steps: 40
 sample_infer_steps: 30
 sample_cfg_scale: 4.0
 sample_sampler_name: "er_sde"
@@ -294,7 +294,7 @@ sample_prompt: "@CHANGE_ME, newest, safe, 1girl,masterpiece, best quality"  # �
 
 loss_curve_steps: 1
 no_progress: false
-log_every: 1
+log_every_steps: 1
 
 no_monitor: false
 monitor_host: "0.0.0.0"

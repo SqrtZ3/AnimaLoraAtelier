@@ -8,6 +8,11 @@
 #   - 第一次跑不要一次改太多。先复制本文件，改路径、data_dir、output_dir。
 #   - ProdigyPlus + Schedule-Free 请保持 lr_scheduler: "none"，并保持 learning_rate: 1.0。
 #   - 本补丁代码会在保存/采样前调用 optimizer.eval()，回到训练时 optimizer.train()。
+#
+# 节奏参数命名（save / sample / 日志 / eval 等"每 N 〈单位〉 做某事"的参数）统一为
+# `<动作>_every_<单位>`，单位 ∈ {epochs, steps, reference_steps}；采样器去噪步数是
+# sample_infer_steps（质量，不是节奏，不带 _every_）。旧键名（如 save_every / sample_steps
+# / log_every）仍可用，启动时会告警提示迁移到新名。详见 trainer/config.py 的 ALIASES。
 
 # ============================================================================
 # 模型路径
@@ -524,23 +529,23 @@ output_dir: "./output/all_args_test"
 output_name: "anima_lokr_all_args"
 
 # 每 N epoch 保存；0=关闭。更建议用 save_every_steps。
-save_every: 0
+save_every_epochs: 0
 
-# 每 N optimizer step 保存 LoRA。建议与 sample_steps 对齐，方便选 checkpoint。
+# 每 N optimizer step 保存 LoRA。建议与 sample_every_steps 对齐，方便选 checkpoint。
 save_every_steps: 100
 
 # Save every N ref_step instead of optimizer step. Requires reference_batch_size > 0.
 save_every_reference_steps: 0
 
 # 每 N step 保存完整训练状态。可断点续训，但文件更大。
-save_state_every: 500
+save_state_every_steps: 500
 
 # 每 N epoch 保存完整训练状态（epoch 末尾触发）。0=关闭。
-# 与按 step 的 save_state_every 完全独立，可同时开：文件名分别是
+# 与按 step 的 save_state_every_steps 完全独立，可同时开：文件名分别是
 #   training_state_step{N}.pt / training_state_epoch{E}_step{N}.pt，互不覆盖。
 # 用途：每 epoch 步数不固定（ARB/navit 打包下 len(dataloader) 会变）时，按 step 的
 # cadence 很难正好落在 epoch 边界；这个开关保证"每个 epoch 末尾一定有一个可续训的点"。
-# 该 epoch 若已由 save_every 写过 LoRA 成品，这里就只写 .pt，不再重复写同内容的 safetensors。
+# 该 epoch 若已由 save_every_epochs 写过 LoRA 成品，这里就只写 .pt，不再重复写同内容的 safetensors。
 save_state_every_epochs: 0
 
 # 从完整训练状态恢复。空字符串表示不用。
@@ -560,15 +565,15 @@ seed: 42
 # 训练中采样
 # ============================================================================
 
-# 每 N epoch 采样；0=关闭。建议用 sample_steps。
-sample_every: 0
+# 每 N epoch 采样；0=关闭。建议用 sample_every_steps。
+sample_every_epochs: 0
 
 # 每 N step 采样。过小会拖慢训练；40-200 适合观察小数据集过拟合点。
-sample_steps: 100
+sample_every_steps: 100
 
 # Sample every N ref_step instead of optimizer step. Requires reference_batch_size > 0.
 # For frequent sampling, consider keep_vae_on_gpu=true and empty_cache_after_sample=false.
-sample_reference_steps: 0
+sample_every_reference_steps: 0
 
 # 单 prompt 采样。若 sample_prompts 非空，通常会轮换多 prompt。
 sample_prompt: "newest, safe, 1girl, masterpiece, best quality"
@@ -642,7 +647,7 @@ loss_curve_steps: 200
 no_progress: false
 
 # 每 N step 打印日志。调小更详细，略影响速度。
-log_every: 10
+log_every_steps: 10
 
 # 关闭 Web 监控。无浏览器/纯终端训练可 true。
 no_monitor: false
@@ -661,8 +666,8 @@ no_browser: true
 # 计时 text_encode / forward / loss / aux / backward / optimizer 等，写 stage_timing.csv。
 # 0 = 关（默认，零开销/行为中立）。开启后每 N 步采样一次，仅被采样步末尾 sync 一次，
 # 稳态 it/s 在非采样步测量不受影响。分析：python tools/analyze_stage_timing.py --csv <output_dir>/stage_timing.csv
-stage_timing_every: 0
-# 计时跳过前 N 步（cudnn autotune / cache 冷），仅 stage_timing_every>0 时生效。
+stage_timing_every_steps: 0
+# 计时跳过前 N 步（cudnn autotune / cache 冷），仅 stage_timing_every_steps>0 时生效。
 stage_timing_warmup: 10
 
 # ============================================================================

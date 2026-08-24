@@ -1578,7 +1578,7 @@ class LoRAInjector:
                         or self.lora_compress_budget_mb > 0.0)
         # 只留压缩件、不写满 rank 主件。省磁盘/下载带宽，但满 rank 权重就只剩
         # training_state(.pt) 一个副本了 —— 调用方（anima_train.py）必须确保
-        # save_state_every>0，否则续训能力会被永久丢弃。这里只能校验"压缩本身开着"。
+        # save_state_every_steps>0，否则续训能力会被永久丢弃。这里只能校验"压缩本身开着"。
         self.lora_compress_replace_main = bool(lora_compress_replace_main)
         if self.lora_compress_replace_main and not _compress_on:
             raise ValueError(

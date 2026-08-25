@@ -136,6 +136,11 @@ def enable() -> dict:
     if _NPU_ENABLED:
         return _NPU_INFO
 
+    # ★ 顺序要紧：allocator 配置必须在**本进程第一次碰设备之前**设好。
+    # caching allocator 只在首次分配时解析一次 PYTORCH_NPU_ALLOC_CONF，之后再改
+    # 是静默无效的。transfer_to_npu 之后的任何设备调用都可能触发首次分配。
+    set_allocator_env()
+
     import torch
 
     try:
@@ -200,9 +205,10 @@ def set_allocator_env() -> None:
 
     只在用户没显式设过时才设。expandable_segments 在昇腾上是否受支持随 torch_npu
     版本变化——设置失败不影响训练，只是少一项优化，所以这里不做断言。
+
+    **不加 ``_NPU_ENABLED`` 守卫**：本函数由 ``enable()`` 在设备就绪之前调用
+    （见那里的顺序说明），此时标志位还没置上。唯一调用点就是 ``enable()``。
     """
-    if not _NPU_ENABLED:
-        return
     if "PYTORCH_NPU_ALLOC_CONF" not in os.environ:
         os.environ["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
         logger.info("[npu] PYTORCH_NPU_ALLOC_CONF=expandable_segments:True")

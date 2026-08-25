@@ -107,6 +107,12 @@ def enable() -> dict:
     if _DCU_ENABLED:
         return _DCU_INFO
 
+    # ★ 顺序要紧：allocator 配置必须在**本进程第一次碰设备之前**设好。
+    # PyTorch 的 caching allocator 只在首次分配时解析一次 PYTORCH_*_ALLOC_CONF，
+    # 之后再改环境变量是静默无效的（不报错，只是没生效）。下面的 _arch_name() /
+    # configure_sdpa_backends() 都会初始化 HIP 上下文并分配张量，所以放在它们前面。
+    set_allocator_env()
+
     import torch
 
     flavor = _torch_flavor(torch)
@@ -242,10 +248,12 @@ def set_allocator_env() -> None:
     ``PYTORCH_CUDA_ALLOC_CONF``。两个都设（只在用户没显式设过时），谁被认就是谁生效。
     ``expandable_segments`` 在 DTK 上是否受支持随版本变化，设置失败不影响训练，
     所以这里不做断言 —— 真值由 ``tools/dcu_probe.py`` 的 allocator 项实测。
+
+    **不加 ``_DCU_ENABLED`` 守卫**：本函数由 ``enable()`` 在确认设备之前调用
+    （见那里的顺序说明），此时标志位还没置上。唯一调用点就是 ``enable()``，
+    而 ``enable()`` 只在 ``device_backend=dcu`` 时被调用，CUDA 路径不受影响。
     """
-    if not _DCU_ENABLED:
-        return
-    for var in ("PYTORCH_HIP_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+    for var in ("PYTORCH_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
         if var not in os.environ:
             os.environ[var] = "expandable_segments:True"
             logger.info("[dcu] %s=expandable_segments:True", var)

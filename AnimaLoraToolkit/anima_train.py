@@ -1112,14 +1112,14 @@ def main():
     # 是 HIP 后端，torch.cuda.* 本身就是 DCU，所以下面 CUDA 那一支照常执行、无需分叉。
     from utils import npu_compat
     from utils import dcu_compat
+    # allocator env 由 enable() 内部在碰设备之前设好（原先在这里调用，
+    # 但那时 enable() 已经分配过张量，allocator 配置解析早就发生过了 —— 静默无效）。
     if npu_compat.npu_requested(getattr(args, "device_backend", "auto")):
         npu_compat.enable()
         npu_compat.guard_unsupported(args)
-        npu_compat.set_allocator_env()
     elif dcu_compat.dcu_requested(getattr(args, "device_backend", "auto")):
         dcu_compat.enable()
         dcu_compat.guard_unsupported(args)
-        dcu_compat.set_allocator_env()
         logger.info("[dcu] %s", dcu_compat.miopen_cache_hint())
 
     # 进程组初始化：放在后端确认之后（这样"torch 被 pip 覆盖成 CUDA 构建"这类环境问题
